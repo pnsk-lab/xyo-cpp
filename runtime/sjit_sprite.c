@@ -173,6 +173,19 @@ void sjit_sprite_set_xy(SRuntime *runtime, SSprite *sprite, double x, double y, 
     if (!sprite) {
         return;
     }
+    if (runtime && runtime->fencing && !sprite->base.is_stage) {
+        /* linux.sb3 deliberately moves an invisible console sprite to huge
+           coordinates and relies on Scratch/TurboWarp fencing to discover
+           the 480x360 stage dimensions. */
+        if (!isfinite(x)) {
+            x = 0.0;
+        }
+        if (!isfinite(y)) {
+            y = 0.0;
+        }
+        x = fmin(240.0, fmax(-240.0, x));
+        y = fmin(180.0, fmax(-180.0, y));
+    }
     if (runtime && sprite->pen_down && (sprite->x != x || sprite->y != y)) {
         sjit_pen_path_push(
             &runtime->pen,

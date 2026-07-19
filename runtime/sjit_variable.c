@@ -101,6 +101,13 @@ void sjit_variable_set_bool(SVariable *variable, int value) {
     variable->value.ptr = NULL;
 }
 
+void sjit_variable_set_list_item_limit(SVariable *variable, int item_limit) {
+    if (!variable || variable->value.tag != SJIT_VALUE_LIST || !variable->value.ptr) {
+        return;
+    }
+    sjit_list_set_item_limit((SList *)variable->value.ptr, item_limit);
+}
+
 double sjit_variable_number(SRuntime *runtime, const SVariable *variable) {
     if (!variable) {
         return 0.0;

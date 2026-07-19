@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -66,17 +67,62 @@ namespace {
 
 constexpr int kStageWidth = 480;
 constexpr int kStageHeight = 360;
-constexpr int kWindowScale = 2;
-// scratch-render keeps the pen framebuffer at the renderer's 480x360 native
-// size even when the visible canvas is enlarged for a high-DPI display.
-constexpr int kPenCanvasWidth = kStageWidth;
-constexpr int kPenCanvasHeight = kStageHeight;
+constexpr double kDefaultStageScale = 2.0;
+constexpr double kMinimumStageScale = 0.25;
+// Keep the visible stage size independent from the pen buffer.  The default
+// window is 2x, so a 2x logical pen buffer gives the pen one pixel per visible
+// display pixel instead of scaling a 480x360 buffer with nearest filtering.
+constexpr double kMinimumPenResolutionScale = 2.0;
 constexpr double kDefaultFps = 60.0;
 constexpr int kDensePenCommandThreshold = 8192;
 // Graphic effect inputs are script-controlled. Bound the number of derived
 // textures so a continuously-changing pixelate value cannot grow host memory
 // without limit. 3D2 uses only 25 non-zero levels.
 constexpr std::size_t kMaxPixelatedSpriteTextures = 64;
+
+struct StageViewport {
+    double scale = kDefaultStageScale;
+    int offset_x = 0;
+    int offset_y = 0;
+    int width = static_cast<int>(kStageWidth * kDefaultStageScale);
+    int height = static_cast<int>(kStageHeight * kDefaultStageScale);
+};
+
+// The host has one active stage window, so keeping the current viewport here
+// lets input, hit testing, and all render paths use exactly the same mapping.
+StageViewport g_stage_viewport;
+
+void setStageViewportForScale(double scale) {
+    g_stage_viewport.scale = std::max(kMinimumStageScale, scale);
+    g_stage_viewport.offset_x = 0;
+    g_stage_viewport.offset_y = 0;
+    g_stage_viewport.width = std::max(
+        1,
+        static_cast<int>(std::lround(kStageWidth * g_stage_viewport.scale)));
+    g_stage_viewport.height = std::max(
+        1,
+        static_cast<int>(std::lround(kStageHeight * g_stage_viewport.scale)));
+}
+
+void updateStageViewportForWindow(int window_width, int window_height) {
+    if (window_width <= 0 || window_height <= 0) {
+        return;
+    }
+    const double scale = std::max(
+        kMinimumStageScale,
+        std::min(
+            static_cast<double>(window_width) / kStageWidth,
+            static_cast<double>(window_height) / kStageHeight));
+    g_stage_viewport.scale = scale;
+    g_stage_viewport.width = std::max(
+        1,
+        static_cast<int>(std::lround(kStageWidth * scale)));
+    g_stage_viewport.height = std::max(
+        1,
+        static_cast<int>(std::lround(kStageHeight * scale)));
+    g_stage_viewport.offset_x = (window_width - g_stage_viewport.width) / 2;
+    g_stage_viewport.offset_y = (window_height - g_stage_viewport.height) / 2;
+}
 
 struct RuntimeExecution {
     SRuntimeTickFn tick = sjit_runtime_tick;
@@ -144,35 +190,225 @@ double frameMsForFps(double fps) {
     return 1000.0 / (fps > 0.0 ? fps : kDefaultFps);
 }
 
+bool configureRuntimeCompatibility(SRuntime *runtime, const ProjectRunOptions &options) {
+    if (!runtime || !sjit_runtime_set_compatibility_mode(runtime, options.compatibility_mode)) {
+        return false;
+    }
+    if (options.list_item_limit > 0 &&
+        !sjit_runtime_set_list_item_limit(runtime, options.list_item_limit)) {
+        return false;
+    }
+    return true;
+}
+
 int scratchToScreenX(double x) {
-    return static_cast<int>(std::lround((x + 240.0) * kWindowScale));
+    return g_stage_viewport.offset_x +
+        static_cast<int>(std::lround((x + 240.0) * g_stage_viewport.scale));
 }
 
 int scratchToScreenY(double y) {
-    return static_cast<int>(std::lround((180.0 - y) * kWindowScale));
+    return g_stage_viewport.offset_y +
+        static_cast<int>(std::lround((180.0 - y) * g_stage_viewport.scale));
 }
 
-int scratchToPenCanvasX(double x) {
-    return static_cast<int>(std::floor(x + (kPenCanvasWidth * 0.5)));
+double penResolutionScale() {
+    return std::max(kMinimumPenResolutionScale, g_stage_viewport.scale);
 }
 
-int scratchToPenCanvasY(double y) {
-    return static_cast<int>(std::floor((kPenCanvasHeight * 0.5) - y));
+int penCanvasWidth() {
+    return std::max(
+        1,
+        static_cast<int>(std::lround(kStageWidth * penResolutionScale())));
+}
+
+int penCanvasHeight() {
+    return std::max(
+        1,
+        static_cast<int>(std::lround(kStageHeight * penResolutionScale())));
+}
+
+double penCanvasScaleForWidth(int width) {
+    return static_cast<double>(width) / static_cast<double>(kStageWidth);
+}
+
+int scratchToPenCanvasX(double x, int width) {
+    return static_cast<int>(std::floor(
+        (x + (kStageWidth * 0.5)) * penCanvasScaleForWidth(width)));
+}
+
+int scratchToPenCanvasY(double y, int height) {
+    return static_cast<int>(std::floor(
+        (kStageHeight * 0.5 - y) *
+        (static_cast<double>(height) / static_cast<double>(kStageHeight))));
 }
 
 double screenToScratchX(int x) {
-    return (static_cast<double>(x) / kWindowScale) - 240.0;
+    return (static_cast<double>(x - g_stage_viewport.offset_x) /
+            g_stage_viewport.scale) - 240.0;
 }
 
 double screenToScratchY(int y) {
-    return 180.0 - (static_cast<double>(y) / kWindowScale);
+    return 180.0 -
+        (static_cast<double>(y - g_stage_viewport.offset_y) /
+         g_stage_viewport.scale);
+}
+
+struct HitMask {
+    int width = 0;
+    int height = 0;
+    std::vector<Uint8> alpha;
+
+    bool valid() const {
+        return width > 0 && height > 0 &&
+            alpha.size() == static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+    }
+};
+
+struct HitMaskCache {
+    std::unordered_map<std::string, HitMask> masks;
+};
+
+const TargetRenderInfo *findTargetRenderInfo(
+    const std::vector<TargetRenderInfo> &render_targets,
+    int target_id);
+const CostumeRenderInfo *findCostumeRenderInfo(
+    const TargetRenderInfo *target,
+    int costume_id);
+std::string spriteTextureKey(const TargetRenderInfo *target, int costume_id);
+
+bool loadHitMask(const CostumeRenderInfo &costume, HitMask &mask) {
+    mask = {};
+    if (costume.source_data.empty()) {
+        return false;
+    }
+
+    if (costume.data_format == "png") {
+        GError *error = nullptr;
+        GdkPixbufLoader *loader = gdk_pixbuf_loader_new();
+        GdkPixbuf *pixbuf = nullptr;
+        if (loader && gdk_pixbuf_loader_write(
+                loader,
+                reinterpret_cast<const guchar *>(costume.source_data.data()),
+                costume.source_data.size(),
+                &error) &&
+            gdk_pixbuf_loader_close(loader, &error)) {
+            pixbuf = gdk_pixbuf_loader_get_pixbuf(loader);
+            if (pixbuf) {
+                g_object_ref(pixbuf);
+            }
+        }
+        if (loader) {
+            g_object_unref(loader);
+        }
+        if (pixbuf) {
+            const int width = gdk_pixbuf_get_width(pixbuf);
+            const int height = gdk_pixbuf_get_height(pixbuf);
+            const int channels = gdk_pixbuf_get_n_channels(pixbuf);
+            const int stride = gdk_pixbuf_get_rowstride(pixbuf);
+            const guchar *pixels = gdk_pixbuf_get_pixels(pixbuf);
+            if (width > 0 && height > 0 && (channels == 3 || channels == 4)) {
+                mask.width = width;
+                mask.height = height;
+                mask.alpha.resize(
+                    static_cast<std::size_t>(width) * static_cast<std::size_t>(height));
+                for (int y = 0; y < height; ++y) {
+                    for (int x = 0; x < width; ++x) {
+                        const guchar *source = pixels + y * stride + x * channels;
+                        mask.alpha[static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
+                                   static_cast<std::size_t>(x)] = channels == 4 ? source[3] : 255;
+                    }
+                }
+            }
+            g_object_unref(pixbuf);
+        }
+        if (error) {
+            g_error_free(error);
+        }
+        return mask.valid();
+    }
+
+    if (costume.data_format != "svg" ||
+        !std::isfinite(costume.width) || !std::isfinite(costume.height) ||
+        costume.width <= 0.0 || costume.height <= 0.0 ||
+        costume.width > static_cast<double>(std::numeric_limits<int>::max()) ||
+        costume.height > static_cast<double>(std::numeric_limits<int>::max())) {
+        return false;
+    }
+
+    const int width = std::max(1, static_cast<int>(std::ceil(costume.width)));
+    const int height = std::max(1, static_cast<int>(std::ceil(costume.height)));
+    GError *error = nullptr;
+    RsvgHandle *handle = rsvg_handle_new_from_data(
+        reinterpret_cast<const guint8 *>(costume.source_data.data()),
+        costume.source_data.size(),
+        &error);
+    if (!handle) {
+        if (error) {
+            g_error_free(error);
+        }
+        return false;
+    }
+
+    cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height);
+    cairo_t *context = cairo_create(surface);
+    RsvgRectangle viewport{0.0, 0.0, costume.width, costume.height};
+    const bool rendered = rsvg_handle_render_document(handle, context, &viewport, &error) &&
+        cairo_surface_status(surface) == CAIRO_STATUS_SUCCESS;
+    cairo_destroy(context);
+    g_object_unref(handle);
+    if (!rendered) {
+        cairo_surface_destroy(surface);
+        if (error) {
+            g_error_free(error);
+        }
+        return false;
+    }
+
+    cairo_surface_flush(surface);
+    const int stride = cairo_image_surface_get_stride(surface);
+    const unsigned char *pixels = cairo_image_surface_get_data(surface);
+    mask.width = width;
+    mask.height = height;
+    mask.alpha.resize(static_cast<std::size_t>(width) * static_cast<std::size_t>(height));
+    for (int y = 0; y < height; ++y) {
+        const unsigned char *source_row = pixels + y * stride;
+        for (int x = 0; x < width; ++x) {
+            std::uint32_t pixel = 0;
+            std::memcpy(&pixel, source_row + x * 4, sizeof(pixel));
+            mask.alpha[static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
+                       static_cast<std::size_t>(x)] =
+                static_cast<Uint8>((pixel >> 24) & 0xffu);
+        }
+    }
+    cairo_surface_destroy(surface);
+    if (error) {
+        g_error_free(error);
+    }
+    return mask.valid();
+}
+
+const HitMask *hitMaskFor(
+    HitMaskCache &cache,
+    const TargetRenderInfo *target,
+    int costume_id) {
+    const CostumeRenderInfo *costume = findCostumeRenderInfo(target, costume_id);
+    if (!target || !costume) {
+        return nullptr;
+    }
+    const std::string key = spriteTextureKey(target, costume_id);
+    auto [entry, inserted] = cache.masks.try_emplace(key);
+    if (inserted) {
+        loadHitMask(*costume, entry->second);
+    }
+    return entry->second.valid() ? &entry->second : nullptr;
 }
 
 int hitTestSpriteAtScreenPoint(
     SRuntime *runtime,
     int screen_x,
     int screen_y,
-    const std::vector<TargetRenderInfo> &render_targets) {
+    const std::vector<TargetRenderInfo> &render_targets,
+    HitMaskCache &hit_masks) {
     if (!runtime) {
         return 0;
     }
@@ -180,21 +416,18 @@ int hitTestSpriteAtScreenPoint(
     int hit_layer = -1;
     for (int i = 0; i < runtime->target_count; ++i) {
         SSprite *target = runtime->targets[i];
-        if (!target || target->base.is_stage || !target->visible || target->size <= 0.0) {
+        if (!target || target->base.is_stage || !target->visible || target->size <= 0.0 ||
+            (std::isfinite(target->graphic_effects[SJIT_GRAPHIC_EFFECT_GHOST]) &&
+             target->graphic_effects[SJIT_GRAPHIC_EFFECT_GHOST] >= 100.0)) {
             continue;
         }
-        const TargetRenderInfo *info = nullptr;
-        for (const TargetRenderInfo &candidate : render_targets) {
-            if (candidate.target_id == target->base.id) {
-                info = &candidate;
-                break;
-            }
-        }
+        const TargetRenderInfo *info = findTargetRenderInfo(render_targets, target->base.id);
         const CostumeRenderInfo *costume = nullptr;
         if (info && target->current_costume >= 0 &&
             target->current_costume < static_cast<int>(info->costumes.size())) {
             costume = &info->costumes[static_cast<size_t>(target->current_costume)];
         }
+        const HitMask *hit_mask = hitMaskFor(hit_masks, info, target->current_costume);
 
         bool inside = false;
         if (costume && costume->width > 0.0 && costume->height > 0.0) {
@@ -207,16 +440,35 @@ int hitTestSpriteAtScreenPoint(
             const double dy = screen_y - pivot_y;
             const double angle = (90.0 - target->direction) * 3.14159265358979323846 / 180.0;
             const double local_x = (std::cos(angle) * dx + std::sin(angle) * dy) /
-                (scale * kWindowScale) + costume->rotation_center_x;
+                (scale * g_stage_viewport.scale) + costume->rotation_center_x;
             const double local_y = (-std::sin(angle) * dx + std::cos(angle) * dy) /
-                (scale * kWindowScale) + costume->rotation_center_y;
-            inside = local_x >= 0.0 && local_y >= 0.0 &&
-                local_x <= costume->width && local_y <= costume->height;
+                (scale * g_stage_viewport.scale) + costume->rotation_center_y;
+            const bool inside_costume = std::isfinite(local_x) && std::isfinite(local_y) &&
+                local_x >= 0.0 && local_y >= 0.0 &&
+                local_x < costume->width && local_y < costume->height;
+            if (inside_costume && hit_mask) {
+                const int mask_x = std::clamp(
+                    static_cast<int>(std::floor(local_x / costume->width * hit_mask->width)),
+                    0,
+                    hit_mask->width - 1);
+                const int mask_y = std::clamp(
+                    static_cast<int>(std::floor(local_y / costume->height * hit_mask->height)),
+                    0,
+                    hit_mask->height - 1);
+                inside = hit_mask->alpha[
+                    static_cast<std::size_t>(mask_y) * static_cast<std::size_t>(hit_mask->width) +
+                    static_cast<std::size_t>(mask_x)] > 0;
+            } else {
+                // If the asset cannot be decoded for picking, retain the
+                // conservative costume bounds rather than making the sprite
+                // impossible to click.
+                inside = inside_costume;
+            }
         } else {
             const int cx = scratchToScreenX(target->x);
             const int cy = scratchToScreenY(target->y);
             const int radius = std::max(8, static_cast<int>(std::lround(
-                (target->size / 100.0) * 18.0 * kWindowScale)));
+                (target->size / 100.0) * 18.0 * g_stage_viewport.scale)));
             const int dx = screen_x - cx;
             const int dy = screen_y - cy;
             inside = (dx * dx) + (dy * dy) <= radius * radius;
@@ -227,6 +479,37 @@ int hitTestSpriteAtScreenPoint(
         }
     }
     return hit_id;
+}
+
+struct MouseInteractionState {
+    bool left_button_down = false;
+    int pressed_target_id = 0;
+    bool pressed_target_draggable = false;
+    bool dragged = false;
+    double press_x = 0.0;
+    double press_y = 0.0;
+    double drag_offset_x = 0.0;
+    double drag_offset_y = 0.0;
+};
+
+SSprite *spriteForTargetId(SRuntime *runtime, int target_id) {
+    if (!runtime || target_id <= 0) {
+        return nullptr;
+    }
+    for (int i = 0; i < runtime->target_count; ++i) {
+        SSprite *target = runtime->targets[i];
+        if (target && target->base.id == target_id) {
+            return target;
+        }
+    }
+    return nullptr;
+}
+
+bool insideStage(int screen_x, int screen_y) {
+    return screen_x >= g_stage_viewport.offset_x &&
+        screen_x < g_stage_viewport.offset_x + g_stage_viewport.width &&
+        screen_y >= g_stage_viewport.offset_y &&
+        screen_y < g_stage_viewport.offset_y + g_stage_viewport.height;
 }
 
 void setColor(SDL_Renderer *renderer, int r, int g, int b, int a = 255) {
@@ -268,14 +551,16 @@ void drawSpritePlaceholder(
         double preview_scale = scale;
         const double source_max = std::max(costume->width, costume->height);
         if (source_max > 0.0) {
-            const double projected = source_max * scale * kWindowScale;
+            const double projected = source_max * scale * g_stage_viewport.scale;
             if (projected > max_screen_dimension) {
                 preview_scale *= max_screen_dimension / projected;
             }
         }
 
-        const int width = std::max(12, static_cast<int>(std::lround(costume->width * preview_scale * kWindowScale)));
-        const int height = std::max(12, static_cast<int>(std::lround(costume->height * preview_scale * kWindowScale)));
+        const int width = std::max(12, static_cast<int>(std::lround(
+            costume->width * preview_scale * g_stage_viewport.scale)));
+        const int height = std::max(12, static_cast<int>(std::lround(
+            costume->height * preview_scale * g_stage_viewport.scale)));
         const int left = scratchToScreenX(command.x - (costume->rotation_center_x * preview_scale));
         const int top = scratchToScreenY(command.y + (costume->rotation_center_y * preview_scale));
 
@@ -286,13 +571,15 @@ void drawSpritePlaceholder(
         const int cx = scratchToScreenX(command.x);
         const int cy = scratchToScreenY(command.y);
         setColor(renderer, costume->fill_r, costume->fill_g, costume->fill_b, 255);
-        fillCircle(renderer, cx, cy, std::max(2, static_cast<int>(std::lround(3.0 * scale))));
+        fillCircle(renderer, cx, cy, std::max(2, static_cast<int>(std::lround(
+            3.0 * scale * g_stage_viewport.scale))));
         return;
     }
 
     const int cx = scratchToScreenX(command.x);
     const int cy = scratchToScreenY(command.y);
-    const int radius = std::max(8, static_cast<int>(std::lround((command.size / 100.0) * 18.0 * kWindowScale)));
+    const int radius = std::max(8, static_cast<int>(std::lround(
+        (command.size / 100.0) * 18.0 * g_stage_viewport.scale)));
 
     setColor(renderer, 247, 154, 43);
     fillCircle(renderer, cx, cy, radius);
@@ -412,11 +699,47 @@ SDL_Texture *spriteTexture(
     }
     const int width = cairo_image_surface_get_width(surface);
     const int height = cairo_image_surface_get_height(surface);
+    // Cairo's ARGB32 image surfaces use premultiplied alpha. SDL's regular
+    // blend mode expects straight-alpha RGBA, so passing the surface bytes
+    // through as ARGB8888 makes translucent SVG pixels get multiplied by
+    // their alpha a second time. Flush before reading the image surface and
+    // unpremultiply into the same byte layout used by the PNG path.
+    cairo_surface_flush(surface);
+    const int stride = cairo_image_surface_get_stride(surface);
+    const unsigned char *source_pixels = cairo_image_surface_get_data(surface);
+    std::vector<Uint8> rgba(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
+    for (int y = 0; y < height; ++y) {
+        const unsigned char *source_row = source_pixels + y * stride;
+        for (int x = 0; x < width; ++x) {
+            std::uint32_t pixel = 0;
+            std::memcpy(&pixel, source_row + x * 4, sizeof(pixel));
+            Uint8 red = 0;
+            Uint8 green = 0;
+            Uint8 blue = 0;
+            const Uint8 alpha = static_cast<Uint8>((pixel >> 24) & 0xffu);
+            if (alpha != 0) {
+                red = static_cast<Uint8>(std::min(
+                    255,
+                    (static_cast<int>((pixel >> 16) & 0xffu) * 255 + alpha / 2) / alpha));
+                green = static_cast<Uint8>(std::min(
+                    255,
+                    (static_cast<int>((pixel >> 8) & 0xffu) * 255 + alpha / 2) / alpha));
+                blue = static_cast<Uint8>(std::min(
+                    255,
+                    (static_cast<int>(pixel & 0xffu) * 255 + alpha / 2) / alpha));
+            }
+            Uint8 *destination = rgba.data() +
+                (static_cast<size_t>(y) * static_cast<size_t>(width) +
+                 static_cast<size_t>(x)) * 4u;
+            destination[0] = red;
+            destination[1] = green;
+            destination[2] = blue;
+            destination[3] = alpha;
+        }
+    }
     SDL_Texture *texture = SDL_CreateTexture(
-        renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STATIC, width, height);
-    if (!texture || SDL_UpdateTexture(
-            texture, nullptr, cairo_image_surface_get_data(surface),
-            cairo_image_surface_get_stride(surface)) != 0) {
+        renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, width, height);
+    if (!texture || SDL_UpdateTexture(texture, nullptr, rgba.data(), width * 4) != 0) {
         if (texture) SDL_DestroyTexture(texture);
         cairo_surface_destroy(surface);
         return nullptr;
@@ -558,7 +881,7 @@ SDL_Texture *pixelatedSpriteTexture(
     }
     if (generated) {
         generated = SDL_SetTextureBlendMode(source, SDL_BLENDMODE_NONE) == 0 &&
-            SDL_SetTextureScaleMode(source, SDL_ScaleModeLinear) == 0 &&
+            SDL_SetTextureScaleMode(source, SDL_ScaleModeNearest) == 0 &&
             SDL_SetTextureColorMod(source, 255, 255, 255) == 0 &&
             SDL_SetTextureAlphaMod(source, 255) == 0;
     }
@@ -652,12 +975,19 @@ bool drawSpriteTexture(
     SDL_Rect destination{
         scratchToScreenX(command.x - costume->rotation_center_x * scale),
         scratchToScreenY(command.y + costume->rotation_center_y * scale),
-        std::max(1, static_cast<int>(std::lround(costume->width * scale * kWindowScale))),
-        std::max(1, static_cast<int>(std::lround(costume->height * scale * kWindowScale)))};
+        std::max(1, static_cast<int>(std::lround(
+            costume->width * scale * g_stage_viewport.scale))),
+        std::max(1, static_cast<int>(std::lround(
+            costume->height * scale * g_stage_viewport.scale)))};
     SDL_Point center{
-        static_cast<int>(std::lround(costume->rotation_center_x * scale * kWindowScale)),
-        static_cast<int>(std::lround(costume->rotation_center_y * scale * kWindowScale))};
-    const double angle = 90.0 - command.direction;
+        static_cast<int>(std::lround(
+            costume->rotation_center_x * scale * g_stage_viewport.scale)),
+        static_cast<int>(std::lround(
+            costume->rotation_center_y * scale * g_stage_viewport.scale))};
+    // Scratch direction 90 points right and 0 points up. SDL's positive
+    // RenderCopyEx angle rotates clockwise in screen coordinates, so the
+    // equivalent angle is direction - 90 rather than 90 - direction.
+    const double angle = command.direction - 90.0;
     const bool rendered = SDL_RenderCopyEx(
         renderer,
         texture,
@@ -684,11 +1014,29 @@ bool drawStageBackdrop(
             continue;
         }
         const TargetRenderInfo *render_info = findTargetRenderInfo(*render_targets, target->base.id);
+        const CostumeRenderInfo *costume = findCostumeRenderInfo(
+            render_info,
+            target->current_costume);
         SDL_Texture *texture = spriteTexture(renderer, cache, render_info, target->current_costume);
-        if (!texture) {
+        if (!texture || !costume ||
+            !std::isfinite(costume->width) || !std::isfinite(costume->height) ||
+            costume->width <= 0.0 || costume->height <= 0.0) {
             return false;
         }
-        SDL_Rect destination{0, 0, kStageWidth * kWindowScale, kStageHeight * kWindowScale};
+
+        // A backdrop is a stage-layer drawable, not a texture that is always
+        // stretched to the stage bounds. Keep its logical costume size and
+        // place its rotation center at the stage origin, matching Scratch's
+        // renderer. Bitmap backdrops with a 2x bitmap resolution already have
+        // logical dimensions in CostumeRenderInfo, so this also handles them.
+        const double scale = 1.0;
+        SDL_Rect destination{
+            scratchToScreenX(-costume->rotation_center_x * scale),
+            scratchToScreenY(costume->rotation_center_y * scale),
+            std::max(1, static_cast<int>(std::lround(
+                costume->width * scale * g_stage_viewport.scale))),
+            std::max(1, static_cast<int>(std::lround(
+                costume->height * scale * g_stage_viewport.scale)))};
         return SDL_RenderCopy(renderer, texture, nullptr, &destination) == 0;
     }
     return false;
@@ -698,6 +1046,8 @@ struct PenLayerCache {
     SDL_Texture *texture = nullptr;
     std::unique_ptr<SkiaPenLayer> layer;
     std::vector<std::uint8_t> pixels;
+    int width = 0;
+    int height = 0;
     int rendered_pen_count = 0;
     int pen_revision = -1;
     bool texture_failed = false;
@@ -732,6 +1082,8 @@ void destroyPenLayerCache(PenLayerCache &cache) {
     }
     cache.layer.reset();
     cache.pixels.clear();
+    cache.width = 0;
+    cache.height = 0;
     cache.rendered_pen_count = 0;
     cache.pen_revision = -1;
     cache.texture_failed = false;
@@ -740,24 +1092,34 @@ void destroyPenLayerCache(PenLayerCache &cache) {
     cache.dense_pixels = false;
 }
 
-bool ensurePenLayerSurface(
-    GrDirectContext *gpu_context,
-    bool use_gpu,
-    PenLayerCache &cache) {
-    if (cache.layer && cache.uses_gpu == use_gpu) {
-        return true;
-    }
-    if (cache.texture_failed) {
-        return false;
-    }
+void discardPenLayerResources(PenLayerCache &cache) {
     if (cache.texture) {
         SDL_DestroyTexture(cache.texture);
         cache.texture = nullptr;
     }
     cache.layer.reset();
     cache.pixels.clear();
-    const int width = kPenCanvasWidth;
-    const int height = kPenCanvasHeight;
+    cache.width = 0;
+    cache.height = 0;
+    cache.rendered_pen_count = 0;
+    cache.pen_revision = -1;
+    cache.uses_gpu = false;
+}
+
+bool ensurePenLayerSurface(
+    GrDirectContext *gpu_context,
+    bool use_gpu,
+    PenLayerCache &cache) {
+    const int width = penCanvasWidth();
+    const int height = penCanvasHeight();
+    if (cache.layer && cache.width == width && cache.height == height &&
+        cache.uses_gpu == use_gpu) {
+        return true;
+    }
+    if (cache.texture_failed) {
+        return false;
+    }
+    discardPenLayerResources(cache);
     cache.layer = std::make_unique<SkiaPenLayer>(width, height, use_gpu ? gpu_context : nullptr);
     if (!cache.layer->valid()) {
         reportPenLayerFailure(cache, "could not create the Skia raster surface");
@@ -766,15 +1128,30 @@ bool ensurePenLayerSurface(
         return false;
     }
     cache.uses_gpu = use_gpu;
+    cache.width = width;
+    cache.height = height;
     return true;
 }
 
 bool ensurePenLayerTexture(SDL_Renderer *renderer, PenLayerCache &cache) {
-    if (cache.texture) {
+    const int width = penCanvasWidth();
+    const int height = penCanvasHeight();
+    const std::size_t pixel_bytes =
+        static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4u;
+    if (cache.texture && cache.width == width && cache.height == height &&
+        cache.pixels.size() == pixel_bytes) {
         return true;
     }
-    const int width = kPenCanvasWidth;
-    const int height = kPenCanvasHeight;
+    if (cache.width != 0 &&
+        (cache.width != width || cache.height != height)) {
+        discardPenLayerResources(cache);
+    } else if (cache.texture) {
+        SDL_DestroyTexture(cache.texture);
+        cache.texture = nullptr;
+        cache.pixels.clear();
+        cache.rendered_pen_count = 0;
+        cache.pen_revision = -1;
+    }
     cache.texture = SDL_CreateTexture(
         renderer,
         SDL_PIXELFORMAT_RGBA32,
@@ -804,36 +1181,30 @@ bool ensurePenLayerTexture(SDL_Renderer *renderer, PenLayerCache &cache) {
         return false;
     }
     cache.pixels.assign(
-        static_cast<std::size_t>(width * height * 4),
+        pixel_bytes,
         std::uint8_t{0});
+    cache.width = width;
+    cache.height = height;
     cache.pen_revision = -1;
     cache.rendered_pen_count = 0;
     return true;
 }
 
 void resetPenLayerStorage(PenLayerCache &cache, bool dense_pixels) {
-    if (cache.texture) {
-        SDL_DestroyTexture(cache.texture);
-        cache.texture = nullptr;
-    }
-    cache.layer.reset();
-    cache.pixels.clear();
-    cache.rendered_pen_count = 0;
-    cache.pen_revision = -1;
-    cache.uses_gpu = false;
+    discardPenLayerResources(cache);
     cache.dense_pixels = dense_pixels;
 }
 
 void blendDensePixel(
     std::vector<std::uint8_t> &pixels,
+    int width,
+    int height,
     int x,
     int y,
     int r,
     int g,
     int b,
     int a) {
-    constexpr int width = kPenCanvasWidth;
-    constexpr int height = kPenCanvasHeight;
     if (x < 0 || y < 0 || x >= width || y >= height || a <= 0) {
         return;
     }
@@ -865,32 +1236,39 @@ void blendDensePixel(
     destination[3] = static_cast<std::uint8_t>(output_alpha);
 }
 
-void rasterizeDenseStroke(std::vector<std::uint8_t> &pixels, const SDrawCommand &command) {
-    int x0 = scratchToPenCanvasX(command.x);
-    int y0 = scratchToPenCanvasY(command.y);
-    const int x1 = scratchToPenCanvasX(command.x2);
-    const int y1 = scratchToPenCanvasY(command.y2);
+void rasterizeDenseStroke(
+    std::vector<std::uint8_t> &pixels,
+    int width,
+    int height,
+    const SDrawCommand &command) {
+    int x0 = scratchToPenCanvasX(command.x, width);
+    int y0 = scratchToPenCanvasY(command.y, height);
+    const int x1 = scratchToPenCanvasX(command.x2, width);
+    const int y1 = scratchToPenCanvasY(command.y2, height);
     if (command.a <= 0) {
         return;
     }
+    const double scale = penCanvasScaleForWidth(width);
     const int dx = std::abs(x1 - x0);
     const int sx = x0 < x1 ? 1 : -1;
     const int dy = -std::abs(y1 - y0);
     const int sy = y0 < y1 ? 1 : -1;
     int error = dx + dy;
     const int radius = std::max(0, static_cast<int>(std::lround(
-        std::max(1.0, command.pen_width))) / 2);
+        std::max(1.0, command.pen_width) * scale)) / 2);
     if (x0 == x1 && y0 == y1 && radius == 0) {
         if (command.a >= 255 && x0 >= 0 && y0 >= 0 &&
-            x0 < kPenCanvasWidth && y0 < kPenCanvasHeight) {
+            x0 < width && y0 < height) {
             std::uint8_t *destination = pixels.data() +
-                (static_cast<std::size_t>(y0 * kPenCanvasWidth + x0) * 4u);
+                (static_cast<std::size_t>(y0 * width + x0) * 4u);
             destination[0] = static_cast<std::uint8_t>(std::clamp(command.r, 0, 255));
             destination[1] = static_cast<std::uint8_t>(std::clamp(command.g, 0, 255));
             destination[2] = static_cast<std::uint8_t>(std::clamp(command.b, 0, 255));
             destination[3] = 255;
         } else {
-            blendDensePixel(pixels, x0, y0, command.r, command.g, command.b, command.a);
+            blendDensePixel(
+                pixels, width, height, x0, y0,
+                command.r, command.g, command.b, command.a);
         }
         return;
     }
@@ -898,7 +1276,7 @@ void rasterizeDenseStroke(std::vector<std::uint8_t> &pixels, const SDrawCommand 
         const std::uint8_t red = static_cast<std::uint8_t>(std::clamp(command.r, 0, 255));
         const std::uint8_t green = static_cast<std::uint8_t>(std::clamp(command.g, 0, 255));
         const std::uint8_t blue = static_cast<std::uint8_t>(std::clamp(command.b, 0, 255));
-        if (x0 > 0 && y0 > 0 && x0 + 1 < kPenCanvasWidth && y0 + 1 < kPenCanvasHeight) {
+        if (x0 > 0 && y0 > 0 && x0 + 1 < width && y0 + 1 < height) {
             const auto writeOpaque = [&](std::uint8_t *destination) {
                 destination[0] = red;
                 destination[1] = green;
@@ -906,21 +1284,21 @@ void rasterizeDenseStroke(std::vector<std::uint8_t> &pixels, const SDrawCommand 
                 destination[3] = 255;
             };
             const std::size_t center =
-                static_cast<std::size_t>(y0 * kPenCanvasWidth + x0) * 4u;
+                static_cast<std::size_t>(y0 * width + x0) * 4u;
             std::uint8_t *destination = pixels.data() + center;
             writeOpaque(destination);
             writeOpaque(destination - 4);
             writeOpaque(destination + 4);
-            writeOpaque(destination - (kPenCanvasWidth * 4));
-            writeOpaque(destination + (kPenCanvasWidth * 4));
+            writeOpaque(destination - (width * 4));
+            writeOpaque(destination + (width * 4));
             return;
         }
         const auto putOpaque = [&](int x, int y) {
-            if (x < 0 || y < 0 || x >= kPenCanvasWidth || y >= kPenCanvasHeight) {
+            if (x < 0 || y < 0 || x >= width || y >= height) {
                 return;
             }
             std::uint8_t *destination = pixels.data() +
-                (static_cast<std::size_t>(y * kPenCanvasWidth + x) * 4u);
+                (static_cast<std::size_t>(y * width + x) * 4u);
             destination[0] = red;
             destination[1] = green;
             destination[2] = blue;
@@ -938,7 +1316,7 @@ void rasterizeDenseStroke(std::vector<std::uint8_t> &pixels, const SDrawCommand 
             for (int ox = -radius; ox <= radius; ++ox) {
                 if (ox * ox + oy * oy <= radius * radius || radius == 0) {
                     blendDensePixel(
-                        pixels, x0 + ox, y0 + oy,
+                        pixels, width, height, x0 + ox, y0 + oy,
                         command.r, command.g, command.b, command.a);
                 }
             }
@@ -976,13 +1354,16 @@ bool renderDensePenLayer(
     for (int i = cache.rendered_pen_count; i < pen.count; ++i) {
         const SDrawCommand &command = pen.items[i];
         if (command.kind == SJIT_DRAW_PEN_STROKE && command.visible) {
-            rasterizeDenseStroke(cache.pixels, command);
+            rasterizeDenseStroke(cache.pixels, cache.width, cache.height, command);
         }
     }
     cache.rendered_pen_count = pen.count;
-    const int row_bytes = kPenCanvasWidth * 4;
+    const int row_bytes = cache.width * 4;
     const SDL_Rect destination{
-        0, 0, kStageWidth * kWindowScale, kStageHeight * kWindowScale};
+        g_stage_viewport.offset_x,
+        g_stage_viewport.offset_y,
+        g_stage_viewport.width,
+        g_stage_viewport.height};
     if (SDL_UpdateTexture(cache.texture, nullptr, cache.pixels.data(), row_bytes) != 0 ||
         SDL_RenderCopy(renderer, cache.texture, nullptr, &destination) != 0) {
         reportPenLayerFailure(cache, SDL_GetError());
@@ -1014,27 +1395,47 @@ bool renderCompactPenRasterTile(
     if (!cache.dense_pixels) {
         resetPenLayerStorage(cache, true);
     }
-    if (!ensurePenLayerTexture(renderer, cache) ||
-        cache.pixels.size() != SJIT_PEN_RASTER_TILE_PIXEL_BYTES) {
+    if (!ensurePenLayerTexture(renderer, cache)) {
         return false;
     }
 
-    std::memcpy(
-        cache.pixels.data(),
-        tile.pixels,
-        SJIT_PEN_RASTER_TILE_PIXEL_BYTES);
+    std::fill(cache.pixels.begin(), cache.pixels.end(), std::uint8_t{0});
+    // The runtime ABI tile intentionally stays at Scratch's logical
+    // 480x360 resolution. Expand it into the independent high-resolution
+    // host buffer before compositing any commands that follow the tile.
+    for (int y = 0; y < cache.height; ++y) {
+        const int source_y = std::min(
+            tile.height - 1,
+            (y * tile.height) / std::max(1, cache.height));
+        const std::uint8_t *source_row = tile.pixels +
+            static_cast<std::size_t>(source_y) * static_cast<std::size_t>(tile.stride);
+        std::uint8_t *destination_row = cache.pixels.data() +
+            static_cast<std::size_t>(y) * static_cast<std::size_t>(cache.width) * 4u;
+        for (int x = 0; x < cache.width; ++x) {
+            const int source_x = std::min(
+                tile.width - 1,
+                (x * tile.width) / std::max(1, cache.width));
+            std::memcpy(
+                destination_row + static_cast<std::size_t>(x) * 4u,
+                source_row + static_cast<std::size_t>(source_x) * 4u,
+                4u);
+        }
+    }
     for (int i = 0; i < runtime->pen.length; ++i) {
         const SDrawCommand &command = runtime->pen.items[i];
         if (command.kind == SJIT_DRAW_PEN_STROKE && command.visible) {
-            rasterizeDenseStroke(cache.pixels, command);
+            rasterizeDenseStroke(cache.pixels, cache.width, cache.height, command);
         }
     }
     cache.pen_revision = tile.revision;
     cache.rendered_pen_count = tile.command_count + runtime->pen.length;
 
-    const int row_bytes = kPenCanvasWidth * 4;
+    const int row_bytes = cache.width * 4;
     const SDL_Rect destination{
-        0, 0, kStageWidth * kWindowScale, kStageHeight * kWindowScale};
+        g_stage_viewport.offset_x,
+        g_stage_viewport.offset_y,
+        g_stage_viewport.width,
+        g_stage_viewport.height};
     if (SDL_UpdateTexture(cache.texture, nullptr, cache.pixels.data(), row_bytes) != 0 ||
         SDL_RenderCopy(renderer, cache.texture, nullptr, &destination) != 0) {
         reportPenLayerFailure(cache, SDL_GetError());
@@ -1054,12 +1455,13 @@ bool drawPenStrokeToLayer(PenLayerCache &cache, const SDrawCommand &command) {
     if (!cache.layer) {
         return false;
     }
+    const double scale = penCanvasScaleForWidth(cache.width);
     return cache.layer->drawStroke(
-        command.x + (kPenCanvasWidth * 0.5),
-        (kPenCanvasHeight * 0.5) - command.y,
-        command.x2 + (kPenCanvasWidth * 0.5),
-        (kPenCanvasHeight * 0.5) - command.y2,
-        std::max(1.0, command.pen_width),
+        (command.x + (kStageWidth * 0.5)) * scale,
+        (kStageHeight * 0.5 - command.y) * scale,
+        (command.x2 + (kStageWidth * 0.5)) * scale,
+        (kStageHeight * 0.5 - command.y2) * scale,
+        std::max(1.0, command.pen_width) * scale,
         command.r,
         command.g,
         command.b,
@@ -1136,10 +1538,11 @@ bool renderPenLayer(
         if (command.kind == SJIT_DRAW_PEN_STROKE && command.visible) {
             if (cache.uses_gpu && command.a >= 255 &&
                 command.x == command.x2 && command.y == command.y2) {
+                const double scale = penCanvasScaleForWidth(cache.width);
                 opaque_points.push_back({
-                    command.x + (kPenCanvasWidth * 0.5),
-                    (kPenCanvasHeight * 0.5) - command.y,
-                    std::max(1.0, command.pen_width),
+                    (command.x + (kStageWidth * 0.5)) * scale,
+                    (kStageHeight * 0.5 - command.y) * scale,
+                    std::max(1.0, command.pen_width) * scale,
                     command.r,
                     command.g,
                     command.b});
@@ -1163,7 +1566,7 @@ bool renderPenLayer(
 
     if (dirty) {
         const std::size_t row_bytes =
-            static_cast<std::size_t>(kPenCanvasWidth) * 4u;
+            static_cast<std::size_t>(cache.width) * 4u;
         if (!cache.layer->readRgbaPixels(cache.pixels.data(), row_bytes)) {
             restoreMainContext();
             reportPenLayerFailure(cache, "could not transfer pixels to SDL");
@@ -1186,7 +1589,10 @@ bool renderPenLayer(
         restoreMainContext();
     }
     const SDL_Rect destination{
-        0, 0, kStageWidth * kWindowScale, kStageHeight * kWindowScale};
+        g_stage_viewport.offset_x,
+        g_stage_viewport.offset_y,
+        g_stage_viewport.width,
+        g_stage_viewport.height};
     if (SDL_RenderCopy(renderer, cache.texture, nullptr, &destination) != 0) {
         reportPenLayerFailure(cache, SDL_GetError());
         return false;
@@ -1283,8 +1689,8 @@ void drawVariableMonitors(SDL_Renderer *renderer, SRuntime *runtime) {
     if (!runtime) {
         return;
     }
-    const int stage_width = kStageWidth * kWindowScale;
-    const int stage_height = kStageHeight * kWindowScale;
+    const int stage_width = g_stage_viewport.width;
+    const int stage_height = g_stage_viewport.height;
     for (int index = 0; index < sjit_runtime_variable_monitor_count(runtime); ++index) {
         const SVariableMonitor *monitor = sjit_runtime_variable_monitor_at(runtime, index);
         if (!monitor || !monitor->visible) {
@@ -1299,25 +1705,36 @@ void drawVariableMonitors(SDL_Renderer *renderer, SRuntime *runtime) {
         const std::string value = valueToDisplay(runtime, variable->value);
         const bool large = monitor->mode == SJIT_MONITOR_MODE_LARGE;
         const std::string text = large ? value : label + ":" + value;
-        const int text_scale = large ? 3 : 2;
-        const int x = std::clamp(
-            static_cast<int>(std::lround(monitor->x * kWindowScale)),
+        const int text_scale = std::max(1, static_cast<int>(std::lround(
+            (large ? 3.0 : 2.0) * g_stage_viewport.scale / kDefaultStageScale)));
+        const int stage_x = std::clamp(
+            static_cast<int>(std::lround(monitor->x * g_stage_viewport.scale)),
             0,
             stage_width - 1);
-        const int y = std::clamp(
-            static_cast<int>(std::lround(monitor->y * kWindowScale)),
+        const int stage_y = std::clamp(
+            static_cast<int>(std::lround(monitor->y * g_stage_viewport.scale)),
             0,
             stage_height - 1);
-        const int auto_width = std::max(120, 16 + static_cast<int>(text.size()) * 4 * text_scale);
+        const int x = g_stage_viewport.offset_x + stage_x;
+        const int y = g_stage_viewport.offset_y + stage_y;
+        const double base_text_scale = large ? 3.0 : 2.0;
+        const double base_auto_width =
+            16.0 + static_cast<double>(text.size()) * 4.0 * base_text_scale;
+        const int auto_width = std::max(
+            1,
+            static_cast<int>(std::lround(
+                base_auto_width * g_stage_viewport.scale / kDefaultStageScale)));
         const int requested_width = monitor->width > 0.0 ?
-            static_cast<int>(std::lround(monitor->width * kWindowScale)) : auto_width;
+            static_cast<int>(std::lround(monitor->width * g_stage_viewport.scale)) : auto_width;
         const int requested_height = monitor->height > 0.0 ?
-            static_cast<int>(std::lround(monitor->height * kWindowScale)) : (large ? 30 : 24);
+            static_cast<int>(std::lround(monitor->height * g_stage_viewport.scale)) :
+            std::max(1, static_cast<int>(std::lround(
+                (large ? 30.0 : 24.0) * g_stage_viewport.scale / kDefaultStageScale)));
         SDL_Rect box{
             x,
             y,
-            std::clamp(requested_width, 1, stage_width - x),
-            std::clamp(requested_height, 1, stage_height - y)};
+            std::clamp(requested_width, 1, stage_width - stage_x),
+            std::clamp(requested_height, 1, stage_height - stage_y)};
         setColor(renderer, 255, 248, 215);
         SDL_RenderFillRect(renderer, &box);
         setColor(renderer, 108, 91, 40);
@@ -1327,7 +1744,7 @@ void drawVariableMonitors(SDL_Renderer *renderer, SRuntime *runtime) {
     }
 }
 
-int keyIndexForSdl(SDL_Keycode key) {
+int keyIndexForSdl(SDL_Keycode key, bool turbo_warp_compatibility) {
     switch (key) {
     case SDLK_UP:
         return SJIT_KEY_UP_ARROW;
@@ -1338,38 +1755,204 @@ int keyIndexForSdl(SDL_Keycode key) {
     case SDLK_LEFT:
         return SJIT_KEY_LEFT_ARROW;
     default:
-        return key >= 0 && key < 256 ? static_cast<int>(key) : -1;
+        break;
     }
+    if (turbo_warp_compatibility) {
+        switch (key) {
+        case SDLK_RETURN:
+        case SDLK_KP_ENTER:
+            return SJIT_KEY_ENTER;
+        case SDLK_BACKSPACE:
+            return SJIT_KEY_BACKSPACE;
+        case SDLK_DELETE:
+            return SJIT_KEY_DELETE;
+        case SDLK_LSHIFT:
+        case SDLK_RSHIFT:
+            return SJIT_KEY_SHIFT;
+        case SDLK_CAPSLOCK:
+            return SJIT_KEY_CAPS_LOCK;
+        case SDLK_SCROLLLOCK:
+            return SJIT_KEY_SCROLL_LOCK;
+        case SDLK_LCTRL:
+        case SDLK_RCTRL:
+            return SJIT_KEY_CONTROL;
+        case SDLK_ESCAPE:
+            return SJIT_KEY_ESCAPE;
+        case SDLK_INSERT:
+            return SJIT_KEY_INSERT;
+        case SDLK_HOME:
+            return SJIT_KEY_HOME;
+        case SDLK_END:
+            return SJIT_KEY_END;
+        case SDLK_PAGEUP:
+            return SJIT_KEY_PAGE_UP;
+        case SDLK_PAGEDOWN:
+            return SJIT_KEY_PAGE_DOWN;
+        case SDLK_KP_0:
+            return '0';
+        case SDLK_KP_1:
+            return '1';
+        case SDLK_KP_2:
+            return '2';
+        case SDLK_KP_3:
+            return '3';
+        case SDLK_KP_4:
+            return '4';
+        case SDLK_KP_5:
+            return '5';
+        case SDLK_KP_6:
+            return '6';
+        case SDLK_KP_7:
+            return '7';
+        case SDLK_KP_8:
+            return '8';
+        case SDLK_KP_9:
+            return '9';
+        case SDLK_KP_PERIOD:
+            return '.';
+        case SDLK_KP_DIVIDE:
+            return '/';
+        case SDLK_KP_MULTIPLY:
+            return '*';
+        case SDLK_KP_MINUS:
+            return '-';
+        case SDLK_KP_PLUS:
+            return '+';
+        case SDLK_KP_EQUALS:
+            return '=';
+        default:
+            break;
+        }
+    }
+    if (key >= 0 && key < 256) {
+        const int raw = static_cast<int>(key);
+        return raw >= 'a' && raw <= 'z' ? raw - ('a' - 'A') : raw;
+    }
+    return -1;
 }
 
 void updateInputFromEvent(
     SHostInputSnapshot &input,
     SRuntime *runtime,
+    MouseInteractionState &mouse,
+    HitMaskCache &hit_masks,
     const std::vector<TargetRenderInfo> &render_targets,
+    bool turbo_warp_compatibility,
     const SDL_Event &event) {
     if (event.type == SDL_MOUSEMOTION) {
         input.mouse_x = screenToScratchX(event.motion.x);
         input.mouse_y = screenToScratchY(event.motion.y);
+        if (mouse.left_button_down && mouse.pressed_target_draggable) {
+            const double x = input.mouse_x;
+            const double y = input.mouse_y;
+            const double dx = x - mouse.press_x;
+            const double dy = y - mouse.press_y;
+            // Ignore sub-pixel motion so a stationary draggable sprite still
+            // behaves as a click. Once crossed, keep the interaction in drag
+            // mode until the button is released.
+            if (!mouse.dragged && dx * dx + dy * dy > 0.25) {
+                mouse.dragged = true;
+            }
+            if (mouse.dragged) {
+                if (SSprite *target = spriteForTargetId(runtime, mouse.pressed_target_id)) {
+                    sjit_sprite_set_xy(
+                        runtime,
+                        target,
+                        x + mouse.drag_offset_x,
+                        y + mouse.drag_offset_y,
+                        0);
+                }
+            }
+        }
     } else if (event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_MOUSEBUTTONUP) {
-        input.mouse_down = event.type == SDL_MOUSEBUTTONDOWN ? 1 : 0;
+        // Scratch's ordinary mouse input is the primary (left) button. Do
+        // not let a right-button event clear a left-button drag or start a
+        // second click hat.
+        if (event.button.button != SDL_BUTTON_LEFT) {
+            return;
+        }
         input.mouse_x = screenToScratchX(event.button.x);
         input.mouse_y = screenToScratchY(event.button.y);
         if (event.type == SDL_MOUSEBUTTONDOWN) {
+            input.mouse_down = 1;
             input.mouse_pressed_edge = 1;
+            mouse.left_button_down = true;
+            mouse.pressed_target_id = 0;
+            mouse.pressed_target_draggable = false;
+            mouse.dragged = false;
+            mouse.press_x = input.mouse_x;
+            mouse.press_y = input.mouse_y;
+
+            if (!insideStage(event.button.x, event.button.y)) {
+                return;
+            }
             const int clicked_target = hitTestSpriteAtScreenPoint(
-                runtime, event.button.x, event.button.y, render_targets);
-            if (clicked_target > 0) {
-                input.sprite_clicked_id = clicked_target;
+                runtime,
+                event.button.x,
+                event.button.y,
+                render_targets,
+                hit_masks);
+            if (SSprite *target = spriteForTargetId(runtime, clicked_target)) {
+                mouse.pressed_target_id = clicked_target;
+                mouse.pressed_target_draggable = target->draggable != 0;
+                mouse.drag_offset_x = target->x - input.mouse_x;
+                mouse.drag_offset_y = target->y - input.mouse_y;
+                if (!mouse.pressed_target_draggable) {
+                    input.sprite_clicked_id = clicked_target;
+                }
             } else {
                 input.stage_clicked = 1;
             }
+        } else {
+            input.mouse_down = 0;
+            if (mouse.left_button_down && mouse.pressed_target_draggable &&
+                !mouse.dragged && insideStage(event.button.x, event.button.y)) {
+                const int released_target = hitTestSpriteAtScreenPoint(
+                    runtime,
+                    event.button.x,
+                    event.button.y,
+                    render_targets,
+                    hit_masks);
+                if (released_target == mouse.pressed_target_id) {
+                    input.sprite_clicked_id = released_target;
+                }
+            }
+            mouse.left_button_down = false;
+            mouse.pressed_target_id = 0;
+            mouse.pressed_target_draggable = false;
+            mouse.dragged = false;
+            mouse.drag_offset_x = 0.0;
+            mouse.drag_offset_y = 0.0;
+        }
+    } else if (event.type == SDL_MOUSEWHEEL) {
+        // TurboWarp's mouseWheel IO starts the corresponding arrow-key hats,
+        // but does not mutate the keyboard's pressed state. Keep this as a
+        // separate event path so scrolling cannot make sensing_keypressed
+        // report an arrow key as held. SDL's flipped direction stores the
+        // opposite sign, so normalize it before applying the DOM-like
+        // deltaY < 0 (up) / deltaY > 0 (down) mapping.
+        if (!turbo_warp_compatibility || !runtime) {
+            return;
+        }
+        const double vertical = event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ?
+            -static_cast<double>(event.wheel.y) : static_cast<double>(event.wheel.y);
+        const char *key = vertical > 0.0 ? "up arrow" :
+            (vertical < 0.0 ? "down arrow" : nullptr);
+        if (key) {
+            sjit_runtime_start_hats(runtime, SJIT_HAT_EVENT_WHENKEYPRESSED, key);
         }
     } else if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP) {
-        const int key = keyIndexForSdl(event.key.keysym.sym);
+        const int key = keyIndexForSdl(event.key.keysym.sym, turbo_warp_compatibility);
         if (key >= 0 && key < 256) {
             input.key_down[key] = event.type == SDL_KEYDOWN ? 1 : 0;
             input.key_pressed_edge[key] = event.type == SDL_KEYDOWN && event.key.repeat == 0 ? 1 : 0;
         }
+    } else if (event.type == SDL_WINDOWEVENT &&
+               event.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
+        input.mouse_down = 0;
+        std::fill(std::begin(input.key_down), std::end(input.key_down), 0);
+        std::fill(std::begin(input.key_pressed_edge), std::end(input.key_pressed_edge), 0);
+        mouse = {};
     }
 }
 
@@ -1391,7 +1974,11 @@ void renderRuntime(
     setColor(renderer, 245, 247, 250);
     SDL_RenderClear(renderer);
 
-    SDL_Rect stage{0, 0, kStageWidth * kWindowScale, kStageHeight * kWindowScale};
+    SDL_Rect stage{
+        g_stage_viewport.offset_x,
+        g_stage_viewport.offset_y,
+        g_stage_viewport.width,
+        g_stage_viewport.height};
     setColor(renderer, 255, 255, 255);
     SDL_RenderFillRect(renderer, &stage);
     setColor(renderer, 212, 218, 227);
@@ -1437,6 +2024,7 @@ void renderRuntime(
 
     drawVariableMonitors(renderer, runtime);
     SDL_RenderPresent(renderer);
+
 }
 
 std::string makeWindowTitle(SRuntime *runtime, int tick) {
@@ -1675,6 +2263,12 @@ int runProjectFile(const char *path, ProjectRunOptions options) {
         return 1;
     }
 
+    if (!configureRuntimeCompatibility(runtime, options)) {
+        std::cerr << "failed to configure runtime compatibility\n";
+        sjit_runtime_destroy(runtime);
+        return 1;
+    }
+
     ProjectLoadResult loaded = loadProjectIntoRuntime(runtime, path ? path : "");
     std::cout << loaded.message << "\n";
     if (!loaded.ok) {
@@ -1685,6 +2279,11 @@ int runProjectFile(const char *path, ProjectRunOptions options) {
     std::cout << "runtime execution: "
               << (execution.uses_llvm_runtime ? "LLVM bitcode" : "host C ABI")
               << "\n";
+    std::cout << "compatibility: "
+              << (sjit_runtime_compatibility_mode(runtime) ==
+                          SJIT_COMPATIBILITY_MODE_TURBOWARP ?
+                      "turbowarp" : "scratch")
+              << " (list limit " << sjit_runtime_list_item_limit(runtime) << ")\n";
 
     const double step_ms = frameMsForFps(options.fps);
     sjit_runtime_set_turbo_mode(runtime, options.turbo_mode ? 1 : 0);
@@ -1734,6 +2333,12 @@ int runProjectWindow(const char *path, ProjectRunOptions options) {
         return 1;
     }
 
+    if (!configureRuntimeCompatibility(runtime, options)) {
+        std::cerr << "failed to configure runtime compatibility\n";
+        sjit_runtime_destroy(runtime);
+        return 1;
+    }
+
     ProjectLoadResult loaded = loadProjectIntoRuntime(runtime, path ? path : "");
     std::cout << loaded.message << "\n";
     if (!loaded.ok) {
@@ -1744,6 +2349,11 @@ int runProjectWindow(const char *path, ProjectRunOptions options) {
     std::cout << "runtime execution: "
               << (execution.uses_llvm_runtime ? "LLVM bitcode" : "host C ABI")
               << "\n";
+    std::cout << "compatibility: "
+              << (sjit_runtime_compatibility_mode(runtime) ==
+                          SJIT_COMPATIBILITY_MODE_TURBOWARP ?
+                      "turbowarp" : "scratch")
+              << " (list limit " << sjit_runtime_list_item_limit(runtime) << ")\n";
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) {
         std::cerr << "SDL_Init failed: " << SDL_GetError() << "\n";
         sjit_runtime_destroy(runtime);
@@ -1751,19 +2361,26 @@ int runProjectWindow(const char *path, ProjectRunOptions options) {
     }
 
     SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
+    setStageViewportForScale(options.stage_scale);
+    const int initial_width = g_stage_viewport.width;
+    const int initial_height = g_stage_viewport.height;
     SDL_Window *window = SDL_CreateWindow(
         "xyo-cpp Scratch window",
         SDL_WINDOWPOS_CENTERED,
         SDL_WINDOWPOS_CENTERED,
-        kStageWidth * kWindowScale,
-        kStageHeight * kWindowScale,
-        SDL_WINDOW_SHOWN | SDL_WINDOW_OPENGL);
+        initial_width,
+        initial_height,
+        SDL_WINDOW_SHOWN | SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
     if (!window) {
         std::cerr << "SDL_CreateWindow failed: " << SDL_GetError() << "\n";
         SDL_Quit();
         sjit_runtime_destroy(runtime);
         return 1;
     }
+    SDL_SetWindowMinimumSize(
+        window,
+        static_cast<int>(std::lround(kStageWidth * kMinimumStageScale)),
+        static_cast<int>(std::lround(kStageHeight * kMinimumStageScale)));
 
     SDL_Renderer *renderer = SDL_CreateRenderer(
         window,
@@ -1782,6 +2399,10 @@ int runProjectWindow(const char *path, ProjectRunOptions options) {
         sjit_runtime_destroy(runtime);
         return 1;
     }
+    int initial_window_width = 0;
+    int initial_window_height = 0;
+    SDL_GetWindowSize(window, &initial_window_width, &initial_window_height);
+    updateStageViewportForWindow(initial_window_width, initial_window_height);
 
     SkiaGpuState gpu;
     gpu.main_window = window;
@@ -1824,18 +2445,41 @@ int runProjectWindow(const char *path, ProjectRunOptions options) {
     SRuntimeStatus last_status = SJIT_STATUS_DONE;
     PenLayerCache pen_cache;
     SpriteTextureCache sprite_cache;
+    HitMaskCache hit_masks;
+    MouseInteractionState mouse;
     Uint64 last = SDL_GetPerformanceCounter();
     Uint64 last_title_update = 0;
     while (running && (options.max_frames <= 0 || tick < options.max_frames)) {
+        int window_width = 0;
+        int window_height = 0;
+        SDL_GetWindowSize(window, &window_width, &window_height);
+        updateStageViewportForWindow(window_width, window_height);
         SDL_Event event;
         clearKeyEdges(input);
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_QUIT) {
                 running = false;
-            } else if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE) {
+            } else if (event.type == SDL_WINDOWEVENT &&
+                       (event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
+                        event.window.event == SDL_WINDOWEVENT_RESIZED)) {
+                updateStageViewportForWindow(
+                    event.window.data1,
+                    event.window.data2);
+            } else if (event.type == SDL_KEYDOWN &&
+                       event.key.keysym.sym == SDLK_ESCAPE &&
+                       sjit_runtime_compatibility_mode(runtime) !=
+                           SJIT_COMPATIBILITY_MODE_TURBOWARP) {
                 running = false;
             }
-            updateInputFromEvent(input, runtime, loaded.program.render_targets, event);
+            updateInputFromEvent(
+                input,
+                runtime,
+                mouse,
+                hit_masks,
+                loaded.program.render_targets,
+                sjit_runtime_compatibility_mode(runtime) ==
+                    SJIT_COMPATIBILITY_MODE_TURBOWARP,
+                event);
         }
         const Uint64 now_counter = SDL_GetPerformanceCounter();
         const double delta_ms = static_cast<double>(now_counter - last) * 1000.0 / static_cast<double>(SDL_GetPerformanceFrequency());

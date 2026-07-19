@@ -13,6 +13,9 @@ typedef struct SListStorage {
     int ref_count;
     double *numbers;
     int numbers_valid;
+    /* Runtime compatibility setting.  This field is appended after the
+       JIT-visible prefix used by older list fast paths. */
+    int item_limit;
 } SListStorage;
 
 #endif

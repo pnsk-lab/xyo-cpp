@@ -809,6 +809,14 @@ SExpr *sjit_expr_create_direction(void) {
     return sjit_expr_create_nullary(SJIT_EXPR_DIRECTION);
 }
 
+SExpr *sjit_expr_create_costume_number_name(int number_name) {
+    SExpr *expr = sjit_expr_create_nullary(SJIT_EXPR_COSTUME_NUMBER_NAME);
+    if (expr) {
+        expr->literal = sjit_make_bool_fast(number_name);
+    }
+    return expr;
+}
+
 SExpr *sjit_expr_create_mouse_down(void) {
     return sjit_expr_create_nullary(SJIT_EXPR_MOUSE_DOWN);
 }
@@ -936,10 +944,76 @@ static int key_index_for_name(const char *name) {
     if (sjit_cstr_equals_ignore_case(name, "space")) {
         return ' ';
     }
+    if (sjit_cstr_equals_ignore_case(name, "enter")) {
+        return SJIT_KEY_ENTER;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "backspace")) {
+        return SJIT_KEY_BACKSPACE;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "delete")) {
+        return SJIT_KEY_DELETE;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "shift")) {
+        return SJIT_KEY_SHIFT;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "caps lock")) {
+        return SJIT_KEY_CAPS_LOCK;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "scroll lock")) {
+        return SJIT_KEY_SCROLL_LOCK;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "control")) {
+        return SJIT_KEY_CONTROL;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "escape")) {
+        return SJIT_KEY_ESCAPE;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "insert")) {
+        return SJIT_KEY_INSERT;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "home")) {
+        return SJIT_KEY_HOME;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "end")) {
+        return SJIT_KEY_END;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "page up")) {
+        return SJIT_KEY_PAGE_UP;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "page down")) {
+        return SJIT_KEY_PAGE_DOWN;
+    }
     if (name[1] == '\0') {
-        return (unsigned char)name[0];
+        const unsigned char character = (unsigned char)name[0];
+        return character >= 'a' && character <= 'z' ?
+            character - ('a' - 'A') : character;
     }
     return -1;
+}
+
+static int key_index_for_number(double number) {
+    if (!isfinite(number) || floor(number) != number) {
+        return -1;
+    }
+    if (number >= 48.0 && number <= 90.0) {
+        return (int)number >= 'a' && (int)number <= 'z' ?
+            (int)number - ('a' - 'A') : (int)number;
+    }
+    if (number == 32.0) {
+        return ' ';
+    }
+    switch ((int)number) {
+    case 37:
+        return SJIT_KEY_LEFT_ARROW;
+    case 38:
+        return SJIT_KEY_UP_ARROW;
+    case 39:
+        return SJIT_KEY_RIGHT_ARROW;
+    case 40:
+        return SJIT_KEY_DOWN_ARROW;
+    default:
+        return -1;
+    }
 }
 
 static SValue string_length_value(SRuntime *runtime, SValue value) {
@@ -1014,6 +1088,16 @@ static SValue eval_expr(SRuntime *runtime, int target_id, SExecContext *context,
     case SJIT_EXPR_DIRECTION: {
         SSprite *sprite = script_sprite(runtime, target_id, context);
         return sjit_make_number_fast(sprite ? sprite->direction : 90.0);
+    }
+    case SJIT_EXPR_COSTUME_NUMBER_NAME: {
+        SSprite *sprite = script_sprite(runtime, target_id, context);
+        if (expr->literal.number != 0.0) {
+            return sjit_make_number_fast(
+                sprite && sprite->costume_count > 0 ?
+                    (double)sprite->current_costume + 1.0 : 0.0);
+        }
+        return sjit_make_string(
+            sjit_sprite_current_costume_name(sprite));
     }
     case SJIT_EXPR_MOUSE_DOWN:
         return sjit_make_bool_fast(runtime->input.mouse_down || runtime->input.mouse_pressed_edge);
@@ -1219,8 +1303,20 @@ static SValue eval_expr(SRuntime *runtime, int target_id, SExecContext *context,
     case SJIT_EXPR_KEY_PRESSED: {
         SValue key = eval_expr(runtime, target_id, context, expr->left);
         SValue text = sjit_to_string(runtime, key);
-        const int index = key_index_for_name(sjit_string_cstr((const SString *)text.ptr));
-        const int pressed = index >= 0 && index < 256 ? runtime->input.key_down[index] : 0;
+        const char *key_name = sjit_string_cstr((const SString *)text.ptr);
+        int pressed = 0;
+        if (sjit_cstr_equals_ignore_case(key_name, "any")) {
+            for (int index = 0; index < 256; ++index) {
+                if (runtime->input.key_down[index]) {
+                    pressed = 1;
+                    break;
+                }
+            }
+        } else {
+            const int index = key.tag == SJIT_VALUE_NUMBER ?
+                key_index_for_number(key.number) : key_index_for_name(key_name);
+            pressed = index >= 0 && index < 256 ? runtime->input.key_down[index] : 0;
+        }
         sjit_value_destroy_fast(key);
         sjit_value_destroy_fast(text);
         return sjit_make_bool_fast(pressed);
@@ -1380,6 +1476,12 @@ static __attribute__((noinline, cold)) int eval_expr_number_cold(
     case SJIT_EXPR_DIRECTION: {
         SSprite *sprite = script_sprite(runtime, target_id, context);
         *out = sprite ? sprite->direction : 90.0;
+        return 1;
+    }
+    case SJIT_EXPR_COSTUME_NUMBER_NAME: {
+        SValue value = eval_expr(runtime, target_id, context, expr);
+        *out = sjit_to_number_fast(runtime, value);
+        sjit_value_destroy_fast(value);
         return 1;
     }
     case SJIT_EXPR_ARGUMENT: {
@@ -2249,6 +2351,21 @@ static SRuntimeStatus execute_statement(
         sjit_value_destroy_fast(text);
         break;
     }
+    case SJIT_STMT_BROADCAST_AND_WAIT: {
+        SValue message = eval_expr(runtime, target_id, context, statement->value);
+        SValue text = sjit_to_string(runtime, message);
+        const SRuntimeStatus status = sjit_event_broadcast_and_wait(
+            runtime,
+            frame,
+            sjit_string_cstr((const SString *)text.ptr),
+            frame ? frame->pc : 0);
+        sjit_value_destroy_fast(message);
+        sjit_value_destroy_fast(text);
+        if (status != SJIT_STATUS_OK) {
+            return status;
+        }
+        break;
+    }
     case SJIT_STMT_WAIT: {
         SValue duration = eval_expr(runtime, target_id, context, statement->value);
         SRuntimeStatus status = sjit_control_wait(runtime, frame, duration, frame ? frame->pc : 0);
@@ -2392,7 +2509,8 @@ static SRuntimeStatus execute_statement(
         SValue index_value = eval_expr(runtime, target_id, context, statement->index);
         const int index = sjit_list_to_index(runtime, index_value, sjit_list_length(list) + 1, 0);
         sjit_value_destroy_fast(index_value);
-        if (!list || index == SJIT_LIST_INDEX_INVALID || index > SJIT_LIST_ITEM_LIMIT) {
+        if (!list || index == SJIT_LIST_INDEX_INVALID ||
+            index > sjit_list_item_limit(list)) {
             break;
         }
         SValue value = eval_expr(runtime, target_id, context, statement->value);
@@ -2718,6 +2836,9 @@ static SRuntimeStatus execute_statement(
     case SJIT_STMT_PEN_UP:
         sjit_pen_up(runtime, script_sprite(runtime, target_id, context));
         break;
+    case SJIT_STMT_PEN_STAMP:
+        sjit_pen_stamp(runtime, script_sprite(runtime, target_id, context));
+        break;
     case SJIT_STMT_PEN_SET_SIZE: {
         double number = 0.0;
         if (eval_expr_number(runtime, target_id, context, statement->value, &number)) {
@@ -2834,6 +2955,25 @@ static SRuntimeStatus execute_statement(
         break;
     case SJIT_STMT_LOOKS_HIDE:
         sjit_looks_hide(runtime, script_sprite(runtime, target_id, context));
+        break;
+    case SJIT_STMT_LOOKS_SWITCH_COSTUME: {
+        SValue costume = eval_expr(
+            runtime,
+            target_id,
+            context,
+            statement->value);
+        sjit_looks_switch_costume(
+            runtime,
+            script_sprite(runtime, target_id, context),
+            costume);
+        sjit_value_destroy_fast(costume);
+        break;
+    }
+    case SJIT_STMT_LOOKS_GO_TO_FRONT_BACK:
+        sjit_looks_go_to_front_back(
+            runtime,
+            script_sprite(runtime, target_id, context),
+            statement->layer_front);
         break;
     case SJIT_STMT_LOOKS_SWITCH_BACKDROP: {
         SValue backdrop = eval_expr(

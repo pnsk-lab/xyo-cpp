@@ -20,6 +20,8 @@ SList *sjit_list_create(void);
 SList *sjit_list_clone(const SList *list);
 void sjit_list_destroy(SList *list);
 int sjit_list_length(const SList *list);
+int sjit_list_set_item_limit(SList *list, int item_limit);
+int sjit_list_item_limit(const SList *list);
 int sjit_list_push(SList *list, SValue value);
 int sjit_list_push_move(SList *list, SValue value);
 int sjit_list_push_number(SList *list, double number);

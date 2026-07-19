@@ -324,6 +324,44 @@ private:
     size_t pos_ = 0;
 };
 
+bool projectFencingEnabled(const Json &root) {
+    /* Scratch projects use fencing by default. TurboWarp stores an explicit
+       override in a _twconfig_ comment; honor it when present. */
+    bool fencing = true;
+    const Json *targets = objectGet(root, "targets");
+    if (!targets || !targets->isArray()) {
+        return fencing;
+    }
+    for (const Json &target : targets->asArray()) {
+        const Json *comments = objectGet(target, "comments");
+        if (!comments || !comments->isObject()) {
+            continue;
+        }
+        for (const auto &entry : comments->asObject()) {
+            const std::string text = objectString(entry.second, "text", "");
+            const std::string marker = " // _twconfig_";
+            const size_t marker_pos = text.rfind(marker);
+            if (marker_pos == std::string::npos) {
+                continue;
+            }
+            const size_t newline = text.rfind('\n', marker_pos);
+            const size_t json_start = newline == std::string::npos ? 0 : newline + 1;
+            try {
+                const Json config = JsonParser(
+                    text.substr(json_start, marker_pos - json_start)).parse();
+                const Json *runtime_options = objectGet(config, "runtimeOptions");
+                if (runtime_options && runtime_options->isObject()) {
+                    fencing = objectBool(*runtime_options, "fencing", fencing);
+                }
+            } catch (const std::exception &) {
+                /* Optional metadata must not make an otherwise valid SB3
+                   project fail to load. */
+            }
+        }
+    }
+    return fencing;
+}
+
 uint16_t readU16(const std::vector<unsigned char> &data, size_t offset) {
     return static_cast<uint16_t>(data[offset] | (data[offset + 1] << 8));
 }
@@ -407,17 +445,50 @@ std::string extractZipEntry(const std::string &path, const std::string &entry_na
 }
 
 std::string extractAttributeValue(const std::string &text, const std::string &attribute) {
-    const std::string needle = attribute + "=\"";
-    const size_t start = text.find(needle);
-    if (start == std::string::npos) {
-        return {};
+    const auto is_attribute_name_char = [](unsigned char ch) {
+        return std::isalnum(ch) || ch == '_' || ch == '-' || ch == ':' || ch == '.';
+    };
+
+    size_t search_start = 0;
+    while (true) {
+        const size_t start = text.find(attribute, search_start);
+        if (start == std::string::npos) {
+            return {};
+        }
+        const size_t after_name = start + attribute.size();
+        if ((start > 0 && is_attribute_name_char(
+                static_cast<unsigned char>(text[start - 1]))) ||
+            (after_name < text.size() && is_attribute_name_char(
+                static_cast<unsigned char>(text[after_name])))) {
+            search_start = after_name;
+            continue;
+        }
+
+        size_t equals = after_name;
+        while (equals < text.size() &&
+               std::isspace(static_cast<unsigned char>(text[equals]))) {
+            ++equals;
+        }
+        if (equals >= text.size() || text[equals] != '=') {
+            search_start = after_name;
+            continue;
+        }
+        ++equals;
+        while (equals < text.size() &&
+               std::isspace(static_cast<unsigned char>(text[equals]))) {
+            ++equals;
+        }
+        if (equals >= text.size() || (text[equals] != '"' && text[equals] != '\'')) {
+            search_start = after_name;
+            continue;
+        }
+        const char quote = text[equals++];
+        const size_t value_end = text.find(quote, equals);
+        if (value_end == std::string::npos || value_end <= equals) {
+            return {};
+        }
+        return text.substr(equals, value_end - equals);
     }
-    const size_t value_start = start + needle.size();
-    const size_t value_end = text.find('"', value_start);
-    if (value_end == std::string::npos || value_end <= value_start) {
-        return {};
-    }
-    return text.substr(value_start, value_end - value_start);
 }
 
 bool parseSvgHexColor(const std::string &text, int &r, int &g, int &b, int &a) {
@@ -512,14 +583,71 @@ double parseSvgDimension(const std::string &svg, const std::string &attribute, d
     const std::string value = extractAttributeValue(svg, attribute);
     if (!value.empty()) {
         try {
-            const double parsed = std::stod(value);
-            if (parsed > 0.0) {
-                return parsed;
+            size_t parsed_length = 0;
+            const double parsed = std::stod(value, &parsed_length);
+            size_t unit_start = parsed_length;
+            while (unit_start < value.size() &&
+                   std::isspace(static_cast<unsigned char>(value[unit_start]))) {
+                ++unit_start;
+            }
+            std::string unit = value.substr(unit_start);
+            std::transform(unit.begin(), unit.end(), unit.begin(), [](unsigned char ch) {
+                return static_cast<char>(std::tolower(ch));
+            });
+
+            double unit_scale = 1.0;
+            if (unit == "px" || unit.empty()) {
+                unit_scale = 1.0;
+            } else if (unit == "in") {
+                unit_scale = 96.0;
+            } else if (unit == "cm") {
+                unit_scale = 96.0 / 2.54;
+            } else if (unit == "mm") {
+                unit_scale = 96.0 / 25.4;
+            } else if (unit == "pt") {
+                unit_scale = 96.0 / 72.0;
+            } else if (unit == "pc") {
+                unit_scale = 16.0;
+            } else {
+                // Percentages and font-relative units need a containing
+                // block or font context. The viewBox is a better intrinsic
+                // size for the standalone costume than guessing here.
+                return fallback;
+            }
+            if (parsed > 0.0 && std::isfinite(parsed)) {
+                return parsed * unit_scale;
             }
         } catch (const std::exception &) {
         }
     }
     return fallback;
+}
+
+bool parsePngDimensions(const std::string &png, int &width, int &height) {
+    static constexpr unsigned char kPngSignature[] = {
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a};
+    if (png.size() < 24 ||
+        std::memcmp(png.data(), kPngSignature, sizeof(kPngSignature)) != 0 ||
+        std::memcmp(png.data() + 12, "IHDR", 4) != 0) {
+        return false;
+    }
+
+    const auto readBigEndian32 = [&](size_t offset) -> uint32_t {
+        return (static_cast<uint32_t>(static_cast<unsigned char>(png[offset])) << 24) |
+            (static_cast<uint32_t>(static_cast<unsigned char>(png[offset + 1])) << 16) |
+            (static_cast<uint32_t>(static_cast<unsigned char>(png[offset + 2])) << 8) |
+            static_cast<uint32_t>(static_cast<unsigned char>(png[offset + 3]));
+    };
+    const uint32_t parsed_width = readBigEndian32(16);
+    const uint32_t parsed_height = readBigEndian32(20);
+    if (parsed_width == 0 || parsed_height == 0 ||
+        parsed_width > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+        parsed_height > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+        return false;
+    }
+    width = static_cast<int>(parsed_width);
+    height = static_cast<int>(parsed_height);
+    return true;
 }
 
 void parseSvgViewBoxDimensions(const std::string &svg, double &width, double &height) {
@@ -1199,6 +1327,13 @@ SExpr *compileBlockExpr(const TargetBuild &target, const std::string &block_id) 
     if (block->opcode == "looks_backdrops") {
         return makeLiteralString(fieldName(*block, "BACKDROP"));
     }
+    if (block->opcode == "looks_costume") {
+        return makeLiteralString(fieldName(*block, "COSTUME"));
+    }
+    if (block->opcode == "looks_costumenumbername") {
+        return sjit_expr_create_costume_number_name(
+            fieldName(*block, "NUMBER_NAME") == "number");
+    }
     throw std::runtime_error(
         "unsupported reporter opcode '" + block->opcode +
         "' in block '" + block->id + "'");
@@ -1291,26 +1426,43 @@ SStatement compileStatement(const TargetBuild &target, const Block &block) {
     } else if (block.opcode == "event_broadcast") {
         statement.opcode = SJIT_STMT_BROADCAST;
         statement.value = compileInputExpr(target, block, "BROADCAST_INPUT");
+    } else if (block.opcode == "event_broadcastandwait") {
+        statement.opcode = SJIT_STMT_BROADCAST_AND_WAIT;
+        statement.value = compileInputExpr(target, block, "BROADCAST_INPUT");
     } else if (block.opcode == "procedures_call") {
         const std::string proccode = mutationString(block, "proccode");
-        auto it = target.procedures.find(proccode);
-        if (it != target.procedures.end()) {
-            statement.opcode = SJIT_STMT_PROCEDURE_CALL;
-            statement.procedure_name = sjit_string_new(proccode.c_str());
-            const ProcedureInfo &procedure = it->second;
-            statement.argument_count = static_cast<int>(procedure.argument_names.size());
-            if (statement.argument_count > 0) {
-                statement.arguments = static_cast<SArgumentExpr *>(
-                    std::calloc(static_cast<size_t>(statement.argument_count), sizeof(SArgumentExpr)));
-                if (!statement.arguments) {
-                    throw std::runtime_error("failed to allocate procedure arguments");
+        // TurboWarp serializes its built-in console logger as a custom-block
+        // call with zero-width spaces around the name.  It has no matching
+        // procedures_definition in the project, so treat it as the runtime's
+        // observable say/log operation instead of rejecting the whole SB3.
+        static const std::string kTurboWarpLogProccode =
+            "\u200b\u200blog\u200b\u200b %s";
+        if (proccode == kTurboWarpLogProccode) {
+            statement.opcode = SJIT_STMT_SAY;
+            statement.value = compileInputExpr(target, block, "arg0");
+        } else {
+            auto it = target.procedures.find(proccode);
+            if (it == target.procedures.end()) {
+                // Leave the statement as NOOP so the common validation below
+                // reports the unresolved custom block and its block id.
+            } else {
+                statement.opcode = SJIT_STMT_PROCEDURE_CALL;
+                statement.procedure_name = sjit_string_new(proccode.c_str());
+                const ProcedureInfo &procedure = it->second;
+                statement.argument_count = static_cast<int>(procedure.argument_names.size());
+                if (statement.argument_count > 0) {
+                    statement.arguments = static_cast<SArgumentExpr *>(
+                        std::calloc(static_cast<size_t>(statement.argument_count), sizeof(SArgumentExpr)));
+                    if (!statement.arguments) {
+                        throw std::runtime_error("failed to allocate procedure arguments");
+                    }
                 }
-            }
-            for (int i = 0; i < statement.argument_count; ++i) {
-                statement.arguments[i].name = sjit_string_new(procedure.argument_names[i].c_str());
-                const std::string input_name = i < static_cast<int>(procedure.argument_ids.size()) ?
-                    procedure.argument_ids[i] : "";
-                statement.arguments[i].value = compileInputExpr(target, block, input_name);
+                for (int i = 0; i < statement.argument_count; ++i) {
+                    statement.arguments[i].name = sjit_string_new(procedure.argument_names[i].c_str());
+                    const std::string input_name = i < static_cast<int>(procedure.argument_ids.size()) ?
+                        procedure.argument_ids[i] : "";
+                    statement.arguments[i].value = compileInputExpr(target, block, input_name);
+                }
             }
         }
     } else if (block.opcode == "looks_sayforsecs") {
@@ -1324,6 +1476,12 @@ SStatement compileStatement(const TargetBuild &target, const Block &block) {
         statement.opcode = SJIT_STMT_LOOKS_SHOW;
     } else if (block.opcode == "looks_hide") {
         statement.opcode = SJIT_STMT_LOOKS_HIDE;
+    } else if (block.opcode == "looks_switchcostumeto") {
+        statement.opcode = SJIT_STMT_LOOKS_SWITCH_COSTUME;
+        statement.value = compileInputExpr(target, block, "COSTUME");
+    } else if (block.opcode == "looks_gotofrontback") {
+        statement.opcode = SJIT_STMT_LOOKS_GO_TO_FRONT_BACK;
+        statement.layer_front = fieldName(block, "FRONT_BACK") == "front" ? 1 : 0;
     } else if (block.opcode == "looks_switchbackdropto") {
         statement.opcode = SJIT_STMT_LOOKS_SWITCH_BACKDROP;
         statement.value = compileInputExpr(target, block, "BACKDROP");
@@ -1368,6 +1526,8 @@ SStatement compileStatement(const TargetBuild &target, const Block &block) {
         statement.opcode = SJIT_STMT_PEN_DOWN;
     } else if (block.opcode == "pen_penUp") {
         statement.opcode = SJIT_STMT_PEN_UP;
+    } else if (block.opcode == "pen_stamp") {
+        statement.opcode = SJIT_STMT_PEN_STAMP;
     } else if (block.opcode == "pen_setPenSizeTo") {
         statement.opcode = SJIT_STMT_PEN_SET_SIZE;
         statement.value = compileInputExpr(target, block, "SIZE");
@@ -1522,6 +1682,7 @@ ProjectLoadResult loadProjectIntoRuntime(SRuntime *runtime, const std::string &p
         if (!targets_json || !targets_json->isArray()) {
             throw std::runtime_error("project.json has no targets array");
         }
+        sjit_runtime_set_fencing(runtime, projectFencingEnabled(root) ? 1 : 0);
 
         std::vector<TargetBuild> targets;
         int script_id = 1000;
@@ -1554,8 +1715,18 @@ ProjectLoadResult loadProjectIntoRuntime(SRuntime *runtime, const std::string &p
                     costume.name = objectString(costume_json, "name", "");
                     costume.asset_id = objectString(costume_json, "assetId", "");
                     costume.data_format = objectString(costume_json, "dataFormat", "");
-                    costume.rotation_center_x = objectNumber(costume_json, "rotationCenterX", 0.0);
-                    costume.rotation_center_y = objectNumber(costume_json, "rotationCenterY", 0.0);
+                    const double bitmap_resolution = [&]() {
+                        const double value = objectNumber(costume_json, "bitmapResolution", 1.0);
+                        return std::isfinite(value) && value > 0.0 ? value : 1.0;
+                    }();
+                    // Bitmap costume metadata is stored in source-pixel units
+                    // in an SB3. Runtime/render coordinates are logical
+                    // costume units, so both the rotation center and the
+                    // decoded dimensions need the bitmap-resolution scale.
+                    costume.rotation_center_x = objectNumber(
+                        costume_json, "rotationCenterX", 0.0) / bitmap_resolution;
+                    costume.rotation_center_y = objectNumber(
+                        costume_json, "rotationCenterY", 0.0) / bitmap_resolution;
 
                     if (costume.data_format == "svg" && !costume.asset_id.empty()) {
                         try {
@@ -1577,6 +1748,12 @@ ProjectLoadResult loadProjectIntoRuntime(SRuntime *runtime, const std::string &p
                     } else if (costume.data_format == "png" && !costume.asset_id.empty()) {
                         try {
                             costume.source_data = extractZipEntry(path, costume.asset_id + ".png");
+                            int bitmap_width = 0;
+                            int bitmap_height = 0;
+                            if (parsePngDimensions(costume.source_data, bitmap_width, bitmap_height)) {
+                                costume.width = static_cast<double>(bitmap_width) / bitmap_resolution;
+                                costume.height = static_cast<double>(bitmap_height) / bitmap_resolution;
+                            }
                         } catch (const std::exception &) {
                             costume.source_data.clear();
                         }
@@ -1653,6 +1830,7 @@ ProjectLoadResult loadProjectIntoRuntime(SRuntime *runtime, const std::string &p
                         continue;
                     }
                     SList *list = static_cast<SList *>(variable->value.ptr);
+                    sjit_list_set_item_limit(list, sjit_runtime_list_item_limit(runtime));
                     for (const Json &item : items_json.asArray()) {
                         pushJsonValue(list, item);
                     }

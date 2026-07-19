@@ -45,6 +45,7 @@ void sjit_variable_set(SVariable *variable, SValue value);
 void sjit_variable_set_move(SVariable *variable, SValue value);
 void sjit_variable_set_number(SVariable *variable, double number);
 void sjit_variable_set_bool(SVariable *variable, int value);
+void sjit_variable_set_list_item_limit(SVariable *variable, int item_limit);
 double sjit_variable_number(SRuntime *runtime, const SVariable *variable);
 void sjit_variable_change_by(SRuntime *runtime, SVariable *variable, SValue delta);
 void sjit_variable_change_by_number(SRuntime *runtime, SVariable *variable, double delta);

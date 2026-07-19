@@ -178,6 +178,14 @@ void sjit_jit_pen_render_list_pixel_from_variables(
     SVariable *index_variable,
     SExpr *replacement_literal,
     int param_id);
+void sjit_jit_set_col_from_numbers(
+    SRuntime *runtime,
+    SSprite *sprite,
+    SVariable *color_list_variable,
+    SVariable *clamp_variable,
+    double red,
+    double green,
+    double blue);
 int sjit_jit_pen_render_row_from_variables(
     SRuntime *runtime,
     SSprite *sprite,

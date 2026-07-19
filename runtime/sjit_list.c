@@ -6,6 +6,7 @@
 #include "sjit_string.h"
 #include "sjit_value.h"
 
+#include <limits.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +17,7 @@ static SListStorage *storage_create(void) {
         storage->ref_count = 1;
         storage->numbers_valid =
             getenv("SJIT_DISABLE_NUMERIC_LIST_CACHE") == NULL;
+        storage->item_limit = SJIT_LIST_ITEM_LIMIT;
     }
     return storage;
 }
@@ -62,6 +64,10 @@ static int ensure_capacity(SList *list, int wanted) {
     }
     int next = list->storage->capacity > 0 ? list->storage->capacity : SJIT_INITIAL_CAPACITY;
     while (next < wanted) {
+        if (next > INT_MAX / 2) {
+            next = wanted;
+            break;
+        }
         next *= 2;
     }
     SValue *items = (SValue *)realloc(list->storage->items, sizeof(SValue) * (size_t)next);
@@ -91,6 +97,7 @@ static __attribute__((noinline)) int ensure_unique_slow(SList *list) {
     if (!copy) {
         return 0;
     }
+    copy->item_limit = list->storage->item_limit;
     if (list->storage->length > 0) {
         copy->items = (SValue *)calloc((size_t)list->storage->length, sizeof(SValue));
         if (!copy->items) {
@@ -167,12 +174,27 @@ int sjit_list_length(const SList *list) {
     return list && list->storage ? list->storage->length : 0;
 }
 
+int sjit_list_set_item_limit(SList *list, int item_limit) {
+    if (!list || !list->storage || item_limit <= 0) {
+        return 0;
+    }
+    list->storage->item_limit = item_limit;
+    return 1;
+}
+
+int sjit_list_item_limit(const SList *list) {
+    if (!list || !list->storage || list->storage->item_limit <= 0) {
+        return SJIT_LIST_ITEM_LIMIT;
+    }
+    return list->storage->item_limit;
+}
+
 int sjit_list_push(SList *list, SValue value) {
     return sjit_list_push_move(list, sjit_value_clone(value));
 }
 
 int sjit_list_push_move(SList *list, SValue value) {
-    if (!ensure_unique(list) || list->storage->length >= SJIT_LIST_ITEM_LIMIT ||
+    if (!ensure_unique(list) || list->storage->length >= sjit_list_item_limit(list) ||
         !ensure_capacity(list, list->storage->length + 1)) {
         sjit_value_destroy(value);
         return 0;
@@ -190,7 +212,7 @@ int sjit_list_push_move(SList *list, SValue value) {
 }
 
 int sjit_list_push_number(SList *list, double number) {
-    if (!ensure_unique(list) || list->storage->length >= SJIT_LIST_ITEM_LIMIT ||
+    if (!ensure_unique(list) || list->storage->length >= sjit_list_item_limit(list) ||
         !ensure_capacity(list, list->storage->length + 1)) {
         return 0;
     }
@@ -211,7 +233,7 @@ int sjit_list_push_repeated(SList *list, SValue value, int count) {
     if (!ensure_unique(list)) {
         return 0;
     }
-    const int available = SJIT_LIST_ITEM_LIMIT - list->storage->length;
+    const int available = sjit_list_item_limit(list) - list->storage->length;
     const int append_count = count < available ? count : available;
     if (append_count <= 0) {
         return 1;
@@ -259,11 +281,12 @@ int sjit_list_insert_move(SList *list, int one_based_index, SValue value) {
     if (one_based_index > list->storage->length + 1) {
         one_based_index = list->storage->length + 1;
     }
-    if (one_based_index > SJIT_LIST_ITEM_LIMIT) {
+    const int item_limit = sjit_list_item_limit(list);
+    if (one_based_index > item_limit) {
         sjit_value_destroy(value);
         return 0;
     }
-    if (list->storage->length >= SJIT_LIST_ITEM_LIMIT) {
+    if (list->storage->length >= item_limit) {
         const int zero = one_based_index - 1;
         sjit_value_destroy(list->storage->items[list->storage->length - 1]);
         if (zero < list->storage->length - 1) {

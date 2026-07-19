@@ -30,13 +30,19 @@ Scratch 互換 VM/JIT の MVP として段階実装されている。
 - stage は 480x360 の固定 Scratch 座標系として扱い、SB3 内の SVG costume を
   rasterize して stage / sprite を表示する。
 - 変数 monitor は SDL 側で簡易バー/テキストとして描画される。
-- pen buffer は runtime が保持し、C++ host が Skia の `SkSurface` に
-  増分描画し、SDL が永続 pen layer として表示する。
+- pen buffer は runtime が保持し、C++ host が論理ステージとは独立した
+  最低2倍解像度の Skia `SkSurface` に増分描画し、SDL が永続 pen layer
+  として表示する。ペン解像度の変更によって表示ステージ自体のサイズは
+  変更しない。
 - sprite の ghost effect は SDL texture alpha、pixelate effect は一時的な
   low-resolution render target と nearest-neighbor upscale で表示する。effect の
   runtime state は Scratch の7種類すべてを保持する。
 - `src/main.cpp` は `--window`, `--gui`, `--frames`, `--fps`, `--turbo`,
-  `--emit-ll` の CLI を持つ。
+  `--compatibility`, `--turbowarp-compat`, `--scratch-compat`, `--list-limit`,
+  `--stage-scale`, `--emit-ll` の CLI を持つ。ウィンドウはリサイズ可能で、
+  ステージは4:3を維持して中央配置する。
+- TurboWarp互換では、マウスホイールの上下を`up arrow`/`down arrow`の
+  key hatとして発火する。これはキーボードの押下状態には反映しない。
 
 ## 3. JIT / LLVM 生成範囲
 

@@ -76,10 +76,76 @@ static int jit_key_index_for_name(const char *name) {
     if (sjit_cstr_equals_ignore_case(name, "space")) {
         return ' ';
     }
+    if (sjit_cstr_equals_ignore_case(name, "enter")) {
+        return SJIT_KEY_ENTER;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "backspace")) {
+        return SJIT_KEY_BACKSPACE;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "delete")) {
+        return SJIT_KEY_DELETE;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "shift")) {
+        return SJIT_KEY_SHIFT;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "caps lock")) {
+        return SJIT_KEY_CAPS_LOCK;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "scroll lock")) {
+        return SJIT_KEY_SCROLL_LOCK;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "control")) {
+        return SJIT_KEY_CONTROL;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "escape")) {
+        return SJIT_KEY_ESCAPE;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "insert")) {
+        return SJIT_KEY_INSERT;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "home")) {
+        return SJIT_KEY_HOME;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "end")) {
+        return SJIT_KEY_END;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "page up")) {
+        return SJIT_KEY_PAGE_UP;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "page down")) {
+        return SJIT_KEY_PAGE_DOWN;
+    }
     if (name[1] == '\0') {
-        return (unsigned char)name[0];
+        const unsigned char character = (unsigned char)name[0];
+        return character >= 'a' && character <= 'z' ?
+            character - ('a' - 'A') : character;
     }
     return -1;
+}
+
+static int jit_key_index_for_number(double number) {
+    if (!isfinite(number) || floor(number) != number) {
+        return -1;
+    }
+    if (number >= 48.0 && number <= 90.0) {
+        const int value = (int)number;
+        return value >= 'a' && value <= 'z' ? value - ('a' - 'A') : value;
+    }
+    if (number == 32.0) {
+        return ' ';
+    }
+    switch ((int)number) {
+    case 37:
+        return SJIT_KEY_LEFT_ARROW;
+    case 38:
+        return SJIT_KEY_UP_ARROW;
+    case 39:
+        return SJIT_KEY_RIGHT_ARROW;
+    case 40:
+        return SJIT_KEY_DOWN_ARROW;
+    default:
+        return -1;
+    }
 }
 
 static SStatement *jit_statement(SCompiledScript *script, int statement_index) {
@@ -732,8 +798,20 @@ int sjit_jit_key_pressed_value(SRuntime *runtime, SValue *key) {
         return 0;
     }
     SValue text = sjit_to_string(runtime, *key);
-    const int index = jit_key_index_for_name(sjit_string_cstr((const SString *)text.ptr));
-    const int pressed = index >= 0 && index < 256 ? runtime->input.key_down[index] : 0;
+    const char *key_name = sjit_string_cstr((const SString *)text.ptr);
+    int pressed = 0;
+    if (sjit_cstr_equals_ignore_case(key_name, "any")) {
+        for (int index = 0; index < 256; ++index) {
+            if (runtime->input.key_down[index]) {
+                pressed = 1;
+                break;
+            }
+        }
+    } else {
+        const int index = key->tag == SJIT_VALUE_NUMBER ?
+            jit_key_index_for_number(key->number) : jit_key_index_for_name(key_name);
+        pressed = index >= 0 && index < 256 ? runtime->input.key_down[index] : 0;
+    }
     sjit_value_destroy(text);
     return pressed;
 }
@@ -1720,6 +1798,47 @@ void sjit_jit_pen_render_list_pixel_from_variables(
     sjit_value_destroy(empty);
 }
 
+static double jit_set_col_clamp(double value) {
+    if (value > 255.0) {
+        return 255.0;
+    }
+    if (value < 0.0) {
+        return 0.0;
+    }
+    return value;
+}
+
+void sjit_jit_set_col_from_numbers(
+    SRuntime *runtime,
+    SSprite *sprite,
+    SVariable *color_list_variable,
+    SVariable *clamp_variable,
+    double red,
+    double green,
+    double blue) {
+    SList *color_list = jit_list_from_variable(color_list_variable);
+    if (color_list) {
+        sjit_list_clear(color_list);
+    }
+
+    const double channels[3] = {red, green, blue};
+    double clamped_channels[3];
+    for (int i = 0; i < 3; ++i) {
+        const double value = jit_set_col_clamp(channels[i]);
+        clamped_channels[i] = value;
+        sjit_variable_set_number_fast(clamp_variable, value);
+        if (color_list && i < 2) {
+            sjit_list_push_number(color_list, value);
+        }
+    }
+
+    const double packed_color =
+        clamped_channels[0] * 65536.0 +
+        clamped_channels[1] * 256.0 +
+        clamped_channels[2];
+    sjit_pen_set_color_value(runtime, sprite, sjit_make_number_fast(packed_color));
+}
+
 static int jit_pen_path_reserve_additional(
     SPenPathBuffer *path,
     int additional) {
@@ -2342,7 +2461,8 @@ void sjit_jit_statement_list_insert(SRuntime *runtime, SCompiledScript *script, 
     SValue index_value = sjit_script_eval_statement_expr_ptr(runtime, script, statement, SJIT_STMT_EXPR_INDEX);
     const int index = sjit_list_to_index(runtime, index_value, sjit_list_length(list) + 1, 0);
     sjit_value_destroy(index_value);
-    if (!list || index == SJIT_LIST_INDEX_INVALID || index > SJIT_LIST_ITEM_LIMIT) {
+    if (!list || index == SJIT_LIST_INDEX_INVALID ||
+        index > sjit_list_item_limit(list)) {
         return;
     }
     SValue value = sjit_script_eval_statement_expr_ptr(runtime, script, statement, SJIT_STMT_EXPR_VALUE);
@@ -2639,10 +2759,13 @@ int sjit_jit_statement_list_add_literal_repeated(
     double count) {
     if (!statement || statement->opcode != SJIT_STMT_LIST_ADD ||
         !statement->value || statement->value->opcode != SJIT_EXPR_LITERAL ||
-        count != count || count < 0.0 || count > (double)SJIT_LIST_ITEM_LIMIT) {
+        count != count || count < 0.0) {
         return 0;
     }
     SList *list = jit_script_list(runtime, script, statement);
+    if (count > (double)sjit_list_item_limit(list)) {
+        return 0;
+    }
     if (list) {
         (void)sjit_list_push_repeated(list, statement->value->literal, (int)count);
     }
@@ -2676,7 +2799,8 @@ void sjit_jit_statement_list_insert_number_at(
     SList *list = jit_script_list(runtime, script, statement);
     SValue index_value = sjit_make_number(index);
     const int resolved_index = sjit_list_to_index(runtime, index_value, sjit_list_length(list) + 1, 0);
-    if (!list || resolved_index == SJIT_LIST_INDEX_INVALID || resolved_index > SJIT_LIST_ITEM_LIMIT) {
+    if (!list || resolved_index == SJIT_LIST_INDEX_INVALID ||
+        resolved_index > sjit_list_item_limit(list)) {
         return;
     }
     sjit_list_insert_move(list, resolved_index, sjit_make_number(value));
@@ -2843,7 +2967,8 @@ void sjit_jit_statement_list_insert_value_ptr(
     SList *list = jit_script_list(runtime, script, statement);
     const int resolved_index = sjit_list_to_index(runtime, moved_index, sjit_list_length(list) + 1, 0);
     sjit_value_destroy(moved_index);
-    if (!list || resolved_index == SJIT_LIST_INDEX_INVALID || resolved_index > SJIT_LIST_ITEM_LIMIT) {
+    if (!list || resolved_index == SJIT_LIST_INDEX_INVALID ||
+        resolved_index > sjit_list_item_limit(list)) {
         sjit_value_destroy(moved_value);
         return;
     }

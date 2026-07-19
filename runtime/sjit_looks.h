@@ -9,6 +9,8 @@ extern "C" {
 
 void sjit_looks_show(SRuntime *runtime, SSprite *sprite);
 void sjit_looks_hide(SRuntime *runtime, SSprite *sprite);
+void sjit_looks_switch_costume(SRuntime *runtime, SSprite *sprite, SValue requested_costume);
+void sjit_looks_go_to_front_back(SRuntime *runtime, SSprite *sprite, int front);
 void sjit_looks_switch_backdrop(SRuntime *runtime, SValue requested_backdrop);
 void sjit_looks_switch_backdrop_value_ptr(SRuntime *runtime, SValue *requested_backdrop);
 int sjit_looks_effect_from_name(const char *effect_name);

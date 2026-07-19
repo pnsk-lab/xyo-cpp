@@ -44,7 +44,8 @@ typedef enum {
     SJIT_EXPR_LIST_VARIABLE = 33,
     /* Implemented by the interpreter and intentionally used to exercise the
        explicit whole-script JIT fallback path. */
-    SJIT_EXPR_DIRECTION = 34
+    SJIT_EXPR_DIRECTION = 34,
+    SJIT_EXPR_COSTUME_NUMBER_NAME = 35
 } SExprOpcode;
 
 typedef enum {
@@ -94,7 +95,11 @@ typedef enum {
     SJIT_STMT_LOOKS_SET_EFFECT = 42,
     SJIT_STMT_LOOKS_CHANGE_EFFECT = 43,
     SJIT_STMT_LOOKS_CLEAR_EFFECTS = 44,
-    SJIT_STMT_SENSING_SET_DRAG_MODE = 45
+    SJIT_STMT_SENSING_SET_DRAG_MODE = 45,
+    SJIT_STMT_LOOKS_SWITCH_COSTUME = 46,
+    SJIT_STMT_LOOKS_GO_TO_FRONT_BACK = 47,
+    SJIT_STMT_PEN_STAMP = 48,
+    SJIT_STMT_BROADCAST_AND_WAIT = 49
 } SStatementOpcode;
 
 typedef enum {
@@ -173,6 +178,7 @@ typedef struct SStatement {
     int drag_mode;
     /* The resolved variable's immutable name/ID object. */
     const SString *variable_cache_identity;
+    int layer_front;
 } SStatement;
 
 typedef struct {
@@ -257,6 +263,7 @@ SExpr *sjit_expr_create_mouse_y(void);
 SExpr *sjit_expr_create_x_position(void);
 SExpr *sjit_expr_create_y_position(void);
 SExpr *sjit_expr_create_direction(void);
+SExpr *sjit_expr_create_costume_number_name(int number_name);
 SExpr *sjit_expr_create_mouse_down(void);
 SExpr *sjit_expr_create_key_pressed(SExpr *key_name);
 void sjit_expr_destroy(SExpr *expr);

@@ -579,8 +579,49 @@ int literalKeyIndex(const SExpr *expr) {
     if (sjit_cstr_equals_ignore_case(name, "space")) {
         return ' ';
     }
+    if (sjit_cstr_equals_ignore_case(name, "enter")) {
+        return SJIT_KEY_ENTER;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "backspace")) {
+        return SJIT_KEY_BACKSPACE;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "delete")) {
+        return SJIT_KEY_DELETE;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "shift")) {
+        return SJIT_KEY_SHIFT;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "caps lock")) {
+        return SJIT_KEY_CAPS_LOCK;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "scroll lock")) {
+        return SJIT_KEY_SCROLL_LOCK;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "control")) {
+        return SJIT_KEY_CONTROL;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "escape")) {
+        return SJIT_KEY_ESCAPE;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "insert")) {
+        return SJIT_KEY_INSERT;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "home")) {
+        return SJIT_KEY_HOME;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "end")) {
+        return SJIT_KEY_END;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "page up")) {
+        return SJIT_KEY_PAGE_UP;
+    }
+    if (sjit_cstr_equals_ignore_case(name, "page down")) {
+        return SJIT_KEY_PAGE_DOWN;
+    }
     if (name[1] == '\0') {
-        return static_cast<unsigned char>(name[0]);
+        const unsigned char character = static_cast<unsigned char>(name[0]);
+        return character >= 'a' && character <= 'z' ?
+            character - ('a' - 'A') : character;
     }
     return -1;
 }
@@ -1456,6 +1497,235 @@ struct NativePenRowPattern {
     const SExpr *xStepExpr = nullptr;
     int paramId = 0;
 };
+
+bool sameStatementVariableReference(
+    const SStatement &left,
+    const SStatement &right) {
+    if (!left.variable_name || !right.variable_name ||
+        !stringEquals(left.variable_name, right.variable_name)) {
+        return false;
+    }
+    if (left.variable_id && right.variable_id) {
+        return stringEquals(left.variable_id, right.variable_id);
+    }
+    return true;
+}
+
+bool expressionMatchesStatementVariable(
+    const SExpr *expr,
+    const SStatement &statement) {
+    if (!expr || expr->opcode != SJIT_EXPR_VARIABLE ||
+        expr->literal.tag != SJIT_VALUE_STRING || !statement.variable_name ||
+        !stringEquals(
+            static_cast<const SString *>(expr->literal.ptr),
+            statement.variable_name)) {
+        return false;
+    }
+    if (statement.variable_id && expr->variable_id) {
+        return stringEquals(expr->variable_id, statement.variable_id);
+    }
+    return true;
+}
+
+bool expressionMatchesStatementList(
+    const SExpr *expr,
+    const SStatement &statement) {
+    if (!expr || expr->opcode != SJIT_EXPR_LIST_ITEM ||
+        expr->literal.tag != SJIT_VALUE_STRING || !statement.variable_name ||
+        !stringEquals(
+            static_cast<const SString *>(expr->literal.ptr),
+            statement.variable_name)) {
+        return false;
+    }
+    if (statement.variable_id && expr->variable_id) {
+        return stringEquals(expr->variable_id, statement.variable_id);
+    }
+    return true;
+}
+
+bool expressionIsListItemProduct(
+    const SExpr *expr,
+    const SStatement &listStatement,
+    double factor,
+    int index) {
+    return expr && expr->opcode == SJIT_EXPR_MUL &&
+        expressionMatchesStatementList(expr->left, listStatement) &&
+        exactNumericLiteral(expr->left->left, index) &&
+        exactNumericLiteral(expr->right, factor);
+}
+
+bool expressionIsProcedureArgument(
+    const SCompiledProcedure &procedure,
+    const SExpr *expr,
+    int expectedIndex) {
+    return procedureArgumentIndex(procedure, expr) == expectedIndex;
+}
+
+bool expressionIsClampCondition(
+    const SExpr *condition,
+    int opcode,
+    const SCompiledProcedure &procedure,
+    int rightArgument) {
+    return condition && condition->opcode == opcode &&
+        expressionIsProcedureArgument(procedure, condition->left, 0) &&
+        expressionIsProcedureArgument(procedure, condition->right, rightArgument);
+}
+
+bool matchNativeClampProcedure(
+    const SCompiledProcedure &procedure,
+    const SStatement *&clampVariableStatement) {
+    if (procedure.argument_count != 3 || procedure.statement_count != 2 ||
+        !procedure.statements) {
+        return false;
+    }
+    const SStatement &initialSet = procedure.statements[0];
+    const SStatement &limitBranch = procedure.statements[1];
+    if (initialSet.opcode != SJIT_STMT_SET_VARIABLE ||
+        !expressionIsProcedureArgument(procedure, initialSet.value, 0) ||
+        limitBranch.opcode != SJIT_STMT_IF_ELSE ||
+        !limitBranch.substack || limitBranch.substack_count != 1 ||
+        !limitBranch.substack2 || limitBranch.substack2_count != 1 ||
+        !expressionIsClampCondition(
+            limitBranch.condition,
+            SJIT_EXPR_GT,
+            procedure,
+            2)) {
+        return false;
+    }
+
+    const SStatement &setMax = limitBranch.substack[0];
+    const SStatement &minimumBranch = limitBranch.substack2[0];
+    if (setMax.opcode != SJIT_STMT_SET_VARIABLE ||
+        !sameStatementVariableReference(initialSet, setMax) ||
+        !expressionIsProcedureArgument(procedure, setMax.value, 2) ||
+        minimumBranch.opcode != SJIT_STMT_IF ||
+        !minimumBranch.substack || minimumBranch.substack_count != 1 ||
+        !expressionIsClampCondition(
+            minimumBranch.condition,
+            SJIT_EXPR_LT,
+            procedure,
+            1)) {
+        return false;
+    }
+
+    const SStatement &setMin = minimumBranch.substack[0];
+    if (setMin.opcode != SJIT_STMT_SET_VARIABLE ||
+        !sameStatementVariableReference(initialSet, setMin) ||
+        !expressionIsProcedureArgument(procedure, setMin.value, 1)) {
+        return false;
+    }
+    clampVariableStatement = &initialSet;
+    return true;
+}
+
+struct NativeSetColPattern {
+    const SStatement *listClear = nullptr;
+    const SStatement *listAdd[3] = {};
+    const SStatement *clampCall[3] = {};
+    const SStatement *clampVariableStatement = nullptr;
+};
+
+bool matchNativeSetColPattern(
+    const SCompiledScript &script,
+    int procedureIndex,
+    NativeSetColPattern &out) {
+    out = {};
+    if (procedureIndex < 0 || procedureIndex >= script.procedure_count) {
+        return false;
+    }
+    const SCompiledProcedure &procedure = script.procedures[procedureIndex];
+    if (!procedure.name ||
+        std::strcmp(sjit_string_cstr(procedure.name), "Set Col %s %s %s") != 0 ||
+        procedure.argument_count != 3 || procedure.statement_count != 7 ||
+        !procedure.statements) {
+        return false;
+    }
+
+    const SStatement &listClear = procedure.statements[0];
+    if (listClear.opcode != SJIT_STMT_LIST_DELETE_ALL || !listClear.variable_name) {
+        return false;
+    }
+    out.listClear = &listClear;
+    int clampProcedureIndex = -1;
+    for (int channel = 0; channel < 3; ++channel) {
+        const int callOffset = 1 + channel * 2;
+        const SStatement &clampCall = procedure.statements[callOffset];
+        const SStatement *listAdd = channel < 2 ?
+            &procedure.statements[callOffset + 1] : nullptr;
+        if (clampCall.opcode != SJIT_STMT_PROCEDURE_CALL ||
+            !clampCall.procedure_name ||
+            std::strcmp(sjit_string_cstr(clampCall.procedure_name), "Clamp %s %s %s") != 0 ||
+            clampCall.argument_count != 3 || !clampCall.arguments ||
+            (listAdd && (
+                listAdd->opcode != SJIT_STMT_LIST_ADD ||
+                !sameStatementVariableReference(listClear, *listAdd) ||
+                !listAdd->value))) {
+            return false;
+        }
+        if (channel == 0) {
+            clampProcedureIndex = findProcedureIndex(script, clampCall.procedure_name);
+        } else if (clampProcedureIndex != findProcedureIndex(script, clampCall.procedure_name)) {
+            return false;
+        }
+        if (clampProcedureIndex < 0 ||
+            !exactNumericLiteral(clampCall.arguments[1].value, 0.0) ||
+            !exactNumericLiteral(clampCall.arguments[2].value, 255.0)) {
+            return false;
+        }
+        out.clampCall[channel] = &clampCall;
+        out.listAdd[channel] = listAdd;
+    }
+
+    const SStatement &setColor = procedure.statements[6];
+    if (setColor.opcode != SJIT_STMT_PEN_SET_COLOR || !setColor.value ||
+        setColor.value->opcode != SJIT_EXPR_ADD ||
+        !setColor.value->left || setColor.value->left->opcode != SJIT_EXPR_ADD ||
+        !setColor.value->left->left ||
+        !setColor.value->left->right ||
+        !setColor.value->right) {
+        return false;
+    }
+
+    const SCompiledProcedure &clampProcedure =
+        script.procedures[clampProcedureIndex];
+    const SStatement *clampVariableStatement = nullptr;
+    if (!matchNativeClampProcedure(clampProcedure, clampVariableStatement)) {
+        return false;
+    }
+    if (!expressionMatchesStatementVariable(
+            setColor.value->right,
+            *clampVariableStatement) ||
+        !expressionIsListItemProduct(
+            setColor.value->left->left,
+            listClear,
+            65536.0,
+            1) ||
+        !expressionIsListItemProduct(
+            setColor.value->left->right,
+            listClear,
+            256.0,
+            2)) {
+        return false;
+    }
+    for (int channel = 0; channel < 3; ++channel) {
+        const SStatement &clampCall = *out.clampCall[channel];
+        const SExpr *rounded = clampCall.arguments[0].value;
+        if (!rounded || rounded->opcode != SJIT_EXPR_ROUND ||
+                !expressionIsProcedureArgument(
+                    procedure,
+                    rounded->left,
+                    channel) ||
+            (channel < 2 && (
+                !out.listAdd[channel] ||
+                !expressionMatchesStatementVariable(
+                    out.listAdd[channel]->value,
+                    *clampVariableStatement)))) {
+            return false;
+        }
+    }
+    out.clampVariableStatement = clampVariableStatement;
+    return true;
+}
 
 bool matchNativePenRowPattern(
     const SStatement *repeat,
@@ -2622,7 +2892,7 @@ ModuleBuild createScriptModule(const llvm::DataLayout &dataLayout, const SCompil
         "SString.jit");
     auto *listStorageTy = llvm::StructType::create(
         *context,
-        {ptr, i32, i32, i32, ptr, i32},
+        {ptr, i32, i32, i32, ptr, i32, i32},
         "SListStorage.jit");
     auto *listTy = llvm::StructType::create(*context, {ptr}, "SList.jit");
     auto *loopStateTy = llvm::StructType::create(*context, {ptr, i32, f64, i32, i32}, "SLoopState.jit");
@@ -2885,6 +3155,10 @@ ModuleBuild createScriptModule(const llvm::DataLayout &dataLayout, const SCompil
     auto *penRenderListPixelFromVariablesTy = llvm::FunctionType::get(
         voidTy,
         {ptr, ptr, ptr, ptr, ptr, ptr, i32},
+        false);
+    auto *setColFromNumbersTy = llvm::FunctionType::get(
+        voidTy,
+        {ptr, ptr, ptr, ptr, f64, f64, f64},
         false);
     auto *penRenderRowFromVariablesTy = llvm::FunctionType::get(
         i32,
@@ -3314,6 +3588,11 @@ ModuleBuild createScriptModule(const llvm::DataLayout &dataLayout, const SCompil
         penRenderListPixelFromVariablesTy,
         llvm::Function::ExternalLinkage,
         "sjit_jit_pen_render_list_pixel_from_variables",
+        module.get());
+    auto *setColFromNumbers = llvm::Function::Create(
+        setColFromNumbersTy,
+        llvm::Function::ExternalLinkage,
+        "sjit_jit_set_col_from_numbers",
         module.get());
     auto *penRenderRowFromVariables = llvm::Function::Create(
         penRenderRowFromVariablesTy,
@@ -7816,6 +8095,46 @@ ModuleBuild createScriptModule(const llvm::DataLayout &dataLayout, const SCompil
                     throw std::runtime_error("procedure call argument was not LLVM-lowerable after eligibility check");
                 }
             }
+
+            NativeSetColPattern setColPattern;
+            const bool setColPatternMatched = matchNativeSetColPattern(script, target, setColPattern);
+            bool canUseSetColFastPath =
+                setColPatternMatched &&
+                statement->argument_count == 3;
+            for (int i = 0; canUseSetColFastPath && i < 3; ++i) {
+                canUseSetColFastPath = procedureCanEvaluateNumberExpr(
+                    procedure,
+                    statement->arguments[i].value);
+            }
+            if (canUseSetColFastPath) {
+                llvm::Value *setColTarget = procTarget;
+                if (llvm::isa<llvm::ConstantPointerNull>(setColTarget)) {
+                    setColTarget = procBuilder.CreateCall(
+                        runtimeGetSprite,
+                        {procRuntime, llvm::ConstantInt::get(i32, script.target_id)},
+                        "set_col_target");
+                }
+                llvm::Value *channels[3] = {};
+                for (int i = 0; i < 3; ++i) {
+                    channels[i] = procBuilder.CreateCall(
+                        roundNumber,
+                        {emitProcNumberExpr(statement->arguments[i].value)},
+                        i == 0 ? "set_col_red_rounded" :
+                            (i == 1 ? "set_col_green_rounded" : "set_col_blue_rounded"));
+                }
+                procBuilder.CreateCall(
+                    setColFromNumbers,
+                    {
+                        procRuntime,
+                        setColTarget,
+                        emitProcStatementListVariable(setColPattern.listClear),
+                        emitProcStatementScalarVariable(setColPattern.clampVariableStatement),
+                        channels[0],
+                        channels[1],
+                        channels[2],
+                    });
+                return llvm::ConstantInt::get(i32, SJIT_STATUS_OK);
+            }
             llvm::Value *argArray = createProcAlloca(
                 f64,
                 llvm::ConstantInt::get(i32, statement->argument_count > 0 ? statement->argument_count : 1),
@@ -10962,7 +11281,14 @@ ModuleBuild createScriptModule(const llvm::DataLayout &dataLayout, const SCompil
             llvm::Value *hasCapacity = builder.CreateICmpSLT(length, capacity, "list_add_has_capacity");
             llvm::Value *underLimit = builder.CreateICmpSLT(
                 length,
-                llvm::ConstantInt::get(i32, SJIT_LIST_ITEM_LIMIT),
+                builder.CreateLoad(
+                    i32,
+                    builder.CreateStructGEP(
+                        listStorageTy,
+                        list.storage,
+                        6,
+                        "list_add_item_limit_ptr"),
+                    "list_add_item_limit"),
                 "list_add_under_limit");
             llvm::Value *itemsOk = builder.CreateNot(isNull(builder, items), "list_add_items_ok");
             llvm::Value *cacheReady = builder.CreateOr(
@@ -11931,6 +12257,8 @@ JitEngine::JitEngine() : impl_(std::make_unique<Impl>()) {
              {llvm::orc::ExecutorAddr::fromPtr(&sjit_jit_pen_render_list_pixel_at_variable), llvm::JITSymbolFlags::Exported}},
             {mangle("sjit_jit_pen_render_list_pixel_from_variables"),
              {llvm::orc::ExecutorAddr::fromPtr(&sjit_jit_pen_render_list_pixel_from_variables), llvm::JITSymbolFlags::Exported}},
+            {mangle("sjit_jit_set_col_from_numbers"),
+             {llvm::orc::ExecutorAddr::fromPtr(&sjit_jit_set_col_from_numbers), llvm::JITSymbolFlags::Exported}},
             {mangle("sjit_jit_pen_render_row_from_variables"),
              {llvm::orc::ExecutorAddr::fromPtr(&sjit_jit_pen_render_row_from_variables), llvm::JITSymbolFlags::Exported}},
             {mangle("sjit_jit_script_set_variable"),

@@ -5,6 +5,7 @@
 #include "sjit_value.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -14,6 +15,74 @@ void sjit_looks_show(SRuntime *runtime, SSprite *sprite) {
 
 void sjit_looks_hide(SRuntime *runtime, SSprite *sprite) {
     sjit_sprite_set_visible(runtime, sprite, 0);
+}
+
+void sjit_looks_switch_costume(
+    SRuntime *runtime,
+    SSprite *sprite,
+    SValue requested_costume) {
+    if (!sprite || sprite->costume_count <= 0) {
+        return;
+    }
+    if (requested_costume.tag == SJIT_VALUE_NUMBER) {
+        sjit_sprite_set_costume_number(
+            runtime,
+            sprite,
+            requested_costume.number - 1.0);
+        return;
+    }
+
+    SValue text_value = sjit_to_string(runtime, requested_costume);
+    const char *text = sjit_string_cstr((const SString *)text_value.ptr);
+    const int named_index = sjit_sprite_costume_index_by_name(sprite, text);
+    if (named_index >= 0) {
+        sjit_sprite_set_costume(runtime, sprite, named_index);
+        sjit_value_destroy_fast(text_value);
+        return;
+    }
+
+    double numeric_index = 0.0;
+    int whitespace = 0;
+    if (sjit_parse_number_for_compare_fast(
+            requested_costume,
+            &numeric_index,
+            &whitespace) && !whitespace) {
+        sjit_sprite_set_costume_number(runtime, sprite, numeric_index - 1.0);
+    }
+    sjit_value_destroy_fast(text_value);
+}
+
+void sjit_looks_go_to_front_back(
+    SRuntime *runtime,
+    SSprite *sprite,
+    int front) {
+    if (!runtime || !sprite) {
+        return;
+    }
+
+    int extreme = sprite->layer_order;
+    for (int i = 0; i < runtime->target_count; ++i) {
+        const SSprite *target = runtime->targets[i];
+        if (!target || target == sprite) {
+            continue;
+        }
+        if (front) {
+            if (target->layer_order > extreme) {
+                extreme = target->layer_order;
+            }
+        } else if (target->layer_order < extreme) {
+            extreme = target->layer_order;
+        }
+    }
+
+    if (front) {
+        if (extreme < INT_MAX) {
+            sprite->layer_order = extreme + 1;
+        }
+    } else if (extreme > INT_MIN) {
+        sprite->layer_order = extreme - 1;
+    }
+    sjit_runtime_request_redraw(runtime);
 }
 
 static int ascii_case_equal(const char *left, const char *right) {

@@ -2035,6 +2035,50 @@ void test_graphic_effect_helpers_clamp_clear_and_clone() {
     sjit_runtime_destroy(runtime);
 }
 
+void test_costume_switch_and_layer_operations() {
+    const OpcodeEffects switch_effects = sjit_statement_opcode_effects(
+        SJIT_STMT_LOOKS_SWITCH_COSTUME);
+    const OpcodeEffects layer_effects = sjit_statement_opcode_effects(
+        SJIT_STMT_LOOKS_GO_TO_FRONT_BACK);
+    require(switch_effects.requiresInterpreter && layer_effects.requiresInterpreter,
+        "costume and layer Looks operations use the checked interpreter path");
+
+    SRuntime *runtime = sjit_runtime_create();
+    SSprite *stage = sjit_runtime_create_sprite(runtime, "Stage", 1);
+    SSprite *sprite = sjit_runtime_create_sprite(runtime, "Sprite", 0);
+    SSprite *other = sjit_runtime_create_sprite(runtime, "Other", 0);
+    require(runtime && stage && sprite && other,
+        "create costume/layer operation runtime");
+    const char *names[] = {"first", "second", "third"};
+    require(sjit_sprite_set_costume_names(sprite, names, 3),
+        "store sprite costume names");
+
+    SValue named = sjit_make_string("third");
+    sjit_looks_switch_costume(runtime, sprite, named);
+    sjit_value_destroy(named);
+    require(sprite->current_costume == 2,
+        "switch costume accepts a costume name");
+    sjit_looks_switch_costume(runtime, sprite, sjit_make_number(1.0));
+    require(sprite->current_costume == 0,
+        "numeric costume selection is one-based");
+
+    sjit_looks_go_to_front_back(runtime, sprite, 1);
+    require(sprite->layer_order > other->layer_order,
+        "go to front moves a sprite above every other target");
+    sjit_looks_go_to_front_back(runtime, sprite, 0);
+    require(sprite->layer_order < other->layer_order &&
+            sprite->layer_order < stage->layer_order,
+        "go to back moves a sprite below every other target");
+
+    sjit_runtime_tick(runtime);
+    const SDrawCommandBuffer *draw = sjit_runtime_get_draw_commands(runtime);
+    require(draw && draw->length == 2 &&
+            draw->items[0].target_id == sprite->base.id &&
+            draw->items[1].target_id == other->base.id,
+        "draw commands follow the updated Scratch layer order");
+    sjit_runtime_destroy(runtime);
+}
+
 void test_graphic_effect_interpreter_statements() {
     const OpcodeEffects set_effects = sjit_statement_opcode_effects(
         SJIT_STMT_LOOKS_SET_EFFECT);
@@ -3024,6 +3068,70 @@ void test_operator_and_list() {
     sjit_list_destroy(numeric_characters);
     sjit_list_destroy(shared);
     sjit_list_destroy(list);
+    sjit_runtime_destroy(runtime);
+}
+
+void test_large_numeric_list_limit() {
+    SList *list = sjit_list_create();
+    require(list, "create large-list regression fixture");
+    require(
+        sjit_list_push_repeated(list, sjit_make_number(7.0), 200001),
+        "append more than the legacy 200k list ceiling");
+    require(
+        sjit_list_length(list) == 200001,
+        "large lists are not truncated at the legacy ceiling");
+    double last = 0.0;
+    require(
+        sjit_list_get_number(list, 200001, &last) && last == 7.0,
+        "large-list tail remains readable");
+    sjit_list_destroy(list);
+}
+
+void test_compatibility_modes_and_turbowarp_keys() {
+    SRuntime *runtime = sjit_runtime_create();
+    require(runtime, "create compatibility runtime");
+    require(
+        sjit_runtime_compatibility_mode(runtime) == SJIT_COMPATIBILITY_MODE_TURBOWARP &&
+            sjit_runtime_list_item_limit(runtime) == SJIT_TURBOWARP_LIST_ITEM_LIMIT,
+        "runtime defaults to TurboWarp compatibility");
+
+    SSprite *sprite = sjit_runtime_create_sprite(runtime, "Sprite", 0);
+    SVariable *variable = sjit_runtime_lookup_or_create_variable(
+        runtime, sprite->base.id, "items", SJIT_VAR_LIST);
+    require(variable && variable->value.tag == SJIT_VALUE_LIST,
+        "create compatibility list variable");
+    SList *list = static_cast<SList *>(variable->value.ptr);
+    require(sjit_list_item_limit(list) == SJIT_TURBOWARP_LIST_ITEM_LIMIT,
+        "new list inherits the TurboWarp limit");
+
+    require(sjit_runtime_set_compatibility_mode(runtime, SJIT_COMPATIBILITY_MODE_SCRATCH),
+        "switch to Scratch compatibility");
+    require(
+        sjit_runtime_list_item_limit(runtime) == SJIT_SCRATCH_LIST_ITEM_LIMIT &&
+            sjit_list_item_limit(list) == SJIT_SCRATCH_LIST_ITEM_LIMIT,
+        "Scratch compatibility applies its list limit to existing lists");
+    require(sjit_runtime_set_list_item_limit(runtime, 3),
+        "override the compatibility list limit");
+    require(sjit_list_push_repeated(list, sjit_make_number(1.0), 5),
+        "append up to the overridden list limit");
+    require(sjit_list_length(list) == 3,
+        "list writes respect the runtime override");
+
+    runtime->input.key_down[SJIT_KEY_DELETE] = 1;
+    runtime->input.key_down[SJIT_KEY_SHIFT] = 1;
+    runtime->input.key_down['A'] = 1;
+    SValue delete_key = sjit_make_string("delete");
+    SValue any_key = sjit_make_string("any");
+    SValue lower_letter = sjit_make_string("a");
+    require(sjit_jit_key_pressed_value(runtime, &delete_key),
+        "TurboWarp delete key is recognized");
+    require(sjit_jit_key_pressed_value(runtime, &any_key),
+        "TurboWarp any key query is recognized");
+    require(sjit_jit_key_pressed_value(runtime, &lower_letter),
+        "letter key queries are case-insensitive");
+    sjit_value_destroy(delete_key);
+    sjit_value_destroy(any_key);
+    sjit_value_destroy(lower_letter);
     sjit_runtime_destroy(runtime);
 }
 
@@ -8843,6 +8951,7 @@ int main() {
     test_opcode_effects_and_reporter_differential_fallback();
     test_backdrop_switch_loader_interpreter_and_semantics();
     test_graphic_effect_helpers_clamp_clear_and_clone();
+    test_costume_switch_and_layer_operations();
     test_graphic_effect_interpreter_statements();
     test_graphic_effect_top_level_native_jit();
     test_graphic_effect_custom_procedure_argument_native_jit();
@@ -8853,6 +8962,8 @@ int main() {
     test_interpreter_cache_rejects_recycled_runtime_identity();
     test_values_cast_compare();
     test_operator_and_list();
+    test_large_numeric_list_limit();
+    test_compatibility_modes_and_turbowarp_keys();
     test_numeric_list_cache_tracks_mutations();
     test_jit_borrowed_list_helpers();
     test_script_boolean_and_list_item_expr();

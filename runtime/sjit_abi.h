@@ -188,7 +188,23 @@ enum {
     SJIT_KEY_UP_ARROW = 128,
     SJIT_KEY_DOWN_ARROW = 129,
     SJIT_KEY_RIGHT_ARROW = 130,
-    SJIT_KEY_LEFT_ARROW = 131
+    SJIT_KEY_LEFT_ARROW = 131,
+    /* TurboWarp exposes these DOM keyboard names as Scratch keys.  Keep them
+       in the normalized input range instead of using browser keyCode values,
+       which collide with printable punctuation (Delete is keyCode 46). */
+    SJIT_KEY_ENTER = 132,
+    SJIT_KEY_BACKSPACE = 133,
+    SJIT_KEY_DELETE = 134,
+    SJIT_KEY_SHIFT = 135,
+    SJIT_KEY_CAPS_LOCK = 136,
+    SJIT_KEY_SCROLL_LOCK = 137,
+    SJIT_KEY_CONTROL = 138,
+    SJIT_KEY_ESCAPE = 139,
+    SJIT_KEY_INSERT = 140,
+    SJIT_KEY_HOME = 141,
+    SJIT_KEY_END = 142,
+    SJIT_KEY_PAGE_UP = 143,
+    SJIT_KEY_PAGE_DOWN = 144
 };
 
 #ifdef __cplusplus

@@ -746,10 +746,12 @@ scalar初期値は0。list初期値は空list。broadcast messageのvalueはname
 
 ### 12.3 List
 
-`Scratch3DataBlocks.LIST_ITEM_LIMIT = 200000` を守る。
+`Scratch3DataBlocks.LIST_ITEM_LIMIT = 200000` をScratch互換プリセットとして
+保持する。TurboWarp互換では大容量リストを許可し、実行時設定で上書きする。
 
 ```c
-#define SJIT_LIST_ITEM_LIMIT 200000
+#define SJIT_SCRATCH_LIST_ITEM_LIMIT 200000
+#define SJIT_TURBOWARP_LIST_ITEM_LIMIT 67108864
 ```
 
 list index変換は `Cast.toListIndex` 互換。
@@ -1198,7 +1200,10 @@ Scratch互換上の重要要件:
 - compareは数値比較優先。ただし空白文字列が0になる場合は文字列比較へ落とす。
 - 文字列比較はcase-insensitive。
 - listは1-indexed。
-- list item limitは200000。
+- Scratch互換の既定list item limitは200000、TurboWarp互換の既定値は67108864。
+  実行時の`--list-limit`で上書きできる。
+- TurboWarp互換では、マウスホイールの上下を`up arrow`/`down arrow`の
+  key hatとして発火する。ただしキーボードの押下状態は変更しない。
 - repeatはMath.round(toNumber(TIMES))。
 - waitはstack timer相当をframeに保存してyieldする。
 - broadcast and waitは起動thread群をframeに保存し、完了までyield/yieldTickする。

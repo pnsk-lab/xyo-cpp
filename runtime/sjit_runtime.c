@@ -1,6 +1,7 @@
 #include "sjit_runtime.h"
 
 #include "sjit_draw.h"
+#include "sjit_list.h"
 #include "sjit_ownership_internal.h"
 #include "sjit_pen.h"
 #include "sjit_scheduler.h"
@@ -185,6 +186,25 @@ static int ensure_variable_monitor_capacity(SRuntime *runtime, int wanted) {
     return 1;
 }
 
+static void apply_runtime_list_item_limit(SRuntime *runtime) {
+    if (!runtime) {
+        return;
+    }
+    for (int target_index = 0; target_index < runtime->target_count; ++target_index) {
+        SSprite *target = runtime->targets[target_index];
+        if (!target) {
+            continue;
+        }
+        for (int variable_index = 0;
+             variable_index < target->base.variable_count;
+             ++variable_index) {
+            sjit_variable_set_list_item_limit(
+                &target->base.variables[variable_index],
+                runtime->list_item_limit);
+        }
+    }
+}
+
 SRuntime *sjit_runtime_create(void) {
     SRuntime *runtime = (SRuntime *)calloc(1, sizeof(SRuntime));
     if (!runtime) {
@@ -198,6 +218,9 @@ SRuntime *sjit_runtime_create(void) {
     runtime->timer_start_ms = 0.0;
     runtime->current_step_time_ms = 1000.0 / 60.0;
     runtime->turbo_mode = 0;
+    runtime->fencing = 0;
+    runtime->compatibility_mode = SJIT_COMPATIBILITY_MODE_TURBOWARP;
+    runtime->list_item_limit = SJIT_TURBOWARP_LIST_ITEM_LIMIT;
     runtime->instance_id = next_runtime_instance_id;
     if (next_runtime_instance_id != 0) {
         ++next_runtime_instance_id;
@@ -287,6 +310,32 @@ static void sjit_runtime_start_input_hats(SRuntime *runtime) {
             name = "right arrow";
         } else if (key == SJIT_KEY_LEFT_ARROW) {
             name = "left arrow";
+        } else if (key == SJIT_KEY_ENTER) {
+            name = "enter";
+        } else if (key == SJIT_KEY_BACKSPACE) {
+            name = "backspace";
+        } else if (key == SJIT_KEY_DELETE) {
+            name = "delete";
+        } else if (key == SJIT_KEY_SHIFT) {
+            name = "shift";
+        } else if (key == SJIT_KEY_CAPS_LOCK) {
+            name = "caps lock";
+        } else if (key == SJIT_KEY_SCROLL_LOCK) {
+            name = "scroll lock";
+        } else if (key == SJIT_KEY_CONTROL) {
+            name = "control";
+        } else if (key == SJIT_KEY_ESCAPE) {
+            name = "escape";
+        } else if (key == SJIT_KEY_INSERT) {
+            name = "insert";
+        } else if (key == SJIT_KEY_HOME) {
+            name = "home";
+        } else if (key == SJIT_KEY_END) {
+            name = "end";
+        } else if (key == SJIT_KEY_PAGE_UP) {
+            name = "page up";
+        } else if (key == SJIT_KEY_PAGE_DOWN) {
+            name = "page down";
         } else if (key == ' ') {
             name = "space";
         } else if (key >= 0 && key < 128 && isprint((unsigned char)key)) {
@@ -369,10 +418,35 @@ SRuntimeStatus sjit_runtime_tick(SRuntime *runtime) {
         runtime->draw_pen_revision = runtime->pen.revision;
         runtime->draw_pen_length = copied_pen ? runtime->pen.length : 0;
     }
-    for (int i = 0; i < runtime->target_count; ++i) {
-        if (runtime->targets[i]->visible) {
-            sjit_draw_push_sprite(&runtime->draw, runtime->targets[i]);
+    /* Draw sprites in Scratch layer order. The target array is project
+       insertion order, while looks_gotofrontback mutates layer_order. Keep
+       equal-layer targets stable by using their target-array index as the
+       secondary key. */
+    int previous_layer = INT_MIN;
+    int previous_index = -1;
+    for (int output = 0; output < visible_targets; ++output) {
+        int selected_index = -1;
+        for (int i = 0; i < runtime->target_count; ++i) {
+            SSprite *target = runtime->targets[i];
+            if (!target || !target->visible ||
+                (target->layer_order < previous_layer) ||
+                (target->layer_order == previous_layer && i <= previous_index)) {
+                continue;
+            }
+            if (selected_index < 0 ||
+                target->layer_order < runtime->targets[selected_index]->layer_order ||
+                (target->layer_order == runtime->targets[selected_index]->layer_order &&
+                 i < selected_index)) {
+                selected_index = i;
+            }
         }
+        if (selected_index < 0) {
+            break;
+        }
+        SSprite *target = runtime->targets[selected_index];
+        sjit_draw_push_sprite(&runtime->draw, target);
+        previous_layer = target->layer_order;
+        previous_index = selected_index;
     }
     if (runtime->draw.items != runtime->pen.items) {
         runtime->draw_owned_items = runtime->draw.items;
@@ -400,6 +474,43 @@ void sjit_runtime_set_turbo_mode(SRuntime *runtime, int enabled) {
     if (runtime) {
         runtime->turbo_mode = enabled ? 1 : 0;
     }
+}
+
+void sjit_runtime_set_fencing(SRuntime *runtime, int enabled) {
+    if (runtime) {
+        runtime->fencing = enabled ? 1 : 0;
+    }
+}
+
+int sjit_runtime_set_compatibility_mode(SRuntime *runtime, int mode) {
+    if (!runtime ||
+        (mode != SJIT_COMPATIBILITY_MODE_SCRATCH &&
+         mode != SJIT_COMPATIBILITY_MODE_TURBOWARP)) {
+        return 0;
+    }
+    runtime->compatibility_mode = mode;
+    runtime->list_item_limit = mode == SJIT_COMPATIBILITY_MODE_SCRATCH ?
+        SJIT_SCRATCH_LIST_ITEM_LIMIT : SJIT_TURBOWARP_LIST_ITEM_LIMIT;
+    apply_runtime_list_item_limit(runtime);
+    return 1;
+}
+
+int sjit_runtime_compatibility_mode(const SRuntime *runtime) {
+    return runtime ? runtime->compatibility_mode : SJIT_COMPATIBILITY_MODE_TURBOWARP;
+}
+
+int sjit_runtime_set_list_item_limit(SRuntime *runtime, int item_limit) {
+    if (!runtime || item_limit <= 0) {
+        return 0;
+    }
+    runtime->list_item_limit = item_limit;
+    apply_runtime_list_item_limit(runtime);
+    return 1;
+}
+
+int sjit_runtime_list_item_limit(const SRuntime *runtime) {
+    return runtime && runtime->list_item_limit > 0 ?
+        runtime->list_item_limit : SJIT_LIST_ITEM_LIMIT;
 }
 
 void sjit_runtime_set_current_step_time(SRuntime *runtime, double step_time_ms) {
@@ -897,6 +1008,7 @@ SVariable *sjit_runtime_lookup_or_create_variable_by_scratch_id(
     SVariable *variable = sjit_runtime_lookup_variable_by_scratch_id(
         runtime, current_target_id, scratch_id, name, type);
     if (variable) {
+        sjit_variable_set_list_item_limit(variable, runtime->list_item_limit);
         return variable;
     }
 
@@ -905,12 +1017,16 @@ SVariable *sjit_runtime_lookup_or_create_variable_by_scratch_id(
     }
     SSprite *current = sjit_runtime_get_sprite(runtime, current_target_id);
     if (current) {
-        return sjit_target_lookup_or_create_variable_by_scratch_id(
+        SVariable *created = sjit_target_lookup_or_create_variable_by_scratch_id(
             &current->base, scratch_id, name, type);
+        sjit_variable_set_list_item_limit(created, runtime->list_item_limit);
+        return created;
     }
     if (runtime->target_count > 0) {
-        return sjit_target_lookup_or_create_variable_by_scratch_id(
+        SVariable *created = sjit_target_lookup_or_create_variable_by_scratch_id(
             &runtime->targets[0]->base, scratch_id, name, type);
+        sjit_variable_set_list_item_limit(created, runtime->list_item_limit);
+        return created;
     }
     return NULL;
 }

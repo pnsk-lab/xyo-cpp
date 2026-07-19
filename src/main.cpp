@@ -4,6 +4,7 @@
 #include "sjit/project_loader.hpp"
 
 #include <cmath>
+#include <cctype>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -11,8 +12,10 @@
 namespace {
 
 void printProjectUsage(const char *program) {
-    std::cerr << "usage: " << program << " <project.sb3> [--frames N] [--fps N] [--turbo]\n";
-    std::cerr << "       " << program << " --window <project.sb3> [--frames N] [--fps N] [--turbo]\n";
+    std::cerr << "usage: " << program << " <project.sb3> [--frames N] [--fps N] [--turbo]"
+              << " [--compatibility scratch|turbowarp] [--list-limit N] [--stage-scale N]\n";
+    std::cerr << "       " << program << " --window <project.sb3> [--frames N] [--fps N] [--turbo]"
+              << " [--compatibility scratch|turbowarp] [--list-limit N] [--stage-scale N]\n";
     std::cerr << "       " << program << " --emit-ll <output.ll>\n";
     std::cerr << "       " << program << " --emit-ll <project.sb3> <output.ll>\n";
     std::cerr << "       " << program << " --emit-runtime-ll <output.ll>\n";
@@ -46,6 +49,23 @@ bool parsePositiveInt(const std::string &text, int *out) {
     }
 }
 
+bool parseCompatibilityMode(const std::string &text, int *out) {
+    std::string normalized;
+    normalized.reserve(text.size());
+    for (const unsigned char character : text) {
+        normalized.push_back(static_cast<char>(std::tolower(character)));
+    }
+    if (normalized == "scratch" || normalized == "scratch-compatible") {
+        *out = SJIT_COMPATIBILITY_MODE_SCRATCH;
+        return true;
+    }
+    if (normalized == "turbowarp" || normalized == "turbo-warp" || normalized == "tw") {
+        *out = SJIT_COMPATIBILITY_MODE_TURBOWARP;
+        return true;
+    }
+    return false;
+}
+
 bool parseRunOptions(int argc, char **argv, int start, sjit::ProjectRunOptions *options) {
     for (int i = start; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -53,6 +73,50 @@ bool parseRunOptions(int argc, char **argv, int start, sjit::ProjectRunOptions *
             options->turbo_mode = true;
         } else if (arg == "--no-turbo") {
             options->turbo_mode = false;
+        } else if (arg == "--turbowarp-compat") {
+            options->compatibility_mode = SJIT_COMPATIBILITY_MODE_TURBOWARP;
+        } else if (arg == "--scratch-compat") {
+            options->compatibility_mode = SJIT_COMPATIBILITY_MODE_SCRATCH;
+        } else if (arg == "--compatibility" || arg == "--compat") {
+            if (i + 1 >= argc ||
+                !parseCompatibilityMode(argv[++i], &options->compatibility_mode)) {
+                std::cerr << "--compatibility requires scratch or turbowarp\n";
+                return false;
+            }
+        } else if (arg.rfind("--compatibility=", 0) == 0 ||
+                   arg.rfind("--compat=", 0) == 0) {
+            const size_t separator = arg.find('=');
+            if (!parseCompatibilityMode(arg.substr(separator + 1), &options->compatibility_mode)) {
+                std::cerr << "--compatibility requires scratch or turbowarp\n";
+                return false;
+            }
+        } else if (arg == "--list-limit" || arg == "--max-list-items") {
+            if (i + 1 >= argc || !parsePositiveInt(argv[++i], &options->list_item_limit)) {
+                std::cerr << "--list-limit requires a positive integer\n";
+                return false;
+            }
+        } else if (arg.rfind("--list-limit=", 0) == 0 ||
+                   arg.rfind("--max-list-items=", 0) == 0) {
+            const size_t separator = arg.find('=');
+            if (!parsePositiveInt(arg.substr(separator + 1), &options->list_item_limit)) {
+                std::cerr << "--list-limit requires a positive integer\n";
+                return false;
+            }
+        } else if (arg == "--stage-scale" || arg == "--scale" || arg == "--window-scale") {
+            if (i + 1 >= argc || !parsePositiveDouble(argv[++i], &options->stage_scale) ||
+                options->stage_scale < 0.25 || options->stage_scale > 8.0) {
+                std::cerr << "--stage-scale requires a number from 0.25 to 8\n";
+                return false;
+            }
+        } else if (arg.rfind("--stage-scale=", 0) == 0 ||
+                   arg.rfind("--scale=", 0) == 0 ||
+                   arg.rfind("--window-scale=", 0) == 0) {
+            const size_t separator = arg.find('=');
+            if (!parsePositiveDouble(arg.substr(separator + 1), &options->stage_scale) ||
+                options->stage_scale < 0.25 || options->stage_scale > 8.0) {
+                std::cerr << "--stage-scale requires a number from 0.25 to 8\n";
+                return false;
+            }
         } else if (arg == "--frames") {
             if (i + 1 >= argc || !parsePositiveInt(argv[++i], &options->max_frames)) {
                 std::cerr << "--frames requires a positive integer\n";
@@ -85,6 +149,10 @@ int main(int argc, char **argv) {
 
     if (argc > 1) {
         const std::string command = argv[1];
+        if (command == "--help" || command == "-h") {
+            printProjectUsage(argv[0]);
+            return 0;
+        }
         if (command == "--emit-ll") {
             if (argc < 3) {
                 printProjectUsage(argv[0]);

@@ -347,6 +347,7 @@ static SOwnershipExprResult analyze_expr(
     case SJIT_EXPR_DAYS_SINCE_2000:
         return reject_expr(context, SJIT_OWNERSHIP_REJECT_LIVE_CLOCK);
     case SJIT_EXPR_DIRECTION:
+    case SJIT_EXPR_COSTUME_NUMBER_NAME:
         return reject_expr(context, SJIT_OWNERSHIP_REJECT_INTERPRETER_ONLY);
     case SJIT_EXPR_LIST_ITEM:
     case SJIT_EXPR_LIST_ITEM_NUMBER:
@@ -590,6 +591,8 @@ static int analyze_statement(
     case SJIT_STMT_LOOKS_SET_EFFECT:
     case SJIT_STMT_LOOKS_CHANGE_EFFECT:
     case SJIT_STMT_LOOKS_CLEAR_EFFECTS:
+    case SJIT_STMT_LOOKS_SWITCH_COSTUME:
+    case SJIT_STMT_LOOKS_GO_TO_FRONT_BACK:
     case SJIT_STMT_SENSING_SET_DRAG_MODE:
         return reject_with(context, SJIT_OWNERSHIP_REJECT_SHARED_EFFECT);
     default:

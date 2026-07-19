@@ -49,6 +49,11 @@ typedef enum {
     SJIT_MONITOR_MODE_LIST = 3
 } SVariableMonitorMode;
 
+typedef enum {
+    SJIT_COMPATIBILITY_MODE_SCRATCH = 0,
+    SJIT_COMPATIBILITY_MODE_TURBOWARP = 1
+} SJITCompatibilityMode;
+
 typedef struct {
     SString *id;
     SString *label;
@@ -190,6 +195,13 @@ struct SRuntime {
     int parallel_step_capacity;
     uint64_t parallel_batch_count;
     uint64_t parallel_task_count;
+    /* Project-level Scratch renderer option. Kept after the JIT-visible
+       prefix so generated code does not depend on this host setting. */
+    int fencing;
+    /* Compatibility settings are host/runtime configuration and are kept
+       after the JIT-visible prefix. */
+    int compatibility_mode;
+    int list_item_limit;
 };
 
 SRuntime *sjit_runtime_create(void);
@@ -201,6 +213,11 @@ SRuntimeStatus sjit_runtime_tick(SRuntime *runtime);
 void sjit_runtime_set_input(SRuntime *runtime, const SHostInputSnapshot *input);
 void sjit_runtime_set_time(SRuntime *runtime, double now_ms, double delta_ms);
 void sjit_runtime_set_turbo_mode(SRuntime *runtime, int enabled);
+void sjit_runtime_set_fencing(SRuntime *runtime, int enabled);
+int sjit_runtime_set_compatibility_mode(SRuntime *runtime, int mode);
+int sjit_runtime_compatibility_mode(const SRuntime *runtime);
+int sjit_runtime_set_list_item_limit(SRuntime *runtime, int item_limit);
+int sjit_runtime_list_item_limit(const SRuntime *runtime);
 void sjit_runtime_set_current_step_time(SRuntime *runtime, double step_time_ms);
 const SDrawCommandBuffer *sjit_runtime_get_draw_commands(SRuntime *runtime);
 void sjit_runtime_clear_draw_commands(SRuntime *runtime);

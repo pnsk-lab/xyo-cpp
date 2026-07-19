@@ -1,0 +1,65 @@
+name: Build and test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: false
+
+      - name: Check out QuickJS submodule
+        run: git submodule update --init quickjs
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake llvm llvm-dev ninja-build zlib1g-dev
+
+      - name: Locate LLVM tools
+        shell: bash
+        run: |
+          llvm_config="$(command -v llvm-config || true)"
+          if [[ -z "$llvm_config" ]]; then
+            llvm_config="$(find /usr/lib/llvm-* -type f -name llvm-config -perm -u+x | sort -V | tail -n 1)"
+          fi
+          test -n "$llvm_config"
+          echo "$(dirname "$llvm_config")" >> "$GITHUB_PATH"
+          echo "LLVM_DIR=$("$llvm_config" --cmakedir)" >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: |
+          cmake -S . -B build-cmake -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSJIT_BUILD_HOST=OFF \
+            -DLLVM_DIR="$LLVM_DIR"
+
+      - name: Build
+        run: cmake --build build-cmake --parallel
+
+      - name: Test
+        run: ctest --test-dir build-cmake --output-on-failure
+
+      - name: Upload build artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xyo-cpp-core-build
+          if-no-files-found: error
+          path: |
+            build-cmake/xyo-runtime-tests
+            build-cmake/libsjit_runtime.a
+            build-cmake/libxyo_core.a
+            build-cmake/sjit_runtime.bc
+            build-cmake/sjit_runtime.o

@@ -72,6 +72,10 @@ OpcodeEffects sjit_expr_opcode_effects(int opcode) {
         /* Deliberately interpreter-only for the first explicit reporter
            fallback path. */
         return effects(false, false, false, false, false, true);
+    case SJIT_EXPR_COSTUME_NUMBER_NAME:
+        /* Costume metadata is target-relative and currently stays on the
+           checked interpreter path. */
+        return effects(false, false, false, false, false, true);
     default:
         return unknown_effects();
     }
@@ -115,6 +119,10 @@ OpcodeEffects sjit_statement_opcode_effects(int opcode) {
     case SJIT_STMT_LOOKS_CHANGE_EFFECT:
     case SJIT_STMT_LOOKS_CLEAR_EFFECTS:
         return effects(false, true, true, false, false, false);
+    case SJIT_STMT_PEN_STAMP:
+        /* Stamp mutates the persistent pen layer and currently uses the
+           checked interpreter path. */
+        return effects(false, true, true, false, false, true);
     case SJIT_STMT_SENSING_SET_DRAG_MODE:
         return effects(false, false, true, false, false, false);
     case SJIT_STMT_LIST_ADD:
@@ -129,6 +137,8 @@ OpcodeEffects sjit_statement_opcode_effects(int opcode) {
         return effects(false, false, false, false, false, false);
     case SJIT_STMT_BROADCAST:
         return effects(false, true, false, false, true, false);
+    case SJIT_STMT_BROADCAST_AND_WAIT:
+        return effects(true, true, false, false, true, true);
     case SJIT_STMT_WAIT:
     case SJIT_STMT_WAIT_UNTIL:
     case SJIT_STMT_LOOKS_SAY_FOR_SECS:
@@ -143,6 +153,12 @@ OpcodeEffects sjit_statement_opcode_effects(int opcode) {
         /* Both native entry shapes call the shared runtime implementation,
            which owns backdrop metadata and starts matching backdrop hats. */
         return effects(false, true, true, false, true, false);
+    case SJIT_STMT_LOOKS_SWITCH_COSTUME:
+    case SJIT_STMT_LOOKS_GO_TO_FRONT_BACK:
+        /* These stateful Looks operations currently use the checked
+           interpreter path; keeping them explicit avoids treating them as
+           malformed/unknown statements in diagnostics. */
+        return effects(false, true, true, false, false, true);
     default:
         return unknown_effects();
     }
@@ -185,6 +201,7 @@ const char *sjit_expr_opcode_name(int opcode) {
     case SJIT_EXPR_CONTAINS: return "contains";
     case SJIT_EXPR_LIST_VARIABLE: return "list-variable";
     case SJIT_EXPR_DIRECTION: return "direction";
+    case SJIT_EXPR_COSTUME_NUMBER_NAME: return "costume-number-name";
     default: return "unknown-expression";
     }
 }
@@ -237,6 +254,10 @@ const char *sjit_statement_opcode_name(int opcode) {
     case SJIT_STMT_LOOKS_CHANGE_EFFECT: return "change-graphic-effect";
     case SJIT_STMT_LOOKS_CLEAR_EFFECTS: return "clear-graphic-effects";
     case SJIT_STMT_SENSING_SET_DRAG_MODE: return "set-drag-mode";
+    case SJIT_STMT_LOOKS_SWITCH_COSTUME: return "switch-costume";
+    case SJIT_STMT_LOOKS_GO_TO_FRONT_BACK: return "go-to-front-back";
+    case SJIT_STMT_PEN_STAMP: return "pen-stamp";
+    case SJIT_STMT_BROADCAST_AND_WAIT: return "broadcast-and-wait";
     default: return "unknown-statement";
     }
 }

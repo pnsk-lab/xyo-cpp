@@ -77,6 +77,17 @@ The window is a minimal SDL2 host renderer for the runtime draw command buffer.
 It shows the 480x360 Scratch stage, rasterized SVG costume textures (including
 position, size, rotation center, and direction), layer-aware costume hit
 testing, and variable monitor bars.
+The window can be resized while running; the stage keeps its 4:3 aspect ratio
+and is centered in the window. Set the initial stage scale with
+`--stage-scale N` (aliases: `--scale N`, `--window-scale N`), for example:
+
+```sh
+./build/scratch-llvm-vm --window linux.sb3 --stage-scale 3
+```
+
+Pen strokes use an independent high-resolution buffer (at least 960x720);
+changing pen resolution does not enlarge the visible Scratch stage.
+
 Press Escape or close the window to exit. The window build requires SDL2 and
 `librsvg-2.0` (available through `pkg-config`) and Skia.
 
@@ -97,6 +108,22 @@ The same runtime options also work in the headless project runner:
 ```sh
 ./build/scratch-llvm-vm 3D.sb3 --frames 600 --fps 120 --turbo
 ```
+
+The runner defaults to TurboWarp compatibility. Select the Scratch preset or
+override the list capacity at runtime when needed:
+
+```sh
+./build/scratch-llvm-vm linux.sb3 --compatibility turbowarp --list-limit 67108864
+./build/scratch-llvm-vm project.sb3 --compatibility scratch --list-limit 200000
+```
+
+TurboWarp compatibility also normalizes its extra keyboard names (`enter`,
+`delete`, `shift`, `caps lock`, `home`, `page up`, and others), supports the
+`any` key query, and uses TurboWarp's case-insensitive letter behavior.
+Vertical mouse-wheel events also start the matching `up arrow` or `down arrow`
+key hats, as in TurboWarp, without making that key appear held to
+`key pressed?`. The `--turbo` option remains the separate scheduler speed
+setting.
 
 Any bundled `.sb3` project can be opened through the same window path:
 
