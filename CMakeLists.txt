@@ -202,7 +202,8 @@ llvm_map_components_to_libnames(LLVM_LIBS
     ExecutionEngine
     OrcJIT
     Linker
-    Native
+    # Lowercase is LLVM's pseudo-component name for the host backend.
+    native
     Support
 )
 
