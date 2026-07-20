@@ -32,9 +32,17 @@ struct CostumeRenderInfo {
     int stroke_a = 255;
 };
 
+struct SoundRenderInfo {
+    std::string name;
+    std::string asset_id;
+    std::string data_format;
+    std::string source_data;
+};
+
 struct TargetRenderInfo {
     int target_id = 0;
     std::vector<CostumeRenderInfo> costumes;
+    std::vector<SoundRenderInfo> sounds;
 };
 
 struct ProjectProgram {

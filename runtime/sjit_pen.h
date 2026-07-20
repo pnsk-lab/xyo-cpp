@@ -28,6 +28,12 @@ void sjit_pen_set_number_color_and_change_brightness(
 void sjit_pen_change_color_param(SRuntime *runtime, SSprite *sprite, const char *param, SValue delta);
 int sjit_pen_color_param_id(const char *param);
 void sjit_pen_change_color_param_number(SRuntime *runtime, SSprite *sprite, int param_id, double delta);
+void sjit_pen_set_color_param_number(SRuntime *runtime, SSprite *sprite, int param_id, double value);
+void sjit_pen_change_size(SRuntime *runtime, SSprite *sprite, double delta);
+void sjit_pen_set_hue_number(SRuntime *runtime, SSprite *sprite, double hue);
+void sjit_pen_change_hue_number(SRuntime *runtime, SSprite *sprite, double delta);
+void sjit_pen_set_shade_number(SRuntime *runtime, SSprite *sprite, double shade);
+void sjit_pen_change_shade_number(SRuntime *runtime, SSprite *sprite, double delta);
 void sjit_pen_change_brightness(SRuntime *runtime, SSprite *sprite, SValue delta);
 void sjit_pen_path_init(SPenPathBuffer *path);
 void sjit_pen_path_destroy(SPenPathBuffer *path);

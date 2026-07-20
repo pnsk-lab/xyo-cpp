@@ -1,6 +1,7 @@
 #include "sjit_script.h"
 
 #include "sjit_compare.h"
+#include "sjit_clone.h"
 #include "sjit_control.h"
 #include "sjit_event.h"
 #include "sjit_frame.h"
@@ -11,6 +12,8 @@
 #include "sjit_opcode_effects.h"
 #include "sjit_operator.h"
 #include "sjit_pen.h"
+#include "sjit_sensing.h"
+#include "sjit_sound.h"
 #include "sjit_string.h"
 #include "sjit_scheduler.h"
 #include "sjit_value.h"
@@ -570,6 +573,8 @@ void sjit_compiled_script_destroy(SCompiledScript *script) {
     for (int i = 0; i < script->procedure_count; ++i) {
         sjit_compiled_procedure_destroy(&script->procedures[i]);
     }
+    sjit_expr_destroy(script->hat_edge_value);
+    script->hat_edge_value = NULL;
     free(script->statements);
     free(script->procedures);
     free(script);
@@ -815,6 +820,84 @@ SExpr *sjit_expr_create_costume_number_name(int number_name) {
         expr->literal = sjit_make_bool_fast(number_name);
     }
     return expr;
+}
+
+SExpr *sjit_expr_create_size(void) {
+    return sjit_expr_create_nullary(SJIT_EXPR_SIZE);
+}
+
+SExpr *sjit_expr_create_backdrop_number_name(int number_name) {
+    SExpr *expr = sjit_expr_create_nullary(SJIT_EXPR_BACKDROP_NUMBER_NAME);
+    if (expr) {
+        expr->literal = sjit_make_bool_fast(number_name);
+    }
+    return expr;
+}
+
+SExpr *sjit_expr_create_list_contents_with_id(
+    const char *list_id,
+    const char *list_name) {
+    return sjit_expr_create_list_expr_with_id(
+        SJIT_EXPR_LIST_CONTENTS,
+        list_id,
+        list_name,
+        NULL);
+}
+
+SExpr *sjit_expr_create_list_contents(const char *list_name) {
+    return sjit_expr_create_list_contents_with_id(NULL, list_name);
+}
+
+SExpr *sjit_expr_create_touching_object(SExpr *object) {
+    return sjit_expr_create_unary(SJIT_EXPR_TOUCHING_OBJECT, object);
+}
+
+SExpr *sjit_expr_create_touching_color(SExpr *color) {
+    return sjit_expr_create_unary(SJIT_EXPR_TOUCHING_COLOR, color);
+}
+
+SExpr *sjit_expr_create_color_touching_color(SExpr *color, SExpr *color2) {
+    return sjit_expr_create_binary(SJIT_EXPR_COLOR_TOUCHING_COLOR, color, color2);
+}
+
+SExpr *sjit_expr_create_distance_to(SExpr *target) {
+    return sjit_expr_create_unary(SJIT_EXPR_DISTANCE_TO, target);
+}
+
+SExpr *sjit_expr_create_sensing_of(SExpr *attribute, SExpr *object) {
+    return sjit_expr_create_binary(SJIT_EXPR_SENSING_OF, attribute, object);
+}
+
+SExpr *sjit_expr_create_current(SExpr *menu) {
+    return sjit_expr_create_unary(SJIT_EXPR_CURRENT, menu);
+}
+
+SExpr *sjit_expr_create_answer(void) {
+    return sjit_expr_create_nullary(SJIT_EXPR_ANSWER);
+}
+
+SExpr *sjit_expr_create_loudness(void) {
+    return sjit_expr_create_nullary(SJIT_EXPR_LOUDNESS);
+}
+
+SExpr *sjit_expr_create_loud(void) {
+    return sjit_expr_create_nullary(SJIT_EXPR_LOUD);
+}
+
+SExpr *sjit_expr_create_online(void) {
+    return sjit_expr_create_nullary(SJIT_EXPR_ONLINE);
+}
+
+SExpr *sjit_expr_create_username(void) {
+    return sjit_expr_create_nullary(SJIT_EXPR_USERNAME);
+}
+
+SExpr *sjit_expr_create_sound_volume(void) {
+    return sjit_expr_create_nullary(SJIT_EXPR_SOUND_VOLUME);
+}
+
+SExpr *sjit_expr_create_counter(void) {
+    return sjit_expr_create_nullary(SJIT_EXPR_COUNTER);
 }
 
 SExpr *sjit_expr_create_mouse_down(void) {
@@ -1099,6 +1182,95 @@ static SValue eval_expr(SRuntime *runtime, int target_id, SExecContext *context,
         return sjit_make_string(
             sjit_sprite_current_costume_name(sprite));
     }
+    case SJIT_EXPR_SIZE: {
+        SSprite *sprite = script_sprite(runtime, target_id, context);
+        return sjit_make_number_fast(sprite ? floor(sprite->size + 0.5) : 0.0);
+    }
+    case SJIT_EXPR_BACKDROP_NUMBER_NAME:
+        return sjit_looks_backdrop_number_name(
+            runtime,
+            expr->literal.tag == SJIT_VALUE_BOOL ? expr->literal.number != 0.0 :
+                expr->literal.number != 0.0);
+    case SJIT_EXPR_LIST_CONTENTS: {
+        SList *list = expr_list(runtime, target_id, expr);
+        return sjit_list_contents(list);
+    }
+    case SJIT_EXPR_TOUCHING_OBJECT: {
+        SValue object = eval_expr(runtime, target_id, context, expr->left);
+        const int touching = sjit_sensing_touching_object(
+            runtime,
+            script_sprite(runtime, target_id, context),
+            object);
+        sjit_value_destroy_fast(object);
+        return sjit_make_bool_fast(touching);
+    }
+    case SJIT_EXPR_TOUCHING_COLOR: {
+        SValue color = eval_expr(runtime, target_id, context, expr->left);
+        const int touching = sjit_sensing_touching_color(
+            runtime,
+            script_sprite(runtime, target_id, context),
+            color);
+        sjit_value_destroy_fast(color);
+        return sjit_make_bool_fast(touching);
+    }
+    case SJIT_EXPR_COLOR_TOUCHING_COLOR: {
+        SValue color = eval_expr(runtime, target_id, context, expr->left);
+        SValue color2 = eval_expr(runtime, target_id, context, expr->right);
+        const int touching = sjit_sensing_color_touching_color(
+            runtime,
+            script_sprite(runtime, target_id, context),
+            color,
+            color2);
+        sjit_value_destroy_fast(color);
+        sjit_value_destroy_fast(color2);
+        return sjit_make_bool_fast(touching);
+    }
+    case SJIT_EXPR_DISTANCE_TO: {
+        SValue target = eval_expr(runtime, target_id, context, expr->left);
+        const double distance = sjit_sensing_distance_to(
+            runtime,
+            script_sprite(runtime, target_id, context),
+            target);
+        sjit_value_destroy_fast(target);
+        return sjit_make_number_fast(distance);
+    }
+    case SJIT_EXPR_SENSING_OF: {
+        SValue attribute = eval_expr(runtime, target_id, context, expr->left);
+        SValue object = eval_expr(runtime, target_id, context, expr->right);
+        SValue result = sjit_sensing_attribute_of(
+            runtime,
+            script_sprite(runtime, target_id, context),
+            attribute,
+            object);
+        sjit_value_destroy_fast(attribute);
+        sjit_value_destroy_fast(object);
+        return result;
+    }
+    case SJIT_EXPR_CURRENT: {
+        SValue menu = eval_expr(runtime, target_id, context, expr->left);
+        SValue text = sjit_to_string(runtime, menu);
+        SValue result = sjit_sensing_current(sjit_string_cstr((const SString *)text.ptr));
+        sjit_value_destroy_fast(menu);
+        sjit_value_destroy_fast(text);
+        return result;
+    }
+    case SJIT_EXPR_ANSWER:
+        return sjit_runtime_get_answer(runtime);
+    case SJIT_EXPR_LOUDNESS:
+        return sjit_make_number_fast(runtime ? runtime->loudness : 0.0);
+    case SJIT_EXPR_LOUD:
+        return sjit_make_bool_fast(runtime && runtime->loudness > 10.0);
+    case SJIT_EXPR_ONLINE:
+        return sjit_make_bool_fast(runtime && runtime->online);
+    case SJIT_EXPR_USERNAME:
+        return sjit_make_string(runtime && runtime->username ?
+            sjit_string_cstr(runtime->username) : "");
+    case SJIT_EXPR_SOUND_VOLUME: {
+        SSprite *sprite = script_sprite(runtime, target_id, context);
+        return sjit_make_number_fast(sjit_sound_volume(sprite));
+    }
+    case SJIT_EXPR_COUNTER:
+        return sjit_make_number_fast(runtime ? (double)runtime->counter : 0.0);
     case SJIT_EXPR_MOUSE_DOWN:
         return sjit_make_bool_fast(runtime->input.mouse_down || runtime->input.mouse_pressed_edge);
     case SJIT_EXPR_ARGUMENT:
@@ -2378,10 +2550,14 @@ static SRuntimeStatus execute_statement(
     case SJIT_STMT_LOOKS_SAY_FOR_SECS: {
         if (frame && frame->wake_time_ms < 0.0) {
             SValue message = eval_expr(runtime, target_id, context, statement->value);
-            SValue text = sjit_to_string(runtime, message);
-            printf("say: %s\n", sjit_string_cstr((const SString *)text.ptr));
+            SSprite *sprite = script_sprite(runtime, target_id, context);
+            sjit_looks_say(runtime, sprite, message, 0);
+            const double seconds = eval_expr_number_coerced(
+                runtime, target_id, context, statement->index);
+            if (sprite) {
+                sprite->bubble_until_ms = runtime->now_ms + fmax(0.0, seconds) * 1000.0;
+            }
             sjit_value_destroy_fast(message);
-            sjit_value_destroy_fast(text);
         }
         SValue duration = eval_expr(runtime, target_id, context, statement->index);
         SRuntimeStatus status = sjit_control_wait(runtime, frame, duration, frame ? frame->pc : 0);
@@ -2400,6 +2576,22 @@ static SRuntimeStatus execute_statement(
     case SJIT_STMT_STOP_OTHER_SCRIPTS:
         sjit_scheduler_stop_for_target(runtime, target_id, context && context->thread ? context->thread->id : -1);
         break;
+    case SJIT_STMT_STOP_OTHER_SCRIPTS_IN_STAGE: {
+        int stage_id = 0;
+        for (int i = 0; i < runtime->target_count; ++i) {
+            if (runtime->targets[i] && runtime->targets[i]->base.is_stage) {
+                stage_id = runtime->targets[i]->base.id;
+                break;
+            }
+        }
+        if (stage_id != 0) {
+            sjit_scheduler_stop_for_target(
+                runtime,
+                stage_id,
+                context && context->thread ? context->thread->id : -1);
+        }
+        break;
+    }
     case SJIT_STMT_STOP_ALL:
         sjit_runtime_stop_all(runtime);
         return SJIT_STATUS_DONE;
@@ -2821,10 +3013,34 @@ static SRuntimeStatus execute_statement(
     }
     case SJIT_STMT_SAY: {
         SValue value = eval_expr(runtime, target_id, context, statement->value);
-        SValue text = sjit_to_string(runtime, value);
-        printf("say: %s\n", sjit_string_cstr((const SString *)text.ptr));
+        sjit_looks_say(runtime, script_sprite(runtime, target_id, context), value, 0);
         sjit_value_destroy_fast(value);
-        sjit_value_destroy_fast(text);
+        break;
+    }
+    case SJIT_STMT_LOOKS_THINK: {
+        SValue value = eval_expr(runtime, target_id, context, statement->value);
+        sjit_looks_say(runtime, script_sprite(runtime, target_id, context), value, 1);
+        sjit_value_destroy_fast(value);
+        break;
+    }
+    case SJIT_STMT_LOOKS_THINK_FOR_SECS: {
+        if (frame && frame->wake_time_ms < 0.0) {
+            SValue value = eval_expr(runtime, target_id, context, statement->value);
+            SSprite *sprite = script_sprite(runtime, target_id, context);
+            sjit_looks_say(runtime, sprite, value, 1);
+            const double seconds = eval_expr_number_coerced(
+                runtime, target_id, context, statement->index);
+            if (sprite) {
+                sprite->bubble_until_ms = runtime->now_ms + fmax(0.0, seconds) * 1000.0;
+            }
+            sjit_value_destroy_fast(value);
+        }
+        SValue duration = eval_expr(runtime, target_id, context, statement->index);
+        SRuntimeStatus status = sjit_control_wait(runtime, frame, duration, frame ? frame->pc : 0);
+        sjit_value_destroy_fast(duration);
+        if (status != SJIT_STATUS_OK) {
+            return status;
+        }
         break;
     }
     case SJIT_STMT_PEN_CLEAR:
@@ -2893,6 +3109,48 @@ static SRuntimeStatus execute_statement(
         sjit_value_destroy_fast(value);
         break;
     }
+    case SJIT_STMT_PEN_SET_COLOR_PARAM: {
+        SValue param = eval_expr(runtime, target_id, context, statement->index);
+        SValue param_text = sjit_to_string(runtime, param);
+        sjit_pen_set_color_param_number(
+            runtime,
+            script_sprite(runtime, target_id, context),
+            sjit_pen_color_param_id(sjit_string_cstr((const SString *)param_text.ptr)),
+            eval_expr_number_coerced(runtime, target_id, context, statement->value));
+        sjit_value_destroy_fast(param);
+        sjit_value_destroy_fast(param_text);
+        break;
+    }
+    case SJIT_STMT_PEN_CHANGE_SIZE:
+        sjit_pen_change_size(
+            runtime,
+            script_sprite(runtime, target_id, context),
+            eval_expr_number_coerced(runtime, target_id, context, statement->value));
+        break;
+    case SJIT_STMT_PEN_SET_SHADE:
+        sjit_pen_set_shade_number(
+            runtime,
+            script_sprite(runtime, target_id, context),
+            eval_expr_number_coerced(runtime, target_id, context, statement->value));
+        break;
+    case SJIT_STMT_PEN_CHANGE_SHADE:
+        sjit_pen_change_shade_number(
+            runtime,
+            script_sprite(runtime, target_id, context),
+            eval_expr_number_coerced(runtime, target_id, context, statement->value));
+        break;
+    case SJIT_STMT_PEN_SET_HUE:
+        sjit_pen_set_hue_number(
+            runtime,
+            script_sprite(runtime, target_id, context),
+            eval_expr_number_coerced(runtime, target_id, context, statement->value));
+        break;
+    case SJIT_STMT_PEN_CHANGE_HUE:
+        sjit_pen_change_hue_number(
+            runtime,
+            script_sprite(runtime, target_id, context),
+            eval_expr_number_coerced(runtime, target_id, context, statement->value));
+        break;
     case SJIT_STMT_MOTION_GOTO_XY: {
         SSprite *sprite = script_sprite(runtime, target_id, context);
         if (sprite) {
@@ -2948,6 +3206,99 @@ static SRuntimeStatus execute_statement(
                 sprite->y + eval_expr_number_coerced(runtime, target_id, context, statement->value),
                 0);
         }
+        break;
+    }
+    case SJIT_STMT_MOTION_MOVE_STEPS: {
+        SValue steps = eval_expr(runtime, target_id, context, statement->value);
+        sjit_motion_move_steps(runtime, script_sprite(runtime, target_id, context), steps);
+        sjit_value_destroy_fast(steps);
+        break;
+    }
+    case SJIT_STMT_MOTION_GOTO: {
+        SValue destination = eval_expr(runtime, target_id, context, statement->value);
+        sjit_motion_goto(runtime, script_sprite(runtime, target_id, context), destination);
+        sjit_value_destroy_fast(destination);
+        break;
+    }
+    case SJIT_STMT_MOTION_TURN_RIGHT:
+    case SJIT_STMT_MOTION_TURN_LEFT: {
+        SValue degrees = eval_expr(runtime, target_id, context, statement->value);
+        sjit_motion_turn(
+            runtime,
+            script_sprite(runtime, target_id, context),
+            degrees,
+            statement->opcode == SJIT_STMT_MOTION_TURN_RIGHT);
+        sjit_value_destroy_fast(degrees);
+        break;
+    }
+    case SJIT_STMT_MOTION_POINT_DIRECTION: {
+        SValue direction = eval_expr(runtime, target_id, context, statement->value);
+        sjit_motion_point_in_direction(
+            runtime,
+            script_sprite(runtime, target_id, context),
+            direction);
+        sjit_value_destroy_fast(direction);
+        break;
+    }
+    case SJIT_STMT_MOTION_POINT_TOWARDS: {
+        SValue destination = eval_expr(runtime, target_id, context, statement->value);
+        sjit_motion_point_towards(
+            runtime,
+            script_sprite(runtime, target_id, context),
+            destination);
+        sjit_value_destroy_fast(destination);
+        break;
+    }
+    case SJIT_STMT_MOTION_GLIDE_XY: {
+        const double seconds = eval_expr_number_coerced(
+            runtime, target_id, context, statement->value);
+        const double x = eval_expr_number_coerced(
+            runtime, target_id, context, statement->index);
+        const double y = eval_expr_number_coerced(
+            runtime, target_id, context, statement->condition);
+        const SRuntimeStatus status = sjit_motion_glide_to_xy(
+            runtime,
+            script_sprite(runtime, target_id, context),
+            frame,
+            statement,
+            seconds,
+            x,
+            y,
+            frame ? frame->pc : 0);
+        if (status != SJIT_STATUS_OK) {
+            return status;
+        }
+        break;
+    }
+    case SJIT_STMT_MOTION_GLIDE_TO: {
+        const double seconds = eval_expr_number_coerced(
+            runtime, target_id, context, statement->value);
+        SValue destination = eval_expr(runtime, target_id, context, statement->index);
+        const SRuntimeStatus status = sjit_motion_glide_to(
+            runtime,
+            script_sprite(runtime, target_id, context),
+            frame,
+            statement,
+            seconds,
+            destination,
+            frame ? frame->pc : 0);
+        sjit_value_destroy_fast(destination);
+        if (status != SJIT_STATUS_OK) {
+            return status;
+        }
+        break;
+    }
+    case SJIT_STMT_MOTION_IF_ON_EDGE_BOUNCE:
+        sjit_motion_if_on_edge_bounce(runtime, script_sprite(runtime, target_id, context));
+        break;
+    case SJIT_STMT_MOTION_SET_ROTATION_STYLE: {
+        SValue style = eval_expr(runtime, target_id, context, statement->value);
+        SValue text = sjit_to_string(runtime, style);
+        sjit_motion_set_rotation_style(
+            script_sprite(runtime, target_id, context),
+            sjit_string_cstr((const SString *)text.ptr));
+        sjit_value_destroy_fast(style);
+        sjit_value_destroy_fast(text);
         break;
     }
     case SJIT_STMT_LOOKS_SHOW:
@@ -3028,13 +3379,194 @@ static SRuntimeStatus execute_statement(
     case SJIT_STMT_LOOKS_SET_SIZE: {
         SSprite *sprite = script_sprite(runtime, target_id, context);
         SValue value = eval_expr(runtime, target_id, context, statement->value);
-        if (sprite) {
-            sprite->size = sjit_to_number_fast(runtime, value);
+        if (sprite && !sprite->base.is_stage) {
+            const double size = sjit_to_number_fast(runtime, value);
+            sprite->size = isfinite(size) ? fmax(0.0, size) : 0.0;
             sjit_runtime_request_redraw(runtime);
         }
         sjit_value_destroy_fast(value);
         break;
     }
+    case SJIT_STMT_LOOKS_SWITCH_BACKDROP_AND_WAIT: {
+        SValue backdrop = eval_expr(runtime, target_id, context, statement->value);
+        SRuntimeStatus status = SJIT_STATUS_OK;
+        sjit_looks_switch_backdrop_and_wait(
+            runtime,
+            frame,
+            backdrop,
+            frame ? frame->pc : 0,
+            &status);
+        sjit_value_destroy_fast(backdrop);
+        if (status != SJIT_STATUS_OK) {
+            return status;
+        }
+        break;
+    }
+    case SJIT_STMT_LOOKS_NEXT_COSTUME:
+        sjit_looks_next_costume(runtime, script_sprite(runtime, target_id, context));
+        break;
+    case SJIT_STMT_LOOKS_NEXT_BACKDROP:
+        sjit_looks_next_backdrop(runtime);
+        break;
+    case SJIT_STMT_LOOKS_CHANGE_SIZE:
+        sjit_looks_change_size(
+            runtime,
+            script_sprite(runtime, target_id, context),
+            eval_expr_number_coerced(runtime, target_id, context, statement->value));
+        break;
+    case SJIT_STMT_LOOKS_HIDE_ALL_SPRITES:
+        sjit_looks_hide_all_sprites(runtime);
+        break;
+    case SJIT_STMT_LOOKS_GO_FORWARD_BACKWARD_LAYERS: {
+        double amount = eval_expr_number_coerced(
+            runtime, target_id, context, statement->value);
+        if (!isfinite(amount)) {
+            amount = 0.0;
+        }
+        if (amount > (double)INT_MAX) amount = (double)INT_MAX;
+        if (amount < (double)INT_MAX * -1.0) amount = (double)INT_MIN;
+        int layers = (int)amount;
+        if (statement->layer_front < 0) layers = -layers;
+        sjit_looks_go_forward_backward_layers(
+            runtime,
+            script_sprite(runtime, target_id, context),
+            layers);
+        break;
+    }
+    case SJIT_STMT_LOOKS_CHANGE_STRETCH:
+        sjit_looks_change_stretch(
+            runtime,
+            script_sprite(runtime, target_id, context),
+            eval_expr_number_coerced(runtime, target_id, context, statement->value));
+        break;
+    case SJIT_STMT_LOOKS_SET_STRETCH:
+        sjit_looks_set_stretch(
+            runtime,
+            script_sprite(runtime, target_id, context),
+            eval_expr_number_coerced(runtime, target_id, context, statement->value));
+        break;
+    case SJIT_STMT_CREATE_CLONE: {
+        SValue requested = eval_expr(runtime, target_id, context, statement->value);
+        sjit_clone_create_requested(
+            runtime,
+            script_sprite(runtime, target_id, context),
+            requested);
+        sjit_value_destroy_fast(requested);
+        break;
+    }
+    case SJIT_STMT_DELETE_CLONE: {
+        SSprite *sprite = script_sprite(runtime, target_id, context);
+        if (sprite && !sprite->base.is_original) {
+            sjit_clone_delete(runtime, sprite);
+            return SJIT_STATUS_DONE;
+        }
+        break;
+    }
+    case SJIT_STMT_CONTROL_INCR_COUNTER:
+        if (runtime->counter < INT_MAX) {
+            ++runtime->counter;
+        }
+        break;
+    case SJIT_STMT_CONTROL_CLEAR_COUNTER:
+        runtime->counter = 0;
+        break;
+    case SJIT_STMT_CONTROL_ALL_AT_ONCE: {
+        const int previous_warp_mode = frame ? frame->warp_mode : 0;
+        if (frame) {
+            frame->warp_mode = 1;
+        }
+        const SRuntimeStatus status = execute_synchronous_substack(
+            runtime,
+            target_id,
+            context,
+            frame,
+            statement->substack,
+            statement->substack_count);
+        if (frame) {
+            frame->warp_mode = previous_warp_mode;
+        }
+        if (status != SJIT_STATUS_OK) {
+            return status;
+        }
+        break;
+    }
+    case SJIT_STMT_SENSING_ASK_AND_WAIT: {
+        if (frame && frame->timed_event_kind == 5 && frame->timed_statement == statement) {
+            if (!runtime->answer_ready) {
+                sjit_runtime_request_redraw(runtime);
+                return SJIT_STATUS_YIELDED;
+            }
+            frame->timed_event_kind = 0;
+            frame->timed_statement = NULL;
+            sjit_string_destroy(runtime->question);
+            runtime->question = NULL;
+            break;
+        }
+        SValue question = eval_expr(runtime, target_id, context, statement->value);
+        SValue text = sjit_to_string(runtime, question);
+        sjit_string_destroy(runtime->question);
+        runtime->question = sjit_string_new(
+            sjit_string_cstr((const SString *)text.ptr));
+        runtime->answer_ready = runtime->ask_input_enabled ? 0 : 1;
+        printf("ask: %s\n", sjit_string_cstr((const SString *)text.ptr));
+        sjit_value_destroy_fast(question);
+        sjit_value_destroy_fast(text);
+        if (frame && runtime->ask_input_enabled) {
+            frame->timed_event_kind = 5;
+            frame->timed_statement = statement;
+            sjit_runtime_request_redraw(runtime);
+            return SJIT_STATUS_YIELDED;
+        }
+        break;
+    }
+    case SJIT_STMT_SOUND_PLAY:
+    case SJIT_STMT_SOUND_PLAY_UNTIL_DONE: {
+        if (statement->opcode == SJIT_STMT_SOUND_PLAY_UNTIL_DONE && frame &&
+            frame->timed_event_kind == 4 && frame->timed_statement == statement) {
+            frame->timed_event_kind = 0;
+            frame->timed_statement = NULL;
+            break;
+        }
+        SValue sound = eval_expr(runtime, target_id, context, statement->value);
+        sjit_sound_play(
+            runtime,
+            script_sprite(runtime, target_id, context),
+            sound,
+            statement->opcode == SJIT_STMT_SOUND_PLAY_UNTIL_DONE);
+        sjit_value_destroy_fast(sound);
+        if (statement->opcode == SJIT_STMT_SOUND_PLAY_UNTIL_DONE && frame) {
+            frame->timed_event_kind = 4;
+            frame->timed_statement = statement;
+            return SJIT_STATUS_YIELDED;
+        }
+        break;
+    }
+    case SJIT_STMT_SOUND_STOP_ALL:
+        sjit_sound_stop_all(runtime);
+        break;
+    case SJIT_STMT_SOUND_SET_EFFECT:
+    case SJIT_STMT_SOUND_CHANGE_EFFECT: {
+        SValue effect = eval_expr(runtime, target_id, context, statement->index);
+        sjit_sound_set_effect(
+            runtime,
+            script_sprite(runtime, target_id, context),
+            effect,
+            eval_expr_number_coerced(runtime, target_id, context, statement->value),
+            statement->opcode == SJIT_STMT_SOUND_CHANGE_EFFECT);
+        sjit_value_destroy_fast(effect);
+        break;
+    }
+    case SJIT_STMT_SOUND_CLEAR_EFFECTS:
+        sjit_sound_clear_effects(runtime, script_sprite(runtime, target_id, context));
+        break;
+    case SJIT_STMT_SOUND_SET_VOLUME:
+    case SJIT_STMT_SOUND_CHANGE_VOLUME:
+        sjit_sound_set_volume(
+            runtime,
+            script_sprite(runtime, target_id, context),
+            eval_expr_number_coerced(runtime, target_id, context, statement->value),
+            statement->opcode == SJIT_STMT_SOUND_CHANGE_VOLUME);
+        break;
     case SJIT_STMT_STOP_THIS_SCRIPT:
         return SJIT_STATUS_DONE;
     case SJIT_STMT_NOOP:
@@ -3152,6 +3684,20 @@ SValue sjit_script_eval_statement_expr_ptr(
     }
     SExpr *expr = statement_expr_for_slot(statement, expr_slot);
     if (!expr) {
+        return sjit_make_null_fast();
+    }
+    SExecContext context;
+    init_exec_context(&context, script, NULL);
+    SValue value = eval_expr(runtime, script->target_id, &context, expr);
+    destroy_exec_context(&context);
+    return value;
+}
+
+SValue sjit_script_eval_expr(
+    SRuntime *runtime,
+    SCompiledScript *script,
+    SExpr *expr) {
+    if (!runtime || !script || !expr) {
         return sjit_make_null_fast();
     }
     SExecContext context;

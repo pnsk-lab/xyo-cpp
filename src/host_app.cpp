@@ -268,6 +268,22 @@ struct HitMaskCache {
     std::unordered_map<std::string, HitMask> masks;
 };
 
+struct ColorImage {
+    int width = 0;
+    int height = 0;
+    std::vector<std::uint8_t> rgba;
+
+    bool valid() const {
+        return width > 0 && height > 0 &&
+            rgba.size() == static_cast<std::size_t>(width) *
+                static_cast<std::size_t>(height) * 4u;
+    }
+};
+
+struct ColorImageCache {
+    std::unordered_map<std::string, ColorImage> images;
+};
+
 const TargetRenderInfo *findTargetRenderInfo(
     const std::vector<TargetRenderInfo> &render_targets,
     int target_id);
@@ -275,6 +291,152 @@ const CostumeRenderInfo *findCostumeRenderInfo(
     const TargetRenderInfo *target,
     int costume_id);
 std::string spriteTextureKey(const TargetRenderInfo *target, int costume_id);
+
+bool loadColorImage(const CostumeRenderInfo &costume, ColorImage &image) {
+    image = {};
+    if (costume.source_data.empty()) {
+        return false;
+    }
+
+    if (costume.data_format == "png") {
+        GError *error = nullptr;
+        GdkPixbufLoader *loader = gdk_pixbuf_loader_new();
+        GdkPixbuf *pixbuf = nullptr;
+        if (loader && gdk_pixbuf_loader_write(
+                loader,
+                reinterpret_cast<const guchar *>(costume.source_data.data()),
+                costume.source_data.size(),
+                &error) &&
+            gdk_pixbuf_loader_close(loader, &error)) {
+            pixbuf = gdk_pixbuf_loader_get_pixbuf(loader);
+            if (pixbuf) {
+                g_object_ref(pixbuf);
+            }
+        }
+        if (loader) {
+            g_object_unref(loader);
+        }
+        if (pixbuf) {
+            const int width = gdk_pixbuf_get_width(pixbuf);
+            const int height = gdk_pixbuf_get_height(pixbuf);
+            const int channels = gdk_pixbuf_get_n_channels(pixbuf);
+            const int stride = gdk_pixbuf_get_rowstride(pixbuf);
+            const guchar *pixels = gdk_pixbuf_get_pixels(pixbuf);
+            if (width > 0 && height > 0 && (channels == 3 || channels == 4)) {
+                image.width = width;
+                image.height = height;
+                image.rgba.resize(
+                    static_cast<std::size_t>(width) *
+                    static_cast<std::size_t>(height) * 4u);
+                for (int y = 0; y < height; ++y) {
+                    for (int x = 0; x < width; ++x) {
+                        const guchar *source = pixels + y * stride + x * channels;
+                        std::uint8_t *destination = image.rgba.data() +
+                            (static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
+                             static_cast<std::size_t>(x)) * 4u;
+                        destination[0] = source[0];
+                        destination[1] = source[1];
+                        destination[2] = source[2];
+                        destination[3] = channels == 4 ? source[3] : 255;
+                    }
+                }
+            }
+            g_object_unref(pixbuf);
+        }
+        if (error) {
+            g_error_free(error);
+        }
+        return image.valid();
+    }
+
+    if (costume.data_format != "svg" ||
+        !std::isfinite(costume.width) || !std::isfinite(costume.height) ||
+        costume.width <= 0.0 || costume.height <= 0.0 ||
+        costume.width > static_cast<double>(std::numeric_limits<int>::max()) ||
+        costume.height > static_cast<double>(std::numeric_limits<int>::max())) {
+        return false;
+    }
+
+    const int width = std::max(1, static_cast<int>(std::ceil(costume.width)));
+    const int height = std::max(1, static_cast<int>(std::ceil(costume.height)));
+    GError *error = nullptr;
+    RsvgHandle *handle = rsvg_handle_new_from_data(
+        reinterpret_cast<const guint8 *>(costume.source_data.data()),
+        costume.source_data.size(),
+        &error);
+    if (!handle) {
+        if (error) {
+            g_error_free(error);
+        }
+        return false;
+    }
+    cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height);
+    cairo_t *context = cairo_create(surface);
+    RsvgRectangle viewport{0.0, 0.0, costume.width, costume.height};
+    const bool rendered = rsvg_handle_render_document(handle, context, &viewport, &error) &&
+        cairo_surface_status(surface) == CAIRO_STATUS_SUCCESS;
+    cairo_destroy(context);
+    g_object_unref(handle);
+    if (!rendered) {
+        cairo_surface_destroy(surface);
+        if (error) {
+            g_error_free(error);
+        }
+        return false;
+    }
+
+    cairo_surface_flush(surface);
+    const int stride = cairo_image_surface_get_stride(surface);
+    const unsigned char *pixels = cairo_image_surface_get_data(surface);
+    image.width = width;
+    image.height = height;
+    image.rgba.resize(
+        static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4u);
+    for (int y = 0; y < height; ++y) {
+        const unsigned char *source_row = pixels + y * stride;
+        for (int x = 0; x < width; ++x) {
+            std::uint32_t pixel = 0;
+            std::memcpy(&pixel, source_row + x * 4, sizeof(pixel));
+            const int alpha = static_cast<int>((pixel >> 24) & 0xffu);
+            int red = static_cast<int>((pixel >> 16) & 0xffu);
+            int green = static_cast<int>((pixel >> 8) & 0xffu);
+            int blue = static_cast<int>(pixel & 0xffu);
+            if (alpha > 0 && alpha < 255) {
+                red = std::min(255, (red * 255 + alpha / 2) / alpha);
+                green = std::min(255, (green * 255 + alpha / 2) / alpha);
+                blue = std::min(255, (blue * 255 + alpha / 2) / alpha);
+            }
+            std::uint8_t *destination = image.rgba.data() +
+                (static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
+                 static_cast<std::size_t>(x)) * 4u;
+            destination[0] = static_cast<std::uint8_t>(red);
+            destination[1] = static_cast<std::uint8_t>(green);
+            destination[2] = static_cast<std::uint8_t>(blue);
+            destination[3] = static_cast<std::uint8_t>(alpha);
+        }
+    }
+    cairo_surface_destroy(surface);
+    if (error) {
+        g_error_free(error);
+    }
+    return image.valid();
+}
+
+const ColorImage *colorImageFor(
+    ColorImageCache &cache,
+    const TargetRenderInfo *target,
+    int costume_id) {
+    const CostumeRenderInfo *costume = findCostumeRenderInfo(target, costume_id);
+    if (!target || !costume) {
+        return nullptr;
+    }
+    const std::string key = spriteTextureKey(target, costume_id);
+    auto [entry, inserted] = cache.images.try_emplace(key);
+    if (inserted) {
+        loadColorImage(*costume, entry->second);
+    }
+    return entry->second.valid() ? &entry->second : nullptr;
+}
 
 bool loadHitMask(const CostumeRenderInfo &costume, HitMask &mask) {
     mask = {};
@@ -540,6 +702,435 @@ const CostumeRenderInfo *findCostumeRenderInfo(const TargetRenderInfo *target, i
     }
     return &target->costumes[static_cast<size_t>(costume_id)];
 }
+
+struct ColorSamplerContext {
+    const std::vector<TargetRenderInfo> *render_targets = nullptr;
+    ColorImageCache images;
+};
+
+const TargetRenderInfo *renderInfoForSprite(
+    const ColorSamplerContext &context,
+    const SSprite *sprite) {
+    if (!context.render_targets || !sprite) {
+        return nullptr;
+    }
+    const int source_id = sprite->base.is_original ? sprite->base.id : sprite->sprite_id;
+    return findTargetRenderInfo(*context.render_targets, source_id);
+}
+
+bool sampleSpriteColor(
+    ColorSamplerContext &context,
+    const SSprite *sprite,
+    double x,
+    double y,
+    int &r,
+    int &g,
+    int &b,
+    int &a) {
+    if (!sprite || (!sprite->base.is_stage && (!sprite->visible || sprite->size <= 0.0)) ||
+        (!sprite->base.is_stage &&
+         std::isfinite(sprite->graphic_effects[SJIT_GRAPHIC_EFFECT_GHOST]) &&
+         sprite->graphic_effects[SJIT_GRAPHIC_EFFECT_GHOST] >= 100.0)) {
+        return false;
+    }
+    const TargetRenderInfo *info = renderInfoForSprite(context, sprite);
+    const CostumeRenderInfo *costume = findCostumeRenderInfo(info, sprite->current_costume);
+    const ColorImage *image = colorImageFor(context.images, info, sprite->current_costume);
+    if (!costume || !image || costume->width <= 0.0 || costume->height <= 0.0) {
+        return false;
+    }
+
+    double local_x = 0.0;
+    double local_y = 0.0;
+    if (sprite->base.is_stage) {
+        local_x = x + costume->rotation_center_x;
+        local_y = costume->rotation_center_y - y;
+    } else {
+        const double scale = sprite->size / 100.0;
+        if (!(scale > 0.0) || !std::isfinite(scale)) {
+            return false;
+        }
+        const double radians = (90.0 - sprite->direction) *
+            3.14159265358979323846 / 180.0;
+        const double dx = x - sprite->x;
+        const double dy = -(y - sprite->y);
+        local_x = (std::cos(radians) * dx + std::sin(radians) * dy) / scale +
+            costume->rotation_center_x;
+        local_y = (-std::sin(radians) * dx + std::cos(radians) * dy) / scale +
+            costume->rotation_center_y;
+    }
+    if (!std::isfinite(local_x) || !std::isfinite(local_y) ||
+        local_x < 0.0 || local_y < 0.0 ||
+        local_x >= costume->width || local_y >= costume->height) {
+        return false;
+    }
+    const int pixel_x = std::clamp(
+        static_cast<int>(std::floor(local_x / costume->width * image->width)),
+        0,
+        image->width - 1);
+    const int pixel_y = std::clamp(
+        static_cast<int>(std::floor(local_y / costume->height * image->height)),
+        0,
+        image->height - 1);
+    const std::uint8_t *pixel = image->rgba.data() +
+        (static_cast<std::size_t>(pixel_y) * static_cast<std::size_t>(image->width) +
+         static_cast<std::size_t>(pixel_x)) * 4u;
+    r = pixel[0];
+    g = pixel[1];
+    b = pixel[2];
+    a = pixel[3];
+    if (sprite->base.is_stage) {
+        return a > 0;
+    }
+    const double ghost = sprite->graphic_effects[SJIT_GRAPHIC_EFFECT_GHOST];
+    if (std::isfinite(ghost) && ghost > 0.0) {
+        a = std::max(0, static_cast<int>(std::lround(
+            static_cast<double>(a) * (1.0 - std::clamp(ghost, 0.0, 100.0) / 100.0))));
+    }
+    return a > 0;
+}
+
+int sampleColorAtWorldPoint(
+    void *opaque_context,
+    const SRuntime *runtime,
+    int sample_target_id,
+    int subject_target_id,
+    double x,
+    double y,
+    int *r,
+    int *g,
+    int *b,
+    int *a) {
+    if (!opaque_context || !runtime || !r || !g || !b || !a) {
+        return 0;
+    }
+    ColorSamplerContext &context = *static_cast<ColorSamplerContext *>(opaque_context);
+    if (sample_target_id != 0) {
+        SSprite *target = sjit_runtime_get_sprite(
+            const_cast<SRuntime *>(runtime),
+            sample_target_id);
+        return sampleSpriteColor(context, target, x, y, *r, *g, *b, *a) ? 1 : 0;
+    }
+
+    bool found = false;
+    int best_layer = std::numeric_limits<int>::min();
+    for (int i = 0; i < runtime->target_count; ++i) {
+        SSprite *target = runtime->targets[i];
+        if (!target || target->base.id == subject_target_id) {
+            continue;
+        }
+        int candidate_r = 0;
+        int candidate_g = 0;
+        int candidate_b = 0;
+        int candidate_a = 0;
+        if (!sampleSpriteColor(
+                context,
+                target,
+                x,
+                y,
+                candidate_r,
+                candidate_g,
+                candidate_b,
+                candidate_a)) {
+            continue;
+        }
+        const int layer = target->base.is_stage ? std::numeric_limits<int>::min() : target->layer_order;
+        if (!found || layer >= best_layer) {
+            found = true;
+            best_layer = layer;
+            *r = candidate_r;
+            *g = candidate_g;
+            *b = candidate_b;
+            *a = candidate_a;
+        }
+    }
+    return found ? 1 : 0;
+}
+
+const SoundRenderInfo *findSoundRenderInfo(
+    const TargetRenderInfo *target,
+    const char *name) {
+    if (!target || !name) {
+        return nullptr;
+    }
+    for (const SoundRenderInfo &sound : target->sounds) {
+        if (sound.name == name) {
+            return &sound;
+        }
+    }
+    return nullptr;
+}
+
+struct AudioVoice {
+    int target_id = 0;
+    double volume = 100.0;
+    double pitch = 0.0;
+    double pan = 0.0;
+    double position = 0.0;
+    std::vector<float> samples;
+};
+
+class AudioPlayer {
+public:
+    AudioPlayer() = default;
+    ~AudioPlayer() {
+        close();
+    }
+
+    AudioPlayer(const AudioPlayer &) = delete;
+    AudioPlayer &operator=(const AudioPlayer &) = delete;
+
+    bool open() {
+        if (device_ != 0) {
+            return true;
+        }
+        SDL_AudioSpec desired{};
+        desired.freq = 44100;
+        desired.format = AUDIO_F32SYS;
+        desired.channels = 2;
+        desired.samples = 1024;
+        desired.callback = &AudioPlayer::audioCallback;
+        desired.userdata = this;
+        device_ = SDL_OpenAudioDevice(nullptr, 0, &desired, &spec_, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
+        if (device_ == 0) {
+            std::cerr << "SDL audio unavailable: " << SDL_GetError() << "\n";
+            return false;
+        }
+        if (spec_.format != AUDIO_F32SYS || spec_.channels == 0 || spec_.freq <= 0) {
+            std::cerr << "SDL audio device does not provide float output\n";
+            SDL_CloseAudioDevice(device_);
+            device_ = 0;
+            return false;
+        }
+        SDL_PauseAudioDevice(device_, 0);
+        return true;
+    }
+
+    void close() {
+        if (device_ != 0) {
+            SDL_LockAudioDevice(device_);
+            voices_.clear();
+            SDL_UnlockAudioDevice(device_);
+            SDL_CloseAudioDevice(device_);
+            device_ = 0;
+        }
+    }
+
+    void process(
+        SRuntime *runtime,
+        const std::vector<TargetRenderInfo> &render_targets) {
+        if (!runtime) {
+            return;
+        }
+        const SAudioCommandBuffer *commands = sjit_runtime_get_audio_commands(runtime);
+        if (!commands || commands->length <= 0 || !commands->items) {
+            return;
+        }
+        if (device_ != 0) {
+            SDL_LockAudioDevice(device_);
+        }
+        for (int i = 0; i < commands->length; ++i) {
+            const SAudioCommand &command = commands->items[i];
+            switch (command.kind) {
+            case SJIT_AUDIO_PLAY: {
+                const SSprite *sprite = sjit_runtime_get_sprite(runtime, command.target_id);
+                const int source_target_id = sprite && !sprite->base.is_original ?
+                    sprite->sprite_id : command.target_id;
+                const TargetRenderInfo *target = findTargetRenderInfo(
+                    render_targets,
+                    source_target_id);
+                const char *sound_name = command.sound_name ?
+                    sjit_string_cstr(command.sound_name) : "";
+                const SoundRenderInfo *sound = findSoundRenderInfo(target, sound_name);
+                if (sound && device_ != 0) {
+                    std::vector<float> samples;
+                    if (decodeWav(*sound, spec_.freq, samples)) {
+                        AudioVoice voice;
+                        voice.target_id = command.target_id;
+                        voice.volume = sprite ? sprite->volume : 100.0;
+                        voice.pitch = sprite ? sprite->sound_pitch : 0.0;
+                        voice.pan = sprite ? sprite->sound_pan : 0.0;
+                        voice.samples = std::move(samples);
+                        voices_.push_back(std::move(voice));
+                    }
+                }
+                break;
+            }
+            case SJIT_AUDIO_STOP_ALL:
+                voices_.clear();
+                break;
+            case SJIT_AUDIO_SET_EFFECT:
+            case SJIT_AUDIO_CHANGE_EFFECT:
+                updateEffect(command);
+                break;
+            case SJIT_AUDIO_CLEAR_EFFECTS:
+                for (AudioVoice &voice : voices_) {
+                    if (voice.target_id == command.target_id) {
+                        voice.pitch = 0.0;
+                        voice.pan = 0.0;
+                    }
+                }
+                break;
+            case SJIT_AUDIO_SET_VOLUME:
+            case SJIT_AUDIO_CHANGE_VOLUME: {
+                const SSprite *sprite = sjit_runtime_get_sprite(runtime, command.target_id);
+                const double volume = sprite ? sprite->volume :
+                    (command.kind == SJIT_AUDIO_SET_VOLUME ? command.value : 100.0);
+                for (AudioVoice &voice : voices_) {
+                    if (voice.target_id == command.target_id) {
+                        voice.volume = volume;
+                    }
+                }
+                break;
+            }
+            default:
+                break;
+            }
+        }
+        if (device_ != 0) {
+            SDL_UnlockAudioDevice(device_);
+        }
+        sjit_runtime_clear_audio_commands(runtime);
+    }
+
+private:
+    static bool decodeWav(
+        const SoundRenderInfo &sound,
+        int output_frequency,
+        std::vector<float> &samples) {
+        samples.clear();
+        if (sound.source_data.empty() || output_frequency <= 0) {
+            return false;
+        }
+        SDL_RWops *rw = SDL_RWFromConstMem(
+            sound.source_data.data(),
+            static_cast<int>(sound.source_data.size()));
+        if (!rw) {
+            return false;
+        }
+        SDL_AudioSpec source{};
+        Uint8 *source_bytes = nullptr;
+        Uint32 source_length = 0;
+        if (!SDL_LoadWAV_RW(rw, 1, &source, &source_bytes, &source_length)) {
+            return false;
+        }
+
+        SDL_AudioCVT converter{};
+        const int convert_result = SDL_BuildAudioCVT(
+            &converter,
+            source.format,
+            source.channels,
+            source.freq,
+            AUDIO_F32SYS,
+            2,
+            output_frequency);
+        if (convert_result < 0) {
+            SDL_FreeWAV(source_bytes);
+            return false;
+        }
+        std::vector<Uint8> converted;
+        Uint32 converted_length = source_length;
+        if (converter.needed) {
+            const std::size_t capacity = static_cast<std::size_t>(source_length) *
+                static_cast<std::size_t>(std::max(1, converter.len_mult));
+            converted.resize(capacity);
+            std::memcpy(converted.data(), source_bytes, source_length);
+            converter.buf = converted.data();
+            converter.len = static_cast<int>(source_length);
+            if (SDL_ConvertAudio(&converter) < 0) {
+                SDL_FreeWAV(source_bytes);
+                return false;
+            }
+            converted_length = static_cast<Uint32>(converter.len_cvt);
+        } else {
+            converted.assign(source_bytes, source_bytes + source_length);
+        }
+        SDL_FreeWAV(source_bytes);
+        if (converted_length < sizeof(float) * 2 ||
+            converted_length % (sizeof(float) * 2) != 0) {
+            return false;
+        }
+        const std::size_t sample_count = converted_length / sizeof(float);
+        samples.resize(sample_count);
+        std::memcpy(samples.data(), converted.data(), converted_length);
+        return !samples.empty();
+    }
+
+    void updateEffect(const SAudioCommand &command) {
+        for (AudioVoice &voice : voices_) {
+            if (voice.target_id != command.target_id) {
+                continue;
+            }
+            double *effect = command.effect == 1 ? &voice.pitch :
+                (command.effect == 2 ? &voice.pan : nullptr);
+            if (!effect) {
+                continue;
+            }
+            *effect = command.kind == SJIT_AUDIO_SET_EFFECT ? command.value : *effect + command.value;
+            if (command.effect == 1) {
+                *effect = std::clamp(*effect, -360.0, 360.0);
+            } else {
+                *effect = std::clamp(*effect, -100.0, 100.0);
+            }
+        }
+    }
+
+    static void audioCallback(void *userdata, Uint8 *stream, int length) {
+        auto *player = static_cast<AudioPlayer *>(userdata);
+        if (!player || !stream || length <= 0) {
+            return;
+        }
+        std::memset(stream, 0, static_cast<std::size_t>(length));
+        if (player->spec_.format != AUDIO_F32SYS || player->spec_.channels == 0) {
+            return;
+        }
+        float *output = reinterpret_cast<float *>(stream);
+        const int channels = player->spec_.channels;
+        const int frame_count = length / static_cast<int>(sizeof(float) * channels);
+        for (AudioVoice &voice : player->voices_) {
+            if (voice.samples.size() < 2) {
+                continue;
+            }
+            const std::size_t source_frames = voice.samples.size() / 2u;
+            const double rate = std::pow(2.0, std::clamp(voice.pitch, -360.0, 360.0) / 100.0);
+            const double gain = std::clamp(voice.volume, 0.0, 100.0) / 100.0;
+            const double pan = std::clamp(voice.pan, -100.0, 100.0) / 100.0;
+            const double left_gain = pan > 0.0 ? 1.0 - pan : 1.0;
+            const double right_gain = pan < 0.0 ? 1.0 + pan : 1.0;
+            for (int frame = 0; frame < frame_count && voice.position < source_frames; ++frame) {
+                const std::size_t index = static_cast<std::size_t>(voice.position);
+                const std::size_t next = std::min(source_frames - 1, index + 1);
+                const double fraction = voice.position - static_cast<double>(index);
+                const float left = static_cast<float>(
+                    voice.samples[index * 2] * (1.0 - fraction) +
+                    voice.samples[next * 2] * fraction);
+                const float right = static_cast<float>(
+                    voice.samples[index * 2 + 1] * (1.0 - fraction) +
+                    voice.samples[next * 2 + 1] * fraction);
+                if (channels >= 2) {
+                    output[frame * channels] += static_cast<float>(left * gain * left_gain);
+                    output[frame * channels + 1] += static_cast<float>(right * gain * right_gain);
+                } else {
+                    output[frame] += static_cast<float>((left + right) * 0.5 * gain);
+                }
+                voice.position += rate;
+            }
+        }
+        player->voices_.erase(
+            std::remove_if(
+                player->voices_.begin(),
+                player->voices_.end(),
+                [](const AudioVoice &voice) {
+                    return voice.samples.size() < 2 ||
+                        voice.position >= static_cast<double>(voice.samples.size() / 2u);
+                }),
+            player->voices_.end());
+    }
+
+    SDL_AudioDeviceID device_ = 0;
+    SDL_AudioSpec spec_{};
+    std::vector<AudioVoice> voices_;
+};
 
 void drawSpritePlaceholder(
     SDL_Renderer *renderer,
@@ -1744,6 +2335,153 @@ void drawVariableMonitors(SDL_Renderer *renderer, SRuntime *runtime) {
     }
 }
 
+void drawSpeechBubbles(SDL_Renderer *renderer, SRuntime *runtime) {
+    if (!runtime) {
+        return;
+    }
+    const int scale = std::max(
+        1,
+        static_cast<int>(std::lround(g_stage_viewport.scale / kDefaultStageScale)));
+    for (int i = 0; i < runtime->target_count; ++i) {
+        const SSprite *sprite = runtime->targets[i];
+        if (!sprite || sprite->base.is_stage || !sprite->visible || !sprite->bubble_text) {
+            continue;
+        }
+        std::string text = sjit_string_cstr(sprite->bubble_text);
+        for (char &character : text) {
+            if (character == '\n' || character == '\r' ||
+                !std::isprint(static_cast<unsigned char>(character))) {
+                character = ' ';
+            }
+        }
+        if (text.size() > 42) {
+            text.resize(40);
+            text += "..";
+        }
+        const int text_width = std::max(12, static_cast<int>(text.size()) * 4 * scale);
+        const int box_width = std::min(
+            std::max(48, text_width + 16 * scale),
+            std::max(48, g_stage_viewport.width - 8));
+        const int box_height = 7 * scale + 12 * scale;
+        const int center_x = scratchToScreenX(sprite->x);
+        const int center_y = scratchToScreenY(sprite->y + 25.0);
+        const int left = std::clamp(
+            center_x - box_width / 2,
+            g_stage_viewport.offset_x + 4,
+            g_stage_viewport.offset_x + g_stage_viewport.width - box_width - 4);
+        const int top = std::clamp(
+            center_y - box_height,
+            g_stage_viewport.offset_y + 4,
+            g_stage_viewport.offset_y + g_stage_viewport.height - box_height - 4);
+        SDL_Rect box{left, top, box_width, box_height};
+        setColor(renderer, 255, 255, 255, 255);
+        SDL_RenderFillRect(renderer, &box);
+        setColor(renderer, 40, 40, 40, 255);
+        SDL_RenderDrawRect(renderer, &box);
+        drawText(renderer, left + 8 * scale, top + 6 * scale, text, scale);
+        if (sprite->bubble_thought) {
+            setColor(renderer, 255, 255, 255, 255);
+            fillCircle(renderer, center_x - 12 * scale, top + box_height + 5 * scale, 4 * scale);
+            fillCircle(renderer, center_x - 3 * scale, top + box_height + 12 * scale, 2 * scale);
+            setColor(renderer, 40, 40, 40, 255);
+            SDL_RenderDrawPoint(renderer, center_x - 12 * scale, top + box_height + 5 * scale);
+        } else {
+            setColor(renderer, 255, 255, 255, 255);
+            SDL_RenderDrawLine(renderer, center_x - 8 * scale, top + box_height,
+                               center_x, top + box_height + 8 * scale);
+            SDL_RenderDrawLine(renderer, center_x + 8 * scale, top + box_height,
+                               center_x, top + box_height + 8 * scale);
+            setColor(renderer, 40, 40, 40, 255);
+            SDL_RenderDrawLine(renderer, center_x - 8 * scale, top + box_height,
+                               center_x, top + box_height + 8 * scale);
+            SDL_RenderDrawLine(renderer, center_x + 8 * scale, top + box_height,
+                               center_x, top + box_height + 8 * scale);
+        }
+    }
+}
+
+struct AskInputState {
+    bool active = false;
+    std::string text;
+};
+
+void synchronizeAskInput(SRuntime *runtime, AskInputState &ask) {
+    const bool waiting = runtime && runtime->question && !runtime->answer_ready;
+    if (waiting && !ask.active) {
+        ask.active = true;
+        ask.text.clear();
+        SDL_StartTextInput();
+    } else if (!waiting && ask.active) {
+        ask.active = false;
+        ask.text.clear();
+        SDL_StopTextInput();
+    }
+}
+
+void handleAskEvent(SRuntime *runtime, AskInputState &ask, const SDL_Event &event) {
+    if (!runtime || !ask.active) {
+        return;
+    }
+    if (event.type == SDL_TEXTINPUT) {
+        if (ask.text.size() < 200) {
+            ask.text.append(event.text.text, 200 - ask.text.size());
+        }
+    } else if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_BACKSPACE) {
+        if (!ask.text.empty()) {
+            ask.text.pop_back();
+            while (!ask.text.empty() &&
+                   (static_cast<unsigned char>(ask.text.back()) & 0xc0u) == 0x80u) {
+                ask.text.pop_back();
+            }
+        }
+    } else if (event.type == SDL_KEYDOWN &&
+               (event.key.keysym.sym == SDLK_RETURN || event.key.keysym.sym == SDLK_KP_ENTER)) {
+        SValue answer = sjit_make_string(ask.text.c_str());
+        sjit_runtime_set_answer(runtime, answer);
+        ask.active = false;
+        ask.text.clear();
+        SDL_StopTextInput();
+    }
+}
+
+void drawAskInput(SDL_Renderer *renderer, SRuntime *runtime, const AskInputState &ask) {
+    if (!runtime || !ask.active || !runtime->question) {
+        return;
+    }
+    const int scale = std::max(
+        1,
+        static_cast<int>(std::lround(g_stage_viewport.scale / kDefaultStageScale)));
+    std::string question = sjit_string_cstr(runtime->question);
+    if (question.size() > 32) {
+        question.resize(32);
+        question += "..";
+    }
+    std::string answer = ask.text;
+    for (char &character : answer) {
+        if (character == '\n' || character == '\r' ||
+            !std::isprint(static_cast<unsigned char>(character))) {
+            character = ' ';
+        }
+    }
+    if (answer.size() > 28) {
+        answer.resize(28);
+        answer += "..";
+    }
+    const std::string text = question + " > " + answer;
+    const int width = std::min(
+        g_stage_viewport.width - 12,
+        std::max(96, static_cast<int>(text.size()) * 4 * scale + 20 * scale));
+    const int height = 11 * scale + 14 * scale;
+    const int left = g_stage_viewport.offset_x + 6;
+    const int top = g_stage_viewport.offset_y + g_stage_viewport.height - height - 6;
+    SDL_Rect box{left, top, width, height};
+    setColor(renderer, 255, 255, 255, 255);
+    SDL_RenderFillRect(renderer, &box);
+    setColor(renderer, 40, 40, 40, 255);
+    SDL_RenderDrawRect(renderer, &box);
+    drawText(renderer, left + 8 * scale, top + 7 * scale, text, scale);
+}
+
 int keyIndexForSdl(SDL_Keycode key, bool turbo_warp_compatibility) {
     switch (key) {
     case SDLK_UP:
@@ -1970,7 +2708,8 @@ void renderRuntime(
     SkiaGpuState *gpu,
     PenLayerCache &pen_cache,
     SpriteTextureCache &sprite_cache,
-    const std::vector<TargetRenderInfo> *render_targets) {
+    const std::vector<TargetRenderInfo> *render_targets,
+    const AskInputState *ask) {
     setColor(renderer, 245, 247, 250);
     SDL_RenderClear(renderer);
 
@@ -2022,7 +2761,11 @@ void renderRuntime(
         }
     }
 
+    drawSpeechBubbles(renderer, runtime);
     drawVariableMonitors(renderer, runtime);
+    if (ask) {
+        drawAskInput(renderer, runtime, *ask);
+    }
     SDL_RenderPresent(renderer);
 
 }
@@ -2275,6 +3018,8 @@ int runProjectFile(const char *path, ProjectRunOptions options) {
         sjit_runtime_destroy(runtime);
         return 1;
     }
+    ColorSamplerContext color_sampler{&loaded.program.render_targets, {}};
+    sjit_sensing_set_color_sampler(runtime, &color_sampler, sampleColorAtWorldPoint);
     RuntimeExecution execution = runtimeExecutionFor(loaded);
     std::cout << "runtime execution: "
               << (execution.uses_llvm_runtime ? "LLVM bitcode" : "host C ABI")
@@ -2345,6 +3090,9 @@ int runProjectWindow(const char *path, ProjectRunOptions options) {
         sjit_runtime_destroy(runtime);
         return 1;
     }
+    ColorSamplerContext color_sampler{&loaded.program.render_targets, {}};
+    sjit_runtime_set_ask_input_enabled(runtime, 1);
+    sjit_sensing_set_color_sampler(runtime, &color_sampler, sampleColorAtWorldPoint);
     RuntimeExecution execution = runtimeExecutionFor(loaded);
     std::cout << "runtime execution: "
               << (execution.uses_llvm_runtime ? "LLVM bitcode" : "host C ABI")
@@ -2354,7 +3102,7 @@ int runProjectWindow(const char *path, ProjectRunOptions options) {
                           SJIT_COMPATIBILITY_MODE_TURBOWARP ?
                       "turbowarp" : "scratch")
               << " (list limit " << sjit_runtime_list_item_limit(runtime) << ")\n";
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) {
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_AUDIO) != 0) {
         std::cerr << "SDL_Init failed: " << SDL_GetError() << "\n";
         sjit_runtime_destroy(runtime);
         return 1;
@@ -2399,6 +3147,8 @@ int runProjectWindow(const char *path, ProjectRunOptions options) {
         sjit_runtime_destroy(runtime);
         return 1;
     }
+    AudioPlayer audio_player;
+    audio_player.open();
     int initial_window_width = 0;
     int initial_window_height = 0;
     SDL_GetWindowSize(window, &initial_window_width, &initial_window_height);
@@ -2447,6 +3197,7 @@ int runProjectWindow(const char *path, ProjectRunOptions options) {
     SpriteTextureCache sprite_cache;
     HitMaskCache hit_masks;
     MouseInteractionState mouse;
+    AskInputState ask;
     Uint64 last = SDL_GetPerformanceCounter();
     Uint64 last_title_update = 0;
     while (running && (options.max_frames <= 0 || tick < options.max_frames)) {
@@ -2454,6 +3205,7 @@ int runProjectWindow(const char *path, ProjectRunOptions options) {
         int window_height = 0;
         SDL_GetWindowSize(window, &window_width, &window_height);
         updateStageViewportForWindow(window_width, window_height);
+        synchronizeAskInput(runtime, ask);
         SDL_Event event;
         clearKeyEdges(input);
         while (SDL_PollEvent(&event)) {
@@ -2471,6 +3223,7 @@ int runProjectWindow(const char *path, ProjectRunOptions options) {
                            SJIT_COMPATIBILITY_MODE_TURBOWARP) {
                 running = false;
             }
+            handleAskEvent(runtime, ask, event);
             updateInputFromEvent(
                 input,
                 runtime,
@@ -2490,6 +3243,8 @@ int runProjectWindow(const char *path, ProjectRunOptions options) {
         sjit_runtime_set_input(runtime, &input);
         sjit_runtime_set_time(runtime, now_ms, delta_ms);
         last_status = execution.tick(runtime);
+        audio_player.process(runtime, loaded.program.render_targets);
+        synchronizeAskInput(runtime, ask);
         renderRuntime(
             renderer,
             runtime,
@@ -2497,7 +3252,8 @@ int runProjectWindow(const char *path, ProjectRunOptions options) {
             &gpu,
             pen_cache,
             sprite_cache,
-            &loaded.program.render_targets);
+            &loaded.program.render_targets,
+            &ask);
         const Uint64 now_ticks = SDL_GetTicks64();
         if (now_ticks - last_title_update >= 1000) {
             SDL_SetWindowTitle(window, makeWindowTitle(runtime, tick).c_str());
@@ -2515,6 +3271,7 @@ int runProjectWindow(const char *path, ProjectRunOptions options) {
     }
 
     printRuntimeSummary(runtime, execution, last_status);
+    audio_player.close();
     destroyPenLayerCache(pen_cache);
     gpu.context_owner.reset();
     if (gpu.context) {

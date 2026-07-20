@@ -35,6 +35,16 @@ static void destroy_costume_names(SString **names, int count) {
     free(names);
 }
 
+static void destroy_costume_geometry(SSprite *sprite) {
+    if (!sprite) {
+        return;
+    }
+    free(sprite->costume_widths);
+    free(sprite->costume_heights);
+    sprite->costume_widths = NULL;
+    sprite->costume_heights = NULL;
+}
+
 static int wrap_costume_index(int index, int count) {
     if (count <= 0) {
         return index < 0 ? 0 : index;
@@ -91,7 +101,16 @@ SSprite *sjit_sprite_create(int id, int drawable_id, const char *name, int is_st
     sprite->pen_brightness = 100.0;
     sprite->pen_transparency = 0.0;
     sprite->costume_names = NULL;
+    sprite->costume_widths = NULL;
+    sprite->costume_heights = NULL;
     sprite->costume_count = 0;
+    sprite->stretch = 100.0;
+    sprite->bubble_text = NULL;
+    sprite->bubble_thought = 0;
+    sprite->bubble_until_ms = -1.0;
+    sprite->sound_pitch = 0.0;
+    sprite->sound_pan = 0.0;
+    sprite->pen_legacy_shade = 50.0;
     for (int effect = 0; effect < SJIT_GRAPHIC_EFFECT_COUNT; ++effect) {
         sprite->graphic_effects[effect] = 0.0;
     }
@@ -128,6 +147,13 @@ SSprite *sjit_sprite_clone(const SSprite *source, int id, int drawable_id) {
     clone->pen_saturation = source->pen_saturation;
     clone->pen_brightness = source->pen_brightness;
     clone->pen_transparency = source->pen_transparency;
+    clone->stretch = source->stretch;
+    clone->bubble_text = sjit_string_clone(source->bubble_text);
+    clone->bubble_thought = source->bubble_thought;
+    clone->bubble_until_ms = source->bubble_until_ms;
+    clone->sound_pitch = source->sound_pitch;
+    clone->sound_pan = source->sound_pan;
+    clone->pen_legacy_shade = source->pen_legacy_shade;
     memcpy(
         clone->graphic_effects,
         source->graphic_effects,
@@ -152,6 +178,14 @@ SSprite *sjit_sprite_clone(const SSprite *source, int id, int drawable_id) {
             sjit_sprite_destroy(clone);
             return NULL;
         }
+        if (!sjit_sprite_set_costume_geometry(
+                clone,
+                source->costume_widths,
+                source->costume_heights,
+                source->costume_count)) {
+            sjit_sprite_destroy(clone);
+            return NULL;
+        }
     }
     sjit_target_copy_variables(&clone->base, &source->base);
     return clone;
@@ -162,8 +196,11 @@ void sjit_sprite_destroy(SSprite *sprite) {
         return;
     }
     destroy_costume_names(sprite->costume_names, sprite->costume_count);
+    destroy_costume_geometry(sprite);
     sprite->costume_names = NULL;
     sprite->costume_count = 0;
+    sjit_string_destroy(sprite->bubble_text);
+    sprite->bubble_text = NULL;
     sjit_target_destroy(&sprite->base);
     free(sprite);
 }
@@ -252,12 +289,56 @@ int sjit_sprite_set_costume_names(
         }
     }
     destroy_costume_names(sprite->costume_names, sprite->costume_count);
+    destroy_costume_geometry(sprite);
     sprite->costume_names = next;
     sprite->costume_count = costume_count;
     sprite->current_costume = wrap_costume_index(
         sprite->current_costume,
         costume_count);
     return 1;
+}
+
+int sjit_sprite_set_costume_geometry(
+    SSprite *sprite,
+    const double *widths,
+    const double *heights,
+    int costume_count) {
+    if (!sprite || costume_count < 0) {
+        return 0;
+    }
+    double *next_widths = NULL;
+    double *next_heights = NULL;
+    if (costume_count > 0) {
+        next_widths = (double *)calloc((size_t)costume_count, sizeof(double));
+        next_heights = (double *)calloc((size_t)costume_count, sizeof(double));
+        if (!next_widths || !next_heights) {
+            free(next_widths);
+            free(next_heights);
+            return 0;
+        }
+        for (int i = 0; i < costume_count; ++i) {
+            next_widths[i] = widths && isfinite(widths[i]) && widths[i] >= 0.0 ?
+                widths[i] : 0.0;
+            next_heights[i] = heights && isfinite(heights[i]) && heights[i] >= 0.0 ?
+                heights[i] : 0.0;
+        }
+    }
+    destroy_costume_geometry(sprite);
+    sprite->costume_widths = next_widths;
+    sprite->costume_heights = next_heights;
+    return 1;
+}
+
+double sjit_sprite_current_costume_width(const SSprite *sprite) {
+    return sprite && sprite->costume_widths && sprite->current_costume >= 0 &&
+            sprite->current_costume < sprite->costume_count ?
+        sprite->costume_widths[sprite->current_costume] : 0.0;
+}
+
+double sjit_sprite_current_costume_height(const SSprite *sprite) {
+    return sprite && sprite->costume_heights && sprite->current_costume >= 0 &&
+            sprite->current_costume < sprite->costume_count ?
+        sprite->costume_heights[sprite->current_costume] : 0.0;
 }
 
 int sjit_sprite_costume_index_by_name(const SSprite *sprite, const char *name) {

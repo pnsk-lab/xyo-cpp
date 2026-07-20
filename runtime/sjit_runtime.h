@@ -40,6 +40,10 @@ typedef struct {
        immutable certified AST.  Scheduler revalidation is O(this count). */
     int *ownership_variable_indices;
     int ownership_variable_count;
+    /* Edge polling state is appended to preserve the original registration
+       prefix used by existing host/JIT consumers. */
+    int edge_initialized;
+    int edge_last_truth;
 } SScriptRegistration;
 
 typedef enum {
@@ -202,6 +206,29 @@ struct SRuntime {
        after the JIT-visible prefix. */
     int compatibility_mode;
     int list_item_limit;
+    int counter;
+    SValue answer;
+    SString *question;
+    int answer_ready;
+    double loudness;
+    int online;
+    SString *username;
+    SAudioCommandBuffer audio;
+    /* Host-only decoded costume sampler.  This is appended after the
+       JIT-visible runtime prefix so generated code keeps its existing ABI. */
+    void *sensing_color_sampler_context;
+    int (*sensing_color_sampler)(
+        void *context,
+        const SRuntime *runtime,
+        int sample_target_id,
+        int subject_target_id,
+        double x,
+        double y,
+        int *r,
+        int *g,
+        int *b,
+        int *a);
+    int ask_input_enabled;
 };
 
 SRuntime *sjit_runtime_create(void);
@@ -226,6 +253,11 @@ const SDrawCommand *sjit_runtime_pen_path_data(const SRuntime *runtime);
 int sjit_runtime_pen_path_count(const SRuntime *runtime);
 int sjit_runtime_pen_path_revision(const SRuntime *runtime);
 void sjit_runtime_request_redraw(SRuntime *runtime);
+const SAudioCommandBuffer *sjit_runtime_get_audio_commands(SRuntime *runtime);
+void sjit_runtime_clear_audio_commands(SRuntime *runtime);
+void sjit_runtime_set_answer(SRuntime *runtime, SValue answer);
+SValue sjit_runtime_get_answer(SRuntime *runtime);
+void sjit_runtime_set_ask_input_enabled(SRuntime *runtime, int enabled);
 
 SSprite *sjit_runtime_create_sprite(SRuntime *runtime, const char *name, int is_stage);
 int sjit_runtime_add_sprite(SRuntime *runtime, SSprite *sprite);
@@ -266,6 +298,10 @@ int sjit_runtime_thread_pool_parallelism(const SRuntime *runtime);
 uint64_t sjit_runtime_parallel_batch_count(const SRuntime *runtime);
 uint64_t sjit_runtime_parallel_task_count(const SRuntime *runtime);
 int sjit_runtime_start_hats(SRuntime *runtime, int opcode_id, const char *match_value);
+/* Start one edge-activated registration without collapsing dynamic hat
+   inputs that happen to share the same serialized match string. */
+int sjit_runtime_start_edge_hat(SRuntime *runtime, SScriptRegistration *registration);
+int sjit_runtime_start_clone_hats(SRuntime *runtime, SSprite *clone);
 int sjit_runtime_count_threads_in_id_range(SRuntime *runtime, int begin_id, int count);
 int sjit_runtime_next_thread_id(const SRuntime *runtime);
 int sjit_runtime_has_threads(const SRuntime *runtime);

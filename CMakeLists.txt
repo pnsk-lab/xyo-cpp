@@ -43,6 +43,8 @@ set(RUNTIME_C_SOURCES
     runtime/sjit_data.c
     runtime/sjit_motion.c
     runtime/sjit_looks.c
+    runtime/sjit_sensing.c
+    runtime/sjit_sound.c
     runtime/sjit_runtime.c
     runtime/sjit_host_api.c
 )
@@ -62,6 +64,15 @@ set(CORE_CXX_SOURCES
 set(HOST_CXX_SOURCES
     src/host_app.cpp
 )
+
+if(EMSCRIPTEN)
+    # The browser build uses the C runtime and interpreter through a small
+    # Emscripten bridge.  The native LLVM ORC JIT, SDL2, and Skia host are not
+    # part of this target; see cmake/Emscripten.cmake for the web link flags.
+    set(SJIT_BUILD_HOST OFF CACHE BOOL "Build the SDL window host" FORCE)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/Emscripten.cmake")
+    return()
+endif()
 
 find_package(LLVM REQUIRED CONFIG)
 find_package(ZLIB REQUIRED)

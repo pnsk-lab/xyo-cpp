@@ -55,6 +55,27 @@ make test-skia SKIA_ROOT=/path/to/skia SKIA_OUT=/path/to/skia/out/Static
 ./build/scratch-llvm-vm
 ```
 
+### WebAssembly / GitHub Pages
+
+The Web build uses the C runtime and interpreter through Emscripten. It does
+not require the native LLVM JIT, SDL2, or Skia. Activate an Emscripten SDK and
+run:
+
+```sh
+bash scripts/build-web.sh
+python3 -m http.server 8080 --directory build-web/site
+```
+
+Open `http://localhost:8080/` and select an `.sb3` project. The generated page
+loads the project into the WASM virtual filesystem and renders the stage on a
+Canvas. A browser will not load the generated ES module correctly from a
+`file://` URL, so use a local HTTP server.
+
+The `.github/workflows/pages.yml` workflow repeats this build on every push to
+`main` and deploys `build-web/site` with GitHub Pages. In the repository
+settings, set Pages' source to **GitHub Actions** once; subsequent pushes are
+published automatically.
+
 If a packaged Skia supplies `skia.pc`, plain `make` discovers it automatically
 and requests its static-link dependencies. Set `PKG_CONFIG_PATH` when the file
 is outside pkg-config's normal search path. For a GN configuration that uses

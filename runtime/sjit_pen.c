@@ -3,6 +3,7 @@
 #include "sjit_draw.h"
 #include "sjit_number.h"
 #include "sjit_string.h"
+#include "sjit_value.h"
 
 #include <stdint.h>
 #include <math.h>
@@ -584,6 +585,108 @@ static inline __attribute__((always_inline)) void pen_change_color_param_number_
 
 void sjit_pen_change_color_param_number(SRuntime *runtime, SSprite *sprite, int param_id, double delta) {
     pen_change_color_param_number_impl(runtime, sprite, param_id, delta);
+}
+
+void sjit_pen_set_color_param_number(
+    SRuntime *runtime,
+    SSprite *sprite,
+    int param_id,
+    double value) {
+    (void)runtime;
+    if (!sprite || !isfinite(value)) {
+        return;
+    }
+    if (param_id == 1) {
+        sprite->pen_hue = wrap_hue(value);
+    } else if (param_id == 2) {
+        sprite->pen_saturation = clamp_percent(value);
+    } else if (param_id == 3) {
+        sprite->pen_brightness = clamp_percent(value);
+    } else if (param_id == 4) {
+        sprite->pen_transparency = clamp_percent(value);
+    } else {
+        return;
+    }
+    apply_pen_color_state(sprite);
+}
+
+void sjit_pen_change_size(SRuntime *runtime, SSprite *sprite, double delta) {
+    if (!sprite || !isfinite(delta)) {
+        return;
+    }
+    sjit_pen_set_size(runtime, sprite, sjit_make_number_fast(sprite->pen_size + delta));
+}
+
+static void legacy_update_pen_color(SRuntime *runtime, SSprite *sprite) {
+    if (!sprite) {
+        return;
+    }
+    const int alpha = sprite->pen_a;
+    sprite->pen_saturation = 100.0;
+    sprite->pen_brightness = 100.0;
+    apply_pen_color_state(sprite);
+
+    double shade = isfinite(sprite->pen_legacy_shade) ?
+        fmod(sprite->pen_legacy_shade, 200.0) : 0.0;
+    if (shade < 0.0) {
+        shade += 200.0;
+    }
+    double r = (double)sprite->pen_r;
+    double g = (double)sprite->pen_g;
+    double b = (double)sprite->pen_b;
+    if (shade < 50.0) {
+        const double fraction = (10.0 + shade) / 60.0;
+        r *= fraction;
+        g *= fraction;
+        b *= fraction;
+    } else {
+        const double fraction = (shade - 50.0) / 60.0;
+        r += (255.0 - r) * fraction;
+        g += (255.0 - g) * fraction;
+        b += (255.0 - b) * fraction;
+    }
+    set_color_rgba(
+        runtime,
+        sprite,
+        (int)r,
+        (int)g,
+        (int)b,
+        alpha);
+}
+
+void sjit_pen_set_hue_number(SRuntime *runtime, SSprite *sprite, double hue) {
+    if (!sprite || !isfinite(hue)) {
+        return;
+    }
+    sprite->pen_hue = wrap_hue(hue / 2.0);
+    sprite->pen_transparency = 0.0;
+    legacy_update_pen_color(runtime, sprite);
+}
+
+void sjit_pen_change_hue_number(SRuntime *runtime, SSprite *sprite, double delta) {
+    if (!sprite || !isfinite(delta)) {
+        return;
+    }
+    sprite->pen_hue = wrap_hue(sprite->pen_hue + delta / 2.0);
+    legacy_update_pen_color(runtime, sprite);
+}
+
+void sjit_pen_set_shade_number(SRuntime *runtime, SSprite *sprite, double shade) {
+    if (!sprite || !isfinite(shade)) {
+        return;
+    }
+    sprite->pen_legacy_shade = fmod(shade, 200.0);
+    if (sprite->pen_legacy_shade < 0.0) {
+        sprite->pen_legacy_shade += 200.0;
+    }
+    legacy_update_pen_color(runtime, sprite);
+}
+
+void sjit_pen_change_shade_number(SRuntime *runtime, SSprite *sprite, double delta) {
+    if (!sprite || !isfinite(delta)) {
+        return;
+    }
+    sjit_pen_set_shade_number(runtime, sprite, sprite->pen_legacy_shade + delta);
 }
 
 void sjit_pen_set_number_color_and_change_brightness(

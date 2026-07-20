@@ -196,35 +196,38 @@ Scratch 互換 VM/JIT の MVP として段階実装されている。
 - 現状は `src/project_loader.cpp` が `.sb3` zip を zlib で読み、`project.json`
   を独自 JSON parser で読む。
 - target/sprite、変数、リスト、procedure 定義と、green flag、key、stage/sprite
-  click、broadcast、backdrop switch の各 hat script を runtime へ
-  登録する。
-- costume/audio asset の完全読み込みや renderer skin 化はまだ未実装だが、
-  SDL host は SVG costume の bounds を使って簡易 preview を描く。
+  click、broadcast、backdrop switch、touching-object、greater-than、clone の各
+  hat script を runtime へ登録する。edge hat は毎 tick の立ち上がりだけを検出し、
+  hat input が reporter の場合も再評価する。
+- costume metadata と SVG/PNG bytes は loader が保持する。音声 bytes の decode と
+  実再生は host 側の残件だが、sound block は runtime の audio command queue へ
+  正規化して渡す。
 
 ## 6. 対応済み statement
 
-現状の SB3 lowering で statement として扱う主な opcode は以下。
+現状の SB3 lowering で statement として扱う標準 core opcode は以下。新規に追加した
+opcode は保守的な interpreter fallback を通る。
 
 - data: `data_setvariableto`, `data_changevariableby`, `data_addtolist`,
   `data_deleteoflist`, `data_deletealloflist`, `data_insertatlist`,
   `data_replaceitemoflist`
-- control: `control_repeat`, `control_repeat_until`, `control_if`,
-  `control_if_else`, `control_forever`, `control_for_each`,
-  `control_wait`, `control_wait_until`, `control_stop` の `this script`,
-  `other scripts in sprite`, `all`
-- event: `event_broadcast`
+- control: `control_repeat`, `control_repeat_until`, `control_while`,
+  `control_if`, `control_if_else`, `control_forever`, `control_for_each`,
+  `control_wait`, `control_wait_until`, `control_stop` の全 stop option、
+  `control_create_clone_of`, `control_delete_this_clone`, counter、
+  `control_all_at_once`
+- event: `event_broadcast`, `event_broadcastandwait`
 - procedures: `procedures_call`
-- looks: `looks_say`, `looks_sayforsecs`, `looks_show`, `looks_hide`,
-  `looks_setsizeto`, `looks_switchbackdropto`, `looks_seteffectto`,
-  `looks_changeeffectby`, `looks_cleargraphiceffects`
-- motion: `motion_gotoxy`, `motion_setx`, `motion_sety`,
-  `motion_changexby`, `motion_changeyby`
-- sensing: `sensing_resettimer`, `sensing_setdragmode`
-- pen: `pen_clear`, `pen_penDown`, `pen_penUp`, `pen_setPenSizeTo`,
-  `pen_setPenColorToColor`, `pen_changePenColorParamBy`
+- looks: say/think、show/hide、costume/backdrop switching（wait/next を含む）、
+  size、layer、graphic effect、legacy stretch/hide-all blocks
+- motion: `motion_movesteps`, `motion_gotoxy`, `motion_goto`, turn、point、glide、
+  edge bounce、rotation style、x/y set/change
+- sensing: `sensing_resettimer`, `sensing_setdragmode`, ask/answer
+- sound: play/play-until-done、stop、effect、clear effect、volume
+- pen: clear/down/up/stamp、set/change size、set color、set/change color parameter、
+  legacy shade/hue blocks
 
-`broadcast and wait` と clone 生成/削除は runtime helper と単体テスト側の土台は
-あるが、SB3 statement lowering としてはまだ網羅されていない。
+`looks_hideallsprites` と stretch 系は Scratch 2 互換の legacy no-op として受理する。
 
 ## 7. 対応済み reporter / expression
 
@@ -240,13 +243,18 @@ Scratch 互換 VM/JIT の MVP として段階実装されている。
 - data/list: `data_variable`, `data_itemoflist`, `data_itemnumoflist`,
   `data_lengthoflist`, `data_listcontainsitem`
 - sensing: `sensing_timer`, `sensing_mousex`, `sensing_mousey`,
-  `sensing_mousedown`, `sensing_keypressed`, `sensing_keyoptions`
+  `sensing_mousedown`, `sensing_keypressed`, `sensing_keyoptions`, touch/color、
+  distance、`sensing_of`、current date/time、answer、loudness/ loud、online、
+  username
+- looks: size、costume number/name、backdrop number/name
+- sound/control: sound volume、counter
 - motion: `motion_xposition`, `motion_yposition`, `motion_direction`
+- data/list: `data_listcontents` を含む list reporter
 - pen menu: `pen_menu_colorParam`
 
-`motion_direction` は SB3 lowering と interpreter evaluation に対応しているが、
-native reporter lowering はまだ無効である。top-level script tree に含む場合は
-明示的に interpreter entry を使い、procedure body の場合はその procedure call を
+`motion_direction` と今回追加した target/renderer 依存 reporter は interpreter
+evaluation に対応し、native lowering は保守的に無効である。top-level script tree に
+含む場合は interpreter entry を使い、procedure body の場合はその procedure call を
 汎用実行へ戻す。`operator_contains` は native / interpreter の両方で対応する。
 上記以外の未対応 reporter は空文字 literal へ
 変換せず、project load 時に opcode と block id を示す error にする。
@@ -282,9 +290,8 @@ native reporter lowering はまだ無効である。top-level script tree に含
   完了後も同じ tick 内で継続する。warp timer による時間上限は未実装。
 - `control_for_each` の回数判定は Scratch VM と同じく `Number(VALUE)` と現在
   index の比較で行い、`VALUE = 2.7` は `1, 2, 3` の3回になる。
-- `sjit_runtime_tick` は thread cleanup、draw buffer clear、scheduler tick、
-  done thread cleanup、pen/sprite draw command 生成を行う。元仕様の monitor
-  thread push や edge-activated hats 評価は完全には実装されていない。
+- `sjit_runtime_tick` は thread cleanup、input/edge hat polling、draw buffer clear、
+  scheduler tick、done thread cleanup、pen/sprite draw command 生成を行う。
 
 ### 8.1 所有権証明付き並列 scheduler
 
@@ -378,18 +385,21 @@ native reporter lowering はまだ無効である。top-level script tree に含
   `SJIT_HAT_EVENT_WHENFLAGCLICKED` 起動を行う。
 - `sjit_event_broadcast` と `sjit_event_broadcast_and_wait` は runtime helper として
   存在する。
-- SB3 loader は green flag、key、stage/sprite click、broadcast、backdrop switch の
-  hats を登録する。clone hat は runtime の clone helper から起動できる。
+- SB3 loader は green flag、key、stage/sprite click、broadcast、backdrop switch、
+  touching-object、greater-than の hats を登録する。clone hat は clone 作成時に
+  clone target id へ起動する。
 - 実行中の同一 hat を restart する場合は live frame をその場で破壊せず、entry が
   unwind した後に scheduler が `restart_pending` を commit する。stop-all が同時に
   発生した場合は stop を優先する。
-- greater-than / touching-object hats の edge activation は未完成。
+- greater-than / touching-object hats は edge activation と dynamic input 再評価に
+  対応する。
 
 ## 10. Clone / Sprite / Draw
 
 - sprite state、clone 作成の基礎、変数複製、pen state 複製は実装されている。
-- `create clone of`, `delete this clone`, `when I start as a clone` の SB3 lowering は
-  まだ仕様書どおりには揃っていない。
+- `create clone of`, `delete this clone`, `when I start as a clone` は SB3 lowering と
+  clone target 用 scheduler 起動まで対応する。clone は元 sprite の変数、pen、costume
+  metadata、sound state をコピーし、clone の native specialization は行わない。
 - draw command は元仕様より拡張され、pen stroke 用に `x2`, `y2`,
   `pen_width`, `r`, `g`, `b`, `a` を持つ。
 - draw buffer は毎 tick の sprite command と、永続 pen buffer から構成される。
@@ -483,37 +493,39 @@ native reporter lowering はまだ無効である。top-level script tree に含
 
 - `SHostInputSnapshot` layout は元仕様どおり。
 - mouse x/y、mouse down、key pressed、timer、reset timer は MVP として動く。
-- 音声入力、touch、video sensing、ask/answer、distance/color/touching 系 sensing は
-  未実装。
+- 音声入力、video sensing、touching-color の decoded pixel sampling は未接続。
+  touch object、distance、attribute-of、ask/answer、date/time、loudness/online などの
+  runtime reporter は実装済み。headless ask は host が `sjit_runtime_set_answer` で
+  answer を注入できる。
 - key name は arrow key 用の拡張値を ABI に持つ。
 
 ## 15. Looks / Motion
 
-- motion は `goto x:y`, `set x`, `set y`, `change x`, `change y`,
-  runtime helper の `point in direction` が中心。
-- looks は show/hide/set size/say、stage backdrop switching、graphic effect state を
-  実装する。backdrop は exact name、1-based number、numeric string、next/previous/
-  random の選択と `when backdrop switches to` hat 起動に対応する。
+- motion は steps/goto/turn/point/glide/bounce/rotation style と x/y set/change を
+  実装する。glide は frame state を使って tick 間で再開する。
+- looks は show/hide/size/say/think、costume switching、stage backdrop switching、
+  layer、graphic effect state を実装する。backdrop は exact name、1-based number、
+  numeric string、next/previous/random の選択と `when backdrop switches to` hat 起動に
+  対応する。
 - color/fisheye/whirl/pixelate/mosaic/brightness/ghost の7 effect state を sprite ごとに
   保持し、set/change/clear と clone copy に対応する。host renderer で現在表示に反映する
   effect は ghost と pixelate である。
 - `sensing_setdragmode` は sprite の draggable state を更新する。
-- `say` は text bubble draw command ではなく、現状は `printf("say: ...")`。
-- costume switching、残り5種類の effect shader、layer ordering、bubble rendering は
-  未完成。
+- `say`/`think` は runtime sprite state と `printf` を更新する。SDL の bubble skin
+  rendering は未接続。
 
 ## 16. 未実装または元仕様から大きく不足している領域
 
-- block graph 全体を LLVM IR へ直接 lowering する codegen。
+- block graph 全体を LLVM IR へ直接 lowering する codegen（追加 core block は
+  interpreter fallback）。
 - Scratch renderer 互換の costume/skin/draw list。
-- audio command queue。
+- audio asset decode、実再生、`play until done` の音声長に基づく厳密な待機。
 - monitor 更新 thread と Scratch monitor 表示 semantics。
-- Promise/I/O block。
-- greater-than / touching-object hats と一部の edge-activated semantics。
-- broadcast SB3 lowering と `broadcast and wait` の完全互換。
-- clone block の SB3 lowering と clone lifecycle の完全互換。
+- touching-color / color-touching-color の decoded costume pixel sampling。
+- ask/answer の GUI 入力 widget。
+- Scratch renderer 互換の bubble skin、残りの effect shader、clone の native specialization。
 - warp mode / procedure yield semantics。
-- asset loader と画像/音声 decode。
+- 音声 asset loader/decode と host audio backend。
 - Scratch VM と同等の stop option 全種。
 - GUI 以外を完全に LLVM 側へ寄せる最終形。
 

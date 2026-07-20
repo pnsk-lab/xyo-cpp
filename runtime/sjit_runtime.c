@@ -1,12 +1,14 @@
 #include "sjit_runtime.h"
 
 #include "sjit_draw.h"
+#include "sjit_event.h"
 #include "sjit_list.h"
 #include "sjit_ownership_internal.h"
 #include "sjit_pen.h"
 #include "sjit_scheduler.h"
 #include "sjit_string.h"
 #include "sjit_thread_pool.h"
+#include "sjit_value.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -186,6 +188,18 @@ static int ensure_variable_monitor_capacity(SRuntime *runtime, int wanted) {
     return 1;
 }
 
+static void clear_audio_commands(SRuntime *runtime) {
+    if (!runtime) {
+        return;
+    }
+    for (int i = 0; i < runtime->audio.length; ++i) {
+        sjit_string_destroy(runtime->audio.items[i].sound_name);
+        runtime->audio.items[i].sound_name = NULL;
+    }
+    runtime->audio.length = 0;
+    ++runtime->audio.revision;
+}
+
 static void apply_runtime_list_item_limit(SRuntime *runtime) {
     if (!runtime) {
         return;
@@ -227,6 +241,17 @@ SRuntime *sjit_runtime_create(void) {
     }
     sjit_draw_buffer_init(&runtime->draw);
     sjit_pen_path_init(&runtime->pen);
+    runtime->audio.items = NULL;
+    runtime->audio.length = 0;
+    runtime->audio.capacity = 0;
+    runtime->audio.revision = 0;
+    runtime->answer = sjit_make_string("");
+    runtime->question = NULL;
+    runtime->answer_ready = 1;
+    runtime->loudness = -1.0;
+    runtime->online = 1;
+    runtime->username = sjit_string_new("");
+    runtime->ask_input_enabled = 0;
     return runtime;
 }
 
@@ -256,12 +281,17 @@ void sjit_runtime_destroy(SRuntime *runtime) {
     free(runtime->scripts);
     free(runtime->variable_monitors);
     free(runtime->draw_owned_items);
+    clear_audio_commands(runtime);
+    free(runtime->audio.items);
     free(runtime->pen_raster_tile.pixels);
     free(runtime->pen_raster_tile.active_bits);
     free(runtime->pen_materialized_items);
     free(runtime->parallel_steps);
     sjit_pen_path_destroy(&runtime->pen);
     free(runtime->pen_color_cache);
+    sjit_value_destroy(runtime->answer);
+    sjit_string_destroy(runtime->question);
+    sjit_string_destroy(runtime->username);
     free(runtime);
 }
 
@@ -278,6 +308,15 @@ void sjit_runtime_green_flag(SRuntime *runtime) {
     sjit_runtime_stop_all(runtime);
     sjit_runtime_remove_done_threads(runtime);
     runtime->timer_start_ms = runtime->now_ms;
+    sjit_string_destroy(runtime->question);
+    runtime->question = NULL;
+    runtime->answer_ready = 1;
+    for (int i = 0; i < runtime->script_count; ++i) {
+        if (runtime->scripts[i].edge_activated) {
+            runtime->scripts[i].edge_initialized = 0;
+            runtime->scripts[i].edge_last_truth = 0;
+        }
+    }
     sjit_runtime_start_hats(runtime, SJIT_HAT_EVENT_WHENFLAGCLICKED, NULL);
 }
 
@@ -365,11 +404,24 @@ SRuntimeStatus sjit_runtime_tick(SRuntime *runtime) {
     runtime->stopped = 0;
     sjit_runtime_remove_done_threads(runtime);
     sjit_runtime_start_input_hats(runtime);
+    sjit_event_poll_edge_hats(runtime);
     runtime->draw.items = runtime->draw_owned_items;
     runtime->draw.capacity = runtime->draw_owned_capacity;
     sjit_draw_buffer_clear(&runtime->draw);
     const SRuntimeStatus status = sjit_scheduler_tick(runtime);
     sjit_runtime_remove_done_threads(runtime);
+    for (int i = 0; i < runtime->target_count; ++i) {
+        SSprite *target = runtime->targets[i];
+        if (!target || !target->bubble_text || target->bubble_until_ms < 0.0 ||
+            runtime->now_ms < target->bubble_until_ms) {
+            continue;
+        }
+        sjit_string_destroy(target->bubble_text);
+        target->bubble_text = NULL;
+        target->bubble_thought = 0;
+        target->bubble_until_ms = -1.0;
+        sjit_runtime_request_redraw(runtime);
+    }
     int visible_targets = 0;
     for (int i = 0; i < runtime->target_count; ++i) {
         if (runtime->targets[i]->visible) {
@@ -548,6 +600,34 @@ void sjit_runtime_request_redraw(SRuntime *runtime) {
     }
 }
 
+const SAudioCommandBuffer *sjit_runtime_get_audio_commands(SRuntime *runtime) {
+    return runtime ? &runtime->audio : NULL;
+}
+
+void sjit_runtime_clear_audio_commands(SRuntime *runtime) {
+    clear_audio_commands(runtime);
+}
+
+void sjit_runtime_set_answer(SRuntime *runtime, SValue answer) {
+    if (!runtime) {
+        sjit_value_destroy(answer);
+        return;
+    }
+    sjit_value_destroy(runtime->answer);
+    runtime->answer = answer;
+    runtime->answer_ready = 1;
+}
+
+SValue sjit_runtime_get_answer(SRuntime *runtime) {
+    return runtime ? sjit_value_clone(runtime->answer) : sjit_make_string("");
+}
+
+void sjit_runtime_set_ask_input_enabled(SRuntime *runtime, int enabled) {
+    if (runtime) {
+        runtime->ask_input_enabled = enabled ? 1 : 0;
+    }
+}
+
 SSprite *sjit_runtime_create_sprite(SRuntime *runtime, const char *name, int is_stage) {
     if (!runtime) {
         return NULL;
@@ -636,6 +716,8 @@ int sjit_runtime_register_script_with_data(
     registration->match_value = sjit_string_new(match_value ? match_value : "");
     registration->restart_existing_threads = restart_existing_threads;
     registration->edge_activated = edge_activated;
+    registration->edge_initialized = 0;
+    registration->edge_last_truth = 0;
     registration->entry = entry;
     registration->script_data = script_data;
     registration->invocation_count = 0;
@@ -891,6 +973,45 @@ int sjit_runtime_start_hats(SRuntime *runtime, int opcode_id, const char *match_
             if (sjit_scheduler_start_script(runtime, registration)) {
                 ++started;
             }
+        }
+    }
+    return started;
+}
+
+int sjit_runtime_start_edge_hat(SRuntime *runtime, SScriptRegistration *registration) {
+    if (!runtime || !registration || !registration->edge_activated) {
+        return 0;
+    }
+    if (find_thread_for_script(runtime, registration)) {
+        return 0;
+    }
+    return sjit_scheduler_start_script(runtime, registration) ? 1 : 0;
+}
+
+int sjit_runtime_start_clone_hats(SRuntime *runtime, SSprite *clone) {
+    if (!runtime || !clone || clone->base.is_original) {
+        return 0;
+    }
+    int started = 0;
+    for (int i = runtime->script_count - 1; i >= 0; --i) {
+        SScriptRegistration *registration = &runtime->scripts[i];
+        if (registration->opcode_id != SJIT_HAT_CONTROL_START_AS_CLONE ||
+            registration->target_id != clone->sprite_id) {
+            continue;
+        }
+        int exists = 0;
+        for (int thread_index = 0; thread_index < runtime->thread_count; ++thread_index) {
+            SThread *thread = runtime->threads[thread_index];
+            if (thread && thread->target_id == clone->base.id &&
+                thread->script_id == registration->script_id &&
+                sjit_thread_is_alive(thread)) {
+                exists = 1;
+                break;
+            }
+        }
+        if (!exists && sjit_scheduler_start_script_for_target(
+                runtime, registration, clone->base.id)) {
+            ++started;
         }
     }
     return started;

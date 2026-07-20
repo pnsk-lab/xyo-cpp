@@ -45,6 +45,17 @@ struct SSprite {
     SString **costume_names;
     int costume_count;
     double graphic_effects[SJIT_GRAPHIC_EFFECT_COUNT];
+    /* Appended metadata; keep the original costume_count/effect offsets
+       stable for generated code and host ABI consumers. */
+    double *costume_widths;
+    double *costume_heights;
+    double stretch;
+    SString *bubble_text;
+    int bubble_thought;
+    double bubble_until_ms;
+    double sound_pitch;
+    double sound_pan;
+    double pen_legacy_shade;
 };
 
 SSprite *sjit_sprite_create(int id, int drawable_id, const char *name, int is_stage);
@@ -58,6 +69,13 @@ int sjit_sprite_set_costume_names(
     SSprite *sprite,
     const char *const *costume_names,
     int costume_count);
+int sjit_sprite_set_costume_geometry(
+    SSprite *sprite,
+    const double *widths,
+    const double *heights,
+    int costume_count);
+double sjit_sprite_current_costume_width(const SSprite *sprite);
+double sjit_sprite_current_costume_height(const SSprite *sprite);
 int sjit_sprite_costume_index_by_name(const SSprite *sprite, const char *name);
 const char *sjit_sprite_current_costume_name(const SSprite *sprite);
 void sjit_sprite_set_costume(SRuntime *runtime, SSprite *sprite, int costume_index);

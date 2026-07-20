@@ -45,7 +45,23 @@ typedef enum {
     /* Implemented by the interpreter and intentionally used to exercise the
        explicit whole-script JIT fallback path. */
     SJIT_EXPR_DIRECTION = 34,
-    SJIT_EXPR_COSTUME_NUMBER_NAME = 35
+    SJIT_EXPR_COSTUME_NUMBER_NAME = 35,
+    SJIT_EXPR_SIZE = 36,
+    SJIT_EXPR_BACKDROP_NUMBER_NAME = 37,
+    SJIT_EXPR_LIST_CONTENTS = 38,
+    SJIT_EXPR_TOUCHING_OBJECT = 39,
+    SJIT_EXPR_TOUCHING_COLOR = 40,
+    SJIT_EXPR_COLOR_TOUCHING_COLOR = 41,
+    SJIT_EXPR_DISTANCE_TO = 42,
+    SJIT_EXPR_SENSING_OF = 43,
+    SJIT_EXPR_CURRENT = 44,
+    SJIT_EXPR_ANSWER = 45,
+    SJIT_EXPR_LOUDNESS = 46,
+    SJIT_EXPR_LOUD = 47,
+    SJIT_EXPR_ONLINE = 48,
+    SJIT_EXPR_USERNAME = 49,
+    SJIT_EXPR_SOUND_VOLUME = 50,
+    SJIT_EXPR_COUNTER = 51
 } SExprOpcode;
 
 typedef enum {
@@ -99,7 +115,49 @@ typedef enum {
     SJIT_STMT_LOOKS_SWITCH_COSTUME = 46,
     SJIT_STMT_LOOKS_GO_TO_FRONT_BACK = 47,
     SJIT_STMT_PEN_STAMP = 48,
-    SJIT_STMT_BROADCAST_AND_WAIT = 49
+    SJIT_STMT_BROADCAST_AND_WAIT = 49,
+    SJIT_STMT_MOTION_MOVE_STEPS = 50,
+    SJIT_STMT_MOTION_GOTO = 51,
+    SJIT_STMT_MOTION_TURN_RIGHT = 52,
+    SJIT_STMT_MOTION_TURN_LEFT = 53,
+    SJIT_STMT_MOTION_POINT_DIRECTION = 54,
+    SJIT_STMT_MOTION_POINT_TOWARDS = 55,
+    SJIT_STMT_MOTION_GLIDE_XY = 56,
+    SJIT_STMT_MOTION_GLIDE_TO = 57,
+    SJIT_STMT_MOTION_IF_ON_EDGE_BOUNCE = 58,
+    SJIT_STMT_MOTION_SET_ROTATION_STYLE = 59,
+    SJIT_STMT_LOOKS_THINK = 60,
+    SJIT_STMT_LOOKS_THINK_FOR_SECS = 61,
+    SJIT_STMT_LOOKS_SWITCH_BACKDROP_AND_WAIT = 62,
+    SJIT_STMT_LOOKS_NEXT_COSTUME = 63,
+    SJIT_STMT_LOOKS_NEXT_BACKDROP = 64,
+    SJIT_STMT_LOOKS_CHANGE_SIZE = 65,
+    SJIT_STMT_LOOKS_HIDE_ALL_SPRITES = 66,
+    SJIT_STMT_LOOKS_GO_FORWARD_BACKWARD_LAYERS = 67,
+    SJIT_STMT_LOOKS_CHANGE_STRETCH = 68,
+    SJIT_STMT_LOOKS_SET_STRETCH = 69,
+    SJIT_STMT_CREATE_CLONE = 70,
+    SJIT_STMT_DELETE_CLONE = 71,
+    SJIT_STMT_CONTROL_GET_COUNTER = 72,
+    SJIT_STMT_CONTROL_INCR_COUNTER = 73,
+    SJIT_STMT_CONTROL_CLEAR_COUNTER = 74,
+    SJIT_STMT_CONTROL_ALL_AT_ONCE = 75,
+    SJIT_STMT_SENSING_ASK_AND_WAIT = 76,
+    SJIT_STMT_SOUND_PLAY = 77,
+    SJIT_STMT_SOUND_PLAY_UNTIL_DONE = 78,
+    SJIT_STMT_SOUND_STOP_ALL = 79,
+    SJIT_STMT_SOUND_SET_EFFECT = 80,
+    SJIT_STMT_SOUND_CHANGE_EFFECT = 81,
+    SJIT_STMT_SOUND_CLEAR_EFFECTS = 82,
+    SJIT_STMT_SOUND_SET_VOLUME = 83,
+    SJIT_STMT_SOUND_CHANGE_VOLUME = 84,
+    SJIT_STMT_STOP_OTHER_SCRIPTS_IN_STAGE = 85,
+    SJIT_STMT_PEN_SET_COLOR_PARAM = 86,
+    SJIT_STMT_PEN_CHANGE_SIZE = 87,
+    SJIT_STMT_PEN_SET_SHADE = 88,
+    SJIT_STMT_PEN_CHANGE_SHADE = 89,
+    SJIT_STMT_PEN_SET_HUE = 90,
+    SJIT_STMT_PEN_CHANGE_HUE = 91
 } SStatementOpcode;
 
 typedef enum {
@@ -220,6 +278,9 @@ struct SCompiledScript {
        pointers or using invocation-local variable handles; a different
        runtime stays on the interpreter path. */
     uint64_t jit_runtime_instance_id;
+    /* Edge-activated hat inputs are kept on the immutable script arena so the
+       runtime can re-evaluate reporter-valued hat arguments each tick. */
+    SExpr *hat_edge_value;
 };
 
 SCompiledScript *sjit_compiled_script_create(int target_id, int statement_count);
@@ -264,6 +325,23 @@ SExpr *sjit_expr_create_x_position(void);
 SExpr *sjit_expr_create_y_position(void);
 SExpr *sjit_expr_create_direction(void);
 SExpr *sjit_expr_create_costume_number_name(int number_name);
+SExpr *sjit_expr_create_size(void);
+SExpr *sjit_expr_create_backdrop_number_name(int number_name);
+SExpr *sjit_expr_create_list_contents(const char *list_name);
+SExpr *sjit_expr_create_list_contents_with_id(const char *list_id, const char *list_name);
+SExpr *sjit_expr_create_touching_object(SExpr *object);
+SExpr *sjit_expr_create_touching_color(SExpr *color);
+SExpr *sjit_expr_create_color_touching_color(SExpr *color, SExpr *color2);
+SExpr *sjit_expr_create_distance_to(SExpr *target);
+SExpr *sjit_expr_create_sensing_of(SExpr *attribute, SExpr *object);
+SExpr *sjit_expr_create_current(SExpr *menu);
+SExpr *sjit_expr_create_answer(void);
+SExpr *sjit_expr_create_loudness(void);
+SExpr *sjit_expr_create_loud(void);
+SExpr *sjit_expr_create_online(void);
+SExpr *sjit_expr_create_username(void);
+SExpr *sjit_expr_create_sound_volume(void);
+SExpr *sjit_expr_create_counter(void);
 SExpr *sjit_expr_create_mouse_down(void);
 SExpr *sjit_expr_create_key_pressed(SExpr *key_name);
 void sjit_expr_destroy(SExpr *expr);
@@ -279,6 +357,10 @@ SValue sjit_script_eval_statement_expr_ptr(
     SCompiledScript *script,
     SStatement *statement,
     int expr_slot);
+SValue sjit_script_eval_expr(
+    SRuntime *runtime,
+    SCompiledScript *script,
+    SExpr *expr);
 double sjit_script_eval_statement_number(
     SRuntime *runtime,
     SCompiledScript *script,

@@ -226,13 +226,16 @@ void sjit_scheduler_add_thread(SRuntime *runtime, int target_id, int script_id) 
     }
 }
 
-SThread *sjit_scheduler_start_script(SRuntime *runtime, SScriptRegistration *registration) {
+SThread *sjit_scheduler_start_script_for_target(
+    SRuntime *runtime,
+    SScriptRegistration *registration,
+    int target_id) {
     if (!runtime || !registration || !registration->entry || !ensure_thread_capacity(runtime, runtime->thread_count + 1)) {
         return NULL;
     }
     SThread *thread = sjit_thread_create(
         runtime->next_thread_id++,
-        registration->target_id,
+        target_id,
         registration->script_id,
         registration->entry,
         registration->script_data);
@@ -244,6 +247,13 @@ SThread *sjit_scheduler_start_script(SRuntime *runtime, SScriptRegistration *reg
         ++registration->invocation_count;
     }
     return thread;
+}
+
+SThread *sjit_scheduler_start_script(SRuntime *runtime, SScriptRegistration *registration) {
+    return sjit_scheduler_start_script_for_target(
+        runtime,
+        registration,
+        registration ? registration->target_id : 0);
 }
 
 void sjit_scheduler_restart_thread(SRuntime *runtime, int thread_id) {

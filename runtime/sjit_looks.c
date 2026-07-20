@@ -6,8 +6,12 @@
 
 #include <ctype.h>
 #include <limits.h>
+#include <math.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
+
+static SSprite *stage_target(SRuntime *runtime);
 
 void sjit_looks_show(SRuntime *runtime, SSprite *sprite) {
     sjit_sprite_set_visible(runtime, sprite, 1);
@@ -15,6 +19,95 @@ void sjit_looks_show(SRuntime *runtime, SSprite *sprite) {
 
 void sjit_looks_hide(SRuntime *runtime, SSprite *sprite) {
     sjit_sprite_set_visible(runtime, sprite, 0);
+}
+
+void sjit_looks_say(SRuntime *runtime, SSprite *sprite, SValue message, int thought) {
+    if (!runtime) {
+        return;
+    }
+    SValue text = sjit_to_string(runtime, message);
+    const char *raw = sjit_string_cstr((const SString *)text.ptr);
+    if (sprite) {
+        sjit_string_destroy(sprite->bubble_text);
+        sprite->bubble_text = raw[0] == '\0' ? NULL : sjit_string_new(raw);
+        sprite->bubble_thought = raw[0] == '\0' ? 0 : (thought ? 1 : 0);
+        sprite->bubble_until_ms = -1.0;
+    }
+    if (raw[0] != '\0') {
+        printf("%s: %s\n", thought ? "think" : "say", raw);
+    }
+    sjit_value_destroy_fast(text);
+    sjit_runtime_request_redraw(runtime);
+}
+
+void sjit_looks_next_costume(SRuntime *runtime, SSprite *sprite) {
+    if (sprite && sprite->costume_count > 0) {
+        sjit_sprite_set_costume(runtime, sprite, sprite->current_costume + 1);
+    }
+}
+
+void sjit_looks_next_backdrop(SRuntime *runtime) {
+    if (!runtime) {
+        return;
+    }
+    SSprite *stage = stage_target(runtime);
+    if (!stage || stage->costume_count <= 0) {
+        return;
+    }
+    sjit_sprite_set_costume(runtime, stage, stage->current_costume + 1);
+    sjit_runtime_start_hats(
+        runtime,
+        SJIT_HAT_EVENT_WHENBACKDROPSWITCHESTO,
+        sjit_sprite_current_costume_name(stage));
+}
+
+void sjit_looks_change_size(SRuntime *runtime, SSprite *sprite, double change) {
+    if (!sprite || sprite->base.is_stage) {
+        return;
+    }
+    if (!isfinite(change)) {
+        change = 0.0;
+    }
+    sprite->size = fmax(0.0, sprite->size + change);
+    sjit_runtime_request_redraw(runtime);
+}
+
+void sjit_looks_change_stretch(SRuntime *runtime, SSprite *sprite, double change) {
+    /* Scratch 3 retains this Scratch 2 compatibility opcode as a no-op. */
+    (void)runtime;
+    (void)sprite;
+    (void)change;
+}
+
+void sjit_looks_set_stretch(SRuntime *runtime, SSprite *sprite, double value) {
+    /* Scratch 3 retains this Scratch 2 compatibility opcode as a no-op. */
+    (void)runtime;
+    (void)sprite;
+    (void)value;
+}
+
+void sjit_looks_go_forward_backward_layers(SRuntime *runtime, SSprite *sprite, int layers) {
+    if (!sprite || sprite->base.is_stage) {
+        return;
+    }
+    const long long next = (long long)sprite->layer_order + (long long)layers;
+    sprite->layer_order = next > INT_MAX ? INT_MAX :
+        (next < INT_MIN ? INT_MIN : (int)next);
+    sjit_runtime_request_redraw(runtime);
+}
+
+void sjit_looks_hide_all_sprites(SRuntime *runtime) {
+    /* Scratch 3 retains this Scratch 2 compatibility opcode as a no-op. */
+    (void)runtime;
+}
+
+SValue sjit_looks_backdrop_number_name(SRuntime *runtime, int number_name) {
+    SSprite *stage = stage_target(runtime);
+    if (number_name) {
+        return sjit_make_number(
+            stage && stage->costume_count > 0 ? stage->current_costume + 1.0 : 0.0);
+    }
+    return sjit_make_string(sjit_sprite_current_costume_name(stage));
 }
 
 void sjit_looks_switch_costume(
@@ -56,7 +149,7 @@ void sjit_looks_go_to_front_back(
     SRuntime *runtime,
     SSprite *sprite,
     int front) {
-    if (!runtime || !sprite) {
+    if (!runtime || !sprite || sprite->base.is_stage) {
         return;
     }
 
@@ -175,11 +268,11 @@ static SSprite *stage_target(SRuntime *runtime) {
     return NULL;
 }
 
-static void start_backdrop_hats(SRuntime *runtime, const SSprite *stage) {
+static int start_backdrop_hats(SRuntime *runtime, const SSprite *stage) {
     if (!runtime || !stage || stage->costume_count <= 0) {
-        return;
+        return 0;
     }
-    sjit_runtime_start_hats(
+    return sjit_runtime_start_hats(
         runtime,
         SJIT_HAT_EVENT_WHENBACKDROPSWITCHESTO,
         sjit_sprite_current_costume_name(stage));
@@ -250,6 +343,51 @@ void sjit_looks_switch_backdrop(SRuntime *runtime, SValue requested_backdrop) {
     /* Scratch starts the hat for the final backdrop even when the requested
        value is invalid or resolves to the already-selected backdrop. */
     start_backdrop_hats(runtime, stage);
+}
+
+void sjit_looks_switch_backdrop_and_wait(
+    SRuntime *runtime,
+    SFrame *frame,
+    SValue requested_backdrop,
+    int resume_pc,
+    SRuntimeStatus *status) {
+    if (status) {
+        *status = SJIT_STATUS_OK;
+    }
+    if (!runtime) {
+        return;
+    }
+    if (!frame) {
+        sjit_looks_switch_backdrop(runtime, requested_backdrop);
+        return;
+    }
+    if (frame->timed_event_kind != 2) {
+        frame->timed_event_kind = 2;
+        frame->started_thread_begin = sjit_runtime_next_thread_id(runtime);
+        sjit_looks_switch_backdrop(runtime, requested_backdrop);
+        frame->started_thread_count =
+            sjit_runtime_next_thread_id(runtime) - frame->started_thread_begin;
+        frame->pc = resume_pc;
+        if (frame->started_thread_count > 0) {
+            if (status) *status = SJIT_STATUS_YIELDED;
+            return;
+        }
+        frame->timed_event_kind = 0;
+        frame->started_thread_begin = -1;
+        frame->started_thread_count = -1;
+        return;
+    }
+    if (sjit_runtime_count_threads_in_id_range(
+            runtime,
+            frame->started_thread_begin,
+            frame->started_thread_count) > 0) {
+        frame->pc = resume_pc;
+        if (status) *status = SJIT_STATUS_YIELDED;
+        return;
+    }
+    frame->timed_event_kind = 0;
+    frame->started_thread_begin = -1;
+    frame->started_thread_count = -1;
 }
 
 void sjit_looks_switch_backdrop_value_ptr(

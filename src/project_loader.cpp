@@ -806,6 +806,56 @@ std::string fieldId(const Block &block, const std::string &field_name) {
     return id.isString() ? id.asString() : "";
 }
 
+std::string firstFieldValue(const Block &block) {
+    if (!block.fields.isObject()) {
+        return "";
+    }
+    for (const auto &[name, field] : block.fields.asObject()) {
+        (void)name;
+        if (!field.isArray() || field.asArray().empty()) {
+            continue;
+        }
+        const Json &value = field.asArray()[0];
+        if (value.isString()) {
+            return value.asString();
+        }
+        if (value.isNumber()) {
+            std::ostringstream out;
+            out << value.asNumber();
+            return out.str();
+        }
+        if (value.isBool()) {
+            return value.asBool() ? "true" : "false";
+        }
+    }
+    return "";
+}
+
+bool isLiteralInputBlock(const Block &block) {
+    if (block.opcode == "math_number" || block.opcode == "text" ||
+        block.opcode == "colour_picker" || block.opcode == "color_picker") {
+        return true;
+    }
+    static const char *const menu_opcodes[] = {
+        "control_create_clone_of_menu",
+        "event_broadcast_menu",
+        "motion_goto_menu",
+        "motion_glideto_menu",
+        "motion_pointtowards_menu",
+        "sensing_distancetomenu",
+        "sensing_of_object_menu",
+        "sensing_touchingobjectmenu",
+        "sound_effects_menu",
+        "sound_sounds_menu"
+    };
+    for (const char *opcode : menu_opcodes) {
+        if (block.opcode == opcode) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::string variableReferenceKey(const std::string &scratch_id, const std::string &name) {
     return scratch_id.empty() ? "name:" + name : "id:" + scratch_id;
 }
@@ -867,6 +917,44 @@ std::string inputBlockId(const Block &block, const std::string &name) {
     return primary.isString() ? primary.asString() : "";
 }
 
+std::string jsonScalarText(const Json &value) {
+    if (value.isString()) {
+        return value.asString();
+    }
+    if (value.isNumber()) {
+        std::ostringstream out;
+        out << value.asNumber();
+        return out.str();
+    }
+    if (value.isBool()) {
+        return value.asBool() ? "true" : "false";
+    }
+    return "";
+}
+
+std::string inputLiteralText(
+    const TargetBuild &target,
+    const Block &block,
+    const std::string &input_name) {
+    const Json *input = inputValue(block, input_name);
+    if (!input || !input->isArray() || input->asArray().size() < 2) {
+        return "";
+    }
+    const Json &primary = input->asArray()[1];
+    if (primary.isString()) {
+        const Block *nested = findBlock(target, primary.asString());
+        return nested && isLiteralInputBlock(*nested) ? firstFieldValue(*nested) : "";
+    }
+    if (primary.isArray() && primary.asArray().size() >= 2) {
+        return jsonScalarText(primary.asArray()[1]);
+    }
+    if (input->asArray().size() >= 3 && input->asArray()[2].isArray() &&
+        input->asArray()[2].asArray().size() >= 2) {
+        return jsonScalarText(input->asArray()[2].asArray()[1]);
+    }
+    return "";
+}
+
 HatRegistration hatRegistrationForBlock(const TargetBuild &target, const Block &block) {
     if (!block.top_level || block.next.empty()) {
         return {};
@@ -888,6 +976,19 @@ HatRegistration hatRegistrationForBlock(const TargetBuild &target, const Block &
     }
     if (block.opcode == "event_whenbackdropswitchesto") {
         return {true, SJIT_HAT_EVENT_WHENBACKDROPSWITCHESTO, fieldName(block, "BACKDROP"), 1, 0};
+    }
+    if (block.opcode == "control_start_as_clone" && !target.is_stage) {
+        return {true, SJIT_HAT_CONTROL_START_AS_CLONE, std::to_string(target.target_id), 0, 0};
+    }
+    if (block.opcode == "event_whentouchingobject" && !target.is_stage) {
+        return {true, SJIT_HAT_EVENT_WHENTOUCHINGOBJECT,
+            inputLiteralText(target, block, "TOUCHINGOBJECTMENU"), 0, 1};
+    }
+    if (block.opcode == "event_whengreaterthan") {
+        const std::string menu = fieldName(block, "WHENGREATERTHANMENU");
+        const std::string threshold = inputLiteralText(target, block, "VALUE");
+        return {true, SJIT_HAT_EVENT_WHENGREATERTHAN,
+            menu + "|" + threshold, 0, 1};
     }
     return {};
 }
@@ -961,7 +1062,11 @@ int blockExprKind(
         block->opcode == "operator_not" ||
         block->opcode == "data_listcontainsitem" ||
         block->opcode == "sensing_mousedown" ||
-        block->opcode == "sensing_keypressed") {
+        block->opcode == "sensing_keypressed" ||
+        block->opcode == "sensing_touchingobject" ||
+        block->opcode == "sensing_touchingcolor" ||
+        block->opcode == "sensing_coloristouchingcolor" ||
+        block->opcode == "sensing_loud") {
         return SJIT_SCALAR_BOOL;
     }
     if (block->opcode == "operator_add" ||
@@ -979,13 +1084,23 @@ int blockExprKind(
         block->opcode == "sensing_dayssince2000" ||
         block->opcode == "sensing_mousex" ||
         block->opcode == "sensing_mousey" ||
-        block->opcode == "motion_direction") {
+        block->opcode == "motion_direction" ||
+        block->opcode == "looks_size" ||
+        block->opcode == "sensing_distanceto" ||
+        block->opcode == "sensing_loudness" ||
+        block->opcode == "sound_volume" ||
+        block->opcode == "control_get_counter" ||
+        block->opcode == "looks_backdropnumbername") {
         return SJIT_SCALAR_NUMBER;
     }
     if (block->opcode == "operator_join" ||
         block->opcode == "operator_letter_of" ||
         block->opcode == "sensing_keyoptions" ||
-        block->opcode == "pen_menu_colorParam") {
+        block->opcode == "data_listcontents" ||
+        block->opcode == "pen_menu_colorParam" ||
+        block->opcode == "sensing_answer" ||
+        block->opcode == "sensing_username" ||
+        block->opcode == "sensing_userid") {
         return SJIT_SCALAR_STRING;
     }
     if (block->opcode == "data_variable") {
@@ -1127,6 +1242,10 @@ SExpr *compileInputExpr(const TargetBuild &target, const Block &block, const std
     }
     const Json &primary = input->asArray()[1];
     if (primary.isString()) {
+        const Block *nested = findBlock(target, primary.asString());
+        if (nested && isLiteralInputBlock(*nested)) {
+            return makeLiteralString(firstFieldValue(*nested));
+        }
         return compileBlockExpr(target, primary.asString());
     }
     if (primary.isArray()) {
@@ -1291,6 +1410,11 @@ SExpr *compileBlockExpr(const TargetBuild &target, const std::string &block_id) 
             name.c_str(),
             compileInputExpr(target, *block, "ITEM"));
     }
+    if (block->opcode == "data_listcontents") {
+        const std::string name = fieldName(*block, "LIST");
+        const std::string id = fieldId(*block, "LIST");
+        return sjit_expr_create_list_contents_with_id(id.c_str(), name.c_str());
+    }
     if (block->opcode == "sensing_timer") {
         return sjit_expr_create_timer();
     }
@@ -1312,6 +1436,13 @@ SExpr *compileBlockExpr(const TargetBuild &target, const std::string &block_id) 
     if (block->opcode == "motion_direction") {
         return sjit_expr_create_direction();
     }
+    if (block->opcode == "looks_size") {
+        return sjit_expr_create_size();
+    }
+    if (block->opcode == "looks_backdropnumbername") {
+        return sjit_expr_create_backdrop_number_name(
+            fieldName(*block, "NUMBER_NAME") == "number");
+    }
     if (block->opcode == "sensing_mousedown") {
         return sjit_expr_create_mouse_down();
     }
@@ -1320,6 +1451,60 @@ SExpr *compileBlockExpr(const TargetBuild &target, const std::string &block_id) 
     }
     if (block->opcode == "sensing_keyoptions") {
         return makeLiteralString(fieldName(*block, "KEY_OPTION"));
+    }
+    if (block->opcode == "sensing_touchingobject" &&
+        inputValue(*block, "TOUCHINGOBJECTMENU")) {
+        return sjit_expr_create_touching_object(
+            compileInputExpr(target, *block, "TOUCHINGOBJECTMENU"));
+    }
+    if (block->opcode == "sensing_touchingcolor" &&
+        inputValue(*block, "COLOR")) {
+        return sjit_expr_create_touching_color(
+            compileInputExpr(target, *block, "COLOR"));
+    }
+    if (block->opcode == "sensing_coloristouchingcolor" &&
+        inputValue(*block, "COLOR") && inputValue(*block, "COLOR2")) {
+        return sjit_expr_create_color_touching_color(
+            compileInputExpr(target, *block, "COLOR"),
+            compileInputExpr(target, *block, "COLOR2"));
+    }
+    if (block->opcode == "sensing_distanceto" &&
+        inputValue(*block, "DISTANCETOMENU")) {
+        return sjit_expr_create_distance_to(
+            compileInputExpr(target, *block, "DISTANCETOMENU"));
+    }
+    if (block->opcode == "sensing_of" && inputValue(*block, "OBJECT")) {
+        return sjit_expr_create_sensing_of(
+            makeLiteralString(fieldName(*block, "PROPERTY")),
+            compileInputExpr(target, *block, "OBJECT"));
+    }
+    if (block->opcode == "sensing_current") {
+        return sjit_expr_create_current(
+            makeLiteralString(fieldName(*block, "CURRENTMENU")));
+    }
+    if (block->opcode == "sensing_answer") {
+        return sjit_expr_create_answer();
+    }
+    if (block->opcode == "sensing_loudness") {
+        return sjit_expr_create_loudness();
+    }
+    if (block->opcode == "sensing_loud") {
+        return sjit_expr_create_loud();
+    }
+    if (block->opcode == "sensing_online") {
+        return sjit_expr_create_online();
+    }
+    if (block->opcode == "sensing_username") {
+        return sjit_expr_create_username();
+    }
+    if (block->opcode == "sensing_userid") {
+        return makeLiteralString("");
+    }
+    if (block->opcode == "sound_volume") {
+        return sjit_expr_create_sound_volume();
+    }
+    if (block->opcode == "control_get_counter") {
+        return sjit_expr_create_counter();
     }
     if (block->opcode == "pen_menu_colorParam") {
         return makeLiteralString(fieldName(*block, "colorParam"));
@@ -1342,6 +1527,7 @@ SExpr *compileBlockExpr(const TargetBuild &target, const std::string &block_id) 
 SStatement compileStatement(const TargetBuild &target, const Block &block) {
     SStatement statement{};
     statement.opcode = SJIT_STMT_NOOP;
+    bool accepted_noop = false;
 
     if (block.opcode == "sensing_resettimer") {
         statement.opcode = SJIT_STMT_RESET_TIMER;
@@ -1415,6 +1601,8 @@ SStatement compileStatement(const TargetBuild &target, const Block &block) {
         statement.opcode = SJIT_STMT_STOP_THIS_SCRIPT;
     } else if (block.opcode == "control_stop" && fieldName(block, "STOP_OPTION") == "other scripts in sprite") {
         statement.opcode = SJIT_STMT_STOP_OTHER_SCRIPTS;
+    } else if (block.opcode == "control_stop" && fieldName(block, "STOP_OPTION") == "other scripts in stage") {
+        statement.opcode = SJIT_STMT_STOP_OTHER_SCRIPTS_IN_STAGE;
     } else if (block.opcode == "control_stop" && fieldName(block, "STOP_OPTION") == "all") {
         statement.opcode = SJIT_STMT_STOP_ALL;
     } else if (block.opcode == "control_wait") {
@@ -1501,6 +1689,39 @@ SStatement compileStatement(const TargetBuild &target, const Block &block) {
     } else if (block.opcode == "looks_setsizeto") {
         statement.opcode = SJIT_STMT_LOOKS_SET_SIZE;
         statement.value = compileInputExpr(target, block, "SIZE");
+    } else if (block.opcode == "looks_changesizeby") {
+        statement.opcode = SJIT_STMT_LOOKS_CHANGE_SIZE;
+        statement.value = compileInputExpr(target, block, "CHANGE");
+    } else if (block.opcode == "looks_think") {
+        statement.opcode = SJIT_STMT_LOOKS_THINK;
+        statement.value = compileInputExpr(target, block, "MESSAGE");
+    } else if (block.opcode == "looks_thinkforsecs") {
+        statement.opcode = SJIT_STMT_LOOKS_THINK_FOR_SECS;
+        statement.value = compileInputExpr(target, block, "MESSAGE");
+        statement.index = compileInputExpr(target, block, "SECS");
+    } else if (block.opcode == "looks_switchbackdroptoandwait") {
+        statement.opcode = SJIT_STMT_LOOKS_SWITCH_BACKDROP_AND_WAIT;
+        statement.value = compileInputExpr(target, block, "BACKDROP");
+    } else if (block.opcode == "looks_nextcostume") {
+        statement.opcode = SJIT_STMT_LOOKS_NEXT_COSTUME;
+    } else if (block.opcode == "looks_nextbackdrop") {
+        statement.opcode = SJIT_STMT_LOOKS_NEXT_BACKDROP;
+    } else if (block.opcode == "looks_hideallsprites") {
+        statement.opcode = SJIT_STMT_LOOKS_HIDE_ALL_SPRITES;
+    } else if (block.opcode == "looks_changeorder") {
+        statement.opcode = SJIT_STMT_LOOKS_GO_FORWARD_BACKWARD_LAYERS;
+        statement.value = compileInputExpr(target, block, "NUM");
+        statement.layer_front = fieldName(block, "FORWARD_BACKWARD") == "forward" ? 1 : -1;
+    } else if (block.opcode == "looks_goforwardbackwardlayers") {
+        statement.opcode = SJIT_STMT_LOOKS_GO_FORWARD_BACKWARD_LAYERS;
+        statement.value = compileInputExpr(target, block, "NUM");
+        statement.layer_front = fieldName(block, "FORWARD_BACKWARD") == "forward" ? 1 : -1;
+    } else if (block.opcode == "looks_changestretchby") {
+        statement.opcode = SJIT_STMT_LOOKS_CHANGE_STRETCH;
+        statement.value = compileInputExpr(target, block, "CHANGE");
+    } else if (block.opcode == "looks_setstretchto") {
+        statement.opcode = SJIT_STMT_LOOKS_SET_STRETCH;
+        statement.value = compileInputExpr(target, block, "STRETCH");
     } else if (block.opcode == "sensing_setdragmode") {
         statement.opcode = SJIT_STMT_SENSING_SET_DRAG_MODE;
         statement.drag_mode = fieldName(block, "DRAG_MODE") == "draggable" ? 1 : 0;
@@ -1520,6 +1741,102 @@ SStatement compileStatement(const TargetBuild &target, const Block &block) {
     } else if (block.opcode == "motion_changeyby") {
         statement.opcode = SJIT_STMT_MOTION_CHANGE_Y;
         statement.value = compileInputExpr(target, block, "DY");
+    } else if (block.opcode == "motion_movesteps") {
+        statement.opcode = SJIT_STMT_MOTION_MOVE_STEPS;
+        statement.value = compileInputExpr(target, block, "STEPS");
+    } else if (block.opcode == "motion_goto") {
+        statement.opcode = SJIT_STMT_MOTION_GOTO;
+        statement.value = compileInputExpr(target, block, "TO");
+    } else if (block.opcode == "motion_turnright") {
+        statement.opcode = SJIT_STMT_MOTION_TURN_RIGHT;
+        statement.value = compileInputExpr(target, block, "DEGREES");
+    } else if (block.opcode == "motion_turnleft") {
+        statement.opcode = SJIT_STMT_MOTION_TURN_LEFT;
+        statement.value = compileInputExpr(target, block, "DEGREES");
+    } else if (block.opcode == "motion_pointindirection") {
+        statement.opcode = SJIT_STMT_MOTION_POINT_DIRECTION;
+        statement.value = compileInputExpr(target, block, "DIRECTION");
+    } else if (block.opcode == "motion_pointtowards") {
+        statement.opcode = SJIT_STMT_MOTION_POINT_TOWARDS;
+        statement.value = compileInputExpr(target, block, "TOWARDS");
+    } else if (block.opcode == "motion_glidesecstoxy") {
+        statement.opcode = SJIT_STMT_MOTION_GLIDE_XY;
+        statement.value = compileInputExpr(target, block, "SECS");
+        statement.index = compileInputExpr(target, block, "X");
+        statement.condition = compileInputExpr(target, block, "Y");
+    } else if (block.opcode == "motion_glideto") {
+        statement.opcode = SJIT_STMT_MOTION_GLIDE_TO;
+        statement.value = compileInputExpr(target, block, "SECS");
+        statement.index = compileInputExpr(target, block, "TO");
+    } else if (block.opcode == "motion_ifonedgebounce") {
+        statement.opcode = SJIT_STMT_MOTION_IF_ON_EDGE_BOUNCE;
+    } else if (block.opcode == "motion_setrotationstyle") {
+        statement.opcode = SJIT_STMT_MOTION_SET_ROTATION_STYLE;
+        statement.value = makeLiteralString(fieldName(block, "STYLE"));
+    } else if (block.opcode == "control_create_clone_of") {
+        statement.opcode = SJIT_STMT_CREATE_CLONE;
+        statement.value = compileInputExpr(target, block, "CLONE_OPTION");
+    } else if (block.opcode == "control_delete_this_clone") {
+        statement.opcode = SJIT_STMT_DELETE_CLONE;
+    } else if (block.opcode == "control_incr_counter") {
+        statement.opcode = SJIT_STMT_CONTROL_INCR_COUNTER;
+    } else if (block.opcode == "control_clear_counter") {
+        statement.opcode = SJIT_STMT_CONTROL_CLEAR_COUNTER;
+    } else if (block.opcode == "control_all_at_once") {
+        statement.opcode = SJIT_STMT_CONTROL_ALL_AT_ONCE;
+        assignSubstack(target, block, "SUBSTACK", statement.substack, statement.substack_count);
+    } else if (block.opcode == "sensing_askandwait") {
+        statement.opcode = SJIT_STMT_SENSING_ASK_AND_WAIT;
+        statement.value = compileInputExpr(target, block, "QUESTION");
+    } else if (block.opcode == "sound_play") {
+        statement.opcode = SJIT_STMT_SOUND_PLAY;
+        statement.value = compileInputExpr(target, block, "SOUND_MENU");
+    } else if (block.opcode == "sound_playuntildone") {
+        statement.opcode = SJIT_STMT_SOUND_PLAY_UNTIL_DONE;
+        statement.value = compileInputExpr(target, block, "SOUND_MENU");
+    } else if (block.opcode == "sound_stopallsounds") {
+        statement.opcode = SJIT_STMT_SOUND_STOP_ALL;
+    } else if (block.opcode == "sound_seteffectto") {
+        statement.opcode = SJIT_STMT_SOUND_SET_EFFECT;
+        statement.index = inputValue(block, "EFFECT") ?
+            compileInputExpr(target, block, "EFFECT") :
+            makeLiteralString(fieldName(block, "EFFECT"));
+        statement.value = compileInputExpr(target, block, "VALUE");
+    } else if (block.opcode == "sound_changeeffectby") {
+        statement.opcode = SJIT_STMT_SOUND_CHANGE_EFFECT;
+        statement.index = inputValue(block, "EFFECT") ?
+            compileInputExpr(target, block, "EFFECT") :
+            makeLiteralString(fieldName(block, "EFFECT"));
+        statement.value = compileInputExpr(target, block, "VALUE");
+    } else if (block.opcode == "sound_cleareffects") {
+        statement.opcode = SJIT_STMT_SOUND_CLEAR_EFFECTS;
+    } else if (block.opcode == "sound_setvolumeto") {
+        statement.opcode = SJIT_STMT_SOUND_SET_VOLUME;
+        statement.value = compileInputExpr(target, block, "VOLUME");
+    } else if (block.opcode == "sound_changevolumeby") {
+        statement.opcode = SJIT_STMT_SOUND_CHANGE_VOLUME;
+        statement.value = compileInputExpr(target, block, "VOLUME");
+    } else if (block.opcode == "pen_setPenColorParamTo") {
+        statement.opcode = SJIT_STMT_PEN_SET_COLOR_PARAM;
+        statement.index = inputValue(block, "COLOR_PARAM") ?
+            compileInputExpr(target, block, "COLOR_PARAM") :
+            makeLiteralString(fieldName(block, "COLOR_PARAM"));
+        statement.value = compileInputExpr(target, block, "VALUE");
+    } else if (block.opcode == "pen_changePenSizeBy") {
+        statement.opcode = SJIT_STMT_PEN_CHANGE_SIZE;
+        statement.value = compileInputExpr(target, block, "SIZE");
+    } else if (block.opcode == "pen_setPenShadeToNumber") {
+        statement.opcode = SJIT_STMT_PEN_SET_SHADE;
+        statement.value = compileInputExpr(target, block, "SHADE");
+    } else if (block.opcode == "pen_changePenShadeBy") {
+        statement.opcode = SJIT_STMT_PEN_CHANGE_SHADE;
+        statement.value = compileInputExpr(target, block, "SHADE");
+    } else if (block.opcode == "pen_setPenHueToNumber") {
+        statement.opcode = SJIT_STMT_PEN_SET_HUE;
+        statement.value = compileInputExpr(target, block, "HUE");
+    } else if (block.opcode == "pen_changePenHueBy") {
+        statement.opcode = SJIT_STMT_PEN_CHANGE_HUE;
+        statement.value = compileInputExpr(target, block, "HUE");
     } else if (block.opcode == "pen_clear") {
         statement.opcode = SJIT_STMT_PEN_CLEAR;
     } else if (block.opcode == "pen_penDown") {
@@ -1538,9 +1855,17 @@ SStatement compileStatement(const TargetBuild &target, const Block &block) {
         statement.opcode = SJIT_STMT_PEN_CHANGE_COLOR_PARAM;
         statement.index = compileInputExpr(target, block, "COLOR_PARAM");
         statement.value = compileInputExpr(target, block, "VALUE");
+    } else if (block.opcode == "motion_scroll_right" ||
+        block.opcode == "motion_scroll_up" ||
+        block.opcode == "motion_align_scene" ||
+        block.opcode == "motion_xscroll" ||
+        block.opcode == "motion_yscroll") {
+        // Scratch 2 compatibility blocks retained in SB3 projects. The
+        // current Scratch VM deliberately treats these as no-ops.
+        accepted_noop = true;
     }
 
-    if (statement.opcode == SJIT_STMT_NOOP) {
+    if (statement.opcode == SJIT_STMT_NOOP && !accepted_noop) {
         throw std::runtime_error(
             "unsupported statement opcode '" + block.opcode +
             "' in block '" + block.id + "'");
@@ -1776,6 +2101,54 @@ ProjectLoadResult loadProjectIntoRuntime(SRuntime *runtime, const std::string &p
                     static_cast<int>(costume_names.size()))) {
                 throw std::runtime_error("failed to store costumes for target " + name);
             }
+            std::vector<double> costume_widths;
+            std::vector<double> costume_heights;
+            costume_widths.reserve(render_info.costumes.size());
+            costume_heights.reserve(render_info.costumes.size());
+            for (const CostumeRenderInfo &costume : render_info.costumes) {
+                costume_widths.push_back(costume.width);
+                costume_heights.push_back(costume.height);
+            }
+            if (!sjit_sprite_set_costume_geometry(
+                    sprite,
+                    costume_widths.empty() ? nullptr : costume_widths.data(),
+                    costume_heights.empty() ? nullptr : costume_heights.data(),
+                    static_cast<int>(costume_widths.size()))) {
+                throw std::runtime_error("failed to store costume geometry for target " + name);
+            }
+
+            const Json *sounds = objectGet(target_json, "sounds");
+            if (sounds && sounds->isArray()) {
+                for (const Json &sound_json : sounds->asArray()) {
+                    if (!sound_json.isObject()) {
+                        continue;
+                    }
+                    SoundRenderInfo sound;
+                    sound.name = objectString(sound_json, "name", "");
+                    sound.asset_id = objectString(sound_json, "assetId", "");
+                    sound.data_format = objectString(sound_json, "dataFormat", "wav");
+                    if (!sound.asset_id.empty()) {
+                        std::vector<std::string> candidates;
+                        if (!sound.data_format.empty()) {
+                            candidates.push_back(sound.asset_id + "." + sound.data_format);
+                        }
+                        candidates.push_back(sound.asset_id + ".wav");
+                        candidates.push_back(sound.asset_id + ".mp3");
+                        candidates.push_back(sound.asset_id + ".ogg");
+                        for (const std::string &candidate : candidates) {
+                            try {
+                                sound.source_data = extractZipEntry(path, candidate);
+                                if (!sound.source_data.empty()) {
+                                    break;
+                                }
+                            } catch (const std::exception &) {
+                                /* Try the next conventional SB3 extension. */
+                            }
+                        }
+                    }
+                    render_info.sounds.push_back(std::move(sound));
+                }
+            }
 
             const Json *variables = objectGet(target_json, "variables");
             if (variables && variables->isObject()) {
@@ -1970,6 +2343,13 @@ ProjectLoadResult loadProjectIntoRuntime(SRuntime *runtime, const std::string &p
                 }
                 copyStatementsToScript(script, statements);
                 copyProceduresToScript(script, target);
+                if (block.opcode == "event_whentouchingobject") {
+                    script->hat_edge_value = compileInputExpr(
+                        target, block, "TOUCHINGOBJECTMENU");
+                } else if (block.opcode == "event_whengreaterthan") {
+                    script->hat_edge_value = compileInputExpr(
+                        target, block, "VALUE");
+                }
                 SScriptEntryFn entry = sjit_script_interpreter_entry;
                 if (jit && !disableScriptJit) {
                     try {

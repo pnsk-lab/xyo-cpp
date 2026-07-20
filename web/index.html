@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>xyo-cpp WebAssembly</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main class="page">
+      <header>
+        <p class="eyebrow">xyo-cpp / Emscripten</p>
+        <h1>Scratch LLVM VM Web Player</h1>
+        <p class="lead">`.sb3` ファイルを選択すると、WASM ランタイムでブラウザ上に実行します。</p>
+      </header>
+
+      <section class="toolbar" aria-label="プロジェクト操作">
+        <label class="file-picker">
+          <span>SB3 を開く</span>
+          <input id="project-file" type="file" accept=".sb3,application/zip">
+        </label>
+        <button id="start" type="button" disabled>緑の旗</button>
+        <button id="stop" type="button" disabled>停止</button>
+        <span id="status" role="status">WASM を読み込み中…</span>
+      </section>
+
+      <section class="player" aria-label="Scratch ステージ">
+        <canvas id="stage" width="480" height="360" tabindex="0" aria-label="Scratch stage"></canvas>
+        <form id="ask" class="ask" hidden>
+          <label id="ask-label" for="ask-input"></label>
+          <div>
+            <input id="ask-input" type="text" maxlength="200" autocomplete="off">
+            <button type="submit">送信</button>
+          </div>
+        </form>
+      </section>
+
+      <details>
+        <summary>GitHub Pages での公開</summary>
+        <p>このページは <code>main</code> への push ごとに GitHub Actions が Emscripten で再ビルドし、GitHub Pages に自動デプロイします。</p>
+      </details>
+    </main>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

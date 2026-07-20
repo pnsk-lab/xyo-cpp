@@ -3,6 +3,7 @@
 
 #include "sjit_abi.h"
 #include "sjit_compare.h"
+#include "sjit_clone.h"
 #include "sjit_control.h"
 #include "sjit_data.h"
 #include "sjit_event.h"
@@ -15,6 +16,8 @@
 #include "sjit_pen.h"
 #include "sjit_runtime.h"
 #include "sjit_script.h"
+#include "sjit_sensing.h"
+#include "sjit_sound.h"
 #include "sjit_value.h"
 
 #endif

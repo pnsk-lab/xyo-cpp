@@ -78,6 +78,16 @@ typedef struct SFrame {
     int waiting_child_count;
     int started_thread_begin;
     int started_thread_count;
+    /* Appended suspension state; the original frame prefix stays stable for
+       generated LLVM code. */
+    const void *timed_statement;
+    int timed_event_kind;
+    int glide_active;
+    double glide_start_x;
+    double glide_start_y;
+    double glide_end_x;
+    double glide_end_y;
+    double glide_finish_ms;
 } SFrame;
 
 typedef SRuntimeStatus (*SScriptEntryFn)(SRuntime *runtime, SThread *thread, SFrame *frame);
@@ -171,6 +181,31 @@ typedef struct {
     int capacity;
     int revision;
 } SPenPathBuffer;
+
+typedef enum {
+    SJIT_AUDIO_PLAY = 0,
+    SJIT_AUDIO_STOP_ALL = 1,
+    SJIT_AUDIO_SET_EFFECT = 2,
+    SJIT_AUDIO_CHANGE_EFFECT = 3,
+    SJIT_AUDIO_CLEAR_EFFECTS = 4,
+    SJIT_AUDIO_SET_VOLUME = 5,
+    SJIT_AUDIO_CHANGE_VOLUME = 6
+} SAudioCommandKind;
+
+typedef struct {
+    int kind;
+    int target_id;
+    int effect;
+    double value;
+    SString *sound_name;
+} SAudioCommand;
+
+typedef struct {
+    SAudioCommand *items;
+    int length;
+    int capacity;
+    int revision;
+} SAudioCommandBuffer;
 
 enum {
     SJIT_HAT_EVENT_WHENFLAGCLICKED = 1,

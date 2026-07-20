@@ -9,10 +9,10 @@ extern "C" {
 
 int sjit_event_broadcast(SRuntime *runtime, const char *message);
 SRuntimeStatus sjit_event_broadcast_and_wait(SRuntime *runtime, SFrame *frame, const char *message, int resume_pc);
+void sjit_event_poll_edge_hats(SRuntime *runtime);
 
 #ifdef __cplusplus
 }
 #endif
 
 #endif
-
