@@ -33,7 +33,10 @@ target_include_directories(xyo-web PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/quickjs_subset
 )
 target_compile_definitions(xyo-web PRIVATE SJIT_WEB=1)
-target_compile_options(xyo-web PRIVATE -fexceptions)
+target_compile_options(xyo-web PRIVATE
+    -fexceptions
+    -sUSE_ZLIB=1
+)
 target_link_libraries(xyo-web PRIVATE sjit_runtime_web)
 target_link_options(xyo-web PRIVATE
     --no-entry

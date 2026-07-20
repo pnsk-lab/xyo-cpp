@@ -9,7 +9,12 @@
 #include <llvm/Analysis/LoopAnalysisManager.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Bitcode/BitcodeReader.h>
+#if __has_include(<llvm/ExecutionEngine/Orc/AbsoluteSymbols.h>)
 #include <llvm/ExecutionEngine/Orc/AbsoluteSymbols.h>
+#else
+// Ubuntu 24.04's LLVM 18 package keeps this API in Core.h.
+#include <llvm/ExecutionEngine/Orc/Core.h>
+#endif
 #include <llvm/ExecutionEngine/Orc/ExecutionUtils.h>
 #include <llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
