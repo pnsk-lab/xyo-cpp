@@ -7,6 +7,7 @@
 
 #include <stdint.h>
 #include <math.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -14,12 +15,23 @@ static int ensure_pen_path_capacity(SPenPathBuffer *path, int wanted) {
     if (!path) {
         return 0;
     }
+    if (wanted < 0 || path->length < 0 || path->capacity < 0 ||
+        path->length > path->capacity) {
+        return 0;
+    }
     if (wanted <= path->capacity) {
-        return 1;
+        return path->items != NULL || wanted == 0;
     }
     int next = path->capacity > 0 ? path->capacity : SJIT_INITIAL_CAPACITY;
     while (next < wanted) {
+        if (next > INT_MAX / 2) {
+            next = wanted;
+            break;
+        }
         next *= 2;
+    }
+    if ((size_t)next > SIZE_MAX / sizeof(SDrawCommand)) {
+        return 0;
     }
     SDrawCommand *items = (SDrawCommand *)realloc(path->items, sizeof(SDrawCommand) * (size_t)next);
     if (!items) {

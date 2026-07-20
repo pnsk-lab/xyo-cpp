@@ -2076,13 +2076,36 @@ jit_pen_store_raster_tile_pixel(
     tile->command_count += 1;
 }
 
-static inline __attribute__((always_inline)) void
+static inline __attribute__((always_inline)) int
 jit_pen_append_reserved_stamp(
     SRuntime *runtime,
     SSprite *sprite,
     double x,
     double y) {
+    if (!runtime || !sprite || runtime->pen.length < 0 ||
+        runtime->pen.capacity < runtime->pen.length ||
+        (runtime->pen.capacity > 0 && !runtime->pen.items)) {
+        return 0;
+    }
     SJIT_PROFILE_INC(runtime, SJIT_PROFILE_PEN_STAMP);
+    if (runtime->pen.length >= runtime->pen.capacity) {
+        if (!sjit_pen_path_push(
+                &runtime->pen,
+                sprite->base.id,
+                x,
+                y,
+                x,
+                y,
+                sprite->pen_size,
+                sprite->pen_r,
+                sprite->pen_g,
+                sprite->pen_b,
+                sprite->pen_a)) {
+            return 0;
+        }
+        sprite->pen_down = 0;
+        return 1;
+    }
     SDrawCommand command = {0};
     command.kind = SJIT_DRAW_PEN_STROKE;
     command.target_id = sprite->base.id;
@@ -2098,6 +2121,7 @@ jit_pen_append_reserved_stamp(
     command.visible = 1;
     runtime->pen.items[runtime->pen.length++] = command;
     sprite->pen_down = 0;
+    return 1;
 }
 
 static int jit_native_pen_row_reject(const char *reason) {
@@ -2274,7 +2298,9 @@ int sjit_jit_pen_render_row_from_variables(
                     sprite);
                 sprite->pen_down = 0;
             } else {
-                jit_pen_append_reserved_stamp(runtime, sprite, x, y);
+                if (!jit_pen_append_reserved_stamp(runtime, sprite, x, y)) {
+                    return jit_native_pen_row_reject("pen append");
+                }
                 runtime->pen_materialized_valid = 0;
             }
         }

@@ -456,13 +456,17 @@ SRuntimeStatus sjit_runtime_tick(SRuntime *runtime) {
             runtime->draw_pen_length = copied_pen ? logical_count : 0;
         }
         runtime->draw_pen_revision = runtime->pen.revision;
-    } else if (runtime->pen.length <= runtime->pen.capacity &&
-               visible_targets <= runtime->pen.capacity - runtime->pen.length) {
-        runtime->draw.items = runtime->pen.items;
-        runtime->draw.length = runtime->pen.length;
-        runtime->draw.capacity = runtime->pen.capacity;
+    } else if (runtime->pen.length <= runtime->pen.capacity) {
+        /* Keep the pen path and the frame draw buffer independently owned.
+           Aliasing pen.items here lets sjit_draw_push() realloc only the draw
+           buffer, leaving pen.items dangling when sprites grow the frame. */
+        const SDrawCommandBuffer source = {
+            runtime->pen.items,
+            runtime->pen.length,
+            runtime->pen.capacity};
+        const int copied_pen = sjit_draw_append(&runtime->draw, &source);
         runtime->draw_pen_revision = runtime->pen.revision;
-        runtime->draw_pen_length = runtime->pen.length;
+        runtime->draw_pen_length = copied_pen ? runtime->pen.length : 0;
     } else {
         const int copied_pen = sjit_pen_path_append_draw(&runtime->draw, &runtime->pen);
         runtime->draw_owned_items = runtime->draw.items;
