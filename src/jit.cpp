@@ -6125,53 +6125,14 @@ ModuleBuild createScriptModule(const llvm::DataLayout &dataLayout, const SCompil
                 resultName);
             return result;
         }
-        case 7: {
-            llvm::Value *angle = activeBuilder.CreateFRem(
-                value,
-                llvm::ConstantFP::get(f64, 360.0),
-                "mathop_tan_angle");
-            llvm::Value *radians = activeBuilder.CreateFMul(
-                angle,
-                llvm::ConstantFP::get(f64, 3.14159265358979323846 / 180.0),
-                "mathop_tan_radians");
-            llvm::Value *tangent = activeBuilder.CreateUnaryIntrinsic(llvm::Intrinsic::tan, radians);
-            llvm::Value *scaled = activeBuilder.CreateFMul(
-                tangent,
-                llvm::ConstantFP::get(f64, 10000000000.0),
-                "mathop_tan_round_scaled");
-            llvm::Value *rounded = activeBuilder.CreateUnaryIntrinsic(llvm::Intrinsic::round, scaled);
-            llvm::Value *finiteResult = activeBuilder.CreateFDiv(
-                rounded,
-                llvm::ConstantFP::get(f64, 10000000000.0),
-                "mathop_tan_rounded");
-            llvm::Value *positiveInfinity = activeBuilder.CreateOr(
-                activeBuilder.CreateFCmpOEQ(angle, llvm::ConstantFP::get(f64, 90.0)),
-                activeBuilder.CreateFCmpOEQ(angle, llvm::ConstantFP::get(f64, -270.0)));
-            llvm::Value *negativeInfinity = activeBuilder.CreateOr(
-                activeBuilder.CreateFCmpOEQ(angle, llvm::ConstantFP::get(f64, -90.0)),
-                activeBuilder.CreateFCmpOEQ(angle, llvm::ConstantFP::get(f64, 270.0)));
-            llvm::Value *withPositiveInfinity = activeBuilder.CreateSelect(
-                positiveInfinity,
-                llvm::ConstantFP::getInfinity(f64),
-                finiteResult);
-            return activeBuilder.CreateSelect(
-                negativeInfinity,
-                llvm::ConstantFP::getInfinity(f64, true),
-                withPositiveInfinity,
-                resultName);
-        }
+        case 7:
         case 8:
         case 9:
-        case 10: {
-            const llvm::Intrinsic::ID inverseIntrinsic = operatorId == 8 ?
-                llvm::Intrinsic::asin :
-                (operatorId == 9 ? llvm::Intrinsic::acos : llvm::Intrinsic::atan);
-            llvm::Value *radians = activeBuilder.CreateUnaryIntrinsic(inverseIntrinsic, value);
-            return activeBuilder.CreateFMul(
-                radians,
-                llvm::ConstantFP::get(f64, 180.0 / 3.14159265358979323846),
-                resultName);
-        }
+        case 10:
+            // LLVM exposes sin/cos intrinsics, but not tan or inverse trig
+            // intrinsics.  Return nullptr so the caller uses the runtime
+            // implementation, which also preserves Scratch's edge cases.
+            return nullptr;
         case 11:
             intrinsic = llvm::Intrinsic::log;
             break;
