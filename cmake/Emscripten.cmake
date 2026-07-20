@@ -52,7 +52,7 @@ target_link_options(xyo-web PRIVATE
     -sMAXIMUM_MEMORY=536870912
     -sNO_EXIT_RUNTIME=1
     "-sEXPORTED_FUNCTIONS=['_malloc','_free','_sjit_web_load_project_bytes','_sjit_web_last_error','_sjit_web_start','_sjit_web_stop','_sjit_web_tick','_sjit_web_set_mouse','_sjit_web_set_key','_sjit_web_blur','_sjit_web_draw_count','_sjit_web_draw_command','_sjit_web_pen_count','_sjit_web_pen_command','_sjit_web_target_count','_sjit_web_target_id','_sjit_web_target_is_stage','_sjit_web_target_name','_sjit_web_render_target_id','_sjit_web_current_costume','_sjit_web_costume_count','_sjit_web_costume_format','_sjit_web_costume_data','_sjit_web_costume_data_size','_sjit_web_costume_width','_sjit_web_costume_height','_sjit_web_costume_rotation_center_x','_sjit_web_costume_rotation_center_y','_sjit_web_answer_pending','_sjit_web_question','_sjit_web_answer','_sjit_web_bubble_text','_sjit_web_bubble_thought']"
-    "-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap']"
+    "-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','HEAPU8','HEAPF64']"
 )
 
 set_target_properties(xyo-web PROPERTIES
