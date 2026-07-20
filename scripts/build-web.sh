@@ -14,9 +14,24 @@ command -v emcmake >/dev/null 2>&1 || {
     exit 1
 }
 
+web_cmake_args=(-DSJIT_BUILD_HOST=OFF)
+if [[ "${SJIT_WEB_LLVM_JIT:-OFF}" == "ON" || -n "${SJIT_WEB_LLVM_BUILD:-}" ]]; then
+    web_cmake_args+=(-DSJIT_WEB_LLVM_JIT=ON)
+    if [[ -n "${SJIT_WEB_LLVM_SOURCE:-}" ]]; then
+        web_cmake_args+=(-DSJIT_WEB_LLVM_SOURCE="${SJIT_WEB_LLVM_SOURCE}")
+    fi
+    if [[ -n "${SJIT_WEB_LLVM_BUILD:-}" ]]; then
+        web_cmake_args+=(-DSJIT_WEB_LLVM_BUILD="${SJIT_WEB_LLVM_BUILD}")
+    fi
+fi
+if [[ -n "${SJIT_WEB_CMAKE_ARGS:-}" ]]; then
+    read -r -a extra_web_cmake_args <<< "${SJIT_WEB_CMAKE_ARGS}"
+    web_cmake_args+=("${extra_web_cmake_args[@]}")
+fi
+
 emcmake cmake -S "${repo_root}" -B "${build_dir}" \
     -DCMAKE_BUILD_TYPE=Release \
-    -DSJIT_BUILD_HOST=OFF
+    "${web_cmake_args[@]}"
 emmake cmake --build "${build_dir}" --parallel
 
 cmake -E make_directory "${site_dir}"

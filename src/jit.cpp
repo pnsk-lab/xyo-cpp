@@ -4,11 +4,15 @@
 #include "sjit_ownership_internal.h"
 #include "sjit_string.h"
 #include "sjit_thread_pool.h"
+#ifdef __EMSCRIPTEN__
+#include "web_jit_bridge.h"
+#endif
 
 #include <llvm/Analysis/CGSCCPassManager.h>
 #include <llvm/Analysis/LoopAnalysisManager.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Bitcode/BitcodeReader.h>
+#ifndef __EMSCRIPTEN__
 #if __has_include(<llvm/ExecutionEngine/Orc/AbsoluteSymbols.h>)
 #include <llvm/ExecutionEngine/Orc/AbsoluteSymbols.h>
 #else
@@ -19,6 +23,7 @@
 #include <llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
+#endif
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/Function.h>
@@ -38,6 +43,15 @@
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Transforms/IPO/GlobalDCE.h>
+#ifdef __EMSCRIPTEN__
+#include <lld/Common/Driver.h>
+LLD_HAS_DRIVER(wasm)
+#include <llvm/IR/LegacyPassManager.h>
+#include <llvm/MC/TargetRegistry.h>
+#include <llvm/Object/Wasm.h>
+#include <llvm/Target/TargetMachine.h>
+#include <llvm/TargetParser/Triple.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -54,6 +68,8 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <limits>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -71,7 +87,7 @@ std::string takeError(llvm::Error error) {
 }
 
 template <class T>
-T unwrapExpected(llvm::Expected<T> expected, const char *context) {
+T unwrapExpected(llvm::Expected<T> expected, const std::string &context) {
     if (!expected) {
         throw std::runtime_error(std::string(context) + ": " + takeError(expected.takeError()));
     }
@@ -84,6 +100,7 @@ void checkError(llvm::Error error, const char *context) {
     }
 }
 
+#ifndef __EMSCRIPTEN__
 std::unique_ptr<llvm::orc::LLJIT> createOptimizedLlJit(const char *context) {
     auto target = unwrapExpected(llvm::orc::JITTargetMachineBuilder::detectHost(), "detect host target");
     target.setCodeGenOptLevel(llvm::CodeGenOptLevel::Aggressive);
@@ -91,6 +108,7 @@ std::unique_ptr<llvm::orc::LLJIT> createOptimizedLlJit(const char *context) {
         llvm::orc::LLJITBuilder().setJITTargetMachineBuilder(std::move(target)).create(),
         context);
 }
+#endif
 
 struct SmokeModule {
     std::unique_ptr<llvm::LLVMContext> context;
@@ -418,6 +436,7 @@ bool linkRuntimeHelpersIntoScript(
     return true;
 }
 
+#ifndef __EMSCRIPTEN__
 bool addRuntimeObjectIfAvailable(llvm::orc::LLJIT &jit) {
     if (std::getenv("SJIT_DISABLE_RUNTIME_OBJECT") != nullptr) {
         return false;
@@ -474,6 +493,7 @@ bool addRuntimeCodeIfAvailable(llvm::orc::LLJIT &jit) {
         "add runtime bitcode");
     return true;
 }
+#endif
 
 llvm::Value *isNull(llvm::IRBuilder<> &builder, llvm::Value *pointer) {
     return builder.CreateICmpEQ(pointer, llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(pointer->getType())));
@@ -11986,6 +12006,7 @@ ModuleBuild createScriptModule(const llvm::DataLayout &dataLayout, const SCompil
 
 } // namespace
 
+#ifndef __EMSCRIPTEN__
 namespace sjit {
 
 struct JitEngine::Impl {
@@ -12700,4 +12721,431 @@ void emitRuntimeLl(const std::string &path) {
     output.flush();
 }
 
+} // namespace sjit
+
+#else
+
+namespace {
+
+constexpr std::size_t kWebWasmPageSize = 65536;
+
+struct WebWasmArtifact {
+    std::vector<uint8_t> module;
+    void *allocation = nullptr;
+    std::size_t allocation_size = 0;
+    std::uintptr_t base = 0;
+    std::uintptr_t stack_base = 0;
+};
+
+std::unique_ptr<llvm::TargetMachine> createWebTargetMachine() {
+    llvm::InitializeAllTargetInfos();
+    llvm::InitializeAllTargets();
+    llvm::InitializeAllTargetMCs();
+    llvm::InitializeAllAsmPrinters();
+
+    const llvm::Triple triple("wasm32-unknown-unknown");
+    std::string error;
+    const llvm::Target *target = llvm::TargetRegistry::lookupTarget(triple, error);
+    if (!target) {
+        throw std::runtime_error("lookup WebAssembly LLVM target: " + error);
+    }
+    llvm::TargetOptions options;
+    auto machine = std::unique_ptr<llvm::TargetMachine>(target->createTargetMachine(
+        triple,
+        "generic",
+        "",
+        options,
+        llvm::Reloc::PIC_,
+        std::nullopt,
+        llvm::CodeGenOptLevel::Aggressive));
+    if (!machine) {
+        throw std::runtime_error("create WebAssembly LLVM target machine");
+    }
+    return machine;
 }
+
+void removeWebFile(const std::string &path) {
+    llvm::sys::fs::remove(path, true);
+}
+
+void writeWebFile(const std::string &path, llvm::StringRef bytes) {
+    std::error_code error;
+    llvm::raw_fd_ostream output(path, error, llvm::sys::fs::OF_None);
+    if (error) {
+        throw std::runtime_error("open " + path + ": " + error.message());
+    }
+    output.write(bytes.data(), bytes.size());
+    output.flush();
+    if (output.has_error()) {
+        throw std::runtime_error("write " + path);
+    }
+}
+
+std::vector<uint8_t> readWebFile(const std::string &path) {
+    auto buffer = llvm::MemoryBuffer::getFile(path);
+    if (!buffer) {
+        throw std::runtime_error("read " + path + ": " + buffer.getError().message());
+    }
+    const auto *begin = reinterpret_cast<const uint8_t *>((*buffer)->getBufferStart());
+    return std::vector<uint8_t>(begin, begin + (*buffer)->getBufferSize());
+}
+
+std::vector<uint8_t> linkWebObject(
+    const std::string &object_path,
+    const std::string &output_path,
+    const std::string &entry_name,
+    std::uintptr_t global_base) {
+    const std::vector<std::string> argument_storage = {
+        "wasm-ld",
+        "--no-entry",
+        "--import-memory",
+        "--allow-undefined",
+        "--gc-sections",
+        "--export=" + entry_name,
+        "--export=__stack_pointer",
+        "--global-base=" + std::to_string(global_base),
+        object_path,
+        "-o",
+        output_path,
+    };
+    std::vector<const char *> arguments;
+    arguments.reserve(argument_storage.size());
+    for (const std::string &argument : argument_storage) {
+        arguments.push_back(argument.c_str());
+    }
+
+    std::string stdout_buffer;
+    std::string stderr_buffer;
+    llvm::raw_string_ostream stdout_stream(stdout_buffer);
+    llvm::raw_string_ostream stderr_stream(stderr_buffer);
+    const lld::DriverDef drivers[] = {
+        {lld::Wasm, &lld::wasm::link},
+    };
+    const lld::Result result = lld::lldMain(
+        arguments,
+        stdout_stream,
+        stderr_stream,
+        drivers);
+    if (result.retCode != 0) {
+        throw std::runtime_error(
+            "link dynamic WebAssembly module: " + stderr_buffer);
+    }
+    return readWebFile(output_path);
+}
+
+uint64_t webWasmMinimumPages(const std::vector<uint8_t> &module) {
+    const llvm::StringRef bytes(
+        reinterpret_cast<const char *>(module.data()),
+        module.size());
+    auto object = unwrapExpected(
+        llvm::object::ObjectFile::createWasmObjectFile(
+            llvm::MemoryBufferRef(bytes, "dynamic-wasm")),
+        "parse dynamic WebAssembly module");
+    const auto memories = object->memories();
+    if (memories.empty()) {
+        return 1;
+    }
+    return memories.front().Minimum;
+}
+
+WebWasmArtifact emitWebWasmModule(
+    llvm::TargetMachine &machine,
+    const SCompiledScript &script,
+    const std::string &name) {
+    ModuleBuild built = createScriptModule(machine.createDataLayout(), script, name);
+    built.module->setTargetTriple(machine.getTargetTriple());
+    built.module->setDataLayout(machine.createDataLayout());
+    if (std::getenv("SJIT_WEB_DISABLE_OPT") == nullptr) {
+        optimizeModule(*built.module);
+    }
+    verifyModuleOrThrow(*built.module, "verify WebAssembly script module");
+
+    llvm::SmallVector<char, 16384> object_bytes;
+    llvm::raw_svector_ostream object_stream(object_bytes);
+    llvm::legacy::PassManager passes;
+    if (machine.addPassesToEmitFile(
+            passes,
+            object_stream,
+            nullptr,
+            llvm::CodeGenFileType::ObjectFile)) {
+        throw std::runtime_error("WebAssembly target cannot emit an object file");
+    }
+    passes.run(*built.module);
+    if (object_bytes.empty()) {
+        throw std::runtime_error("LLVM emitted an empty WebAssembly object");
+    }
+
+    static uint32_t next_module_id = 1;
+    const uint32_t module_id = next_module_id++;
+    const std::string stem = "/sjit-web-" + std::to_string(module_id);
+    const std::string object_path = stem + ".o";
+    const std::string first_output_path = stem + ".first.wasm";
+    const std::string final_output_path = stem + ".wasm";
+    try {
+        writeWebFile(
+            object_path,
+            llvm::StringRef(object_bytes.data(), object_bytes.size()));
+        const std::vector<uint8_t> first_module = linkWebObject(
+            object_path,
+            first_output_path,
+            name,
+            0);
+        const uint64_t minimum_pages = webWasmMinimumPages(first_module);
+        const uint64_t reserve_pages = std::max<uint64_t>(
+            4,
+            minimum_pages + 1);
+        if (reserve_pages > (std::numeric_limits<std::size_t>::max() / kWebWasmPageSize) - 1) {
+            throw std::runtime_error("dynamic WebAssembly stack reservation is too large");
+        }
+        const std::size_t allocation_size =
+            static_cast<std::size_t>(reserve_pages + 1) * kWebWasmPageSize;
+        void *allocation = std::malloc(allocation_size);
+        if (!allocation) {
+            throw std::runtime_error("reserve dynamic WebAssembly linear memory");
+        }
+        const std::uintptr_t raw = reinterpret_cast<std::uintptr_t>(allocation);
+        const std::uintptr_t base =
+            (raw + kWebWasmPageSize - 1) & ~(kWebWasmPageSize - 1);
+        const std::uintptr_t stack_base =
+            base + static_cast<std::uintptr_t>(reserve_pages * kWebWasmPageSize) - 16;
+
+        try {
+            WebWasmArtifact artifact;
+            artifact.module = linkWebObject(
+                object_path,
+                final_output_path,
+                name,
+                base);
+            artifact.allocation = allocation;
+            artifact.allocation_size = allocation_size;
+            artifact.base = base;
+            artifact.stack_base = stack_base;
+            removeWebFile(first_output_path);
+            removeWebFile(final_output_path);
+            removeWebFile(object_path);
+            return artifact;
+        } catch (...) {
+            std::free(allocation);
+            throw;
+        }
+    } catch (...) {
+        removeWebFile(first_output_path);
+        removeWebFile(final_output_path);
+        removeWebFile(object_path);
+        throw;
+    }
+}
+
+} // namespace
+
+namespace sjit {
+
+struct JitEngine::Impl {
+    struct ScriptBinding {
+        SCompiledScript *script = nullptr;
+        SScriptEntryFn scriptEntry = nullptr;
+        std::vector<SProcedureEntryFn> procedureEntries;
+        int webHandle = 0;
+        void *allocation = nullptr;
+        std::size_t allocationSize = 0;
+    };
+
+    std::unique_ptr<llvm::TargetMachine> targetMachine;
+    std::string lastFallbackReason;
+    std::vector<ScriptBinding> scriptBindings;
+
+    ~Impl() {
+        for (ScriptBinding &binding : scriptBindings) {
+            if (binding.webHandle != 0) {
+                sjit_web_jit_unregister_module(binding.webHandle);
+            }
+            if (binding.script) {
+                binding.script->web_jit_handle = 0;
+            }
+            std::free(binding.allocation);
+            binding.webHandle = 0;
+            binding.allocation = nullptr;
+            binding.allocationSize = 0;
+        }
+    }
+
+    void rememberEntries(
+        SCompiledScript &script,
+        SScriptEntryFn scriptEntry,
+        int webHandle,
+        void *allocation,
+        std::size_t allocationSize) {
+        scriptBindings.push_back({
+            &script,
+            scriptEntry,
+            std::vector<SProcedureEntryFn>(
+                static_cast<std::size_t>(std::max(0, script.procedure_count)),
+                nullptr),
+            webHandle,
+            allocation,
+            allocationSize,
+        });
+    }
+
+    bool hasExactBinding(
+        const SCompiledScript &script,
+        SScriptEntryFn entry) const {
+        for (const ScriptBinding &binding : scriptBindings) {
+            if (binding.script == &script && binding.scriptEntry == entry &&
+                binding.webHandle == static_cast<int>(script.web_jit_handle)) {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+JitEngine::JitEngine() : impl_(std::make_unique<Impl>()) {
+    impl_->targetMachine = createWebTargetMachine();
+}
+
+JitEngine::~JitEngine() = default;
+
+SScriptEntryFn JitEngine::compileScript(
+    const SCompiledScript &script,
+    const std::string &name,
+    SRuntime *runtime) {
+    SCompiledScript &mutableScript = const_cast<SCompiledScript &>(script);
+    impl_->lastFallbackReason.clear();
+    mutableScript.web_jit_handle = 0;
+    mutableScript.jit_runtime_instance_id =
+        runtime && std::getenv("SJIT_DISABLE_VARIABLE_PREBIND") == nullptr ?
+            runtime->instance_id : 0;
+    if (!unsafeRawRuntimeObjectConstantsEnabled()) {
+        mutableScript.bound_target = nullptr;
+    }
+    for (int i = 0; i < mutableScript.procedure_count; ++i) {
+        mutableScript.procedures[i].jit_entry = nullptr;
+    }
+
+    if (const std::string reason = scriptInterpreterFallbackReason(script); !reason.empty()) {
+        impl_->lastFallbackReason = reason;
+        if (std::getenv("SJIT_LOG_JIT_FALLBACK") != nullptr) {
+            std::fprintf(
+                stderr,
+                "sjit: %s uses interpreter fallback: %s\n",
+                name.c_str(),
+                reason.c_str());
+        }
+        return sjit_script_interpreter_entry;
+    }
+    if (runtime && std::getenv("SJIT_DISABLE_VARIABLE_PREBIND") == nullptr) {
+        prebindScriptVariables(runtime, mutableScript);
+    }
+
+    WebWasmArtifact artifact = emitWebWasmModule(
+        *impl_->targetMachine,
+        script,
+        name);
+    const int handle = sjit_web_jit_register_module(
+        artifact.module.data(),
+        static_cast<int>(artifact.module.size()),
+        name.c_str(),
+        static_cast<int>(artifact.stack_base));
+    if (handle == 0) {
+        std::free(artifact.allocation);
+        throw std::runtime_error("instantiate generated WebAssembly module");
+    }
+    mutableScript.web_jit_handle = static_cast<uint32_t>(handle);
+    impl_->rememberEntries(
+        mutableScript,
+        sjit_web_wasm_entry,
+        handle,
+        artifact.allocation,
+        artifact.allocation_size);
+    return sjit_web_wasm_entry;
+}
+
+bool JitEngine::certifyScriptOwnership(
+    SRuntime *runtime,
+    int scriptId,
+    const SCompiledScript &script,
+    SScriptEntryFn entry) const {
+    if (!impl_ || !runtime || !entry ||
+        entry == sjit_script_interpreter_entry ||
+        !impl_->hasExactBinding(script, entry)) {
+        return false;
+    }
+    return sjit_runtime_record_attested_script_ownership(
+        runtime,
+        scriptId,
+        &script,
+        entry) != 0;
+}
+
+const std::string &JitEngine::lastFallbackReason() const {
+    return impl_->lastFallbackReason;
+}
+
+bool JitEngine::hasRuntimeBitcode() const {
+    return false;
+}
+
+SRuntimeTickFn JitEngine::runtimeTick() {
+    return nullptr;
+}
+
+SRuntimeVoidFn JitEngine::runtimeGreenFlag() {
+    return nullptr;
+}
+
+SRuntimeVoidFn JitEngine::runtimeStopAll() {
+    return nullptr;
+}
+
+SRuntimeThreadQueryFn JitEngine::runtimeHasThreads() {
+    return nullptr;
+}
+
+SRuntimeThreadQueryFn JitEngine::runtimeThreadCount() {
+    return nullptr;
+}
+
+SRuntimePenPathDataFn JitEngine::runtimePenPathData() {
+    return nullptr;
+}
+
+SRuntimeThreadQueryFn JitEngine::runtimePenPathCount() {
+    return nullptr;
+}
+
+SRuntimeThreadQueryFn JitEngine::runtimePenPathRevision() {
+    return nullptr;
+}
+
+void JitEngine::emitScriptLl(
+    const SCompiledScript &script,
+    const std::string &name,
+    const std::string &path) {
+    (void)script;
+    (void)name;
+    (void)path;
+    throw std::runtime_error("LLVM textual IR emission is unavailable in the Web build");
+}
+
+void JitEngine::emitRuntimeLl(const std::string &path) {
+    (void)path;
+    throw std::runtime_error("LLVM textual IR emission is unavailable in the Web build");
+}
+
+SValue runSmokeJit() {
+    return sjit_make_number(7.0);
+}
+
+void emitSmokeLl(const std::string &path) {
+    (void)path;
+    throw std::runtime_error("LLVM textual IR emission is unavailable in the Web build");
+}
+
+void emitRuntimeLl(const std::string &path) {
+    (void)path;
+    throw std::runtime_error("LLVM textual IR emission is unavailable in the Web build");
+}
+
+} // namespace sjit
+#endif

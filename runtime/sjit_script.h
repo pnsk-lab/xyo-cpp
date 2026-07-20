@@ -3,6 +3,8 @@
 
 #include "sjit_runtime.h"
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -281,6 +283,10 @@ struct SCompiledScript {
     /* Edge-activated hat inputs are kept on the immutable script arena so the
        runtime can re-evaluate reporter-valued hat arguments each tick. */
     SExpr *hat_edge_value;
+    /* Web LLVM JIT metadata.  These fields are appended so the generated
+       native ABI prefix remains unchanged.  The handle is owned by the
+       JitEngine and is invalidated before this script arena is destroyed. */
+    uint32_t web_jit_handle;
 };
 
 SCompiledScript *sjit_compiled_script_create(int target_id, int statement_count);
