@@ -63,3 +63,106 @@ jobs:
             build-cmake/libxyo_core.a
             build-cmake/sjit_runtime.bc
             build-cmake/sjit_runtime.o
+
+  web-llvm-jit:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: false
+
+      - name: Check out QuickJS submodule
+        run: git submodule update --init quickjs
+
+      - name: Check out pinned LLVM/lld sources
+        uses: actions/checkout@v4
+        with:
+          repository: llvm/llvm-project
+          ref: 8a119310dae2fd67497c8611fc3208d16a36a2c3
+          path: .ci/llvm-project
+          fetch-depth: 1
+
+      - name: Install Web LLVM build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build python3
+
+      - name: Set up Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 4.0.15
+          actions-cache-folder: emsdk-cache
+
+      - name: Cache Web LLVM build
+        uses: actions/cache@v4
+        with:
+          path: .ci/llvm-build
+          key: ${{ runner.os }}-web-llvm-emscripten-4.0.15-8a119310-${{ hashFiles('scripts/build-web-llvm.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-web-llvm-emscripten-4.0.15-
+
+      - name: Build LLVM/lld for WebAssembly
+        env:
+          LLVM_SOURCE_DIR: ${{ github.workspace }}/.ci/llvm-project
+          LLVM_BUILD_DIR: ${{ github.workspace }}/.ci/llvm-build
+          LLVM_CMAKE_GENERATOR: Ninja
+        run: bash scripts/build-web-llvm.sh
+
+      - name: Build Web LLVM JIT bundle
+        env:
+          SJIT_WEB_LLVM_JIT: ON
+          SJIT_WEB_LLVM_SOURCE: ${{ github.workspace }}/.ci/llvm-project
+          SJIT_WEB_LLVM_BUILD: ${{ github.workspace }}/.ci/llvm-build
+          WEB_BUILD_DIR: ${{ github.workspace }}/build-web-llvm
+          WEB_SITE_DIR: ${{ github.workspace }}/build-web-llvm/site
+        run: bash scripts/build-web.sh
+
+      - name: Exercise dynamic WebAssembly JIT
+        env:
+          WEB_BUILD_DIR: ${{ github.workspace }}/build-web-llvm
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import {pathToFileURL} from 'node:url';
+
+          const build = process.env.WEB_BUILD_DIR;
+          const {default: XyoModule} = await import(
+              pathToFileURL(`${build}/xyo-web.js`));
+          const wasm = fs.readFileSync(`${build}/xyo-web.wasm`);
+          const project = fs.readFileSync('script.sb3');
+
+          for (let round = 0; round < 3; round += 1) {
+              const module = await XyoModule({wasmBinary: wasm, noInitialRun: true});
+              const pointer = module._malloc(project.length);
+              module.HEAPU8.set(project, pointer);
+              const loaded = module._sjit_web_load_project_bytes(pointer, project.length);
+              module._free(pointer);
+              if (!loaded) {
+                  throw new Error(module.UTF8ToString(module._sjit_web_last_error()));
+              }
+              module._sjit_web_start();
+              for (let tick = 0; tick < 30; tick += 1) {
+                  if (!module._sjit_web_tick(tick * 16.666, 16.666)) {
+                      throw new Error(`tick failed in round ${round + 1}`);
+                  }
+              }
+              const dynamicModules = module.sjitWebJitModules?.size ?? 0;
+              if (dynamicModules < 1) {
+                  throw new Error(`no dynamic module in round ${round + 1}`);
+              }
+              console.log(
+                  `round ${round + 1}: dynamic_modules=${dynamicModules}, ` +
+                  `draw_commands=${module._sjit_web_draw_count()}`);
+          }
+          NODE
+
+      - name: Upload Web LLVM JIT artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xyo-cpp-web-llvm-jit
+          if-no-files-found: error
+          path: build-web-llvm/site

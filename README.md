@@ -71,8 +71,29 @@ loads the project into the WASM virtual filesystem and renders the stage on a
 Canvas. A browser will not load the generated ES module correctly from a
 `file://` URL, so use a local HTTP server.
 
+To exercise the LLVM Web JIT path locally, build a WebAssembly-targeted
+`llvm-project` checkout first, then set its source and build directories:
+
+```sh
+LLVM_SOURCE_DIR=/path/to/llvm-project \
+LLVM_BUILD_DIR=/path/to/llvm-web-build \
+LLVM_CMAKE_GENERATOR=Ninja \
+bash scripts/build-web-llvm.sh
+
+SJIT_WEB_LLVM_JIT=ON \
+SJIT_WEB_LLVM_SOURCE=/path/to/llvm-project \
+SJIT_WEB_LLVM_BUILD=/path/to/llvm-web-build \
+bash scripts/build-web.sh
+```
+
+The `web-llvm-jit` job in `.github/workflows/ci.yml` builds the pinned LLVM/lld
+sources, caches the cross-build, and runs a dynamic WebAssembly reload smoke
+test. The normal Web build remains the smaller interpreter build unless
+`SJIT_WEB_LLVM_JIT=ON` is set.
+
 The `.github/workflows/pages.yml` workflow repeats this build on every push to
-`main` and deploys `build-web/site` with GitHub Pages. In the repository
+`main`, enables the LLVM Web JIT path, and deploys `build-web-llvm/site` with
+GitHub Pages. In the repository
 settings, set Pages' source to **GitHub Actions** once; subsequent pushes are
 published automatically.
 
