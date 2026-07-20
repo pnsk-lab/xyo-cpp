@@ -44,6 +44,10 @@ jobs:
         uses: mymindstorm/setup-emsdk@v14
         with:
           version: 4.0.15
+          # Share one emsdk cache with the CI workflow so the SDK restores to
+          # a stable workspace path; the cached LLVM build tree hardcodes that
+          # path and stays reusable across runs.
+          cache-key: emsdk-4.0.15-${{ runner.os }}-${{ runner.arch }}
           actions-cache-folder: emsdk-cache
 
       - name: Cache Web LLVM build

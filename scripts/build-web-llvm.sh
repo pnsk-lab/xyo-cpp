@@ -13,6 +13,25 @@ command -v cmake >/dev/null 2>&1 || {
     exit 1
 }
 
+# A cached build tree (e.g. restored by actions/cache) is only reusable when
+# it was configured against the same Emscripten SDK. setup-emsdk may extract
+# the SDK to a fresh path on every run, leaving the restored CMakeCache.txt
+# pointing at a compiler that no longer exists; reconfiguring such a tree
+# fails in CMakeDetermineCCompiler. Detect the mismatch and start over.
+cmake_cache="${LLVM_BUILD_DIR}/CMakeCache.txt"
+if [[ -f "${cmake_cache}" ]]; then
+    emscripten_root="$(cd "$(dirname "$(command -v emcmake)")" && pwd)"
+    current_toolchain="${emscripten_root}/cmake/Modules/Platform/Emscripten.cmake"
+    cached_toolchain="$(sed -n 's/^CMAKE_TOOLCHAIN_FILE:[A-Za-z]*=//p' "${cmake_cache}" | head -n 1)"
+    if [[ "${cached_toolchain}" != "${current_toolchain}" ]]; then
+        echo "LLVM build tree was configured with a different Emscripten SDK:" >&2
+        echo "  cached:  ${cached_toolchain:-<unknown>}" >&2
+        echo "  current: ${current_toolchain}" >&2
+        echo "Removing ${LLVM_BUILD_DIR} and reconfiguring from scratch." >&2
+        rm -rf "${LLVM_BUILD_DIR}"
+    fi
+fi
+
 configure_args=(
     -S "${LLVM_SOURCE_DIR}/llvm"
     -B "${LLVM_BUILD_DIR}"
