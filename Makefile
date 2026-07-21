@@ -8,6 +8,8 @@ PKG_CONFIG ?= pkg-config
 
 BUILD_DIR := build
 RUNTIME_C := $(wildcard runtime/*.c)
+# Native host uses the pthread pool; web stub is only for Emscripten builds.
+RUNTIME_C := $(filter-out runtime/sjit_thread_pool_web.c,$(RUNTIME_C))
 RUNTIME_HEADERS := $(wildcard runtime/*.h) $(wildcard include/sjit/*.hpp)
 QUICKJS_SUBSET_C := quickjs/cutils.c quickjs/dtoa.c quickjs_subset/sjit_quickjs_string.c
 CORE_CXX := src/compiler.cpp src/jit.cpp src/project_loader.cpp
@@ -45,7 +47,11 @@ SDL_CFLAGS := $(shell $(PKG_CONFIG) --cflags sdl2)
 SDL_LDFLAGS := $(shell $(PKG_CONFIG) --libs sdl2)
 SVG_CFLAGS := $(shell $(PKG_CONFIG) --cflags librsvg-2.0)
 SVG_LDFLAGS := $(shell $(PKG_CONFIG) --libs librsvg-2.0)
-SKIA_ROOT ?=
+DEFAULT_SKIA_ROOT := $(CURDIR)/.deps/skia
+ifeq ($(wildcard $(DEFAULT_SKIA_ROOT)/include/core/SkCanvas.h),)
+DEFAULT_SKIA_ROOT :=
+endif
+SKIA_ROOT ?= $(DEFAULT_SKIA_ROOT)
 SKIA_OUT ?= $(if $(SKIA_ROOT),$(SKIA_ROOT)/out/Static,)
 SKIA_ROOT_CFLAGS :=
 SKIA_LIBRARY_DEP :=
@@ -60,7 +66,7 @@ else
 SKIA_ROOT_CFLAGS := -isystem $(SKIA_ROOT)
 SKIA_CFLAGS ?=
 SKIA_LIBRARY_DEP := $(SKIA_OUT)/libskia.a
-SKIA_GN_AUX_LIBRARIES := $(foreach library,raw_ptr allocator_base allocator_core allocator_shim,$(wildcard $(SKIA_OUT)/lib$(library).a))
+SKIA_GN_AUX_LIBRARIES := $(foreach library,raw_ptr allocator_base allocator_core allocator_shim harfbuzz expat png zlib jpeg webp wuffs dng_sdk piex,$(wildcard $(SKIA_OUT)/lib$(library).a))
 ifeq ($(shell uname -s),Linux)
 # PartitionAlloc's static archives contain circular references.  Match GN's
 # executable link rule and let the linker rescan the complete archive set.
