@@ -54,8 +54,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .ci/llvm-build
-          key: ${{ runner.os }}-web-llvm-emscripten-4.0.15-8a119310-${{ hashFiles('scripts/build-web-llvm.sh') }}
+          key: ${{ runner.os }}-web-llvm-emscripten-4.0.15-8a119310-ninja-${{ hashFiles('scripts/build-web-llvm.sh') }}
           restore-keys: |
+            ${{ runner.os }}-web-llvm-emscripten-4.0.15-8a119310-ninja-
             ${{ runner.os }}-web-llvm-emscripten-4.0.15-
 
       - name: Build LLVM/lld for WebAssembly

@@ -14,19 +14,48 @@ command -v cmake >/dev/null 2>&1 || {
 }
 
 # A cached build tree (e.g. restored by actions/cache) is only reusable when
-# it was configured against the same Emscripten SDK. setup-emsdk may extract
-# the SDK to a fresh path on every run, leaving the restored CMakeCache.txt
-# pointing at a compiler that no longer exists; reconfiguring such a tree
-# fails in CMakeDetermineCCompiler. Detect the mismatch and start over.
+# it was configured with the same source tree, Emscripten SDK, emulator, and
+# CMake generator. setup-emsdk may extract the SDK to a fresh path on every
+# run, and the cache fallback may restore a tree made before Ninja was used.
+# Reusing either kind of stale CMakeCache.txt makes configuration fail before
+# the actual CMake error is useful, so detect the mismatches and start over.
 cmake_cache="${LLVM_BUILD_DIR}/CMakeCache.txt"
 if [[ -f "${cmake_cache}" ]]; then
     emscripten_root="$(cd "$(dirname "$(command -v emcmake)")" && pwd)"
     current_toolchain="${emscripten_root}/cmake/Modules/Platform/Emscripten.cmake"
+    expected_source="$(cd "${LLVM_SOURCE_DIR}/llvm" && pwd)"
+    expected_generator="${LLVM_CMAKE_GENERATOR:-}"
+    # em-config prints NODE_JS as a Python-style list on some emsdk
+    # versions (for example: ['.../node']); CMakeCache.txt stores only the
+    # path, so normalize both forms before comparing them.
+    current_emulator="$(em-config NODE_JS 2>/dev/null | sed -e "s/^\['//" -e "s/'\]$//" || true)"
+
     cached_toolchain="$(sed -n 's/^CMAKE_TOOLCHAIN_FILE:[A-Za-z]*=//p' "${cmake_cache}" | head -n 1)"
+    cached_source="$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "${cmake_cache}" | head -n 1)"
+    cached_generator="$(sed -n 's/^CMAKE_GENERATOR:INTERNAL=//p' "${cmake_cache}" | head -n 1)"
+    cached_emulator="$(sed -n 's/^CMAKE_CROSSCOMPILING_EMULATOR:[A-Za-z]*=//p' "${cmake_cache}" | head -n 1)"
+
+    cache_mismatch=""
     if [[ "${cached_toolchain}" != "${current_toolchain}" ]]; then
-        echo "LLVM build tree was configured with a different Emscripten SDK:" >&2
-        echo "  cached:  ${cached_toolchain:-<unknown>}" >&2
-        echo "  current: ${current_toolchain}" >&2
+        cache_mismatch="Emscripten toolchain"
+    elif [[ "${cached_source}" != "${expected_source}" ]]; then
+        cache_mismatch="LLVM source directory"
+    elif [[ -n "${expected_generator}" && "${cached_generator}" != "${expected_generator}" ]]; then
+        cache_mismatch="CMake generator"
+    elif [[ -n "${current_emulator}" && "${cached_emulator}" != "${current_emulator}" ]]; then
+        cache_mismatch="CMake cross-compiling emulator"
+    fi
+
+    if [[ -n "${cache_mismatch}" ]]; then
+        echo "LLVM build cache is stale (${cache_mismatch})." >&2
+        echo "  cached toolchain: ${cached_toolchain:-<unknown>}" >&2
+        echo "  current toolchain: ${current_toolchain}" >&2
+        echo "  cached source: ${cached_source:-<unknown>}" >&2
+        echo "  current source: ${expected_source}" >&2
+        echo "  cached generator: ${cached_generator:-<unknown>}" >&2
+        echo "  current generator: ${expected_generator:-<default>}" >&2
+        echo "  cached emulator: ${cached_emulator:-<unknown>}" >&2
+        echo "  current emulator: ${current_emulator:-<default>}" >&2
         echo "Removing ${LLVM_BUILD_DIR} and reconfiguring from scratch." >&2
         rm -rf "${LLVM_BUILD_DIR}"
     fi
