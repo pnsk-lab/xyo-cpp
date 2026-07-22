@@ -6365,24 +6365,28 @@ void test_runtime_draw_and_broadcast() {
     sjit_runtime_destroy(runtime);
 }
 
-void test_runtime_draw_alias_and_owned_fallback() {
+void test_runtime_draw_owned_storage() {
     SRuntime *runtime = sjit_runtime_create();
-    SSprite *sprite = sjit_runtime_create_sprite(runtime, "AliasPen", 0);
-    require(runtime && sprite, "create draw alias runtime");
+    SSprite *sprite = sjit_runtime_create_sprite(runtime, "OwnedPenTail", 0);
+    require(runtime && sprite, "create draw owned-storage runtime");
     sjit_pen_stamp(runtime, sprite);
     sjit_runtime_tick(runtime);
 
     const SDrawCommandBuffer *draw = sjit_runtime_get_draw_commands(runtime);
-    require(draw && draw->items == runtime->pen.items, "draw queue aliases pen storage when tail capacity is available");
-    require(draw->length == 2, "aliased draw queue contains pen command and visible sprite");
+    require(
+        draw && draw->items != runtime->pen.items,
+        "draw queue owns storage when pen tail capacity is available");
+    require(draw->length == 2, "owned draw queue contains pen command and visible sprite");
     require(
         draw->items[0].kind == SJIT_DRAW_PEN_STROKE && draw->items[1].kind == SJIT_DRAW_SPRITE,
-        "aliased draw queue preserves command ordering");
+        "owned draw queue preserves command ordering");
     sjit_runtime_clear_draw_commands(runtime);
-    require(sjit_runtime_pen_path_count(runtime) == 1, "clearing aliased draw queue does not clear pen history");
+    require(sjit_runtime_pen_path_count(runtime) == 1, "clearing owned draw queue does not clear pen history");
     sjit_runtime_tick(runtime);
     draw = sjit_runtime_get_draw_commands(runtime);
-    require(draw && draw->items == runtime->pen.items && draw->length == 2, "next tick restores aliased draw commands");
+    require(
+        draw && draw->items != runtime->pen.items && draw->length == 2,
+        "next tick restores owned draw commands");
     sjit_runtime_destroy(runtime);
 
     runtime = sjit_runtime_create();
@@ -8987,7 +8991,7 @@ int main() {
     test_native_pen_row_embedded_null_marker_matches_c_string_equality();
     test_native_pen_row_ast_matcher_only_emits_for_invariant_shape();
     test_runtime_draw_and_broadcast();
-    test_runtime_draw_alias_and_owned_fallback();
+    test_runtime_draw_owned_storage();
     test_pen_stroke_buffer();
     test_interpreter_adjacent_pen_stamp();
     test_interpreter_adjacent_pen_color_change();
