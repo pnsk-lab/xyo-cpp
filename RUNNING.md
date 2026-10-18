@@ -23,13 +23,16 @@ Linux 版は 2 種類あります。どちらも **LLVM は静的リンク**な�
 
 同梱: `xyo`（JIT + SDL2 レンダラ + ランチャー GUI + Vulkan compute）
 
-動的リンクの依存（LLVM は静的リンク済み）:
+動的リンクの依存（**LLVM は静的リンク済み**なので `libLLVM` は不要）:
 
 | ライブラリ | パッケージ例（Ubuntu 24.04） |
 |---|---|
 | `libSDL2-2.0.so.0` | `libsdl2-2.0-0` |
-| `librsvg-2.so` / cairo / pango / glib | `librsvg2-2` |
+| `librsvg-2.so.2` / `libcairo.so.2` / `libglib-2.0.so.0` / `libgobject-2.0.so.0` | `librsvg2-2` |
 | `libGL.so.1`（GPU ペン層） | `libgl1` |
+| `libz.so.1` / `libzstd.so.1` / `libtinfo.so.6`（LLVM 静的ライブラリが参照） | `zlib1g` / `libzstd1` / `libtinfo6` |
+
+`ldd` で実際に必要なのは上記のみです（`libxml2` は不要）。
 
 ```sh
 ./xyo play <project.sb3>             # ウィンドウで再生

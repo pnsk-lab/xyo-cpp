@@ -55,6 +55,24 @@ cmake --build build-asan
 - LLVM は `llvm-config` で検出（`llvm orcjit native passes`、現在 LLVM 23）。`XYO_JIT` は既定 ON。`XYO_JIT=OFF` では `src/jit/nojit_stub.cpp`（JitEngine 空実装 + C ABI スタブ）が入り、`->jit` 参照に ifdef を散らさない — interp のみ。
 - SDL2 は Linux では pkg-config、それ以外では `find_package(SDL2 CONFIG)`（`-DSDL2_DIR=` / `-DCMAKE_PREFIX_PATH=`）でも探す。`SDL_MAIN_HANDLED` を定義して SDL に main を奪わせない。
 - **librsvg は任意**（`option(XYO_RSVG ...)`、既定 ON）: 見つからなければ SVG コスチュームを失敗キャッシュし、ビットマップコスチュームのみ描画する（headless / Windows はこれで動く）。Cairo/Pango/Fontconfig は librsvg のリンク依存で、SVG の text/tspan とフォント選択・Unicode シェーピングを担う。SVG 内の文字は OS のフォントを使う。モニタ/バブルの文字は同梱フォント（後述）と `XYO_FONT` で描く。
+- **静的リンク（リリース用）**: `-DXYO_STATIC_LLVM=ON`（静的 LLVM + 静的 libstdc++/libgcc）、
+  `-DXYO_STATIC=ON`（完全静的 `-static`）、`-DXYO_SDL2=OFF`（headless）、
+  `-DXYO_LLVM_MODE=auto|config|llvm-config`（既定 auto = llvm-config 優先、
+  無ければ LLVMConfig.cmake）。Ubuntu の **`llvm-18-dev` は静的アーカイブを同梱**する
+  （apt.llvm.org の `llvm-23-dev` は同梱しない）ため、静的リンクは LLVM 18 +
+  `llvm-config-18 --link-static` で行う。LLVM 18〜23 の API 差は
+  `src/jit/llvm_compat.hpp` が吸収する（`lookupTarget`/`createTargetMachine`/
+  `setTargetTriple` の Triple vs StringRef、`ThreadSafeContext::withContextDo`）。
+  完全静的は SDL2/librsvg を外した headless のみ（librsvg の静的版は無い）。
+  `-static` 時は `ZLIB::ZLIB`（.so を指す）ではなく `libz.a` を明示的にリンクする。
+- **静的リンクでは ORC の dlsym が効かない**: バックエンドが `frem`→`fmod`、
+  `llvm.log`→`log`、memcmp→`bcmp` の libcall を生成する。動的リンクでは
+  `DynamicLibrarySearchGenerator` が解決するが、`-static` では自プロセスの
+  静的シンボルが見えず `JIT session error: Symbols not found: [ fmod ]` に
+  なる（interp へフォールバックするので気付きにくい）。`jit.cpp` の
+  `hostLibcallSymbols()` を `kRtSymbols` と同じ absoluteSymbols として
+  JITDylib へ define して解決する — **新たな libcall が必要になったらこの表へ追加**。
+  CI/Release の静的ジョブは stderr の "JIT session error" を検出したら失敗する。
 - `-fno-exceptions -fno-rtti`。例外は使わず error コード/`std::optional`。
 - アセンブリ: `src/engine/fiber_x86_64_sysv.S`（FiberRegs レイアウトは fiber.hpp と厳密一致）。aarch64 は未実装。Windows x86-64 は `fiber_x86_64_win64.S`（Win64 ABI: rdi/rsi/xmm6-15 も callee-saved、`this` は r15→rcx）。
 
