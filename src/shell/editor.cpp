@@ -491,12 +491,11 @@ struct Editor {
         if (varFocus>=0) applyVarField(varFocus);
     }
 };
-};
-
-} // anon
+}; // struct Editor
 
 
-static std::vector<uint8_t> readFile(const char* path, bool& ok) {
+
+ std::vector<uint8_t> loadFile(const char* path, bool& ok) {
     std::ifstream f(pathFromUtf8(path), std::ios::binary);
     if (!f) { ok = false; return {}; }
     ok = true;
@@ -506,7 +505,7 @@ static std::vector<uint8_t> readFile(const char* path, bool& ok) {
 
 int editorMain(const char* path) {
     bool ok;
-    std::vector<uint8_t> data = readFile(path, ok);
+    std::vector<uint8_t> data = loadFile(path, ok);
     if (!ok) { std::fprintf(stderr, "cannot read %s\n", path); return 1; }
     Runtime rt;
     Sb3LoadResult r = loadSb3File(rt, data.data(), data.size());
