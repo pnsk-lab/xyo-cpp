@@ -1,0 +1,147 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  LLVM_MAJOR: "23"
+
+jobs:
+  linux:
+    name: Linux リリースビルド
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 依存パッケージ（LLVM 23, SDL2, librsvg, glslc）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config zlib1g-dev \
+            libsdl2-dev librsvg2-dev libgl-dev glslc \
+            wget gnupg ca-certificates
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-${LLVM_MAJOR} main" \
+            | sudo tee /etc/apt/sources.list.d/llvm.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "llvm-${LLVM_MAJOR}-dev"
+
+      - name: Configure + build (Release)
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DXYO_BUILD_TESTS=OFF \
+            -DLLVM_CONFIG="/usr/lib/llvm-${LLVM_MAJOR}/bin/llvm-config"
+          cmake --build build -j"$(nproc)"
+
+      - name: Smoke（リリースバイナリで run / play / AOT）
+        run: |
+          export SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy
+          ./build/xyo run examples/play_demo.sb3 --frames 30
+          XYO_EXIT_FRAMES=10 XYO_SHOT=shot.ppm ./build/xyo play examples/play_demo.sb3
+          test -s shot.ppm
+          ./build/xyo aot examples/play_demo.sb3 -o demo-app
+          ./demo-app run --frames 30
+
+      - name: パッケージ
+        run: |
+          mkdir -p dist/pkg
+          cp build/xyo dist/pkg/
+          cp LICENSE dist/pkg/
+          cp RUNNING.md dist/pkg/RUNNING.txt
+          tar -C dist/pkg -czf "dist/xyo-linux-x86_64.tar.gz" \
+            xyo LICENSE RUNNING.txt
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-dist
+          path: dist/xyo-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: Windows リリースビルド（zig クロス）
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: zig 0.15.1
+        run: |
+          curl -sL -o zig.tar.xz \
+            https://ziglang.org/download/0.15.1/zig-x86_64-linux-0.15.1.tar.xz
+          tar xf zig.tar.xz
+          echo "$PWD/zig-x86_64-linux-0.15.1" >>"$GITHUB_PATH"
+          ./zig-x86_64-linux-0.15.1/zig version
+
+      - name: Windows 用 zlib
+        run: |
+          mkdir -p .windeps
+          curl -sL -o .windeps/zlib.tar.gz \
+            https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz
+          tar xzf .windeps/zlib.tar.gz -C .windeps
+          cmake -B .windeps/zlib-build -S .windeps/zlib-1.3.1 \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/cmake/zig-windows-x86_64.cmake" \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build .windeps/zlib-build --target zlibstatic -j"$(nproc)"
+          mkdir -p .windeps/zlib/lib .windeps/zlib/include
+          cp .windeps/zlib-build/libzlibstatic.a .windeps/zlib/lib/
+          cp .windeps/zlib-1.3.1/zlib.h .windeps/zlib-build/zconf.h \
+            .windeps/zlib/include/
+
+      - name: Configure + build xyo.exe
+        run: |
+          cmake -B build-win \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/cmake/zig-windows-x86_64.cmake" \
+            -DXYO_JIT=OFF -DXYO_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release \
+            -DZLIB_LIBRARY="$PWD/.windeps/zlib/lib/libzlibstatic.a" \
+            -DZLIB_INCLUDE_DIR="$PWD/.windeps/zlib/include"
+          cmake --build build-win -j"$(nproc)"
+          file build-win/xyo.exe
+
+      - name: パッケージ
+        run: |
+          mkdir -p dist/pkg
+          cp build-win/xyo.exe dist/pkg/
+          cp LICENSE dist/pkg/
+          cp RUNNING.md dist/pkg/RUNNING.txt
+          (cd dist/pkg && zip -q "../xyo-windows-x86_64.zip" xyo.exe LICENSE RUNNING.txt)
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-dist
+          path: dist/xyo-windows-x86_64.zip
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release 作成
+    needs: [linux, windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: チェックサム
+        run: |
+          cd dist
+          sha256sum xyo-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          ls -lh
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: xyo-cpp ${{ github.ref_name }}
+          files: |
+            dist/xyo-linux-x86_64.tar.gz
+            dist/xyo-windows-x86_64.zip
+            dist/SHA256SUMS.txt
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
+          fail_on_unmatched_files: true
