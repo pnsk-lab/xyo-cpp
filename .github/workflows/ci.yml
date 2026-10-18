@@ -60,7 +60,7 @@ jobs:
 
       - name: 失敗時のテストログ
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: linux-test-log
           path: build/Testing/Temporary/LastTest.log

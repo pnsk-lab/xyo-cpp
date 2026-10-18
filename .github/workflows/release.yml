@@ -57,7 +57,7 @@ jobs:
             xyo LICENSE RUNNING.txt
           ls -lh dist
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: linux-dist
           path: dist/xyo-linux-x86_64.tar.gz
@@ -111,7 +111,7 @@ jobs:
           (cd dist/pkg && zip -q "../xyo-windows-x86_64.zip" xyo.exe LICENSE RUNNING.txt)
           ls -lh dist
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: windows-dist
           path: dist/xyo-windows-x86_64.zip
@@ -122,7 +122,7 @@ jobs:
     needs: [linux, windows]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           path: dist
           merge-multiple: true
