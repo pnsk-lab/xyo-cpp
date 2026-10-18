@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "gui.hpp"
+#include "editor.hpp"
 
 #include "core/cast.hpp"
 #include "core/fileio.hpp"
@@ -57,7 +58,7 @@ static int usage() {
         " [--gpu-realtime ray|path]\n"
         "  xyo aot <project.sb3> (-o <out> | --obj <file>)  "
         "事前コンパイル（実験的）\n"
-        "  xyo gui [dir]                   ランチャー GUI（引数なしでも起動）\n"
+        "  xyo gui [dir]                   ランチャー GUI（引数なしでも起動）\n  xyo edit <project.sb3>             ビルトインエディタ\n"
         "  xyo dump <project.sb3>\n"
         "  xyo test <fixture.sb3|dir> [--aot obj]\n");
     return 1;
@@ -715,6 +716,7 @@ int main(int argc, char** argv) {
 #endif
     if (std::strcmp(cmd, "gui") == 0) return guiMain(argv[2]);
     if (std::strcmp(cmd, "dump") == 0) return cmdDump(argv[2]);
+    if (std::strcmp(cmd, "edit") == 0) return editorMain(argv[2]);
     if (std::strcmp(cmd, "test") == 0) return cmdTest(argv[2]);
     return usage();
 }

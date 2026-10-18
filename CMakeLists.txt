@@ -265,7 +265,7 @@ endif()
 
 # --- シェル ---
 if(XYO_BUILD_SHELL)
-  add_executable(xyo-cli src/shell/main.cpp src/shell/gui.cpp)
+  add_executable(xyo-cli src/shell/main.cpp src/shell/gui.cpp src/shell/editor.cpp)
   target_link_libraries(xyo-cli PRIVATE xyo)
   set_target_properties(xyo-cli PROPERTIES OUTPUT_NAME xyo)
 endif()
