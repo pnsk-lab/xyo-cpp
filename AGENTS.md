@@ -76,7 +76,7 @@ cmake --build build-asan
 - `-fno-exceptions -fno-rtti`。例外は使わず error コード/`std::optional`。
 - アセンブリ: `src/engine/fiber_x86_64_sysv.S`（FiberRegs レイアウトは fiber.hpp と厳密一致）。aarch64 は未実装。Windows x86-64 は `fiber_x86_64_win64.S`（Win64 ABI: rdi/rsi/xmm6-15 も callee-saved、`this` は r15→rcx）。
 
-### Windows .exe（zig クロスコンパイル、interp のみ）
+### Windows .exe（MSYS2 ネイティブ = JIT / zig クロス = interp）
 
 ```sh
 # 1) zlib を Windows 向けにビルド（zig toolchain を再利用）
@@ -118,8 +118,8 @@ cmake --build build-win    # → build-win/xyo.exe（PE32+ x86-64、約 1.5MB）
   **UTF-8 パスとコンソール**は従来どおり。
 - **UTF-8**: コマンドラインは `GetCommandLineW` + `CommandLineToArgvW` で UTF-16 から UTF-8 へ取り直し（`main.cpp` の `winInit`）、`SetConsoleOutputCP(CP_UTF8)` で日本語出力も化けない。ファイルは `src/core/fileio.*` の `fopenUtf8` / `pathFromUtf8` が UTF-8 → UTF-16 へ変換して wide API に渡すので、日本語ファイル名の sb3 も開ける（`XYO_FONT` / `XYO_SHOT` も同様）。
 - **`play` / `gui` を有効にする**: Windows 版 SDL2 を用意して `-DSDL2_DIR=<SDL2-devel-*-mingw>` を渡す（クロスビルドでホストの Linux SDL2 を拾わないよう、`SDL2_DIR`/`CMAKE_PREFIX_PATH` の明示が無ければ config モード探索をしない。Windows 以外の SDL2 を掴んだ場合は `IMPORTED_IMPLIB` 検査で拒否）。`SDL_MAIN_HANDLED` を定義して SDL に main を奪わせない。**librsvg は任意**: 無ければ SVG コスチュームを失敗キャッシュしてビットマップのみ描画する（`-DXYO_RSVG=OFF` で明示的に切れる）。同梱フォントは SDL2 があるときだけ埋め込む（テキスト描画が無いビルドでは死荷重になるため）。
-- **AOT**: `writeExecutable`/`readSelf` は Windows でも動く（`GetModuleFileNameW` + `CopyFileW` + 追記）。ただし JIT が無い Windows ビルドでは `xyo aot` 自体が存在しない（LLVM for Windows を用意したビルドでのみ有効）。
-- **JIT が無い**: LLVM の Windows ライブラリが無いため interp のみ — linux.sb3 級は非常に遅い。Vulkan compute を使うループはこの限りではない。
+- **AOT**: `writeExecutable`/`readSelf` は Windows でも動く（`GetModuleFileNameW` + `CopyFileW` + 追記）。MSYS2 JIT ビルドでは `xyo aot` が実際に動く（COFF オブジェクトを追記 → ORC でロード、CI で検証済み）。
+- **zig クロスビルドは interp のみ**（LLVM for Windows が無いため高速化は Vulkan compute 頼み）。JIT が要る場合は MSYS2 ビルドを使う。
 - 移植済み shim: `M_PI`/`M_LN10`（#ifndef 定義 — ISO 外）、`localtime_s`、`_strtod_l`/`_create_locale`、`GetCurrentThreadStackLimits` + メインスタック記録（fiber 上の collect 対策）、VirtualAlloc/VirtualProtect/VirtualFree。`windows.h` を直接 include する箇所は `NOMINMAX` + `WIN32_LEAN_AND_MEAN` を定義する。
 - デバッグ用環境変数: `XYO_JIT_DUMP=1`（生成 IR ダンプ）、`XYO_JIT_DUMP2=1`（O2 後 IR ダンプ）、`XYO_JIT_DISABLE=1`（JIT 無効・インタプリタのみ）、`XYO_JIT_VERBOSE=1`（コンパイルログ）、`XYO_PROF=1`（sequencer/compile の内訳プロファイルを終了時に stderr 出力）、`XYO_PAR=0`（並列スケジューラ無効化）、`XYO_DEPGRAPH=<dir|->`（衝突グラフの DOT 出力、`-` で stderr）、`XYO_SEED=<n>`（`Rng::global` を固定シードに — AOT/JIT/interp の一致検査用。並列時は順序で揺れるため `XYO_PAR=0` 併用）、`XYO_DUMPVARS=1`（`xyo run`/AOT 実行の後に全変数・リストを決定的順で出力）、`XYO_AOT_VERBOSE=1`（AOT slot 束縛ログ）、`XYO_GUI_ACTIONS=<a,b,...>`/`XYO_GUI_DEBUG=1`（ランチャー GUI の自動操作・ログ）、`XYO_PROJECT_DIR=<dir>`（GUI の開始フォルダ）。
 - `xyo play` 用: `XYO_FONT=<path>`（フォント指定）、`XYO_EXIT_FRAMES=N`（N フレームで終了）、`XYO_SHOT=path.ppm`（最終フレーム保存）、`XYO_INJECT="F:op:args|..."`（合成イベント注入: `md/mu/mm:x,y`、`txt:utf8`、`key:name`）、`XYO_DEBUG=1`（UI/オーディオのデバッグログ）、`XYO_PENLOG=1`（各ペンストロークの直径・端点・alpha を stderr に出力 — JIT/interp の描画差分切り分け用）、`XYO_PENPROF=1`（ペンラスタ/バッチ集計を終了時に stderr）、`XYO_PENSKIP=1`（ラスタ/バッチをスキップ — 計測分離用）、`XYO_PEN_CPU=1`（GPU ペン層を無効化して CPU ラスタへ）、`XYO_SET="name=value;..."`（緑旗直後に変数セット — ベンチ用）。`SDL_VIDEODRIVER=dummy`/`SDL_AUDIODRIVER=dummy` でヘッドレス検証可能。デモ: `python3 tests/fixtures/gen_play_demo.py examples/play_demo.sb3` → `./build/xyo play examples/play_demo.sb3`、全機能検証用は `tests/fixtures/gen_fx_demo.py`。
