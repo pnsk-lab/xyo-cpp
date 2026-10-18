@@ -100,7 +100,22 @@ cmake --build build-win    # → build-win/xyo.exe（PE32+ x86-64、約 1.5MB）
 ```
 
 - ツールチェーン: `tools/zig-{cc,cxx,ar,ranlib}` + `cmake/zig-windows-x86_64.cmake`（`x86_64-windows-gnu`、pkg-config 無効化 — ホストの Linux SDL2 誤検出防止）。fiber switch は `src/engine/fiber_x86_64_win64.S`（Win64 ABI: rdi/rsi/xmm6-15 も callee-saved）。
-- **できること**: `run` / `test`（interp。JIT は LLVM for Windows が必要で未対応）、**Vulkan compute による headless GPU オフロード**（`LoadLibraryA("vulkan-1.dll")` で遅延解決、`XYO_VK_DEV` / `XYO_GPU_DEBUG` は Linux と共通）、**UTF-8 パスとコンソール**。
+- **JIT 対応（MSYS2 mingw LLVM）**: `windows-latest` + MSYS2 の `mingw-w64-x86_64-llvm`
+  （**静的アーカイブ同梱**）で JIT 有効ビルドができる:
+  ```sh
+  cmake -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    -DXYO_JIT=ON -DXYO_LLVM_MODE=llvm-config \
+    -DXYO_STATIC=ON -DXYO_STATIC_LLVM=ON \
+    -DXYO_SDL2=OFF -DXYO_BUILD_TESTS=OFF
+  ```
+  `XYO_STATIC=ON` で LLVM/libstdc++/libgcc を静的リンクした単体 `xyo.exe` になる
+  （`LLVM-*.dll` 不要）。**AOT 書き出しも Windows で動作**する（COFF オブジェクトを
+  末尾に追記し、ORC でロード）。JIT 有効の Windows ビルドは初めてコンパイルされる
+  コード（`src/jit/`）を含むため、POSIX 依存（`localtime_r`、`M_PI`）は
+  `_WIN32` ガードが必要 — `windows-jit` CI ジョブが検証する。
+- **zig クロスは interp 専用**（LLVM for Windows が無いため）。`run` / `test` と
+  **Vulkan compute による headless GPU オフロード**（`LoadLibraryA("vulkan-1.dll")`）、
+  **UTF-8 パスとコンソール**は従来どおり。
 - **UTF-8**: コマンドラインは `GetCommandLineW` + `CommandLineToArgvW` で UTF-16 から UTF-8 へ取り直し（`main.cpp` の `winInit`）、`SetConsoleOutputCP(CP_UTF8)` で日本語出力も化けない。ファイルは `src/core/fileio.*` の `fopenUtf8` / `pathFromUtf8` が UTF-8 → UTF-16 へ変換して wide API に渡すので、日本語ファイル名の sb3 も開ける（`XYO_FONT` / `XYO_SHOT` も同様）。
 - **`play` / `gui` を有効にする**: Windows 版 SDL2 を用意して `-DSDL2_DIR=<SDL2-devel-*-mingw>` を渡す（クロスビルドでホストの Linux SDL2 を拾わないよう、`SDL2_DIR`/`CMAKE_PREFIX_PATH` の明示が無ければ config モード探索をしない。Windows 以外の SDL2 を掴んだ場合は `IMPORTED_IMPLIB` 検査で拒否）。`SDL_MAIN_HANDLED` を定義して SDL に main を奪わせない。**librsvg は任意**: 無ければ SVG コスチュームを失敗キャッシュしてビットマップのみ描画する（`-DXYO_RSVG=OFF` で明示的に切れる）。同梱フォントは SDL2 があるときだけ埋め込む（テキスト描画が無いビルドでは死荷重になるため）。
 - **AOT**: `writeExecutable`/`readSelf` は Windows でも動く（`GetModuleFileNameW` + `CopyFileW` + 追記）。ただし JIT が無い Windows ビルドでは `xyo aot` 自体が存在しない（LLVM for Windows を用意したビルドでのみ有効）。

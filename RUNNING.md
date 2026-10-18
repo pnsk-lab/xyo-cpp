@@ -41,22 +41,17 @@ Linux 版は 2 種類あります。どちらも **LLVM は静的リンク**な�
 
 ## Windows x86-64（xyo-windows-x86_64.zip）
 
-同梱: `xyo.exe`（インタプリタ + Vulkan compute、ヘッドレス）
+同梱: `xyo.exe`（**JIT 有効** + ランチャー以外の CLI、LLVM・libstdc++ は静的リンク）
 
 ```sh
-xyo.exe run <project.sb3> --frames N
-xyo.exe test <dir|file>
-xyo.exe play <project.sb3>           # SDL2 付きビルドでのみ利用可
+xyo.exe run <project.sb3> --frames N   # ヘッドレス実行（LLVM JIT）
+xyo.exe test <fixture.sb3|dir>         # フィクスチャ検証
+xyo.exe aot <project.sb3> -o <app.exe> # 単体実行ファイルを書き出し
+xyo.exe play <project.sb3>             # SDL2 付きビルドでのみ利用可
 ```
 
+- **LLVM JIT が動きます**（MSYS2 の mingw-w64 LLVM でビルド。LLVM は静的リンクなので
+  `LLVM-*.dll` は不要）。ホットなスクリプトはネイティブコードにコンパイルされます。
+- **AOT 書き出しも Windows で動作**します（COFF オブジェクトを exe 末尾へ追記）。
 - Vulkan（`vulkan-1.dll`）があれば GPU 並列ループが有効になります。
-- JIT は LLVM for Windows が必要なため、このビルドでは無効（interp）です。
-- UTF-8 のパス・コンソール出力に対応しています（日本語ファイル名の sb3 も可）。
-
-## ビルド
-
-```sh
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-ctest --test-dir build
-```
+- UTF-8 のパス・コンソール出力に対応（日本語ファイル名の sb3 も可）。
