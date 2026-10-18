@@ -585,7 +585,11 @@ uint64_t xyo_sns_current(JitCtx* c, uint64_t menu) {
     std::u16string option = u16lower(toV(menu));
     std::time_t now = std::time(nullptr);
     std::tm tm;
+#ifdef _WIN32
+    localtime_s(&tm, &now);   // 引数順が POSIX localtime_r と逆
+#else
     localtime_r(&now, &tm);
+#endif
     if (option == u"year") return toB(V(tm.tm_year + 1900.0));
     if (option == u"month") return toB(V(tm.tm_mon + 1.0));
     if (option == u"date") return toB(V(double(tm.tm_mday)));
