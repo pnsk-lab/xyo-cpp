@@ -63,6 +63,11 @@ if(XYO_JIT)
   endif()
 endif()
 
+if(WIN32)
+  # GetCurrentThreadStackLimits など Win8+ API を使う（zig toolchain も同値を設定）
+  add_compile_definitions(_WIN32_WINNT=0x0A00 WINVER=0x0A00)
+endif()
+
 # --- コアライブラリ ---
 file(GLOB_RECURSE XYO_CORE_SOURCES CONFIGURE_DEPENDS
   src/core/*.cpp

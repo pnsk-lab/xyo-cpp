@@ -109,6 +109,57 @@ jobs:
             echo "==== JIT シンボル解決に失敗 ===="; cat jit-err.txt; exit 1
           fi
 
+  # Windows で JIT を有効にする（MSYS2 の mingw-w64 LLVM を使う）。
+  # zig クロスでは LLVM for Windows が無いため interp のみだった。
+  windows-jit:
+    name: Windows JIT（MSYS2 mingw LLVM）
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-llvm
+            mingw-w64-x86_64-zlib
+
+      - name: LLVM の確認（静的アーカイブの有無）
+        run: |
+          llvm-config --version
+          ls /mingw64/lib/cmake/llvm/LLVMConfig.cmake
+          echo "--- 静的アーカイブ ---"
+          ls /mingw64/lib/libLLVM*.a 2>/dev/null | head -5 || echo "(なし)"
+          echo "--- --link-static --libs ---"
+          llvm-config --link-static --libs core orcjit native passes 2>&1 | head -c 300
+          echo
+
+      - name: Configure + build（JIT 有効）
+        run: |
+          cmake -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DXYO_JIT=ON -DXYO_LLVM_MODE=config \
+            -DXYO_SDL2=OFF -DXYO_BUILD_TESTS=OFF
+          cmake --build build-win -j"$(nproc)"
+          ls -la build-win/xyo.exe
+
+      - name: スモーク（JIT が実際にコンパイルすること / AOT）
+        run: |
+          ./build-win/xyo.exe run examples/play_demo.sb3 --frames 30
+          echo "--- JIT コンパイル数 ---"
+          XYO_JIT_VERBOSE=1 ./build-win/xyo.exe run examples/play_demo.sb3 --frames 10 2>&1 | grep -c "compiled" || true
+          ./build-win/xyo.exe aot examples/play_demo.sb3 -o app.exe
+          ./app.exe run --frames 30 2>jit-err.txt
+          if grep -q "JIT session error" jit-err.txt; then
+            echo "==== JIT シンボル解決に失敗 ===="; cat jit-err.txt; exit 1
+          fi
+
   windows:
     name: Windows (zig クロス、headless)
     runs-on: ubuntu-24.04
