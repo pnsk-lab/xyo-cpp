@@ -1,0 +1,24 @@
+# --- ビルド生成物 ---
+build/
+build-*/
+.windeps/
+
+# --- ローカル実行生成物 ---
+.m/
+.w/
+*.ppm
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+gmon.out
+compile_commands.json
+__pycache__/
+
+# AOT 単体実行ファイル（ローカルビルド）
+/linux
+/teapot
+
+# --- 第三者チェックアウト（テストの真実のソース。submodule でも可）---
+/refs/

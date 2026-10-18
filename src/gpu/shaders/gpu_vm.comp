@@ -1,0 +1,276 @@
+#version 430 core
+layout(local_size_x=64) in;
+
+// params: [0]sx [1]sy [2]size [3]h [4]s [5]v [6]t [7]penDown
+//  [8]fenceL [9]fenceR [10]fenceB [11]fenceT
+//  [12]nSlots [13]nWb [14]maxPerLane [15]lanes [16]seed
+//  [17]codeLen [18]stride [19]miscLimits  [20..20+nWb) wbSlot[]
+//  [20+nWb]=penDownAll [21+nWb]=endAttrMask
+//  [22+nWb..27+nWb)=endAttr{size,h,s,v,t}（lanes>0 の初期状態）
+layout(std430, binding=0) readonly buffer P { float pr[]; };
+layout(std430, binding=1) readonly buffer C { uint code[]; };
+layout(std430, binding=2) writeonly buffer R { vec4 recs[]; };
+layout(std430, binding=3) writeonly buffer N { uint cnts[]; };
+layout(std430, binding=4) writeonly buffer O { float lout[]; };
+layout(std430, binding=5) readonly buffer G { float globs[]; };
+
+uint lane, iter, maxPerLane, nWb, stride, seed;
+float posX, posY, penSize;
+float hC, sC, vC, tC, shC;
+vec4 rgba;
+bool penDown, guarded;
+float slots[96];
+float st[128];
+int sp = 0;
+uint recN = 0;
+uint flags = 0;
+uint wbMask[4];
+
+vec3 hsv2rgb(float h100, float s100, float v100) {
+    float h = mod(h100 * 3.6, 360.0); if (h < 0.0) h += 360.0;
+    float s = clamp(s100 / 100.0, 0.0, 1.0);
+    float v = clamp(v100 / 100.0, 0.0, 1.0);
+    int i = int(floor(h / 60.0));
+    float f = h / 60.0 - float(i);
+    float p = v * (1.0 - s), q = v * (1.0 - s * f),
+          t = v * (1.0 - s * (1.0 - f));
+    vec3 r;
+    if (i == 1) r = vec3(q, v, p);
+    else if (i == 2) r = vec3(p, v, t);
+    else if (i == 3) r = vec3(p, q, v);
+    else if (i == 4) r = vec3(t, p, v);
+    else if (i == 5) r = vec3(v, p, q);
+    else r = vec3(v, t, p);
+    return floor(r * 255.0) / 255.0;
+}
+vec3 rgb2hsv(vec3 c255) {   // 入力 0-255 → (h,s,v) = (deg,0-1,0-1)
+    vec3 c = c255 / 255.0;
+    float x = min(c.r, min(c.g, c.b));
+    float v = max(c.r, max(c.g, c.b));
+    float h = 0.0, s = 0.0;
+    if (x != v) {
+        float f = (c.r == x) ? c.g - c.b
+                : (c.g == x) ? c.b - c.r : c.r - c.g;
+        float i = (c.r == x) ? 3.0 : (c.g == x) ? 5.0 : 1.0;
+        h = mod((i - f / (v - x)) * 60.0, 360.0);
+        s = (v - x) / v;
+    }
+    return vec3(h, s, v);
+}
+void updRgba() {
+    rgba = vec4(hsv2rgb(hC, sC, vC), 1.0 - tC / 100.0);
+}
+float rnd() {
+    seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+    return float(seed) * (1.0 / 4294967296.0);
+}
+float wrapC(float v) { v = mod(v, 100.0); return v < 0.0 ? v + 100.0 : v; }
+
+void push(float v) { st[sp++] = v; }
+float pop() { return st[--sp]; }
+
+void stroke(float x0, float y0, float x1, float y1) {
+    if (isnan(x0) || isinf(x0) || isnan(y0) || isinf(y0) ||
+        isnan(x1) || isinf(x1) || isnan(y1) || isinf(y1)) return;
+    if (recN < maxPerLane) {
+        uint i = (lane * maxPerLane + recN) * 3u;
+        recs[i] = vec4(x0, y0, x1, y1);
+        recs[i + 1u] = vec4(penSize, rgba.r, rgba.g, rgba.b);
+        recs[i + 2u] = vec4(rgba.a, 0.0, 0.0, 0.0);
+    }
+    recN++;
+}
+void gotoXY(float nx, float ny) {
+    float fl = pr[8], fr = pr[9], fb = pr[10], ft = pr[11];
+    if (nx > fr) nx = floor(fr);
+    else if (nx < fl) nx = ceil(fl);
+    if (ny > ft) ny = floor(ft);
+    else if (ny < fb) ny = ceil(fb);
+    if (penDown) stroke(posX, posY, nx, ny);
+    posX = nx; posY = ny;
+    flags |= 1u;
+}
+void writeBack() {
+    uint base = lane * stride;
+    lout[base] = uintBitsToFloat(flags | (penDown ? 8u : 0u));
+    lout[base + 1u] = posX;
+    lout[base + 2u] = posY;
+    lout[base + 3u] = penSize;
+    lout[base + 4u] = hC; lout[base + 5u] = sC;
+    lout[base + 6u] = vC; lout[base + 7u] = tC;
+    uint mw = (nWb + 31u) / 32u;
+    for (uint i = 0u; i < mw && i < 4u; ++i)
+        lout[base + 8u + i] = uintBitsToFloat(wbMask[i]);
+    for (uint i = 0u; i < nWb; ++i)
+        lout[base + 8u + mw + i] = slots[uint(pr[20u + i])];
+    lout[base + 8u + mw + nWb] = shC;   // PENCOLN 時点の brightness/2
+    cnts[lane] = recN | (guarded ? 0x80000000u : 0u);
+}
+
+void main() {
+    lane = gl_GlobalInvocationID.x;
+    // ディスパッチは 64 単位で切り上げ — 範囲外レーンは即 return
+    // （cnts/lout/recs への範囲外書き込み防止）
+    if (lane >= uint(pr[15])) return;
+    iter = lane;
+    guarded = false;
+    maxPerLane = uint(pr[14]);
+    nWb = uint(pr[13]);
+    stride = uint(pr[18]);
+    seed = iter * 2654435761u ^ floatBitsToUint(pr[16]);
+    if (seed == 0u) seed = 2654435769u;   // xorshift は 0 から復帰不能
+    posX = pr[0]; posY = pr[1];
+    penSize = pr[2];
+    hC = pr[3]; sC = pr[4]; vC = pr[5]; tC = pr[6];
+    // lanes>0 は前レーン終端状態から始まる — penDown は
+    // 「全パス penUp 終了」なら up、「全パス down 終了」なら down
+    // （コンパイラ証明済み — 混在はコンパイル不可）。属性も
+    // 終端一様値があればそれで初期化する。
+    // lane0 のみ dispatch 時点の実状態を引き継ぐ。
+    uint eBase = 20u + nWb;
+    bool lane0 = (iter == 0u);
+    penDown = lane0 ? (pr[7] != 0.0) : (pr[eBase] != 0.0);
+    if (!lane0) {
+        uint am = uint(pr[eBase + 1u]);
+        if ((am & 1u) != 0u) penSize = pr[eBase + 2u];
+        if ((am & 2u) != 0u) hC = pr[eBase + 3u];
+        if ((am & 4u) != 0u) sC = pr[eBase + 4u];
+        if ((am & 8u) != 0u) vC = pr[eBase + 5u];
+        if ((am & 16u) != 0u) tC = pr[eBase + 6u];
+    }
+    for (int i = 0; i < 4; ++i) wbMask[i] = 0u;
+    for (int i = 0; i < 96; ++i) slots[i] = 0.0;
+    updRgba();
+
+    uint codeLen = uint(pr[17]);
+    uint pc = 0u;
+    for (uint guard = 0u; guard < 200000u; ++guard) {
+        if (pc >= codeLen) break;
+        uint op = code[pc * 2u], ar = code[pc * 2u + 1u];
+        ++pc;
+        switch (op) {
+        case 0u: writeBack(); return;                    // HALT
+        case 1u: push(uintBitsToFloat(ar)); break;       // PUSH
+        case 2u: push(float(iter)); break;               // ITER
+        case 3u: push(slots[ar]); break;                 // LOADV
+        case 4u: slots[ar] = pop(); break;               // STOREV
+        case 5u: {                                       // STOREVM
+            uint s = ar & 0xFFFFu, w = ar >> 16;
+            slots[s] = pop();
+            if (w < 128u) wbMask[w / 32u] |= 1u << (w % 32u);
+        } break;
+        case 6u: push(globs[ar]); break;                 // LOADG
+        case 7u: push(posX); break;
+        case 8u: push(posY); break;
+        case 9u:  { float b = pop(), a = pop(); push(a + b); } break;
+        case 10u: { float b = pop(), a = pop(); push(a - b); } break;
+        case 11u: { float b = pop(), a = pop(); push(a * b); } break;
+        case 12u: { float b = pop(), a = pop(); push(a / b); } break;
+        case 13u: { float b = pop(), a = pop();
+            push(a - b * floor(a / b)); } break;         // MOD (floored)
+        case 14u: { float b = pop(), a = pop(); push(a < b ? 1.0 : 0.0); } break;
+        case 15u: { float b = pop(), a = pop(); push(a > b ? 1.0 : 0.0); } break;
+        case 16u: { float b = pop(), a = pop(); push(a == b ? 1.0 : 0.0); } break;
+        case 17u: { float b = pop(), a = pop(); push(a <= b ? 1.0 : 0.0); } break;
+        case 18u: { float b = pop(), a = pop(); push(a >= b ? 1.0 : 0.0); } break;
+        case 19u: { float b = pop(), a = pop(); push(a != b ? 1.0 : 0.0); } break;
+        case 20u: { float b = pop(), a = pop();
+            push((a != 0.0 && b != 0.0) ? 1.0 : 0.0); } break;
+        case 21u: { float b = pop(), a = pop();
+            push((a != 0.0 || b != 0.0) ? 1.0 : 0.0); } break;
+        case 22u: push(pop() == 0.0 ? 1.0 : 0.0); break; // NOT
+        case 23u: push(-pop()); break;                   // NEG
+        case 24u: {                                      // MATH
+            float a = pop();
+            float r;
+            switch (ar) {
+            case 0u: r = abs(a); break;
+            case 1u: r = floor(a); break;
+            case 2u: r = ceil(a); break;
+            case 3u: r = sqrt(a); break;
+            case 4u: r = sin(radians(a)); break;
+            case 5u: r = cos(radians(a)); break;
+            case 6u: r = tan(radians(a)); break;
+            case 7u: r = degrees(asin(clamp(a,-1.0,1.0))); break;
+            case 8u: r = degrees(acos(clamp(a,-1.0,1.0))); break;
+            case 9u: r = degrees(atan(a)); break;
+            case 10u: r = log(a); break;
+            case 11u: r = log(a) / log(10.0); break;
+            case 12u: r = exp(a); break;
+            case 13u: r = pow(10.0, a); break;
+            case 14u: r = floor(a + 0.5); break;          // ROUND
+            default: r = 0.0; break;
+            }
+            push(r);
+        } break;
+        case 25u: {                                      // RAND
+            float to = pop(), from = pop();
+            float lo = min(from, to), hi = max(from, to);
+            float r;
+            if (floor(lo) == lo && floor(hi) == hi &&
+                lo > -2147483648.0 && hi < 2147483648.0)
+                r = lo + floor(rnd() * (hi - lo + 1.0));
+            else r = lo + rnd() * (hi - lo);
+            push(r);
+        } break;
+        case 26u: pc = ar; break;                        // JMP
+        case 27u: if (pop() == 0.0) pc = ar; break;      // JMPIF0
+        case 28u: { float y = pop(), x = pop(); gotoXY(x, y);
+            flags |= 64u | 128u; } break;                // GOTOXY: X+Y
+        case 29u: gotoXY(pop(), posY); flags |= 64u; break;   // SETX
+        case 30u: gotoXY(posX, pop()); flags |= 128u; break;  // SETY
+        case 31u: gotoXY(posX + pop(), posY); flags |= 64u; break;
+        case 32u: gotoXY(posX, posY + pop()); flags |= 128u; break;
+        case 33u:                                        // PENDOWN
+            penDown = true;
+            flags |= 4u;
+            stroke(posX, posY, posX, posY);
+            break;
+        case 34u: penDown = false; flags |= 4u; break;   // PENUP
+        case 35u: {                                      // PENSIZE
+            float sv = pop();
+            penSize = pr[19] != 0.0 ? clamp(sv, 1.0, 1200.0)
+                                    : max(sv, 0.0);
+            flags |= 2u | 256u;
+        } break;
+        case 36u: {                                      // PENSIZED
+            float sv = pop();
+            penSize = pr[19] != 0.0 ? clamp(penSize + sv, 1.0, 1200.0)
+                                    : max(penSize + sv, 0.0);
+            flags |= 2u | 256u;
+        } break;
+        case 37u: {                                      // PENCOLN
+            float n = pop();
+            // cast::toRgbColorObject → decimalToRgb と同じ
+            // （alpha ビットは a>0 なら透明度、0 なら不透明）
+            float nn = n < 0.0 ? floor(4294967296.0 + n) : floor(n);
+            uint ci = uint(nn);
+            uint a = (ci >> 24) & 0xFFu;
+            vec3 hsv = rgb2hsv(vec3(float((ci >> 16) & 0xFFu),
+                                    float((ci >> 8) & 0xFFu),
+                                    float(ci & 0xFFu)));
+            hC = hsv.x / 3.6; sC = hsv.y * 100.0; vC = hsv.z * 100.0;
+            tC = (a > 0u && a < 255u)
+                 ? 100.0 * (1.0 - float(a) / 255.0) : 0.0;
+            shC = vC / 2.0;   // shade は PENCOLN 時点の brightness/2
+            updRgba();
+            flags |= 2u | 16u | 512u | 1024u | 2048u | 4096u;
+        } break;
+        case 38u:                                        // PENCOLP (set)
+        case 39u: {                                      // PENCOLPB (add)
+            float v = pop();
+            bool chg = op == 39u;
+            if (ar == 0u)      hC = wrapC(v + (chg ? hC : 0.0));
+            else if (ar == 1u) sC = clamp(v + (chg ? sC : 0.0), 0.0, 100.0);
+            else if (ar == 2u) vC = clamp(v + (chg ? vC : 0.0), 0.0, 100.0);
+            else               tC = clamp(v + (chg ? tC : 0.0), 0.0, 100.0);
+            updRgba();
+            flags |= 2u | (512u << ar);
+        } break;
+        default: guarded = true; writeBack(); return;   // 未知 op
+        }
+    }
+    // ガード上限到達 = 実行未完（無限ループ級の TIMES 等）
+    guarded = true;
+    writeBack();
+}
