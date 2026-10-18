@@ -12,6 +12,8 @@
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Passes/PassBuilder.h>
 
+#include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -352,6 +354,71 @@ std::string hexDecode(const std::string& h) {
 /// runtime_helpers.cpp の ASCII 1 文字キャッシュ（AOT slot 束縛用）。
 extern "C" SStr* const* xyo_ascii_cache();
 
+namespace {
+
+/// バックエンドが libcall として生成する libc/libm のシンボルを明示登録する。
+///
+/// `frem` は x86-64 では `fmod` 呼び出しへ、`llvm.log` は `log`、memcmp は
+/// `bcmp` へ降格される。動的リンクなら ORC の
+/// `DynamicLibrarySearchGenerator`（dlsym）が解決できるが、**完全静的
+/// リンク（-static）では dlsym が自プロセスの静的シンボルを見ない**ため
+/// `JIT session error: Symbols not found` になる。ここで実アドレスを
+/// プロセスシンボル表へ入れておくと静的リンクでも解決できる。
+void registerHostLibcalls() {
+    using llvm::sys::DynamicLibrary;
+    static bool done = false;
+    if (done) return;
+    done = true;
+    const auto add = [](const char* n, void* p) {
+        DynamicLibrary::AddSymbol(n, p);
+    };
+    // libm（frem / llvm.* の libcall 降格先）
+    add("fmod", (void*)(double (*)(double, double))std::fmod);
+    add("fmodf", (void*)(float (*)(float, float))std::fmod);
+    add("pow", (void*)(double (*)(double, double))std::pow);
+    add("powf", (void*)(float (*)(float, float))std::pow);
+    add("log", (void*)(double (*)(double))std::log);
+    add("logf", (void*)(float (*)(float))std::log);
+    add("log2", (void*)(double (*)(double))std::log2);
+    add("log10", (void*)(double (*)(double))std::log10);
+    add("exp", (void*)(double (*)(double))std::exp);
+    add("exp2", (void*)(double (*)(double))std::exp2);
+    add("sqrt", (void*)(double (*)(double))std::sqrt);
+    add("sqrtf", (void*)(float (*)(float))std::sqrt);
+    add("sin", (void*)(double (*)(double))std::sin);
+    add("cos", (void*)(double (*)(double))std::cos);
+    add("tan", (void*)(double (*)(double))std::tan);
+    add("asin", (void*)(double (*)(double))std::asin);
+    add("acos", (void*)(double (*)(double))std::acos);
+    add("atan", (void*)(double (*)(double))std::atan);
+    add("atan2", (void*)(double (*)(double, double))std::atan2);
+    add("sinh", (void*)(double (*)(double))std::sinh);
+    add("cosh", (void*)(double (*)(double))std::cosh);
+    add("tanh", (void*)(double (*)(double))std::tanh);
+    add("floor", (void*)(double (*)(double))std::floor);
+    add("ceil", (void*)(double (*)(double))std::ceil);
+    add("trunc", (void*)(double (*)(double))std::trunc);
+    add("round", (void*)(double (*)(double))std::round);
+    add("rint", (void*)(double (*)(double))std::rint);
+    add("nearbyint", (void*)(double (*)(double))std::nearbyint);
+    add("fabs", (void*)(double (*)(double))std::fabs);
+    add("copysign", (void*)(double (*)(double, double))std::copysign);
+    add("ldexp", (void*)(double (*)(double, int))std::ldexp);
+    add("fma", (void*)(double (*)(double, double, double))std::fma);
+    // メモリ/文字列（memcpy/memset の libcall と memcmp→bcmp 最適化）
+    add("memcpy", (void*)(void* (*)(void*, const void*, size_t))std::memcpy);
+    add("memmove",
+        (void*)(void* (*)(void*, const void*, size_t))std::memmove);
+    add("memset", (void*)(void* (*)(void*, int, size_t))std::memset);
+    add("memcmp",
+        (void*)(int (*)(const void*, const void*, size_t))std::memcmp);
+    add("bcmp", (void*)(int (*)(const void*, const void*, size_t))std::memcmp);
+    add("strlen", (void*)(size_t (*)(const char*))std::strlen);
+    add("abort", (void*)(void (*)(void))std::abort);
+}
+
+} // namespace
+
 struct JitEngine::Impl {
     llvm::orc::ThreadSafeContext tsc;
     std::unique_ptr<llvm::orc::LLJIT> jit;
@@ -369,6 +436,8 @@ struct JitEngine::Impl {
 JitEngine::JitEngine() {
     llvm::InitializeNativeTarget();
     llvm::InitializeNativeTargetAsmPrinter();
+    // 完全静的リンクでも libcall（fmod/log/bcmp 等）を解決できるようにする
+    registerHostLibcalls();
 
     impl_ = std::make_unique<Impl>();
     impl_->tsc = llvm::orc::ThreadSafeContext(

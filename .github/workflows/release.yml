@@ -88,7 +88,10 @@ jobs:
           export SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy
           ./build-static/xyo run examples/play_demo.sb3 --frames 30
           ./build-static/xyo aot examples/play_demo.sb3 -o static-app
-          ./static-app run --frames 30
+          ./static-app run --frames 30 2>jit-err.txt
+          if grep -q "JIT session error" jit-err.txt; then
+            echo "==== JIT シンボル解決に失敗 ===="; cat jit-err.txt; exit 1
+          fi
 
       - name: パッケージ
         run: |

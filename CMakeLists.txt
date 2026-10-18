@@ -22,8 +22,15 @@ if(XYO_JIT)
   # auto: config モード（LLVMConfig.cmake）を優先する。静的アーカイブの
   #       依存関係（component → library の順序）を llvm-config より確実に解決できる。
   # config: config モードのみ / llvm-config: llvm-config のみ（--link-static を明示）
-  if(XYO_LLVM_MODE STREQUAL "auto" OR XYO_LLVM_MODE STREQUAL "config")
+  if(XYO_LLVM_MODE STREQUAL "config")
     find_package(LLVM CONFIG QUIET)
+  elseif(XYO_LLVM_MODE STREQUAL "auto")
+    # 既定は従来どおり llvm-config（共有 libLLVM を優先）。
+    # llvm-config が無い環境のみ config モードへフォールバックする。
+    find_program(XYO_LLVM_CONFIG_PROBE llvm-config)
+    if(NOT XYO_LLVM_CONFIG_PROBE)
+      find_package(LLVM CONFIG QUIET)
+    endif()
   endif()
   if(LLVM_FOUND)
     message(STATUS "LLVM ${LLVM_PACKAGE_VERSION} (config mode): ${LLVM_INCLUDE_DIRS}")

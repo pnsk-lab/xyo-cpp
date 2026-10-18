@@ -102,7 +102,12 @@ jobs:
           export SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy
           ./build-static/xyo run examples/play_demo.sb3 --frames 30
           ./build-static/xyo aot examples/play_demo.sb3 -o static-app
-          ./static-app run --frames 30
+          # 静的リンクでは ORC が dlsym で libcall を解決できないため、
+          # fmod/log/bcmp 等の未解決が起きていないことを確認する
+          ./static-app run --frames 30 2>jit-err.txt
+          if grep -q "JIT session error" jit-err.txt; then
+            echo "==== JIT シンボル解決に失敗 ===="; cat jit-err.txt; exit 1
+          fi
 
   windows:
     name: Windows (zig クロス、headless)
