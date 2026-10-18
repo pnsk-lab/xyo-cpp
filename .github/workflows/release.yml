@@ -15,7 +15,7 @@ jobs:
     name: Linux リリースビルド
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: 依存パッケージ（LLVM 23, SDL2, librsvg, glslc）
         run: |
@@ -67,7 +67,7 @@ jobs:
     name: Windows リリースビルド（zig クロス）
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: zig 0.15.1
         run: |
