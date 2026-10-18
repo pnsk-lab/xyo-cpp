@@ -3,6 +3,9 @@
 // プロパティパネル）を参考にした内蔵エディタ。
 #include "editor.hpp"
 
+#include <cstdio>
+#include <vector>
+
 #ifdef XYO_HAVE_SDL2
 
 #include <SDL.h>
@@ -493,9 +496,8 @@ struct Editor {
 };
 }; // struct Editor
 
-
-
- std::vector<uint8_t> loadFile(const char* path, bool& ok) {
+namespace xyo {
+static std::vector<uint8_t> loadFile(const char* path, bool& ok) {
     std::ifstream f(pathFromUtf8(path), std::ios::binary);
     if (!f) { ok = false; return {}; }
     ok = true;
@@ -525,6 +527,12 @@ int editorMain(const char* path) {
     ed.inspWin = SDL_CreateWindow("xyo Editor — Inspector",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 360, 720,
         SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+    // place inspector to the right of the stage window
+    if (ed.ren.window()) {
+        int sx, sy; SDL_GetWindowPosition(ed.ren.window(), &sx, &sy);
+        int sw, sh; SDL_GetWindowSize(ed.ren.window(), &sw, &sh);
+        SDL_SetWindowPosition(ed.inspWin, sx + sw + 16, sy);
+    }
     ed.inspRen = SDL_CreateRenderer(ed.inspWin, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!ed.inspRen) {
         std::fprintf(stderr, "inspector renderer failed\n");
@@ -606,10 +614,13 @@ int editorMain(const char* path) {
     if (ed.inspWin) SDL_DestroyWindow(ed.inspWin);
     return 0;
 }
+} // namespace xyo
 
 #else
+namespace xyo {
 int editorMain(const char* path) {
-    std::fprintf(stderr, "xyo built without SDL2\n");
+    std::fprintf(stderr, "editor: %s (this build has no SDL2)\n", path);
     return 1;
 }
+} // namespace xyo
 #endif
