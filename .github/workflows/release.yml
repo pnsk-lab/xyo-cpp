@@ -141,6 +141,7 @@ jobs:
             -DXYO_STATIC=ON -DXYO_STATIC_LLVM=ON \
             -DXYO_SDL2=OFF -DXYO_BUILD_TESTS=OFF
           cmake --build build-win -j"$(nproc)"
+          strip -s build-win/xyo.exe
           ls -la build-win/xyo.exe
 
       - name: Smoke（JIT で run / AOT 書き出し）
