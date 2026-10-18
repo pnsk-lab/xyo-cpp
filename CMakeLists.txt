@@ -36,8 +36,26 @@ if(XYO_JIT)
     message(STATUS "LLVM ${LLVM_PACKAGE_VERSION} (config mode): ${LLVM_INCLUDE_DIRS}")
     llvm_map_components_to_libnames(XYO_LLVM_LIBS core orcjit native passes)
     set(LLVM_LIBS ${XYO_LLVM_LIBS})
+    # system-libs はプラットフォーム依存（Windows: psapi/shell32/...、
+    # Linux: z/zstd/tinfo/xml2/m）。llvm-config があればそれに従う。
     if(NOT LLVM_SYSTEM_LIBS)
-      set(LLVM_SYSTEM_LIBS "-lz -lzstd -ltinfo -lxml2 -lm")
+      find_program(XYO_LLVM_CONFIG_FOR_SYSLIBS llvm-config)
+      if(XYO_LLVM_CONFIG_FOR_SYSLIBS)
+        if(XYO_STATIC_LLVM OR XYO_STATIC)
+          execute_process(COMMAND ${XYO_LLVM_CONFIG_FOR_SYSLIBS} --link-static --system-libs
+                          OUTPUT_VARIABLE LLVM_SYSTEM_LIBS OUTPUT_STRIP_TRAILING_WHITESPACE)
+        else()
+          execute_process(COMMAND ${XYO_LLVM_CONFIG_FOR_SYSLIBS} --system-libs
+                          OUTPUT_VARIABLE LLVM_SYSTEM_LIBS OUTPUT_STRIP_TRAILING_WHITESPACE)
+        endif()
+      endif()
+    endif()
+    if(NOT LLVM_SYSTEM_LIBS)
+      if(WIN32)
+        set(LLVM_SYSTEM_LIBS "-lpsapi -lshell32 -lole32 -luuid")
+      else()
+        set(LLVM_SYSTEM_LIBS "-lz -lzstd -ltinfo -lxml2 -lm")
+      endif()
     endif()
     separate_arguments(LLVM_SYSTEM_LIBS)
     set(LLVM_LDFLAGS "")
@@ -265,7 +283,9 @@ endif()
 
 # --- シェル ---
 if(XYO_BUILD_SHELL)
-  add_executable(xyo-cli src/shell/main.cpp src/shell/gui.cpp src/shell/editor.cpp)
+  # editor.cpp は WIP のため未使用（editor_default.cpp が弱い既定実装）
+  add_executable(xyo-cli src/shell/main.cpp src/shell/gui.cpp
+                 src/shell/editor_default.cpp)
   target_link_libraries(xyo-cli PRIVATE xyo)
   set_target_properties(xyo-cli PROPERTIES OUTPUT_NAME xyo)
 endif()

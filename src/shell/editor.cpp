@@ -545,7 +545,12 @@ int editorMain(const char* path) {
 
     using clock = std::chrono::steady_clock;
     const auto kFrame = std::chrono::microseconds(33333);
+    int exitFrames = 0;
+    if (const char* ef = std::getenv("XYO_EXIT_FRAMES")) exitFrames = std::atoi(ef);
+    int frameCount = 0;
     while (!ed.quit) {
+        if (exitFrames > 0 && frameCount >= exitFrames) { ed.quit = true; break; }
+        ++frameCount;
         auto t0 = clock::now();
         SDL_Event ev;
         // stage window events
