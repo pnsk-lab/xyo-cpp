@@ -130,6 +130,9 @@ jobs:
             mingw-w64-x86_64-ninja
             mingw-w64-x86_64-llvm
             mingw-w64-x86_64-zlib
+            mingw-w64-x86_64-zstd
+            mingw-w64-x86_64-ncurses
+            mingw-w64-x86_64-libxml2
 
       - name: LLVM の確認（静的アーカイブの有無）
         run: |
@@ -158,6 +161,21 @@ jobs:
           ./app.exe run --frames 30 2>jit-err.txt
           if grep -q "JIT session error" jit-err.txt; then
             echo "==== JIT シンボル解決に失敗 ===="; cat jit-err.txt; exit 1
+          fi
+
+      - name: 完全静的 xyo.exe（LLVM 静的 + -static）
+        run: |
+          cmake -B build-win-static -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DXYO_JIT=ON -DXYO_LLVM_MODE=llvm-config \
+            -DXYO_STATIC=ON -DXYO_STATIC_LLVM=ON \
+            -DXYO_SDL2=OFF -DXYO_BUILD_TESTS=OFF
+          cmake --build build-win-static -j"$(nproc)"
+          ls -la build-win-static/xyo.exe
+          ./build-win-static/xyo.exe run examples/play_demo.sb3 --frames 30
+          ./build-win-static/xyo.exe aot examples/play_demo.sb3 -o app-s.exe
+          ./app-s.exe run --frames 30 2>jit-err-s.txt
+          if grep -q "JIT session error" jit-err-s.txt; then
+            echo "==== JIT シンボル解決に失敗（静的） ===="; cat jit-err-s.txt; exit 1
           fi
 
   windows:
