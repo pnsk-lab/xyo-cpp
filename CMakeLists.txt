@@ -15,17 +15,45 @@ option(XYO_BUILD_SHELL "Build xyo CLI shell" ON)
 option(XYO_BUILD_TESTS "Build tests" ON)
 
 # --- LLVM ---
+option(XYO_STATIC_LLVM "Link LLVM statically (static archives required)" OFF)
+set(XYO_LLVM_MODE "auto" CACHE STRING "LLVM の検出方法: auto | config | llvm-config")
+option(XYO_STATIC "Link the executable fully static (-static)" OFF)
 if(XYO_JIT)
-  find_program(LLVM_CONFIG llvm-config REQUIRED)
-  execute_process(COMMAND ${LLVM_CONFIG} --version OUTPUT_VARIABLE LLVM_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE)
-  execute_process(COMMAND ${LLVM_CONFIG} --includedir OUTPUT_VARIABLE LLVM_INCLUDE_DIRS OUTPUT_STRIP_TRAILING_WHITESPACE)
-  execute_process(COMMAND ${LLVM_CONFIG} --ldflags OUTPUT_VARIABLE LLVM_LDFLAGS OUTPUT_STRIP_TRAILING_WHITESPACE)
-  execute_process(COMMAND ${LLVM_CONFIG} --system-libs OUTPUT_VARIABLE LLVM_SYSTEM_LIBS OUTPUT_STRIP_TRAILING_WHITESPACE)
-  execute_process(COMMAND ${LLVM_CONFIG} --libs core orcjit native passes OUTPUT_VARIABLE LLVM_LIBS OUTPUT_STRIP_TRAILING_WHITESPACE)
-  separate_arguments(LLVM_LIBS)
-  separate_arguments(LLVM_SYSTEM_LIBS)
-  separate_arguments(LLVM_LDFLAGS)
-  message(STATUS "LLVM ${LLVM_VERSION}: ${LLVM_INCLUDE_DIRS}")
+  # auto: config モード（LLVMConfig.cmake）を優先する。静的アーカイブの
+  #       依存関係（component → library の順序）を llvm-config より確実に解決できる。
+  # config: config モードのみ / llvm-config: llvm-config のみ（--link-static を明示）
+  if(XYO_LLVM_MODE STREQUAL "auto" OR XYO_LLVM_MODE STREQUAL "config")
+    find_package(LLVM CONFIG QUIET)
+  endif()
+  if(LLVM_FOUND)
+    message(STATUS "LLVM ${LLVM_PACKAGE_VERSION} (config mode): ${LLVM_INCLUDE_DIRS}")
+    llvm_map_components_to_libnames(XYO_LLVM_LIBS core orcjit native passes)
+    set(LLVM_LIBS ${XYO_LLVM_LIBS})
+    if(NOT LLVM_SYSTEM_LIBS)
+      set(LLVM_SYSTEM_LIBS "-lz -lzstd -ltinfo -lxml2 -lm")
+    endif()
+    separate_arguments(LLVM_SYSTEM_LIBS)
+    set(LLVM_LDFLAGS "")
+    set(XYO_LLVM_LINK_DIRS ${LLVM_LIBRARY_DIRS})
+    set(XYO_LLVM_CONFIG_MODE ON)
+  else()
+    # 2) 従来の llvm-config（--link-static 指定で静的アーカイブ）
+    find_program(LLVM_CONFIG llvm-config REQUIRED)
+    execute_process(COMMAND ${LLVM_CONFIG} --version OUTPUT_VARIABLE LLVM_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE)
+    execute_process(COMMAND ${LLVM_CONFIG} --includedir OUTPUT_VARIABLE LLVM_INCLUDE_DIRS OUTPUT_STRIP_TRAILING_WHITESPACE)
+    execute_process(COMMAND ${LLVM_CONFIG} --ldflags OUTPUT_VARIABLE LLVM_LDFLAGS OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(XYO_STATIC_LLVM OR XYO_STATIC)
+      execute_process(COMMAND ${LLVM_CONFIG} --link-static --system-libs OUTPUT_VARIABLE LLVM_SYSTEM_LIBS OUTPUT_STRIP_TRAILING_WHITESPACE)
+      execute_process(COMMAND ${LLVM_CONFIG} --link-static --libs core orcjit native passes OUTPUT_VARIABLE LLVM_LIBS OUTPUT_STRIP_TRAILING_WHITESPACE)
+    else()
+      execute_process(COMMAND ${LLVM_CONFIG} --system-libs OUTPUT_VARIABLE LLVM_SYSTEM_LIBS OUTPUT_STRIP_TRAILING_WHITESPACE)
+      execute_process(COMMAND ${LLVM_CONFIG} --libs core orcjit native passes OUTPUT_VARIABLE LLVM_LIBS OUTPUT_STRIP_TRAILING_WHITESPACE)
+    endif()
+    separate_arguments(LLVM_LIBS)
+    separate_arguments(LLVM_SYSTEM_LIBS)
+    separate_arguments(LLVM_LDFLAGS)
+    message(STATUS "LLVM ${LLVM_VERSION} (llvm-config): ${LLVM_INCLUDE_DIRS}")
+  endif()
 endif()
 
 # --- コアライブラリ ---
@@ -78,9 +106,14 @@ endif()
 if(XYO_JIT)
   target_compile_definitions(xyo PUBLIC XYO_JIT=1)
   target_include_directories(xyo SYSTEM PUBLIC ${LLVM_INCLUDE_DIRS})
+  if(XYO_LLVM_LINK_DIRS)
+    target_link_directories(xyo PUBLIC ${XYO_LLVM_LINK_DIRS})
+  endif()
   # LLVM headers require RTTI disabled-compatible flags; keep exceptions off in our code
   target_link_libraries(xyo PUBLIC ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS})
-  target_link_options(xyo PUBLIC ${LLVM_LDFLAGS})
+  if(NOT (XYO_STATIC_LLVM OR XYO_STATIC))
+    target_link_options(xyo PUBLIC ${LLVM_LDFLAGS})
+  endif()
 endif()
 
 # --- Vulkan GPU executor（headless/Windows 用 compute dispatch）---
@@ -117,6 +150,9 @@ endif()
 # third_party/: stb_image (PNG), stb_truetype (フォント), nanosvg (SVG)
 
 # --- SDL2（xyo play 表示レンダラ・任意依存）---
+# ヘッドレス用途（静的リンク・サーバ）では -DXYO_SDL2=OFF で完全に外せる。
+option(XYO_SDL2 "Enable the SDL2 window renderer (play/gui)" ON)
+if(XYO_SDL2)
 # Linux: pkg-config / Windows 等: SDL2Config.cmake（-DSDL2_DIR= か
 # -DCMAKE_PREFIX_PATH= で mingw 用 SDL2 を指定すると play/gui が有効になる）。
 option(XYO_RSVG "Use librsvg for SVG costumes (Windows では通常 OFF)" ON)
@@ -168,6 +204,10 @@ else()
   message(STATUS "SDL2 not found: building without window renderer")
 endif()
 
+else()
+  message(STATUS "SDL2 disabled (XYO_SDL2=OFF): building headless")
+endif()
+
 # --- 同梱フォント（Scratch の Arial 系メトリクス: Liberation Sans, OFL）---
 # TTF を C++ 配列へ埋め込む（XYO_FONT 未指定時に使う既定フォント）。
 set(XYO_FONT_INC_DIR ${CMAKE_CURRENT_BINARY_DIR}/font_data)
@@ -200,6 +240,17 @@ if(XYO_BUILD_SHELL)
   add_executable(xyo-cli src/shell/main.cpp src/shell/gui.cpp)
   target_link_libraries(xyo-cli PRIVATE xyo)
   set_target_properties(xyo-cli PROPERTIES OUTPUT_NAME xyo)
+endif()
+
+# --- 静的リンク ---
+if(XYO_JIT)
+  if(XYO_STATIC)
+    target_link_options(xyo PUBLIC -static -static-libstdc++ -static-libgcc)
+    message(STATUS "link: fully static")
+  elseif(XYO_STATIC_LLVM)
+    target_link_options(xyo PUBLIC -static-libstdc++ -static-libgcc)
+    message(STATUS "link: static LLVM + static libstdc++/libgcc")
+  endif()
 endif()
 
 # --- テスト ---

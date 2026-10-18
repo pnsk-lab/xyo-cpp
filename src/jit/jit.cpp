@@ -1,6 +1,8 @@
 // xyo-cpp: LLJIT 基盤 — design.md §7.6。
 #include "jit.hpp"
 
+#include "llvm_compat.hpp"
+
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
 #include <llvm/IR/LLVMContext.h>
@@ -449,10 +451,11 @@ const CompiledScript* JitEngine::compile(Thread& thread, Runtime& runtime,
         "xyo_script_" + std::to_string(scriptCounter_++);
     bool emitOk = false;
 
-    impl_->tsc.withContextDo([&](llvm::LLVMContext* lc) {
+    llvmc::withContext(impl_->tsc, [&](llvm::LLVMContext* lc) {
         auto mod = std::make_unique<llvm::Module>("xyo_script", *lc);
         mod->setDataLayout(impl_->jit->getDataLayout());
-        mod->setTargetTriple(impl_->jit->getTargetTriple());
+        mod->setTargetTriple(
+            llvmc::tripleArg(impl_->jit->getTargetTriple()));
         emitOk = jitEmitScript(*mod, *lc, runtime, thread.target, blocks,
                                topId, entryName, *cs, impl_->pinned, fnNames,
                                procNameMap);

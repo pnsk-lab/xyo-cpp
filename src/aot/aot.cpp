@@ -1,6 +1,8 @@
 // xyo-cpp: AOT コンパイラ本体（emit / meta / 自己実行ファイル）。
 #include "aot.hpp"
 
+#include "jit/llvm_compat.hpp"
+
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Module.h>
@@ -198,15 +200,17 @@ bool compileProject(Runtime& rt, uint64_t projectHash, BuildResult& out,
     llvm::Triple triple(llvm::sys::getProcessTriple());
     std::string err;
     const llvm::Target* target =
-        llvm::TargetRegistry::lookupTarget(triple, err);
+        llvm::TargetRegistry::lookupTarget(llvmc::tripleArg(triple),
+                                            err);
     if (!target) {
         if (why) *why = "no target: " + err;
         return false;
     }
     llvm::TargetOptions opt;
     auto tm = std::unique_ptr<llvm::TargetMachine>(
-        target->createTargetMachine(triple, llvm::sys::getHostCPUName().str(),
-                                    "", opt, llvm::Reloc::PIC_));
+        target->createTargetMachine(llvmc::tripleArg(triple),
+                                    llvm::sys::getHostCPUName().str(), "", opt,
+                                    llvm::Reloc::PIC_));
     if (!tm) {
         if (why) *why = "TargetMachine creation failed";
         return false;
@@ -215,7 +219,7 @@ bool compileProject(Runtime& rt, uint64_t projectHash, BuildResult& out,
     llvm::LLVMContext lc;
     auto mod = std::make_unique<llvm::Module>("xyo_aot", lc);
     mod->setDataLayout(tm->createDataLayout());
-    mod->setTargetTriple(triple);
+    mod->setTargetTriple(llvmc::tripleArg(triple));
 
     AotEmit emit;
     std::vector<ScriptMeta> scripts;

@@ -66,6 +66,44 @@ jobs:
           path: build/Testing/Temporary/LastTest.log
           if-no-files-found: ignore
 
+  # 完全静的（headless）: LLVM 18 の静的アーカイブ + 静的 libstdc++。
+  # 動的依存ゼロのバイナリを作る（Ubuntu の llvm-18-dev は .a を同梱する）。
+  linux-static:
+    name: Linux 完全静的（headless / 依存ゼロ）
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 依存パッケージ（静的ライブラリ）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            llvm-18-dev llvm-18 \
+            zlib1g-dev libzstd-dev libxml2-dev libncurses-dev
+
+      - name: Configure（-static / 静的 LLVM / SDL2 なし）
+        run: |
+          cmake -B build-static -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DXYO_LLVM_MODE=llvm-config \
+            -DLLVM_CONFIG=/usr/lib/llvm-18/bin/llvm-config \
+            -DXYO_STATIC=ON -DXYO_STATIC_LLVM=ON \
+            -DXYO_SDL2=OFF -DXYO_BUILD_TESTS=OFF
+
+      - name: Build
+        run: cmake --build build-static -j"$(nproc)"
+
+      - name: 静的リンクの確認とスモーク
+        run: |
+          echo "--- 動的依存（NEEDED） ---"
+          readelf -d build-static/xyo | grep NEEDED || echo "NEEDED なし = 完全静的"
+          test "$(readelf -d build-static/xyo | grep -c NEEDED)" = "0"
+          file build-static/xyo
+          export SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy
+          ./build-static/xyo run examples/play_demo.sb3 --frames 30
+          ./build-static/xyo aot examples/play_demo.sb3 -o static-app
+          ./static-app run --frames 30
+
   windows:
     name: Windows (zig クロス、headless)
     runs-on: ubuntu-24.04
