@@ -118,7 +118,16 @@ if(XYO_JIT)
   endif()
   # LLVM headers require RTTI disabled-compatible flags; keep exceptions off in our code
   target_link_libraries(xyo PUBLIC ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS})
-  if(NOT (XYO_STATIC_LLVM OR XYO_STATIC))
+  if(XYO_STATIC_LLVM OR XYO_STATIC)
+    # 静的リンクでは -rpath を落とすが、ライブラリ探索パス(-L)は必要
+    # （LLVM の静的アーカイブは /usr/lib/llvm-NN/lib にある）。
+    separate_arguments(XYO_LLVM_LDFLAGS_LIST NATIVE_COMMAND "${LLVM_LDFLAGS}")
+    foreach(_f ${XYO_LLVM_LDFLAGS_LIST})
+      if(_f MATCHES "^-L")
+        target_link_options(xyo PUBLIC ${_f})
+      endif()
+    endforeach()
+  else()
     target_link_options(xyo PUBLIC ${LLVM_LDFLAGS})
   endif()
 endif()
