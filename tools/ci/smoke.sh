@@ -44,6 +44,24 @@ check_jit_errors() {
     fi
 }
 
+# AOT 実行ファイルを動かす。失敗したら stderr を出し、同じオブジェクトを
+# --aot で読む経路も試して「実行ファイル側かオブジェクト側か」を切り分ける。
+run_aot() {
+    app=$1
+    if "$app" run --frames 30 2>"$work/aot-err.txt"; then
+        check_jit_errors "$work/aot-err.txt"
+        return 0
+    fi
+    echo "==== AOT 実行ファイルが失敗 ====" >&2
+    cat "$work/aot-err.txt" >&2 || true
+    echo "--- 同じオブジェクトを --aot で読む（切り分け） ---" >&2
+    "$bin" aot "$project" --obj "$work/project.o" >/dev/null 2>&1 || true
+    if [ -f "$work/project.o" ]; then
+        "$bin" run "$project" --aot "$work/project.o" --frames 30 >&2 || true
+    fi
+    return 1
+}
+
 case "$cmd" in
 run)
     echo "--- run ---"
@@ -56,8 +74,7 @@ run)
     echo "--- AOT 書き出しと実行 ---"
     app="$work/app$exe_suffix"
     "$bin" aot "$project" -o "$app"
-    "$app" run --frames 30 2>"$work/jit-err.txt"
-    check_jit_errors "$work/jit-err.txt"
+    run_aot "$app"
     ;;
 play)
     echo "--- play（SDL dummy ドライバ） ---"
