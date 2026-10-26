@@ -16,6 +16,14 @@ const CompiledScript* JitEngine::compile(Thread&, Runtime&, Sequencer&,
                                        const Block*) {
     return nullptr;
 }
+bool JitEngine::decideCompile(Thread&, const Block*) {
+    return false;
+}
+void JitEngine::noteInterpBlocks(const void*, uint64_t) {}
+bool JitEngine::scriptStats(const void*, ScriptStats*) const { return false; }
+uint8_t JitEngine::scanScriptLoop(Blocks&, const Block*, uint32_t*) {
+    return 1;
+}
 const AccessSet* JitEngine::accessFor(const Thread&, Runtime&) {
     return nullptr;
 }

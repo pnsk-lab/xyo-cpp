@@ -24,6 +24,29 @@ namespace xyo {
 /// ピクセル矩形（SDL_Rect 相当。ヘッダで SDL 型を露出させないため独立型）
 struct IRect { int x = 0, y = 0, w = 0, h = 0; };
 
+/// ペン層の累積統計（XYO_PENPROF と同値。ベンチ・適応制御用）。
+struct PenStats {
+    uint64_t strokes = 0;    // penStroke 呼び出し
+    uint64_t rasterPx = 0;   // CPU ラスタが触れた画素
+    uint64_t quads = 0;      // GPU バッチへ積んだストローク
+    uint64_t flushes = 0;    // FBO への描画回数
+    uint64_t readbacks = 0;  // FBO → CPU 転送回数
+    uint64_t convPx = 0;     // premult→straight 変換画素
+    uint64_t uploads = 0;    // SDL_UpdateTexture 回数
+    uint64_t frames = 0;     // draw() 回数
+    uint64_t records = 0;    // GPU レコード描画数
+    uint64_t rcFlushes = 0;  // 逆順合成でフラッシュした回数
+    uint64_t fwdFlushes = 0; // 前向き合成でフラッシュした回数
+    double strokeMs = 0, rasterMs = 0, quadMs = 0, flushMs = 0,
+           readbackMs = 0, convertMs = 0, uploadMs = 0, copyMs = 0,
+           drawMs = 0, presentMs = 0;
+};
+
+/// プロセス全体のペン層統計を返す（カウンタはリセットしない）。
+PenStats penStats();
+/// 統計をリセットする（ベンチの区間計測用）。
+void penStatsReset();
+
 class SdlRenderer : public RendererAPI {
 public:
     SdlRenderer() = default;
@@ -35,7 +58,28 @@ public:
     /// ウィンドウ+レンダラ生成 + runtime.targets の drawable 化。
     /// scale=1 で 480x360。成功時 true。
     bool init(Runtime& rt, int scale = 2);
+    /// 埋め込みモード（エディタ）: 既存の SDL_Renderer を共有して
+    /// ステージをその中の 1 領域へ描く。ウィンドウは作らない。
+    /// renderer の寿命は呼び出し側が管理する（このオブジェクトは破棄しない）。
+    bool initEmbedded(Runtime& rt, SDL_Renderer* renderer);
+    /// 埋め込み時のステージ表示矩形（renderer のクライアント座標）を設定。
+    /// 描画・pick・マウス座標変換の基準になる。
+    void setStageRect(const IRect& r);
+    /// 現在のステージ矩形（renderer クライアント座標）。
+    IRect stageRect() const { return stageRect_; }
+    /// 埋め込みモードか（自前ウィンドウなし）。
+    bool embedded() const { return embedded_; }
     bool ok() const { return renderer_ != nullptr; }
+    SDL_Window* window() const { return window_; }
+    SDL_Renderer* sdlRenderer() const { return renderer_; }
+    /// ask and wait の入力 UI がアクティブか（イベント転送判定用）。
+    bool askActive() const { return askActive_; }
+    /// スプライトの現在コスチュームの描画テクスチャ（UI サムネイル用）。
+    /// 見つからなければ nullptr。論理サイズ・回転中心も返す。
+    SDL_Texture* spriteTexture(Target* t, double* lw, double* lh,
+                               double* rcx, double* rcy);
+    /// コスチュームの描画テクスチャ（Costumes タブ用）。装飾なしの素の見た目。
+    SDL_Texture* costumeTexture(const Costume* c, double* lw, double* lh);
 
     /// SDL イベントを ioDevices/UI に流す。終了要求で false。
     bool pollEvents();
@@ -101,6 +145,27 @@ private:
         Target* target = nullptr;
         std::string group = "sprite";
         double order = 0;
+        /// getFencedPosition 用キャッシュ。4 隅の回転後オフセット
+        /// (rx,ry) は skin・size・direction・rotation style にのみ依存
+        /// するため、移動のたびに cos/sin と 4 隅変換をやり直さない
+        /// （setXY は毎ストローク走る）。加算順序は元実装と同一に保ち
+        /// 浮動小数の丸めまで一致させる。
+        mutable const Costume* fenceCostume = nullptr;
+        mutable const Skin* fenceSkin = nullptr;
+        mutable double fenceSize = 0, fenceDir = 0;
+        mutable double fenceW = 0, fenceH = 0;   // skin 寸法もキーに含める
+        mutable std::string fenceRot;
+        mutable double fenceRx[4] = {0, 0, 0, 0};
+        mutable double fenceRy[4] = {0, 0, 0, 0};
+        /// 4 隅の stage px オフセット min/max と inset（=min(15,幅/2)）。
+        /// 前計算しておき、毎移動の min/max ループと floor を省く。
+        /// ステージ寸法は実行時に変わり得るので保持しない（毎回
+        /// stageW_/2 - inset で求める）。
+        mutable double fenceMinRx = 0, fenceMaxRx = 0;
+        mutable double fenceMinRy = 0, fenceMaxRy = 0;
+        mutable double fenceInset = 0;
+        mutable double fenceMaxAbsRx = 0, fenceMaxAbsRy = 0;
+        mutable bool fenceValid = false;
     };
     /// 実際に描画・サンプリする画素列（エフェクト適用後）
     struct Rendered {
@@ -109,7 +174,13 @@ private:
         int w = 0, h = 0;
     };
 
+    /// getFencedPosition の 1 エントリメモ（同一 drawable が連続で動く）
+    mutable int lastFenceId_ = -1;
+    mutable const Drawable* lastFenceDrawable_ = nullptr;
+
     // --- drawable/skin ---
+    /// init/initEmbedded 共通の後半（drawable・コールバック・カーソル・ask）
+    void initTargetsAndUi();
     Drawable* drawableFor(int id);
     const Drawable* drawableFor(int id) const;
     void createDrawableForTarget(Target* t, const char* group);
@@ -156,9 +227,42 @@ private:
     void penEnsure();
     void penStroke(const float rgba[4], double diameter, double x0,
                    double y0, double x1, double y1);
+    void penAppendRecord(const float rgba[4], float width, float x, float y,
+                         float dx, float dy, float length);
     void penBlendPremult(uint8_t* p, const float rgba[4], double coverage);
     void penBlendPx(int x, int y, const uint8_t c[4]);
     double penScale() const { return penScale_; } // ペン px / 論理 px
+
+    // --- 遅延バッチ + 逆順合成（CPU ラスタのオーバードロー対策）---
+    // CPU ラスタでは即時合成の代わりにストロークを溜め、フラッシュ時に
+    // 推定オーバードローから「前向き逐次合成」と「逆順合成 + 早期終了」を
+    // 選ぶ。逆順合成は (T,P) 半群
+    //     (T2,P2)∘(T1,P1) = (T2·T1, P2 + T2·P1)
+    // を新しい順に適用し、透過率 T が閾値を下回った画素を以降スキップする。
+    struct PenRec {
+        float rgba[4];
+        float width;
+        float fx0, fy0, fdx, fdy;
+        float L;   // float 精度の線分長（厳密経路と同一値）
+    };
+    void penStrokeRaster(const PenRec& r);   // 前向き逐次合成（厳密経路）
+    void penFlushCpuBatch();                 // バッチを penPx_ へ反映
+    void penRasterReverse();                 // 逆順合成 + 早期終了
+    void penBatchPush(const PenRec& r);
+    void penRcEnv();
+    /// 逆順合成の透過率閾値（XYO_PEN_EPS、既定 1/512）
+    float penRcEps() const { return penRcEps_; }
+    std::vector<PenRec> penBatch_;
+    double penBatchArea_ = 0;    // バッチの推定被覆面積（オーバードロー判定）
+    uint32_t penImmediate_ = 0;  // 直近フラッシュ以降に即時ラスタした本数
+    double penBatchBx0_ = 1e30, penBatchBy0_ = 1e30;
+    double penBatchBx1_ = -1e30, penBatchBy1_ = -1e30;
+    float penRcEps_ = 1.0f / 512.0f;
+    int penRcMode_ = -1;         // -1=auto, 0=forward 固定, 1=RC 固定
+    bool penRcInit_ = false;
+    uint64_t penRcFlushes_ = 0, penFwdFlushes_ = 0;
+    std::vector<float> penAcc_;      // 逆順合成の蓄積（premult rgb + T）
+    std::vector<int32_t> penRowOpen_;  // 行ごとの T>=eps 画素数
 
     // --- UI ---
     bool hitChrome(int mx, int my, int& which) const; // 0=flag 1=stop
@@ -208,6 +312,7 @@ private:
     Runtime* rt_ = nullptr;
     SDL_Window* window_ = nullptr;
     SDL_Renderer* renderer_ = nullptr;
+    bool embedded_ = false;   // initEmbedded: window_/renderer_ を所有しない
     std::function<void()> frameCapture_;
     int stageW_ = 480, stageH_ = 360;
     int scale_ = 2;                  // 初期スケール
@@ -256,7 +361,8 @@ private:
     void penFlushGpu();          // バッチを FBO へ描画（readback 無し）
     void penSyncCpu();           // バッチ描画 + penPx_ へ readback
     void penStrokeGpu(const float rgba[4], float width,
-                      float fx0, float fy0, float fdx, float fdy);
+                      float fx0, float fy0, float fdx, float fdy,
+                      float L);
 
     // --- GPU 並列スクリプト実行（GL4.3 compute。src/gpu 参照）---
     // コンパイル済みミニ VM バイトコードを compute shader で

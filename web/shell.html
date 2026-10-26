@@ -1,0 +1,111 @@
+<!doctype html>
+<!--
+  xyo — WASM ブラウザシェル（Emscripten --shell-file）。
+  ステージ canvas に SDL2 で描画する。sb3/sb2 をドロップ（またはファイル
+  選択）すると MEMFS へ書き込み、`play <path>` で main を呼ぶ。
+  build: cmake -DXYO_SDL2=ON -DXYO_WASM_ASYNCIFY=ON （cmake/emscripten.cmake）
+-->
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>xyo — WASM</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #1e1f22; color: #e6e6e6;
+               font: 14px/1.5 system-ui, "Helvetica Neue", Arial, sans-serif; }
+  #bar { display: flex; gap: 12px; align-items: center; padding: 8px 12px;
+         background: #2b2d31; border-bottom: 1px solid #000; flex-wrap: wrap; }
+  #bar b { color: #8ab4f8; letter-spacing: .04em; }
+  #hint, #status { color: #9aa0a6; }
+  label.btn { background: #3a3d42; border: 1px solid #55585e; color: #eee;
+              padding: 5px 10px; border-radius: 5px; cursor: pointer; }
+  label.btn:hover { background: #4a4e55; }
+  #wrap { position: relative; display: flex; justify-content: center;
+          padding: 12px; }
+  #canvas { background: #fff; touch-action: none; display: none; }
+  #drop { border: 2px dashed #55585e; border-radius: 10px; padding: 40px 56px;
+          text-align: center; color: #9aa0a6; }
+  #drop.hot { border-color: #8ab4f8; color: #8ab4f8; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <b>xyo</b>
+  <span id="hint">Scratch/TurboWarp 互換ランタイム（WASM・interp）</span>
+  <label class="btn">sb3 を開く<input id="file" type="file" accept=".sb3,.sb2" hidden></label>
+  <span id="status"></span>
+</div>
+<div id="wrap">
+  <div id="drop">ここに .sb3 / .sb2 をドロップ<br><small>または「sb3 を開く」</small></div>
+  <canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
+</div>
+<script>
+var Module = {
+  noInitialRun: true,
+  canvas: (function () { return document.getElementById('canvas'); })(),
+  print:    function (t) { console.log(t); },
+  printErr: function (t) { console.error(t); },
+};
+var statusEl = document.getElementById('status');
+function setStatus(s) { statusEl.textContent = s; }
+
+function runProject(name, bytes) {
+  var path = '/proj/' + name.replace(/[^\w.\-]/g, '_');
+  try { Module.FS.mkdir('/proj'); } catch (e) { /* 既存 */ }
+  Module.FS.writeFile(path, new Uint8Array(bytes));
+  document.getElementById('drop').style.display = 'none';
+  var canvas = document.getElementById('canvas');
+  canvas.style.display = 'block';
+  Module.canvas = canvas;
+  setStatus('running ' + name);
+  // main は play ループ。Asyncify により sleep/poll でブラウザへ譲る。
+  Module.callMain(['play', path]);
+}
+
+function handleFile(f) {
+  if (!f) return;
+  var r = new FileReader();
+  r.onload = function () { runProject(f.name, r.result); };
+  r.onerror = function () { setStatus('read error'); };
+  r.readAsArrayBuffer(f);
+}
+
+document.getElementById('file').addEventListener('change', function (e) {
+  handleFile(e.target.files[0]);
+});
+['dragenter', 'dragover'].forEach(function (ev) {
+  document.addEventListener(ev, function (e) {
+    e.preventDefault();
+    var d = document.getElementById('drop');
+    if (d) d.classList.add('hot');
+  });
+});
+['dragleave', 'drop'].forEach(function (ev) {
+  document.addEventListener(ev, function (e) {
+    e.preventDefault();
+    var d = document.getElementById('drop');
+    if (d) d.classList.remove('hot');
+  });
+});
+document.addEventListener('drop', function (e) {
+  if (e.dataTransfer && e.dataTransfer.files.length)
+    handleFile(e.dataTransfer.files[0]);
+});
+Module.onRuntimeInitialized = function () {
+  // ?sb3=<url> で起動時に自動ロード（デモ・ブラウザ自動検証用）。
+  var url = null;
+  try { url = new URLSearchParams(location.search).get('sb3'); } catch (e) {}
+  if (!url) { setStatus('ready — sb3 を開いてください'); return; }
+  setStatus('loading ' + url);
+  fetch(url).then(function (r) {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.arrayBuffer();
+  }).then(function (buf) {
+    runProject(url.split('/').pop(), buf);
+  }).catch(function (e) { setStatus('load error: ' + e.message); });
+};
+</script>
+{{{ SCRIPT }}}
+</body>
+</html>

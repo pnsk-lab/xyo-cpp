@@ -35,6 +35,15 @@ struct FiberRegs {
     uint64_t sp;
     uint64_t d8, d9, d10, d11, d12, d13, d14, d15;
 };
+#elif defined(__wasm32__) || defined(__EMSCRIPTEN__)
+// WASM（Emscripten）: ネイティブの context switch は不可能。Phase A は
+// interp 専用で fiber は実行されないため、コンパイル・リンクを通すための
+// 最小スタブ。実際に resume/yield が呼ばれると abort する（fiber.cpp 参照）。
+// 本物の Asyncify fiber（emscripten_fiber_*）は JIT の WASM 対応
+// （Phase C の WASM モジュール化 JIT）で導入する。
+struct FiberRegs {
+    uint64_t rsp, rip, r15;
+};
 #else
 #   error "fiber: unsupported arch (implement fiber_<arch>.S + FiberRegs)"
 #endif

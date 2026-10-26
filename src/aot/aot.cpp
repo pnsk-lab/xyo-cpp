@@ -73,6 +73,7 @@ struct ScriptMeta {
     std::string entry;
     int ti = 0;   // Runtime::targets 順のターゲット index
     bool mayYield = true;
+    bool mainThread = true;
     std::map<std::string, std::string> procs;
 };
 
@@ -130,6 +131,8 @@ std::string buildMeta(uint64_t hash, const std::vector<ScriptMeta>& scripts,
         appendEscaped(s, m.entry);
         s += "\",\"mayYield\":";
         s += m.mayYield ? "true" : "false";
+        s += ",\"mainThread\":";
+        s += m.mainThread ? "true" : "false";
         s += ",\"procs\":[";
         bool fp = true;
         for (const auto& [vk, sym] : m.procs) {
@@ -244,6 +247,7 @@ bool compileProject(Runtime& rt, uint64_t projectHash, BuildResult& out,
             m.entry = entry;
             m.ti = ti;
             m.mayYield = cs.mayYield;
+            m.mainThread = cs.mainThread;
             m.procs = std::move(procs);
             scripts.push_back(std::move(m));
             ++n;

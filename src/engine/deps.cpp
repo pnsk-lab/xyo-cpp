@@ -26,6 +26,9 @@ struct OpRule {
     Var list = Var::None;        // LIST フィールド
     bool spawn = false;
     bool unknown = false;
+    /// 任意の変数を動的に読む（sensing_of）— 変数使用解析用
+    bool varDynamic = false;
+    bool mainThread = false;
     /// 入力メニュー経由で他ターゲットの X,Y を読む op
     /// (motion_goto / pointtowards / glideto / sensing_distanceto)
     const char* menuInput = nullptr;
@@ -33,7 +36,13 @@ struct OpRule {
 
 OpRule ruleVar(OpRule::Var v) { OpRule r; r.var = v; return r; }
 OpRule ruleList(OpRule::Var v) { OpRule r; r.list = v; return r; }
-OpRule ruleF(uint16_t r, uint16_t w) { OpRule o; o.fr = r; o.fw = w; return o; }
+OpRule ruleF(uint16_t r, uint16_t w) {
+    OpRule o; o.fr = r; o.fw = w;
+    // Setters invoke arbitrary target/renderer hooks and update the shared
+    // refreshTargets/redraw flags even when explicit per-target keys differ.
+    o.mainThread = w != 0;
+    return o;
+}
 OpRule ruleG(uint16_t r, uint16_t w) { OpRule o; o.gr = r; o.gw = w; return o; }
 
 const std::unordered_map<std::string, OpRule>& opRules() {
@@ -121,15 +130,35 @@ const std::unordered_map<std::string, OpRule>& opRules() {
         add("looks_changestretchby", OpRule{});
         add("looks_setstretchto", OpRule{});
 
+        // --- pen 拡張 ---
+        // 描画はレンダラ（main thread 専用）を直接叩く。ペン状態は
+        // ターゲット固有だが、描画順序が観測可能なので mainThread に固定する。
+        // （以前はルール未登録 → unknown で同じく逐次だった。理由の
+        //   ラベルだけが「未知の op」から「main」に変わる。）
+        {
+            OpRule r;
+            r.mainThread = true;
+            for (const char* op :
+                 {"pen_clear", "pen_stamp", "pen_penDown", "pen_penUp",
+                  "pen_setPenColorToColor", "pen_changePenColorParamBy",
+                  "pen_setPenColorParamTo", "pen_changePenSizeBy",
+                  "pen_setPenSizeTo", "pen_setPenShadeToNumber",
+                  "pen_changePenShadeBy", "pen_setPenHueToNumber",
+                  "pen_changePenHueBy"})
+                add(op, r);
+        }
+
         // --- sensing ---
         add("sensing_timer", ruleG(gb(GK::Timer), 0));
         add("sensing_resettimer", ruleG(0, gb(GK::Timer)));
         add("sensing_mousex", ruleG(gb(GK::Io), 0));
         add("sensing_mousey", ruleG(gb(GK::Io), 0));
         add("sensing_mousedown", ruleG(gb(GK::Io), 0));
-        add("sensing_keypressed", ruleG(gb(GK::Io), 0));
-        add("sensing_loudness", ruleG(gb(GK::Io), 0));
-        add("sensing_loud", ruleG(gb(GK::Io), 0));
+        // These reporters are not read-only: keyboard inserts usedKeys and
+        // loudness updates a runtime cache / invokes the audio backend.
+        { OpRule r = ruleG(gb(GK::Io), 0); r.mainThread = true;
+          add("sensing_keypressed", r);
+          add("sensing_loudness", r); add("sensing_loud", r); }
         add("sensing_answer", ruleG(gb(GK::Io), 0));
         add("sensing_username", ruleG(gb(GK::Io), 0));
         add("sensing_online", ruleG(gb(GK::Io), 0));
@@ -138,7 +167,8 @@ const std::unordered_map<std::string, OpRule>& opRules() {
         add("sensing_dayssince2000", ruleG(gb(GK::Io), 0));
         add("sensing_setdragmode", ruleF(0, fb(TF::Drag)));
         // 動的ターゲット/プロパティ解決 — 任意 var/field/renderer 状態を読む
-        { OpRule r; r.unknown = true; add("sensing_of", r); }
+        { OpRule r; r.unknown = true; r.varDynamic = true;
+          add("sensing_of", r); }
         { OpRule r; r.unknown = true; add("sensing_touchingobject", r); }
         { OpRule r; r.unknown = true; add("sensing_touchingcolor", r); }
         { OpRule r; r.unknown = true;
@@ -242,11 +272,35 @@ struct Walker {
     Target& target;
     Blocks& blocks;
     AccessSet& out;
-    std::unordered_set<const Block*> activeProcs;
+    std::vector<AccessNote>* notes = nullptr;
+    // The summary is a union of accesses. A procedure's body contributes the
+    // same keys on every call, including recursive calls; visit it once.
+    std::unordered_set<const Block*> seenProcs;
+
+    /// 逐次実行の理由を記録（opcode 単位で重複排除・最大 8 件）
+    void note(AccessNote::Kind k, const Block* b, const char* detail) {
+        if (!notes || notes->size() >= 8) return;
+        const std::string op = b ? b->opcode : std::string{};
+        for (const AccessNote& n : *notes)
+            if (n.kind == k && n.opcode == op) return;
+        notes->push_back(AccessNote{k, op, detail ? detail : ""});
+    }
+    void markUnknown(const Block* b, const char* detail) {
+        out.unknown = true;
+        note(AccessNote::Kind::Unknown, b, detail);
+    }
+    void markSpawn(const Block* b) {
+        out.spawn = true;
+        note(AccessNote::Kind::Spawn, b, nullptr);
+    }
+    void markMainThread(const Block* b, const char* detail) {
+        out.mainThread = true;
+        note(AccessNote::Kind::MainThread, b, detail);
+    }
 
     /// チェーン (next リンク) を走査
     void chain(const std::string& firstId, int depth = 0) {
-        if (depth > 4096) { out.unknown = true; return; }
+        if (depth > 4096) { markUnknown(nullptr, "nesting too deep"); return; }
         std::string id = firstId;
         while (!id.empty() && !out.unknown) {
             const Block* b = blocks.getBlock(id);
@@ -286,7 +340,7 @@ struct Walker {
         if (it == opRules().end()) {
             // hat ブロック自体はトップにしか現れないが、未登録 op は
             // compat/未実装 — 保守的に unknown
-            if (!rt.getIsHat(op)) out.unknown = true;
+            if (!rt.getIsHat(op)) markUnknown(blk, "no dependency rule");
             return;
         }
         const OpRule& r = it->second;
@@ -295,7 +349,7 @@ struct Walker {
 
     /// reporter 位置の子ブロック（emitInputBlock の走査相当）
     void reporter(const BlockInput& in, int depth) {
-        if (depth > 4096) { out.unknown = true; return; }
+        if (depth > 4096) { markUnknown(nullptr, "nesting too deep"); return; }
         std::string id = !in.block.empty() ? in.block : in.shadow;
         if (id.empty()) return;
         const Block* blk = blocks.getBlock(id);
@@ -316,22 +370,32 @@ struct Walker {
     }
 
     void readVar(const BlockField* f, const char* type) {
-        if (Variable* v = resolveVarNoCreate(target, f, type))
+        if (Variable* v = resolveVarNoCreate(target, f, type)) {
             out.reads.insert(MemKey::var(v));
-        else
-            out.unknown = true;   // 未解決 → 実行時変数生成
+            // listOfVar lazily creates storage even for reporters. Until the
+            // list exists this is not a read/read-safe operation.
+            if (type == Variable::kListType && !v->list)
+                markMainThread(nullptr, "lazy list creation");
+        } else {
+            markUnknown(nullptr, "unresolved variable");   // 実行時変数生成
+        }
     }
     void writeVar(const BlockField* f, const char* type) {
         if (!f) return;           // フィールド欠落 → codegen も no-op
         if (Variable* v = resolveVarNoCreate(target, f, type))
             out.writes.insert(MemKey::var(v));
         else
-            out.unknown = true;
+            markUnknown(nullptr, "unresolved variable");
     }
 
     void applyRule(const Block* blk, const OpRule& r) {
-        if (r.unknown) { out.unknown = true; return; }
-        if (r.spawn) out.spawn = true;
+        if (r.varDynamic) {
+            out.varDynamic = true;
+            note(AccessNote::Kind::VarDynamic, blk, "dynamic variable access");
+        }
+        if (r.mainThread) markMainThread(blk, nullptr);
+        if (r.unknown) { markUnknown(blk, nullptr); return; }
+        if (r.spawn) markSpawn(blk);
         for (int i = 0; i < int(TF::_Count); ++i) {
             TF s = TF(i);
             if (r.fr & fb(s)) out.reads.insert(MemKey::field(&target, s));
@@ -365,27 +429,28 @@ struct Walker {
                         out.reads.insert(MemKey::field(t, TF::X));
                         out.reads.insert(MemKey::field(t, TF::Y));
                     } else {
-                        out.unknown = true;   // 名前未解決 — 動的かも
+                        markUnknown(blk, "unresolved menu target");
                     }
                 }
                 // _random_ は rng が thread_local のためキー不要
             } else {
-                out.unknown = true;   // 動的メニュー
+                markUnknown(blk, "dynamic menu input");
             }
         }
     }
 
-    /// procedures_call — 定義本体を再帰解析（循環 → unknown）
+    /// procedures_call — reachable procedure bodies form a finite graph.
+    /// Visiting each definition once computes the transitive union, even for
+    /// mutual recursion. Reporter arguments are still visited at every call.
     void callProc(const Block* call, int depth) {
-        if (!call->mutation) { out.unknown = true; return; }
+        if (!call->mutation) { markUnknown(call, "call without mutation"); return; }
         const std::string pc = call->mutation->attr("proccode");
         const std::string defId = blocks.getProcedureDefinition(pc);
         const Block* def = defId.empty() ? nullptr : blocks.getBlock(defId);
         // 未定義手続き呼び出しは no-op（JIT/TW とも NOP）— 依存なし
         if (!def) return;
-        if (!activeProcs.insert(def).second) { out.unknown = true; return; }
+        if (!seenProcs.insert(def).second) return;
         chain(def->next, depth + 1);
-        activeProcs.erase(def);
     }
 };
 
@@ -413,12 +478,88 @@ std::string describeKey(const MemKey& k) {
 }
 
 AccessSet analyzeScript(Runtime& rt, Target& target, Blocks& blocks,
-                        const Block* top) {
+                        const Block* top, std::vector<AccessNote>* notes) {
     AccessSet as;
-    if (!top) { as.unknown = true; return as; }
-    Walker w{rt, target, blocks, as, {}};
+    if (!top) {
+        as.unknown = true;
+        if (notes) notes->push_back(AccessNote{AccessNote::Kind::Unknown, "", "null top"});
+        return as;
+    }
+    Walker w{rt, target, blocks, as, notes, {}};
     if (!top->next.empty()) w.chain(top->next);
     return as;
+}
+
+VariableUsage analyzeVariableUsage(Runtime& rt) {
+    VariableUsage u;
+    auto addSet = [&](const AccessSet& as) {
+        if (as.varDynamic) u.dynamic = true;
+        for (const MemKey& k : as.reads)
+            if (k.kind == MemKey::Var)
+                u.used.insert(static_cast<const Variable*>(k.a));
+        for (const MemKey& k : as.writes)
+            if (k.kind == MemKey::Var)
+                u.used.insert(static_cast<const Variable*>(k.a));
+    };
+
+    for (Target* t : rt.targets) {
+        if (!t || !t->blocks) continue;
+        for (const std::string& topId : t->blocks->getScripts()) {
+            const Block* top = t->blocks->getBlock(topId);
+            if (!top) continue;
+            // analyzeScript は top 自身を評価しない（ハット前提）。トップ
+            // レベルに置かれた sensing_of だけは動的変数参照として扱う。
+            if (top->opcode == "sensing_of") u.dynamic = true;
+            addSet(analyzeScript(rt, *t, *t->blocks, top));
+            ++u.scripts;
+        }
+        // トップレベルの変数/リスト reporter は getScripts() に含まれない
+        // （analyzeScript は top 自身を評価しないため）。
+        for (const auto& [id, b] : t->blocks->allBlocks()) {
+            (void)id;
+            if (b.opcode != "data_variable" &&
+                b.opcode != "data_listcontents")
+                continue;
+            if (!b.topLevel && !b.parent.empty()) continue;  // 上で走査済み
+            const bool isList = b.opcode == "data_listcontents";
+            auto it = b.fields.find(isList ? "LIST" : "VARIABLE");
+            const BlockField* f =
+                it == b.fields.end() ? nullptr : &it->second;
+            if (Variable* v = resolveVarNoCreate(
+                    *t, f, isList ? Variable::kListType
+                                  : Variable::kScalarType))
+                u.used.insert(v);
+        }
+    }
+
+    // モニタ: data_variable / data_listcontents の id は変数 id
+    // （scratch-vm の MonitorRecord と同じ）。item/length 等のリスト
+    // モニタは params の LIST 名で参照する。sensing_of のモニタは
+    // PROPERTY の変数名を毎フレーム動的に読む。
+    for (const auto& [mid, rec] : rt.monitorState.records) {
+        (void)mid;
+        Target* t = rec.spriteName.empty()
+                        ? rt.getTargetForStage()
+                        : rt.getSpriteTargetByName(rec.spriteName);
+        if (!t) t = rt.getTargetForStage();
+        if (!t) continue;
+        if (rec.opcode == "sensing_of") u.dynamic = true;
+        if (rec.opcode == "data_variable" ||
+            rec.opcode == "data_listcontents") {
+            if (Variable* v = t->lookupVariableById(rec.id))
+                u.used.insert(v);
+        }
+        auto markParam = [&](const char* key, const char* type) {
+            auto it = rec.params.find(key);
+            if (it == rec.params.end()) return;
+            if (Variable* v = t->lookupVariableByNameAndType(it->second, type))
+                u.used.insert(v);
+        };
+        markParam("VARIABLE", Variable::kScalarType);
+        markParam("LIST", Variable::kListType);
+    }
+    u.ok = true;
+    return u;
 }
 
 DepGraph buildDepGraph(const std::vector<const AccessSet*>& sets) {
@@ -454,6 +595,62 @@ DepGraph buildDepGraph(const std::vector<const AccessSet*>& sets) {
         }
     }
     return g;
+}
+
+std::vector<std::vector<size_t>> buildDepGroups(
+    const std::vector<const AccessSet*>& sets) {
+    const size_t n = sets.size();
+    std::vector<size_t> parent(n), rank(n, 0);
+    for (size_t i = 0; i < n; ++i) parent[i] = i;
+    auto find = [&](size_t x) {
+        while (parent[x] != x) {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        return x;
+    };
+    auto unite = [&](size_t a, size_t b) {
+        a = find(a);
+        b = find(b);
+        if (a == b) return;
+        if (rank[a] < rank[b]) {
+            parent[a] = b;
+        } else {
+            parent[b] = a;
+            if (rank[a] == rank[b]) ++rank[a];
+        }
+    };
+
+    // A key with a writer connects all of its writers and readers. One
+    // writer anchor therefore preserves the full graph's components without
+    // constructing its potentially quadratic clique. Complete this pass
+    // before visiting readers so readers before the first writer also join.
+    std::unordered_map<MemKey, size_t, MemKeyHash> writers;
+    for (size_t i = 0; i < n; ++i) {
+        for (const MemKey& key : sets[i]->writes) {
+            auto [it, inserted] = writers.emplace(key, i);
+            if (!inserted) unite(i, it->second);
+        }
+    }
+    for (size_t i = 0; i < n; ++i) {
+        for (const MemKey& key : sets[i]->reads) {
+            auto it = writers.find(key);
+            if (it != writers.end()) unite(i, it->second);
+        }
+    }
+
+    // Stable first-member order, independent of hash iteration/union roots.
+    std::vector<size_t> component(n, n);
+    std::vector<std::vector<size_t>> out;
+    for (size_t i = 0; i < n; ++i) {
+        size_t root = find(i);
+        if (component[root] == n) {
+            component[root] = out.size();
+            out.emplace_back();
+        }
+        out[component[root]].push_back(i);
+    }
+    return out;
 }
 
 std::vector<std::vector<size_t>> DepGraph::groups() const {

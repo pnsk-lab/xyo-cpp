@@ -42,7 +42,13 @@ struct SdlRendererTestAccess {
         auto it = r.skins_.find(c);
         return it == r.skins_.end() ? nullptr : it->second.get();
     }
-    static uint8_t* penPx(SdlRenderer& r) { return r.penPx_.data(); }
+    static uint8_t* penPx(SdlRenderer& r) {
+        // GL ペン層では penPx_ は遅延同期（CPU 読者の直前でのみ readback）。
+        // interop 表示経路は readback を行わないため、内部バッファを直接
+        // 覗くテストはここで明示的に同期させる。
+        r.penSyncCpu();
+        return r.penPx_.data();
+    }
     static int penW(const SdlRenderer& r) { return r.penW_; }
     static int penH(const SdlRenderer& r) { return r.penH_; }
     static void penBlendPx(SdlRenderer& r, int x, int y, const uint8_t c[4]) {
@@ -82,6 +88,16 @@ const char* kSvgBadViewBox =
     R"SVG(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 -10 -10"><rect width="5" height="5" fill="#ff0000"/></svg>)SVG";
 const char* kSvgNegDim =
     R"SVG(<svg xmlns="http://www.w3.org/2000/svg" width="10" height="-5"></svg>)SVG";
+
+// SVG のラスタ化バックエンド: librsvg（有り）または nanosvg（無し = Windows 等）。
+// nanosvg は <text>/<tspan> を描画せず、viewBox の無い SVG を図形の
+// バウンディングボックスから採寸する。文字や厳密な画素の検査は librsvg
+// ビルド専用なので、フォールバックでは XYO_TEST_RSVG=0 で読み飛ばす。
+#if defined(XYO_HAVE_RSVG)
+#define XYO_TEST_RSVG 1
+#else
+#define XYO_TEST_RSVG 0
+#endif
 
 Target* spriteOf(Runtime& rt) {
     for (Target* t : rt.targets) if (t->sprite && !t->isStage) return t;
@@ -468,6 +484,86 @@ int test_pen_points_gpu() {
     return g_fail;
 }
 
+// A zero-length line is the generic-path oracle for the point specialization.
+// Explicit readback makes this test valid on live GL as well as dummy/CPU.
+int test_pen_point_record_parity(int stageWidth = 480, int stageHeight = 360) {
+    Runtime rt;
+    CHECK(loadProject(rt, "[]"));
+    rt.stageWidth = stageWidth;
+    rt.stageHeight = stageHeight;
+    SdlRenderer ren;
+    CHECK(ren.init(rt, 1));
+    rt.renderer = &ren;
+    const int skin = ren.createPenSkin();
+    const size_t bytes = size_t(TA::penW(ren)) * TA::penH(ren) * 4;
+    const float color[4] = {0.2f, 0.7f, 0.4f, 0.375f};
+    const double inf = std::numeric_limits<double>::infinity();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double huge = std::numeric_limits<double>::max();
+    const double tiny = std::numeric_limits<double>::denorm_min();
+    auto compare = [&](double d, double x, double y) {
+        ren.penClear(skin);
+        const auto beforePoint = penStats();
+        ren.penPoint(skin, color, d, x, y);
+        const auto afterPoint = penStats();
+        const uint8_t* p = TA::penPx(ren);
+        std::vector<uint8_t> snap(p, p + bytes);
+        ren.penClear(skin);
+        const auto beforeLine = penStats();
+        ren.penLine(skin, color, d, x, y, x, y);
+        const auto afterLine = penStats();
+        CHECK(std::memcmp(TA::penPx(ren), snap.data(), bytes) == 0);
+        CHECK_EQ(afterPoint.strokes - beforePoint.strokes,
+                 afterLine.strokes - beforeLine.strokes);
+        CHECK_EQ(afterPoint.quads - beforePoint.quads,
+                 afterLine.quads - beforeLine.quads);
+    };
+    for (double d : {0.0, -0.0, nan, inf, -inf, huge, -1.0, tiny, -tiny,
+                     1.0, std::nextafter(1.0, 0.0), std::nextafter(1.0, 2.0),
+                     3.0, std::nextafter(3.0, 2.0), std::nextafter(3.0, 4.0),
+                     2.7, 12.5})
+        for (const auto& xy : {std::pair{0.0, -0.0}, std::pair{0.25, -0.75},
+                               std::pair{-240.0, 180.0}})
+            compare(d, xy.first, xy.second);
+    for (double v : {nan, inf, -inf, huge, -huge}) {
+        compare(1.0, v, 0.0);
+        compare(1.0, 0.0, v);
+    }
+    // Cross the append flush threshold; alternate with generic lines to check
+    // order, then exercise readback and discarding a pending batch via clear.
+    for (int n : {99999, 100000, 100001}) {
+        auto feed = [&](bool points) {
+            ren.penClear(skin);
+            for (int i = 0; i < n; ++i) {
+                double x = (i % 480) - 240.0, y = ((i / 480) % 360) - 180.0;
+                const float alternate[4] = {0.8f, 0.1f, 0.9f, 0.625f};
+                const float* brush = (i % 2) ? color : alternate;
+                if (points && (i % 3)) ren.penPoint(skin, brush, 2.7, x, y);
+                else ren.penLine(skin, brush, 2.7, x, y, x, y);
+            }
+        };
+        feed(true);
+        const uint8_t* p = TA::penPx(ren);
+        std::vector<uint8_t> snap(p, p + bytes);
+        feed(false);
+        CHECK(std::memcmp(TA::penPx(ren), snap.data(), bytes) == 0);
+        ren.penPoint(skin, color, 100, 0, 0);
+        ren.penClear(skin);
+        CHECK_EQ(penNonZero(TA::penPx(ren), TA::penW(ren), TA::penH(ren)), 0);
+    }
+    const auto before = penStats();
+    ren.penPoint(skin + 100, color, 1, 0, 0);
+    CHECK_EQ(penStats().strokes, before.strokes);
+    CHECK_EQ(penStats().quads, before.quads);
+    if (std::getenv("XYO_TEST_PEN_RECORDS")) {
+        CHECK(penStats().quads > 0); // Do not silently validate CPU fallback.
+        CHECK(penStats().flushes > 0);
+        CHECK(penStats().records > 0); // Also reject the legacy quad path.
+    }
+    std::printf("pen-point-parity: %d checks, %d failures\n", g_checks, g_fail);
+    return g_fail;
+}
+
 int test_pen_lines() {
     Runtime rt;
     CHECK(loadProject(rt, "[]"));
@@ -702,6 +798,17 @@ int test_svg_text_render() {
     CHECK(ren.init(rt, 1));
     rt.renderer = &ren;
 
+#if !XYO_TEST_RSVG
+    // nanosvg フォールバックは <text>/<tspan> を描かないため、画素検査は
+    // librsvg ビルドでのみ行う。ここでは「文字だけのコスチュームでも
+    // 採用された寸法でデコードされ、キャッシュに載る」ことだけ検証する。
+    for (int i = 0; i < 5; ++i) CHECK(svgSkin(ren, sp, i) != nullptr);
+    CHECK_EQ(TA::skinCount(ren), 5u);
+    std::printf("svg-text: %d checks, %d failures (nanosvg: 画素検査スキップ)\n",
+                g_checks, g_fail);
+    return g_fail;
+#endif
+
     const auto* s = svgSkin(ren, sp, 0);
     CHECK(s != nullptr);
     if (s) {
@@ -817,12 +924,14 @@ int test_svg_anchor_and_viewbox() {
     if (s) {
         CHECK_EQ(s->w, 480);
         CHECK_EQ(s->h, 160);
+#if XYO_TEST_RSVG
         const uint8_t* px = s->px.data();
         auto red = [](const uint8_t* p) {
             return p[3] > 0 && p[0] > 128 && p[1] < 96 && p[2] < 96;
         };
         CHECK(countPix(px, s->w, 0, 0, 235, 160, red) > 0);
         CHECK(countPix(px, s->w, 245, 0, 480, 160, red) > 0);
+#endif
     }
 
     s = svgSkin(ren, sp, 1);
@@ -863,7 +972,14 @@ int test_svg_bad_decode() {
 
     for (int i = 0; i < 5; ++i) {
         const auto* s = svgSkin(ren, sp, i);
+#if XYO_TEST_RSVG
         CHECK(s == nullptr);
+#else
+        // nanosvg は viewBox の無い SVG を図形のバウンディングボックスから
+        // 採寸するため、librsvg が拒否する入力（kSvgUnsized）も成功し得る。
+        // 壊れた寸法のスキンが描画へ渡らないことだけ検証する。
+        if (s) CHECK(s->w > 0 && s->h > 0);
+#endif
         CHECK(TA::cached(ren, &sp->sprite->costumes[i]));
     }
     CHECK_EQ(TA::skinCount(ren), 5u);
@@ -884,8 +1000,15 @@ int test_svg_text_usage() {
     Target* sp = spriteOf(rt);
     CHECK(sp != nullptr);
     if (!sp) return g_fail;
+#if XYO_TEST_RSVG
     const char* kUse =
         R"SVG(<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><text x="8" y="38" font-size="30" fill="#ff0000">AB</text></svg>)SVG";
+#else
+    // nanosvg フォールバックは <text> を描かないため、同じ 100x50 を塗る
+    // 矩形で pick / touchingColor / stamp の経路を検証する。
+    const char* kUse =
+        R"SVG(<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><rect x="0" y="0" width="100" height="50" fill="#ff0000"/></svg>)SVG";
+#endif
     setCostumeData(sp, 0, kUse, std::strlen(kUse));
 
     SdlRenderer ren;
@@ -1298,9 +1421,136 @@ int test_frame_capture() {
     return g_fail;
 }
 
+// 逆順合成（遅延バッチ + (T,P) 半群 + 早期終了）の回帰テスト。
+// 強制的に RC 経路を通し、前向き逐次合成との差が知覚閾値内であることを
+// 検証する。順序（描画順）が保たれることも併せて確認する。
+int test_pen_reverse_composite() {
+    const float cols[4][4] = {
+        {1.0f, 0.0f, 0.0f, 1.0f},
+        {0.0f, 0.5f, 1.0f, 0.5f},
+        {0.2f, 0.9f, 0.3f, 0.25f},
+        {1.0f, 1.0f, 1.0f, 1.0f},
+    };
+    auto run = [&](bool rc, std::vector<uint8_t>& out) {
+        if (rc) setenv("XYO_PEN_RC", "1", 1);
+        else setenv("XYO_PEN_RC", "0", 1);
+        Runtime rt;
+        if (!loadProject(rt, "[]")) return false;
+        SdlRenderer ren;
+        if (!ren.init(rt, 1)) return false;
+        rt.renderer = &ren;
+        const int skin = ren.createPenSkin();
+        if (skin < 0) return false;
+        // 400 本を狭い領域へ重ねる（バッチ閾値 256 を超え、重なりも深い）
+        for (int i = 0; i < 400; ++i) {
+            const float* c = cols[i % 4];
+            const double x = -20.0 + double((i * 37) % 40);
+            const double y = -20.0 + double((i * 53) % 40);
+            ren.penLine(skin, c, 3.0 + double(i % 5), x, y, x + 6.0,
+                        y + 4.0);
+        }
+        const uint8_t* p = TA::penPx(ren);
+        out.assign(p, p + size_t(TA::penW(ren)) * TA::penH(ren) * 4);
+        return true;
+    };
+    std::vector<uint8_t> fwd, rev;
+    const bool ok1 = run(false, fwd);
+    const bool ok2 = run(true, rev);
+    unsetenv("XYO_PEN_RC");
+    CHECK(ok1);
+    CHECK(ok2);
+    if (!ok1 || !ok2) return g_fail;
+    CHECK_EQ(fwd.size(), rev.size());
+    int maxErr = 0;
+    long sumErr = 0, nz = 0;
+    for (size_t i = 0; i < fwd.size(); i += 4) {
+        for (int c = 0; c < 4; ++c) {
+            const int e = std::abs(int(fwd[i + c]) - int(rev[i + c]));
+            if (e > maxErr) maxErr = e;
+            sumErr += e;
+        }
+        if (fwd[i + 3]) ++nz;
+    }
+    // 描画されている（バッチ経路が実際に走った）
+    CHECK(nz > 1000);
+    // 知覚できない差（タッチ色判定の許容 ±5 以内）
+    CHECK(maxErr <= 4);
+    CHECK(sumErr / long(fwd.size()) <= 2);
+    std::printf("pen-reverse: %d checks, %d failures (maxErr=%d mean=%.3f)\n",
+                g_checks, g_fail, maxErr, double(sumErr) / double(fwd.size()));
+    return g_fail;
 }
 
+#if !XYO_TEST_RSVG
+// librsvg の無いビルド（Windows 等）の nanosvg フォールバックの回帰テスト。
+// 図形は描かれ、文字は描かれない（nanosvg の既知の制約）ことを固定する。
+int test_svg_nanosvg_fallback() {
+    Runtime rt;
+    CHECK(loadSvgCostumes(rt, 3, 0, 0));
+    Target* sp = spriteOf(rt);
+    CHECK(sp != nullptr);
+    if (!sp) return g_fail;
+    const char* kShape =
+        R"SVG(<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10" viewBox="0 0 20 10"><rect x="0" y="0" width="20" height="10" fill="#ff0000"/><circle cx="5" cy="5" r="2" fill="#00ff00"/></svg>)SVG";
+    const char* kTextOnly =
+        R"SVG(<svg xmlns="http://www.w3.org/2000/svg" width="60" height="30"><text x="4" y="24" font-size="20" fill="#ff0000">AB</text></svg>)SVG";
+    setCostumeData(sp, 0, kShape, std::strlen(kShape));
+    setCostumeData(sp, 1, kTextOnly, std::strlen(kTextOnly));
+    setCostumeData(sp, 2, kSvgUnsized, std::strlen(kSvgUnsized));
+
+    SdlRenderer ren;
+    CHECK(ren.init(rt, 1));
+    rt.renderer = &ren;
+
+    const auto* s = svgSkin(ren, sp, 0);
+    CHECK(s != nullptr);
+    if (s) {
+        CHECK_EQ(s->w, 40);   // librsvg 経路と同じ 2x ラスタ
+        CHECK_EQ(s->h, 20);
+        CHECK_EQ(int(s->scale), 2);
+        const uint8_t* px = s->px.data();
+        CHECK(countPix(px, s->w, 0, 0, s->w, s->h,
+                       [](const uint8_t* p) {
+                           return p[3] > 200 && p[0] > 200 && p[1] < 60 &&
+                                  p[2] < 60;
+                       }) > 0);
+        // circle(cx=5,cy=5,r=2) は device px で (10,10) 付近
+        CHECK(countPix(px, s->w, 6, 6, 14, 14,
+                       [](const uint8_t* p) {
+                           return p[3] > 200 && p[1] > 200 && p[0] < 60;
+                       }) > 0);
+    }
+
+    s = svgSkin(ren, sp, 1);
+    CHECK(s != nullptr);
+    if (s) {
+        CHECK_EQ(s->w, 120);
+        CHECK_EQ(s->h, 60);
+        CHECK_EQ(countPix(s->px.data(), s->w, 0, 0, s->w, s->h,
+                          [](const uint8_t* p) { return p[3] > 0; }), 0);
+    }
+
+    // viewBox の無い SVG は図形のバウンディングボックスで採寸される
+    s = svgSkin(ren, sp, 2);
+    CHECK(s != nullptr);
+    if (s) {
+        CHECK_EQ(s->w, 20);
+        CHECK_EQ(s->h, 20);
+    }
+    std::printf("svg-nanosvg: %d checks, %d failures\n", g_checks, g_fail);
+    return g_fail;
+}
+#endif
+
+} // namespace
+
 int main() {
+    if (std::getenv("XYO_TEST_PEN_RECORDS")) {
+        test_pen_point_record_parity();
+        test_pen_point_record_parity(640, 480);
+        return g_fail ? 1 : 0;
+    }
+    test_pen_point_record_parity();
     test_negative_cache_zero_svg();
     test_negative_cache_empty_and_bad_bitmap();
     test_positive_cache_valid_svg();
@@ -1318,6 +1568,10 @@ int main() {
     test_pen_border_fenced();
     test_pen_full_coverage();
     test_frame_capture();
+    test_pen_reverse_composite();
+#if !XYO_TEST_RSVG
+    test_svg_nanosvg_fallback();
+#endif
     std::printf("render: %d checks, %d failures\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

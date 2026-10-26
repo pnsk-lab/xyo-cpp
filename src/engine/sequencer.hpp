@@ -12,6 +12,7 @@ namespace xyo {
 
 struct Runtime;
 struct DepGraph;
+struct AccessSet;
 
 class Sequencer {
 public:
@@ -28,7 +29,10 @@ public:
     /// detach された旧スレッド配列の寿命管理（stepThreads 生存期間中）
     std::vector<std::unique_ptr<std::vector<Thread*>>> detachedLists;
 
-    static constexpr double WARP_TIME = 500.0;
+    /// warp スレッドの時間予算（`Runtime::warpTimeMs`、TurboWarp の
+    /// `WARP_TIME` = 500ms 相当）を使い切ったか。`Runtime::dangerMode`
+    /// では予算が無制限（+inf）なので常に false = 時間では譲らない。
+    bool warpBudgetExhausted(const Thread& thread) const;
 
     /// 全スレッドを 1 ティック分ステップ。完了スレッドを返す。
     std::vector<Thread*> stepThreads();
@@ -45,8 +49,8 @@ public:
     // --- 並列実行（スレッド間メモリ依存グラフ）---
     /// 並列機能有効か（XYO_PAR=0 で無効化）
     bool parallelEnabled() const;
-    /// このスレッドを並列バッチに入れられるか（JIT 済み・yield 無し・
-    /// 依存解析が安全）
+    /// このスレッドを並列バッチに入れられるか（JIT 済み・依存解析が
+    /// worker-safe。yield する fiber も可）
     bool parallelEligible(Thread& t) const;
     /// flushParBatch の実行後帳簿
     struct ParFlush {
@@ -60,9 +64,17 @@ public:
     void dumpDepGraph(const DepGraph& g,
                       const std::vector<Thread*>& batch);
 
+    struct ParallelStats {
+        uint64_t batches = 0, dispatches = 0, threads = 0, groups = 0;
+    };
+    const ParallelStats& parallelStats() const { return parStats_; }
+
 private:
+    const AccessSet* parallelAccessFor(Thread& t) const;
     std::unique_ptr<WorkerPool> parPool_;
     std::vector<Thread*> parBatch_;
+    std::vector<const AccessSet*> parSets_;
+    ParallelStats parStats_;
     int depGraphSeq_ = 0;
 };
 

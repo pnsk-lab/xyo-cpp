@@ -14,6 +14,11 @@
 #include <cmath>
 #include <cstring>
 
+// M_PI は ISO C++ 標準ではない（mingw の <cmath> では未定義）
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 #define DR_MP3_IMPLEMENTATION
 #define DR_MP3_NO_STDIO
 #include "../../third_party/dr_mp3.h"
@@ -22,6 +27,8 @@ namespace xyo {
 
 bool SdlAudioBank::init(Runtime& rt) {
     rt_ = &rt;
+    // SDL_main を使わないので明示的に main ready を立てる（Windows で必須）
+    SDL_SetMainReady();
     if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0)
         return false;
     SDL_AudioSpec want{}, have{};

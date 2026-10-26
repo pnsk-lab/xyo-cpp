@@ -5,6 +5,7 @@
 #include "pen_api.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <memory>
 #include <string>
 
@@ -31,6 +32,79 @@ void updatePenColor(PenState& p) {
     p.rgba[1] = rgb.g / 255.0f;
     p.rgba[2] = rgb.b / 255.0f;
     p.rgba[3] = 1.0f - static_cast<float>(p.transparency / 100.0);
+}
+
+/// setPenColorToColor の RGB→HSV→RGB 往復結果キャッシュ。
+/// TW は set 時に rgbToHsv、描画時に hsvToRgb で色を確定するため、
+/// 同じ RGB なら結果は常に同一（入力の Value 表現に依存しない）。
+/// 直接マップ 2048 エントリ。パレット色を繰り返す作品でヒットする。
+struct ColorRoundTrip {
+    uint32_t key = 0; // packed RGB + 1 (0 = empty)
+    double color = 0, sat = 0, bright = 0, shade = 0;
+    float rgba[3] = {};
+};
+constexpr uint32_t kColorCacheN = 2048;
+// Pure conversion data only, no Target/Value/GC pointers. Each OS thread owns
+// its table: no atomic payload traffic, key revalidation, or mixed snapshots
+// from colliding writers. Conversion never yields or invokes user callbacks.
+// Fibers may share the table; they cannot suspend in the middle of a lookup.
+thread_local ColorRoundTrip g_colorCache[kColorCacheN];
+
+/// 計測用: 往復キャッシュを無効化して従来経路（遅延 rgba）で動かす。
+/// A/B は同一バイナリで `XYO_PEN_NOCACHE=1`。
+static const bool g_noColorCache = std::getenv("XYO_PEN_NOCACHE") != nullptr;
+
+/// setPenColorToColor の色確定（rgbToHsv → hsvToRgb 往復）をキャッシュ
+/// 経由で行う。colorDirty を立てない（rgba まで確定済み）ので、
+/// 次の移動時の syncPenColor が no-op になる。
+void applyColorCached(PenState& p, const Rgba& rgb) {
+    if (g_noColorCache) {
+        const Hsv hsv = color::rgbToHsv({rgb.r, rgb.g, rgb.b});
+        p.color = (hsv.h / 360.0) * 100.0;
+        p.saturation = hsv.s * 100.0;
+        p.brightness = hsv.v * 100.0;
+        p.transparency =
+            rgb.a < 255 ? 100.0 * (1.0 - rgb.a / 255.0) : 0.0;
+        p.shade = p.brightness / 2.0;
+        p.colorDirty = true;
+        return;
+    }
+    const uint32_t packed = (uint32_t(rgb.r) << 16) |
+                            (uint32_t(rgb.g) << 8) | uint32_t(rgb.b);
+    ColorRoundTrip& e = g_colorCache[(packed * 2654435761u) >> 21];
+    const uint32_t want = packed + 1;
+    if (e.key == want) {
+        p.color = e.color;
+        p.saturation = e.sat;
+        p.brightness = e.bright;
+        p.shade = e.shade;
+        p.rgba[0] = e.rgba[0];
+        p.rgba[1] = e.rgba[1];
+        p.rgba[2] = e.rgba[2];
+    } else {
+        const Hsv hsv = color::rgbToHsv({rgb.r, rgb.g, rgb.b});
+        p.color = (hsv.h / 360.0) * 100.0;
+        p.saturation = hsv.s * 100.0;
+        p.brightness = hsv.v * 100.0;
+        p.shade = p.brightness / 2.0;
+        const Rgb out = color::hsvToRgb({p.color * 360.0 / 100.0,
+                                         p.saturation / 100.0,
+                                         p.brightness / 100.0});
+        p.rgba[0] = out.r / 255.0f;
+        p.rgba[1] = out.g / 255.0f;
+        p.rgba[2] = out.b / 255.0f;
+        e.color = p.color;
+        e.sat = p.saturation;
+        e.bright = p.brightness;
+        e.shade = p.shade;
+        e.rgba[0] = p.rgba[0];
+        e.rgba[1] = p.rgba[1];
+        e.rgba[2] = p.rgba[2];
+        e.key = want;
+    }
+    p.transparency = rgb.a < 255 ? 100.0 * (1.0 - rgb.a / 255.0) : 0.0;
+    p.rgba[3] = 1.0f - static_cast<float>(p.transparency / 100.0);
+    p.colorDirty = false;
 }
 
 /// rgba の遅延同期 — 描画読み取り前に必ず呼ぶ。
@@ -160,15 +234,7 @@ void penStampCore(Target* t, Runtime* rt) {
 }
 void penSetColorToColorCore(Target* t, Value color) {
     PenState& p = penStateOf(t);
-    const Rgba rgb = cast::toRgbColorObject(color);
-    const Hsv hsv = color::rgbToHsv({rgb.r, rgb.g, rgb.b});
-    p.color = (hsv.h / 360.0) * 100.0;
-    p.saturation = hsv.s * 100.0;
-    p.brightness = hsv.v * 100.0;
-    // JS は hasOwnProperty('a') で判定するが、decimalToRgb は無ければ 255 を返す
-    p.transparency = rgb.a < 255 ? 100.0 * (1.0 - rgb.a / 255.0) : 0.0;
-    p.shade = p.brightness / 2.0;   // scratch2 と同じ更新
-    p.colorDirty = true;
+    applyColorCached(p, cast::toRgbColorObject(color));
     p.lastSetColor = color.bits;
 }
 void penColorParamCore(Target* t, std::u16string_view param, Value v,
@@ -299,14 +365,7 @@ void setColorToColor(Target* t, Value color) {
     penSetColorToColorCore(t, color);
 }
 void setColorToColorState(PenState& p, Value color) {
-    const Rgba rgb = cast::toRgbColorObject(color);
-    const Hsv hsv = color::rgbToHsv({rgb.r, rgb.g, rgb.b});
-    p.color = (hsv.h / 360.0) * 100.0;
-    p.saturation = hsv.s * 100.0;
-    p.brightness = hsv.v * 100.0;
-    p.transparency = rgb.a < 255 ? 100.0 * (1.0 - rgb.a / 255.0) : 0.0;
-    p.shade = p.brightness / 2.0;
-    p.colorDirty = true;
+    applyColorCached(p, cast::toRgbColorObject(color));
     p.lastSetColor = color.bits;
 }
 void colorParam(Target* t, std::u16string_view param, Value v, bool change) {

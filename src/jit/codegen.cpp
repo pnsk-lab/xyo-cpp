@@ -4,17 +4,21 @@
 // 入力・スタック双方、未 lowering のものは compat 層へ落とす。
 #include "jit.hpp"
 #include "aot_emit.hpp"
+#include "parfor.hpp"
 
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Module.h>
+#include <llvm/IR/Metadata.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Transforms/Utils/Cloning.h>
+#include <llvm/Transforms/Utils/Local.h>
 
 #include <cstddef>
 #include <cmath>
 #include <map>
 #include <optional>
 #include <set>
+#include <unordered_map>
 
 #include "../blocks/pen_api.hpp"
 #include "../core/cast.hpp"
@@ -56,11 +60,51 @@ struct Codegen {
     AotEmit* aot = nullptr;
     bool fail = false;
     const bool verbose = std::getenv("XYO_JIT_VERBOSE") != nullptr;
+    // Compile-time A/B switch; no branch is added to generated hot loops.
+    const bool boxedMotion = std::getenv("XYO_JIT_MOTION_BOXED") != nullptr;
+    const bool genericEq = std::getenv("XYO_JIT_EQ_GENERIC") != nullptr;
+    const bool slotReload = std::getenv("XYO_JIT_SLOT_RELOAD") != nullptr;
+    const bool genericLiteralNum = std::getenv("XYO_JIT_LITERAL_NUM_GENERIC") != nullptr;
+    const bool genericMathBox = std::getenv("XYO_JIT_MATH_BOX_GENERIC") != nullptr;
 
     // 手続き variantKey(proccode|warp) → 宣言済み Function
     std::map<std::string, Function*> procFns;
     std::string prefix;   // シンボル一意化用
     uint64_t procCounter = 0;
+
+    // --- par-for（並列 append ループ）----------------------------------
+    // 検出したループ本体は (ctx, iter, ctr, SList**, i64*) の別関数へ emit し、
+    // 反復範囲をワーカープールで分割実行する（xyo_par_for）。
+    struct ParForCtx {
+        llvm::Value* lists = nullptr;   // SList** （append 先）
+        llvm::Value* bases = nullptr;   // i64*   （各リストの開始 len）
+        llvm::Value* iter = nullptr;    // i64    現在の反復番号
+        std::unordered_map<std::string, int> index;  // LIST id → k
+    };
+    ParForCtx* parFor = nullptr;
+    /// カウンタ変数を反復ローカルへ差し替える（VARIABLE id → alloca）
+    std::unordered_map<std::string, llvm::AllocaInst*> varOverride;
+    struct PendingParFor {
+        Function* f = nullptr;
+        jit::ParForPlan plan;
+    };
+    std::vector<PendingParFor> pendingParFors;
+    std::vector<Function*> parFns;
+    bool parForDisabled = std::getenv("XYO_PARFOR") != nullptr &&
+                          std::getenv("XYO_PARFOR")[0] == '0';
+
+    // --- ループ不変 pen setter のホイスト -------------------------------
+    // warp 手続き内のループで、本体先頭に並ぶ pen 設定（サイズ/色）の引数が
+    // ループ不変なら、ループの外へ 1 回だけ出す。本体からは除去する。
+    // 「本体が 1 回も実行されない」ケースを保存するため、呼出し側で
+    // 実行ガード（repeat なら trip>=1）の中に置く。
+    std::unordered_set<Block*> hoistedSetters;
+    bool curFnWarp = false;
+    /// ループ本体で書き込まれる変数/リスト（不変性判定用）
+    struct LoopWriteScan {
+        std::unordered_set<std::string> vars, lists;
+        bool hasCall = false;
+    };
     // 現在コンパイル中の手続きの引数名→index（argument reporter 用）
     std::map<std::u16string, int64_t> argIndex;
     // 手続き内なら仮引数の SSA 値（ctx=0、args=1..n）。argument
@@ -75,7 +119,7 @@ struct Codegen {
     // 同じ id でも別 GlobalVariable だとキャッシュが全ミスになる。
     std::map<std::string, Constant*> idGlobals;
     std::map<std::u16string, Constant*> nameGlobals;
-    /// 変数スロット idx（モジュール単位 — proc fn 共有）。
+    /// 変数スロット idx（スクリプト単位 — proc fn 共有、同一 AOT Module 内でも別スクリプトとは非共有）。
     /// (id,isList) → idx。初出時に entryFn 先頭へ xyo_varslot_init を
     /// 挿入し、以後の使用は ctx->varSlotData[idx] の直接 load。
     /// clone は変数をコピーするので実行時 target 解決は維持しつつ、
@@ -110,9 +154,221 @@ struct Codegen {
                          why.c_str(), blk->id.c_str(), blk->opcode.c_str());
         return nullptr;
     }
+
+    /// ループ本体で書き込まれる変数/リストを集める（本体木全体。呼出しは hasCall）
+    void scanLoopWrites(const std::string& firstId, LoopWriteScan& out) {
+        std::vector<std::string> stack{firstId};
+        std::unordered_set<std::string> seen;
+        auto mark = [&](Block* b, const char* f) {
+            auto it = b->fields.find(f);
+            if (it != b->fields.end()) out.vars.insert(it->second.id);
+        };
+        while (!stack.empty()) {
+            std::string id = std::move(stack.back());
+            stack.pop_back();
+            if (id.empty() || !seen.insert(id).second) continue;
+            Block* b = blocks->getBlock(id);
+            if (!b) continue;
+            const std::string& op = b->opcode;
+            if (op == "procedures_call") out.hasCall = true;
+            if (op == "data_setvariableto" || op == "data_changevariableby" ||
+                op == "control_for_each")
+                mark(b, "VARIABLE");
+            if (op == "data_addtolist" || op == "data_deleteoflist" ||
+                op == "data_deletealloflist" || op == "data_insertatlist" ||
+                op == "data_replaceitemoflist") {
+                auto it = b->fields.find("LIST");
+                if (it != b->fields.end()) out.lists.insert(it->second.id);
+            }
+            if (!b->next.empty()) stack.push_back(b->next);
+            for (const auto& [n, in] : b->inputs.items) {
+                (void)n;
+                if (!in.block.empty()) stack.push_back(in.block);
+                if (!in.shadow.empty()) stack.push_back(in.shadow);
+            }
+        }
+    }
+
+    /// 引数の式がループ不変か（本体が書き込む変数/リストを読まない・副作用なし）
+    bool argInvariant(const BlockInput& in, const LoopWriteScan& w) {
+        std::string id = !in.block.empty() ? in.block : in.shadow;
+        if (id.empty()) return true;
+        Block* b = blocks->getBlock(id);
+        if (!b) return true;
+        if (b->shadow) return true;   // 定数
+        const std::string& op = b->opcode;
+        if (op == "procedures_call" || op.rfind("sensing_", 0) == 0 ||
+            op == "operator_random" || op == "procedures_return")
+            return false;
+        if (op == "data_variable") {
+            auto it = b->fields.find("VARIABLE");
+            return it == b->fields.end() || !w.vars.count(it->second.id);
+        }
+        if (op == "data_itemoflist" || op == "data_itemnumoflist" ||
+            op == "data_lengthoflist" || op == "data_listcontainsitem" ||
+            op == "data_listcontents") {
+            auto it = b->fields.find("LIST");
+            if (it != b->fields.end() && w.lists.count(it->second.id))
+                return false;
+        }
+        // pen/motion はターゲット状態依存 — 保守側で不変扱いしない
+        if (op.rfind("pen_", 0) == 0 || op.rfind("motion_", 0) == 0)
+            return false;
+        for (const auto& [n, in2] : b->inputs.items) {
+            (void)n;
+            if (!argInvariant(in2, w)) return false;
+        }
+        return true;
+    }
+
+    static bool hoistablePenSetter(const std::string& op) {
+        return op == "pen_setPenSizeTo" || op == "pen_setPenColorToColor" ||
+               op == "pen_setPenColorParamTo";
+    }
+
+    /// 本体先頭の連続する pen setter（引数がループ不変）を集める。
+    /// warp 手続き内のみ（非 warp ループは他のスクリプトが間に走り得る）。
+    std::vector<Block*> hoistableSetters(Block* loop) {
+        std::vector<Block*> out;
+        static const bool disabled = [] {
+            const char* v = std::getenv("XYO_PENHOIST");
+            return v && v[0] == '0';
+        }();
+        if (disabled || !curFnWarp || !blocks) return out;
+        const BlockInput* sub = loop->inputs.find("SUBSTACK");
+        if (!sub || sub->block.empty()) return out;
+        LoopWriteScan w;
+        scanLoopWrites(sub->block, w);
+        if (w.hasCall) return out;   // 呼出し越しの不変性は保証しない
+        std::string id = sub->block;
+        while (!id.empty()) {
+            Block* b = blocks->getBlock(id);
+            if (!b || !hoistablePenSetter(b->opcode)) break;
+            bool ok = true;
+            for (const auto& [n, in] : b->inputs.items) {
+                (void)n;
+                if (!argInvariant(in, w)) { ok = false; break; }
+            }
+            if (!ok) break;
+            out.push_back(b);
+            id = b->next;
+        }
+        return out;
+    }
+
+    /// ホイストした setter を、本体が 1 回以上実行されるガード内で emit する
+    /// （guard が null なら無条件 — forever 用）。
+    void emitHoistedSetters(const std::vector<Block*>& hs, llvm::Value* guard) {
+        if (hs.empty()) return;
+        BasicBlock* runBB = nullptr, *afterBB = nullptr;
+        if (guard) {
+            runBB = BasicBlock::Create(lc, "", fn);
+            afterBB = BasicBlock::Create(lc, "", fn);
+            b.CreateCondBr(guard, runBB, afterBB);
+            b.SetInsertPoint(runBB);
+        }
+        emitChainBlocks(hs);                       // 先に emit
+        for (Block* h : hs) hoistedSetters.insert(h);   // 本体からは除去
+        if (guard) {
+            if (!bbDone(b.GetInsertBlock())) b.CreateBr(afterBB);
+            b.SetInsertPoint(afterBB);
+        }
+    }
+
     const gpu::Program* tryGpuLoop(Block* blk) {
         const gpu::ParallelLoop* pl = tryGpuLoopEx(blk);
         return pl ? &pl->program : nullptr;
+    }
+
+    /// par-for の最小反復数（これ未満は逐次ループの方が速い）
+    static int64_t parForMinTrip() {
+        static const int64_t v = [] {
+            const char* s = std::getenv("XYO_PARFOR_MIN");
+            int64_t r = s ? std::strtoll(s, nullptr, 10) : 512;
+            return r > 0 ? r : int64_t(512);
+        }();
+        return v;
+    }
+
+    /// 「カウンタ + append」ループを並列実行する高速パスを emit する。
+    /// 失敗（xyo_par_for が 0 を返した）ときは fallback（逐次ループの head）へ。
+    /// リストは反復順に slot を書くので、最終内容は逐次と完全に一致する。
+    bool tryEmitParFor(Block* blk, llvm::Value* n, BasicBlock* fallback,
+                       BasicBlock* merge) {
+        if (parForDisabled || aot || !blocks) return false;
+        std::string why;
+        auto planOpt = jit::analyzeParFor(*blocks, blk, &why);
+        if (!planOpt) {
+            if (verbose)
+                std::fprintf(stderr, "xyo-jit: parfor skip (%s): %s\n",
+                             blk->id.c_str(), why.c_str());
+            return false;
+        }
+        jit::ParForPlan& plan = *planOpt;
+        const uint32_t k = uint32_t(plan.lists.size());
+
+        // append 先の SList* を配列へ。1 つでも null（未生成）なら逐次へ。
+        AllocaInst* listsArr = entryAlloca(ptrt, k, "pf_lists");
+        AllocaInst* basesArr = entryAlloca(i64t, k, "pf_bases");
+        llvm::Value* allNonNull = b.getInt1(true);
+        for (uint32_t i = 0; i < k; ++i) {
+            llvm::Value* lp = varListPtr(plan.lists[i]);
+            b.CreateStore(lp, b.CreateGEP(ptrt, listsArr, ci64(i)));
+            allNonNull = b.CreateAnd(
+                allNonNull,
+                b.CreateICmpNE(b.CreatePtrToInt(lp, i64t), ci64(0)));
+        }
+
+        // trip = round(n)（逐次ループの i>=0.5 判定と同値）+ 範囲ガード。
+        llvm::Value* inRange = b.CreateFCmpOLE(n, cf64(9.0e15));
+        llvm::Value* usable =
+            b.CreateAnd(b.CreateFCmpOGE(n, cf64(0.5)), inRange);
+        llvm::Value* safeN = b.CreateSelect(usable, n, cf64(0.0));
+        llvm::Value* trip =
+            b.CreateFPToSI(b.CreateFAdd(safeN, cf64(0.5)), i64t);
+        llvm::Value* cond = b.CreateAnd(
+            b.CreateICmpNE(loadIsWarp(), ci32(0)),
+            b.CreateAnd(allNonNull,
+                        b.CreateAnd(inRange,
+                                    b.CreateICmpSGE(trip,
+                                                    ci64(parForMinTrip())))));
+
+        BasicBlock* prep = BasicBlock::Create(lc, "", fn);
+        b.CreateCondBr(cond, prep, fallback);
+        b.SetInsertPoint(prep);
+        // 開始 len を並列領域の前に確定（ワーカーは len/cap を触らない）
+        for (uint32_t i = 0; i < k; ++i) {
+            llvm::Value* lp =
+                b.CreateLoad(ptrt, b.CreateGEP(ptrt, listsArr, ci64(i)));
+            llvm::Value* len = b.CreateZExt(
+                b.CreateLoad(i32t, b.CreateConstGEP1_32(i8t, lp, kListLenOff)),
+                i64t);
+            b.CreateStore(len, b.CreateGEP(i64t, basesArr, ci64(i)));
+        }
+
+        // 本体関数 void(JitCtx*, iter, ctr, SList**, i64*) を宣言し、
+        // 実体は emitPendingParFors で埋める（呼出し側の emit と独立）。
+        std::vector<Type*> ps{ptrt, i64t, f64t, ptrt, ptrt};
+        Function* bf = Function::Create(
+            FunctionType::get(voidt, ps, false), Function::InternalLinkage,
+            prefix + "_pf" + std::to_string(procCounter++), &mod);
+        parFns.push_back(bf);
+        pendingParFors.push_back({bf, plan});
+
+        llvm::Value* initF = emitToNumF64(emitVarGet(plan.counterField));
+        llvm::Value* ok = callN(
+            "xyo_par_for", i32t,
+            {ctxArg, trip, initF, cf64(plan.delta), listsArr, basesArr,
+             ci64(k), bf});
+        BasicBlock* okBB = BasicBlock::Create(lc, "", fn);
+        b.CreateCondBr(b.CreateICmpNE(ok, ci32(0)), okBB, fallback);
+        b.SetInsertPoint(okBB);
+        // カウンタの書き戻し（整数域なので厳密）
+        llvm::Value* fin = b.CreateFAdd(
+            initF, b.CreateFMul(b.CreateSIToFP(trip, f64t), cf64(plan.delta)));
+        emitVarSet(plan.counterField, emitCanon(fin));
+        b.CreateBr(merge);
+        return true;
     }
 
     // helpers ------------------------------------------------------------
@@ -250,8 +506,12 @@ struct Codegen {
         return g;
     }
 
+    bool mainThread = false;
     FunctionCallee decl(const char* name, Type* ret,
                         ArrayRef<Type*> args) {
+        // Compat/reporters may mutate shared execution caches or invoke
+        // registered primitives that static opcode memory keys cannot model.
+        if (std::string_view(name).starts_with("xyo_rt_")) mainThread = true;
         return mod.getOrInsertFunction(
             name, FunctionType::get(ret, args, false));
     }
@@ -427,6 +687,12 @@ struct Codegen {
     }
     /// emitCanon 等で num タグが保証される SSA 値（再チェック省略用）
     std::unordered_set<llvm::Value*> knownNum;
+    // Only constValue registers immutable string literals, keyed by their exact
+    // emitted boxed Value, never by interpreting arbitrary ConstantInt pointers.
+    // Keep across native functions: LLVM constants are safe module-wide, while
+    // instruction keys (including AOT slot-derived bits) are unique SSA values.
+    // Payloads are doubles only: no GC references or AOT host pointers.
+    std::map<llvm::Value*, double> literalNums;
 
     /// double → NaN 正規化 bits（Value::numCanonical と同型）
     llvm::Value* emitCanon(llvm::Value* d) {
@@ -475,6 +741,10 @@ struct Codegen {
     llvm::Value* emitToNumF64(llvm::Value* bits) {
         if (auto d = constNumV(bits))
             return cf64(std::isnan(*d) ? 0.0 : *d);
+        if (!genericLiteralNum) {
+            auto it = literalNums.find(bits);
+            if (it != literalNums.end()) return cf64(it->second);
+        }
         if (knownNum.count(bits)) return emitNotNaN(emitAsF64(bits));
         llvm::Value* ok;
         llvm::Value* d = emitNumBoolF64(bits, &ok);
@@ -494,13 +764,11 @@ struct Codegen {
         b.SetInsertPoint(strBB);
         llvm::Value* sp = b.CreateIntToPtr(
             b.CreateAnd(bits, ci64(val::kPtrMask)), ptrt);
-        llvm::Value* st = b.CreateLoad(
-            i32t, b.CreateConstGEP1_32(i8t, sp, kSStrNumStateOff));
+        llvm::Value* st = loadSStrCache(i32t, sp, kSStrNumStateOff, true);
         llvm::Value* hit = b.CreateICmpNE(st, ci32(0));
         b.CreateCondBr(hit, hitBB, missBB);
         b.SetInsertPoint(hitBB);
-        llvm::Value* nc = b.CreateLoad(
-            f64t, b.CreateConstGEP1_32(i8t, sp, kSStrNumCacheOff));
+        llvm::Value* nc = loadSStrCache(f64t, sp, kSStrNumCacheOff, false);
         // numState==2 は NaN — cast::toNumber 意味では 0
         llvm::Value* cd = b.CreateSelect(b.CreateICmpEQ(st, ci32(2)),
                                          cf64(0.0), nc);
@@ -517,6 +785,15 @@ struct Codegen {
         p->addIncoming(hv, missBB);
         p->addIncoming(cf64(0.0), zeroBB);
         return p;
+    }
+    // Match SStr's atomic_ref cache protocol, including speculative payload
+    // loads in list-index lowering. Acquire state publishes the relaxed payload.
+    llvm::Value* loadSStrCache(Type* type, llvm::Value* str, uint32_t off,
+                                bool state) {
+        auto* load = b.CreateLoad(type, b.CreateConstGEP1_32(i8t, str, off));
+        load->setAtomic(state ? AtomicOrdering::Acquire
+                              : AtomicOrdering::Monotonic);
+        return load;
     }
     static constexpr uint32_t kSStrNumStateOff =
         uint32_t(offsetof(SStr, numState));
@@ -551,7 +828,12 @@ struct Codegen {
         llvm::Value* arr = b.CreateLoad(
             ptrt, b.CreateConstGEP1_32(i8t, ctxArg, kVarSlotDataOff));
         llvm::Value* p = b.CreateGEP(ptrt, arr, ci64(it->second));
-        return b.CreateLoad(ptrt, p);
+        auto* load = b.CreateLoad(ptrt, p);
+        // Survives procedure inlining; only the final Variable* load is marked,
+        // never Variable::value, Variable::list, or any list backing storage.
+        load->setMetadata("xyo.varslot", MDNode::get(lc,
+            {ConstantAsMetadata::get(ci64(it->second))}));
+        return load;
     }
     static constexpr uint32_t kVarSlotDataOff =
         uint32_t(offsetof(JitCtx, varSlotData));
@@ -560,6 +842,11 @@ struct Codegen {
     static constexpr uint32_t kVarListOff =
         uint32_t(offsetof(Variable, list));
     llvm::Value* varValuePtr(const BlockField* f) {
+        // par-for の反復カウンタは反復ローカル（i64 の Value bits）へ差し替える
+        if (!varOverride.empty()) {
+            auto ov = varOverride.find(f->id);
+            if (ov != varOverride.end()) return ov->second;
+        }
         llvm::Value* v = varSlot(f, false);
         return b.CreateConstGEP1_32(i8t, v, kVarValueOff);
     }
@@ -646,15 +933,13 @@ struct Codegen {
         b.SetInsertPoint(strBB);
         llvm::Value* sp = b.CreateIntToPtr(
             b.CreateAnd(bits, ci64(val::kPtrMask)), ptrt);
-        llvm::Value* st = b.CreateLoad(
-            i32t, b.CreateConstGEP1_32(i8t, sp, kSStrNumStateOff));
+        llvm::Value* st = loadSStrCache(i32t, sp, kSStrNumStateOff, true);
         // state1(数値) | state4(Infinity リテラル) は数値比較可
         llvm::Value* isOne = b.CreateOr(
             b.CreateICmpEQ(st, ci32(1)), b.CreateICmpEQ(st, ci32(4)));
         b.CreateCondBr(isOne, strHitBB, strBadBB);
         b.SetInsertPoint(strHitBB);
-        llvm::Value* nc = b.CreateLoad(
-            f64t, b.CreateConstGEP1_32(i8t, sp, kSStrNumCacheOff));
+        llvm::Value* nc = loadSStrCache(f64t, sp, kSStrNumCacheOff, false);
         b.CreateBr(merge);
         b.SetInsertPoint(strBadBB);
         b.CreateBr(merge);
@@ -792,12 +1077,129 @@ struct Codegen {
         return p;
     }
 
+    /// Recognize a literal from the input AST, rather than emitted pointer bits:
+    /// AOT string literals are slot loads, not ConstantInts. Only a text shadow
+    /// is accepted; arbitrary reporters with a TEXT field must still execute.
+    std::optional<std::u16string> eqAsciiWord(Block* blk, const char* input) {
+        const BlockInput* in = blk->inputs.find(input);
+        if (!in) return std::nullopt;
+        const std::string& id = in->block.empty() ? in->shadow : in->block;
+        Block* literal = id.empty() ? nullptr : getBlock(id);
+        if (!literal || !literal->shadow || literal->opcode != "text")
+            return std::nullopt;
+        const BlockField* field = findField(literal, "TEXT");
+        if (!field || !field->value.isString() || !field->value.asStrPtr())
+            return std::nullopt;
+        auto text = field->value.asStrPtr()->view();
+        if (text.empty() || text.size() > 8) return std::nullopt;
+        std::u16string word(text);
+        for (char16_t& c : word) {
+            if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+            if (c < 'a' || c > 'z') return std::nullopt;
+        }
+        // Test the ORIGINAL spelling: "Infinity" is numeric but "infinity"
+        // is not. Numeric literals must retain Scratch's numeric comparison
+        // (e.g. Infinity == "1e999"), not just case-insensitive text matching.
+        if (!std::isnan(cast::toNumberOrNaN(field->value))) return std::nullopt;
+        return word;
+    }
+
+    /// Equality with a nonnumeric ASCII word of 1..8 letters (3D2 uses "n"
+    /// and "none"). A different first ASCII unit cannot lowercase to the word:
+    /// lowercasing never removes that ASCII prefix. Otherwise inline comparison
+    /// requires equal length and ALL ASCII units. Unicode anywhere, or unequal
+    /// length after a matching prefix, falls back without assuming anything
+    /// about Unicode length or mappings (Kelvin sign, dotted I, surrogates).
+    /// Only SINGLE letters can reject non-heap Values: numeric cast of the
+    /// literal is NaN, forcing string comparison; finite numbers contain digits,
+    /// NaN/Infinity/true/false/undefined/r,g,b have multiple characters, and the
+    /// inline empty string has none. Words retain the helper because e.g. bool
+    /// true == "true" and numeric NaN == "NaN" must still succeed.
+    llvm::Value* emitEqAsciiWord(llvm::Value* a, llvm::Value* bv,
+                               llvm::Value* dynamic, std::u16string_view word) {
+        BasicBlock* strBB = newBB("eq.lit.str");
+        BasicBlock* firstBB = newBB("eq.lit.first");
+        BasicBlock* asciiBB = newBB("eq.lit.ascii");
+        BasicBlock* lenBB = newBB("eq.lit.len");
+        BasicBlock* wordBB = newBB("eq.lit.word");
+        BasicBlock* compareBB = newBB("eq.lit.compare");
+        BasicBlock* ret0BB = newBB("eq.lit.no");
+        BasicBlock* ret1BB = newBB("eq.lit.yes");
+        BasicBlock* helperBB = newBB("eq.lit.slow");
+        BasicBlock* merge = newBB("eq.lit.merge");
+        llvm::Value* isStr = b.CreateICmpEQ(
+            b.CreateLShr(dynamic, ci64(48)), ci64(val::kTagStr >> 48));
+        b.CreateCondBr(isStr, strBB, word.size() == 1 ? ret0BB : helperBB);
+        b.SetInsertPoint(strBB);
+        llvm::Value* sp = b.CreateIntToPtr(
+            b.CreateAnd(dynamic, ci64(val::kPtrMask)), ptrt);
+        llvm::Value* len = b.CreateLoad(i32t, fld(sp, kSStrLenOff));
+        b.CreateCondBr(b.CreateICmpEQ(len, ci32(0)), ret0BB, firstBB);
+        b.SetInsertPoint(firstBB);
+        llvm::Value* first = b.CreateLoad(i16t, fld(sp, kSStrDataOff));
+        b.CreateCondBr(b.CreateICmpULT(first, b.getInt16(128)),
+                       asciiBB, helperBB);
+        b.SetInsertPoint(asciiBB);
+        llvm::Value* upper = b.CreateAnd(
+            b.CreateICmpUGE(first, b.getInt16('A')),
+            b.CreateICmpULE(first, b.getInt16('Z')));
+        llvm::Value* lower = b.CreateSelect(
+            upper, b.CreateAdd(first, b.getInt16('a' - 'A')), first);
+        b.CreateCondBr(b.CreateICmpEQ(lower, b.getInt16(word[0])),
+                       lenBB, ret0BB);
+        b.SetInsertPoint(lenBB);
+        // Do not load any trailing code units until the length check dominates.
+        b.CreateCondBr(b.CreateICmpEQ(len, ci32(uint32_t(word.size()))),
+                       wordBB, helperBB);
+        b.SetInsertPoint(wordBB);
+        llvm::Value* allAscii = b.getTrue();
+        llvm::Value* matches = b.getTrue(); // first unit was already matched
+        for (size_t i = 1; i < word.size(); ++i) {
+            llvm::Value* unit = b.CreateLoad(
+                i16t, fld(sp, kSStrDataOff + uint32_t(i * sizeof(char16_t))));
+            allAscii = b.CreateAnd(allAscii,
+                b.CreateICmpULT(unit, b.getInt16(128)));
+            llvm::Value* isUpper = b.CreateAnd(
+                b.CreateICmpUGE(unit, b.getInt16('A')),
+                b.CreateICmpULE(unit, b.getInt16('Z')));
+            llvm::Value* folded = b.CreateSelect(
+                isUpper, b.CreateAdd(unit, b.getInt16('a' - 'A')), unit);
+            matches = b.CreateAnd(matches,
+                b.CreateICmpEQ(folded, b.getInt16(word[i])));
+        }
+        // A mismatch in one ASCII unit must not hide Unicode in another unit:
+        // use the original helper whenever ANY trailing unit is non-ASCII.
+        b.CreateCondBr(allAscii, compareBB, helperBB);
+        b.SetInsertPoint(compareBB);
+        b.CreateCondBr(matches, ret1BB, ret0BB);
+        b.SetInsertPoint(ret0BB);
+        b.CreateBr(merge);
+        b.SetInsertPoint(ret1BB);
+        b.CreateBr(merge);
+        b.SetInsertPoint(helperBB);
+        llvm::Value* slow = call2("xyo_eq", i32t, a, bv);
+        b.CreateBr(merge);
+        b.SetInsertPoint(merge);
+        PHINode* result = b.CreatePHI(i32t, 3);
+        result->addIncoming(ci32(0), ret0BB);
+        result->addIncoming(ci32(1), ret1BB);
+        result->addIncoming(slow, helperBB);
+        return result;
+    }
+
     /// operator_equals（i32）。xyo_eq と同型:
     /// 1) bits 一致 → 1  2) 両辺 compare 数値 → fcmp
     /// 3) 両 str かつ numState 既知かつ不一致 → 0  4) 他 → helper
     llvm::Value* emitEq(Block* blk) {
         llvm::Value* a = emitInputOf(blk, "OPERAND1");
         llvm::Value* bv = emitInputOf(blk, "OPERAND2");
+        // Always emit BOTH operands, in order, before selecting a fast path.
+        if (!genericEq) {
+            if (auto word = eqAsciiWord(blk, "OPERAND2"))
+                return emitEqAsciiWord(a, bv, a, *word);
+            if (auto word = eqAsciiWord(blk, "OPERAND1"))
+                return emitEqAsciiWord(a, bv, bv, *word);
+        }
         BasicBlock* sameBB = BasicBlock::Create(lc, "", fn);
         BasicBlock* notSameBB = BasicBlock::Create(lc, "", fn);
         BasicBlock* cmpBB = BasicBlock::Create(lc, "", fn);
@@ -848,10 +1250,8 @@ struct Codegen {
              b.CreateConstGEP1_32(i8t, sp2, kSStrDataOff), nBytes});
         b.CreateCondBr(b.CreateICmpEQ(mc, ci32(0)), ret1BB, diffBB);
         b.SetInsertPoint(diffBB);
-        llvm::Value* st1 = b.CreateLoad(
-            i32t, b.CreateConstGEP1_32(i8t, sp1, kSStrNumStateOff));
-        llvm::Value* st2 = b.CreateLoad(
-            i32t, b.CreateConstGEP1_32(i8t, sp2, kSStrNumStateOff));
+        llvm::Value* st1 = loadSStrCache(i32t, sp1, kSStrNumStateOff, true);
+        llvm::Value* st2 = loadSStrCache(i32t, sp2, kSStrNumStateOff, true);
         llvm::Value* known = b.CreateAnd(
             b.CreateICmpNE(st1, ci32(0)), b.CreateICmpNE(st2, ci32(0)));
         // state4(Infinity リテラル) は case 違い state2 と等しいため
@@ -940,7 +1340,10 @@ struct Codegen {
         llvm::Value* ny = kind == 1
             ? b.CreateFAdd(b.CreateLoad(f64t, fld(t, ly().y)), d)
             : kind == 3 ? d : b.CreateLoad(f64t, fld(t, ly().y));
-        emitSetXY(nx, ny, [&]{ call2(helper, voidt, ctxArg, dv); });
+        emitSetXY(nx, ny, [&] {
+            if (boxedMotion) call2(helper, voidt, ctxArg, dv);
+            else call3("xyo_mot_setxy_num", voidt, ctxArg, nx, ny);
+        });
     }
 
     /// pen_penUp。penrt::up は penStateOf で遅延生成するが
@@ -1052,29 +1455,28 @@ struct Codegen {
     }
 
     /// pen_setPenColorToColor。COLOR が定数なら
-    /// penSetColorToColorCore 相当をコンパイル時計算し
-    /// PenState フィールドを直接 store（recolor すら不要）。
-    /// penState==null または非定数 → helper。
+    /// setColorToColorState 相当をコンパイル時計算し PenState
+    /// フィールドを直接 store。非定数は PenState* を渡すだけの
+    /// helper（toRgbColorObject + RGB→HSV→RGB 往復キャッシュ）へ。
+    /// penState==null は target から生成する helper。
+    /// 直前と同一 arg bits の再適用は lastSetColor メモでスキップ。
     void emitPenSetColor(Block* blk) {
         llvm::Value* cv = emitInputOf(blk, "COLOR");
         auto* ci = dyn_cast<ConstantInt>(cv);
         BasicBlock* chkBB  = newBB("sc.c");
         BasicBlock* workBB = newBB("sc.w");
-        BasicBlock* numBB  = newBB("sc.n");
         BasicBlock* helpBB = newBB("sc.s");
         BasicBlock* merge  = newBB("sc.m");
         llvm::Value* t = ctxPtr(1);
         llvm::Value* ps = b.CreateLoad(ptrt, fld(t, ly().penState));
-        // ps==null → helper（penState 生成が必要）。
-        // 同一 arg bits の再適用は O(1) スキップ（lastSetColor メモ）
         b.CreateCondBr(b.CreateIsNotNull(ps), chkBB, helpBB);
         b.SetInsertPoint(chkBB);
         llvm::Value* lc = b.CreateLoad(i64t, fld(ps, ly().psLast));
         b.CreateCondBr(b.CreateICmpEQ(lc, cv), merge, workBB);
         b.SetInsertPoint(workBB);
         if (ci) {
-            // 定数 → penSetColorToColorCore 相当をコンパイル時計算し
-            // PenState フィールドを直接 store
+            // 定数 → コンパイル時計算。rgba は dirty 遅延（次の移動で
+            // syncPenColor が 1 回だけ hsvToRgb — memo で 1 回きり）。
             PenState tmp;
             penrt::setColorToColorState(tmp,
                                         Value{ci->getZExtValue()});
@@ -1083,52 +1485,9 @@ struct Codegen {
                                cf64(tmp.transparency), cf64(tmp.shade));
             b.CreateBr(merge);
         } else {
-            // num → decColor inline、str && rgbState==1 →
-            // rgbCache から decColor inline、他 → helper
-            // （rgbState 0/2 は helper がパース/decimal 処理）
-            BasicBlock* strBB = newBB("sc.t");
-            b.CreateCondBr(emitIsNum(cv), numBB, strBB);
-            b.SetInsertPoint(strBB);
-            llvm::Value* isStr = b.CreateICmpEQ(
-                b.CreateLShr(cv, ci64(48)),
-                ci64(val::kTagStr >> 48));
-            BasicBlock* cachedBB = newBB("sc.rs");
-            b.CreateCondBr(isStr, cachedBB, helpBB);
-            b.SetInsertPoint(cachedBB);
-            llvm::Value* sp = b.CreateIntToPtr(
-                b.CreateAnd(cv, ci64(val::kPtrMask)), ptrt);
-            llvm::Value* rst = b.CreateLoad(
-                i32t, b.CreateConstGEP1_32(i8t, sp, kSStrRgbStateOff));
-            BasicBlock* decBB = newBB("sc.d");
-            BasicBlock* dec2BB = newBB("sc.d2");
-            b.CreateCondBr(b.CreateICmpEQ(rst, ci32(1)),
-                           decBB, dec2BB);
-            b.SetInsertPoint(decBB);
-            llvm::Value* iv2 = b.CreateZExt(
-                b.CreateLoad(i32t, b.CreateConstGEP1_32(
-                                     i8t, sp, kSStrRgbCacheOff)),
-                i64t);
-            emitPenDecColorFields(ps, cv, iv2);
-            b.CreateBr(merge);
-            b.SetInsertPoint(dec2BB);
-            // rgbState==2（'#' 以外）→ decimalToRgb(int64(toNumber))
-            // numState!=0 → numCache そのまま（NaN も raw —
-            // fptosi(NaN)=INT64_MIN は helper の
-            // static_cast<int64_t>(NaN) と同一）。0 → helper。
-            llvm::Value* nst = b.CreateLoad(
-                i32t, b.CreateConstGEP1_32(i8t, sp, kSStrNumStateOff));
-            BasicBlock* rawBB = newBB("sc.r");
-            b.CreateCondBr(b.CreateICmpNE(nst, ci32(0)),
-                           rawBB, helpBB);
-            b.SetInsertPoint(rawBB);
-            llvm::Value* nc = b.CreateLoad(
-                f64t, b.CreateConstGEP1_32(i8t, sp, kSStrNumCacheOff));
-            emitPenDecColorFields(
-                ps, cv, b.CreateFPToSI(nc, i64t));
-            b.CreateBr(merge);
-            b.SetInsertPoint(numBB);
-            llvm::Value* iv = b.CreateFPToSI(emitToNumF64(cv), i64t);
-            emitPenDecColorFields(ps, cv, iv);
+            // 数値・文字列の判別と decimal 化は helper 側
+            // （toRgbColorObject が SStr の rgbCache/numCache を使う）。
+            call2("xyo_pen_setcolor_ps", voidt, ps, cv);
             b.CreateBr(merge);
         }
         b.SetInsertPoint(helpBB);
@@ -1150,64 +1509,6 @@ struct Codegen {
         b.CreateStore(shade, fld(ps, ly().psShade));
         b.CreateStore(ci8(1), fld(ps, ly().psDirty));
         b.CreateStore(lastBits, fld(ps, ly().psLast));
-    }
-
-    /// decimalToRgb(int64) + rgbToHsv + フィールド書込みの inline 展開
-    /// （setColorToColorState の数値入力経路と同一）。
-    /// iv = int64 色値。iv の上位バイト列から r,g,b,a を抽出する。
-    void emitPenDecColorFields(llvm::Value* ps, llvm::Value* lastBits,
-                               llvm::Value* iv) {
-        auto byte = [&](int s) {
-            return b.CreateAnd(b.CreateLShr(iv, ci64(uint64_t(s))),
-                               ci64(0xFF));
-        };
-        llvm::Value* ri = byte(16);
-        llvm::Value* gi = byte(8);
-        llvm::Value* bi = byte(0);
-        llvm::Value* ai = b.CreateSelect(
-            b.CreateICmpSGT(byte(24), ci64(0)), byte(24), ci64(255));
-        llvm::Value* rd = b.CreateFDiv(
-            b.CreateSIToFP(ri, f64t), cf64(255.0));
-        llvm::Value* gd = b.CreateFDiv(
-            b.CreateSIToFP(gi, f64t), cf64(255.0));
-        llvm::Value* bd = b.CreateFDiv(
-            b.CreateSIToFP(bi, f64t), cf64(255.0));
-        // rgbToHsv: x=min, v=max
-        llvm::Value* x = b.CreateMinNum(b.CreateMinNum(rd, gd), bd);
-        llvm::Value* v = b.CreateMaxNum(b.CreateMaxNum(rd, gd), bd);
-        llvm::Value* diff = b.CreateFSub(v, x);
-        llvm::Value* rIsX = b.CreateFCmpOEQ(rd, x);
-        llvm::Value* gIsX = b.CreateFCmpOEQ(gd, x);
-        llvm::Value* f = b.CreateSelect(
-            rIsX, b.CreateFSub(gd, bd),
-            b.CreateSelect(gIsX, b.CreateFSub(bd, rd),
-                           b.CreateFSub(rd, gd)));
-        llvm::Value* i = b.CreateSelect(
-            rIsX, cf64(3.0),
-            b.CreateSelect(gIsX, cf64(5.0), cf64(1.0)));
-        // h = fmod((i - f/(v-x)) * 60, 360); s = (v-x)/v; x==v → 0
-        llvm::Value* h1 = b.CreateFMul(
-            b.CreateFSub(i, b.CreateFDiv(f, diff)), cf64(60.0));
-        llvm::Value* h2 = b.CreateFRem(h1, cf64(360.0));
-        llvm::Value* s1 = b.CreateFDiv(diff, v);
-        llvm::Value* eq0 = b.CreateFCmpOEQ(x, v);
-        llvm::Value* h = b.CreateSelect(eq0, cf64(0.0), h2);
-        llvm::Value* s = b.CreateSelect(eq0, cf64(0.0), s1);
-        llvm::Value* bright = b.CreateFMul(v, cf64(100.0));
-        // transparency = a<255 ? 100*(1-a/255) : 0
-        llvm::Value* transp = b.CreateSelect(
-            b.CreateICmpSLT(ai, ci64(255)),
-            b.CreateFMul(cf64(100.0),
-                         b.CreateFSub(cf64(1.0),
-                                      b.CreateFDiv(
-                                          b.CreateSIToFP(ai, f64t),
-                                          cf64(255.0)))),
-            cf64(0.0));
-        emitPenColorFields(
-            ps, lastBits,
-            b.CreateFMul(b.CreateFDiv(h, cf64(360.0)), cf64(100.0)),
-            b.CreateFMul(s, cf64(100.0)), bright, transp,
-            b.CreateFDiv(bright, cf64(2.0)));
     }
 
     /// 比較（両辺が compare 意味の数値なら fcmp、他は helper）。
@@ -1308,12 +1609,10 @@ struct Codegen {
         b.SetInsertPoint(stBB);
         llvm::Value* sp = b.CreateIntToPtr(
             b.CreateAnd(idx, ci64(val::kPtrMask)), ptrt);
-        llvm::Value* ns = b.CreateLoad(
-            i32t, b.CreateConstGEP1_32(i8t, sp, kSStrNumStateOff));
+        llvm::Value* ns = loadSStrCache(i32t, sp, kSStrNumStateOff, true);
         // parse 済み数値（1/3/4）。0=未parse・2=NaN('last'/'random' 含む)
         // → helper。
-        llvm::Value* nc = b.CreateLoad(
-            f64t, b.CreateConstGEP1_32(i8t, sp, kSStrNumCacheOff));
+        llvm::Value* nc = loadSStrCache(f64t, sp, kSStrNumCacheOff, false);
         llvm::Value* cached = b.CreateAnd(
             b.CreateICmpNE(ns, ci32(0)),
             b.CreateICmpNE(ns, ci32(2)));
@@ -1342,12 +1641,17 @@ struct Codegen {
         b.SetInsertPoint(haveBB);
         auto [dBB, d] = emitListIdxAsF64(idx, slowBB);
         b.SetInsertPoint(dBB);
-        llvm::Value* i0 = b.CreateSub(b.CreateFPToSI(d, i64t), ci64(1));
         llvm::Value* len = b.CreateLoad(
             i32t, b.CreateConstGEP1_32(i8t, l, kListLenOff));
-        llvm::Value* inb = b.CreateICmpULT(i0, b.CreateZExt(len, i64t));
+        // Ordered bounds BEFORE fptosi: NaN/Inf/huge values must not create
+        // poison used by the branch. For positive d, trunc(d)-1 < len iff
+        // 1 <= d < len+1. A u32 len and len+1 are exactly representable in f64.
+        llvm::Value* upper = b.CreateFAdd(b.CreateUIToFP(len, f64t), cf64(1.0));
+        llvm::Value* inb = b.CreateAnd(b.CreateFCmpOGE(d, cf64(1.0)),
+                                       b.CreateFCmpOLT(d, upper));
         b.CreateCondBr(inb, fastBB, emptyBB);
         b.SetInsertPoint(fastBB);
+        llvm::Value* i0 = b.CreateSub(b.CreateFPToSI(d, i64t), ci64(1));
         llvm::Value* items = b.CreateLoad(
             ptrt, b.CreateConstGEP1_32(i8t, l, kListItemsOff));
         llvm::Value* v = b.CreateLoad(i64t, b.CreateGEP(i64t, items, i0));
@@ -1380,12 +1684,16 @@ struct Codegen {
         b.SetInsertPoint(haveBB);
         auto [dBB, d] = emitListIdxAsF64(idx, slowBB);
         b.SetInsertPoint(dBB);
-        llvm::Value* i0 = b.CreateSub(b.CreateFPToSI(d, i64t), ci64(1));
         llvm::Value* len = b.CreateLoad(
             i32t, b.CreateConstGEP1_32(i8t, l, kListLenOff));
-        llvm::Value* inb = b.CreateICmpULT(i0, b.CreateZExt(len, i64t));
+        // Same ordered guard as list reads; invalid numeric indices are no-op,
+        // with INDEX and ITEM already evaluated in their original order above.
+        llvm::Value* upper = b.CreateFAdd(b.CreateUIToFP(len, f64t), cf64(1.0));
+        llvm::Value* inb = b.CreateAnd(b.CreateFCmpOGE(d, cf64(1.0)),
+                                       b.CreateFCmpOLT(d, upper));
         b.CreateCondBr(inb, fastBB, merge);
         b.SetInsertPoint(fastBB);
+        llvm::Value* i0 = b.CreateSub(b.CreateFPToSI(d, i64t), ci64(1));
         llvm::Value* items = b.CreateLoad(
             ptrt, b.CreateConstGEP1_32(i8t, l, kListItemsOff));
         b.CreateStore(item, b.CreateGEP(i64t, items, i0));
@@ -1401,7 +1709,22 @@ struct Codegen {
 
     /// data_addtolist — l!=null && len<cap なら store/len++/dirty のみ。
     /// null・満杯（要 ensure）は helper（SList 生成/realloc 込み）。
+    /// par-for の本体では「base+iter 番目のスロット書き込み」に置き換える
+    /// （len は並列領域の前に確保済み）。
     void emitListAdd(Block* blk, const BlockField* f) {
+        if (parFor) {
+            auto k = parFor->index.find(f->id);
+            if (k != parFor->index.end()) {
+                llvm::Value* item = emitInputOf(blk, "ITEM");
+                llvm::Value* l = b.CreateLoad(
+                    ptrt, b.CreateGEP(ptrt, parFor->lists, ci64(k->second)));
+                llvm::Value* base = b.CreateLoad(
+                    i64t, b.CreateGEP(i64t, parFor->bases, ci64(k->second)));
+                llvm::Value* idx = b.CreateAdd(base, parFor->iter);
+                callN("xyo_par_slot", voidt, {l, idx, item});
+                return;
+            }
+        }
         llvm::Value* item = emitInputOf(blk, "ITEM");
         llvm::Value* l = varListPtr(f);
         llvm::Value* nonNull = b.CreateICmpNE(
@@ -1584,12 +1907,21 @@ struct Codegen {
     llvm::Value* constValue(Value v) {
         if (v.isString()) {
             SStr* s = v.asStrPtr();
+            llvm::Value* bits;
             if (aot) {
                 std::u16string u =
                     s ? std::u16string(s->view()) : std::u16string();
-                return strLitBits(u, s);
+                bits = strLitBits(u, s);
+            } else {
+                if (s) pinned.strings.push_back(s);
+                bits = ci64(v.bits);
             }
-            if (s) pinned.strings.push_back(s);
+            // This explicit immutable literal boundary also covers defaults and
+            // static fields, not reporter evaluation. Preserve its boxed string
+            // for string/list/compare uses; only numeric conversion may fold.
+            // Shared cast semantics include empty strings, NaN -> 0 and -0/Inf.
+            if (!genericLiteralNum) literalNums[bits] = cast::toNumber(v);
+            return bits;
         }
         return ci64(v.bits);
     }
@@ -1725,7 +2057,10 @@ struct Codegen {
             if (it != ops.end()) fn = it->second;
             llvm::Value* x = emitToNumF64(emitInputOf(blk, "NUM"));
             llvm::Value* r = emitMathop(fn, x);
-            return call1("xyo_num", i64t, r);
+            // xyo_num is exactly Value::numCanonical. Keep its NaN/Inf/±0
+            // semantics inline, and expose the numeric result to consumers so
+            // immediate arithmetic need not re-test bool/string tags.
+            return genericMathBox ? call1("xyo_num", i64t, r) : emitCanon(r);
         }
 
         // --- sensing 軽量 ---
@@ -1946,10 +2281,13 @@ struct Codegen {
     }
 
     void emitChainBlocks(const std::vector<Block*>& chain) {
-        for (Block* blk : chain) {
+        for (size_t i = 0; i < chain.size(); ++i) {
+            Block* blk = chain[i];
             if (fail) return;
             // 現在位置が既に終端済み（stop 等）なら残りは到達不能 — 打ち切る
             if (bbDone(b.GetInsertBlock())) return;
+            if (!hoistedSetters.empty() && hoistedSetters.count(blk))
+                continue;   // ループ外へホイスト済み
             emitStackBlock(blk);
         }
     }
@@ -1988,17 +2326,28 @@ struct Codegen {
             const gpu::Program* gp = tryGpuLoop(blk);
             AllocaInst* iv = entryAlloca(f64t, 1, "rep_i");
             b.CreateStore(n, iv);
+            // 本体先頭の不変 pen setter をループ外へ（本体が 0 回なら実行しない）
+            emitHoistedSetters(hoistableSetters(blk),
+                               b.CreateFCmpOGE(n, cf64(0.5)));
             BasicBlock* head = BasicBlock::Create(lc, "", fn);
             BasicBlock* bodyBB = BasicBlock::Create(lc, "", fn);
             BasicBlock* merge = BasicBlock::Create(lc, "", fn);
-            if (gp) {
-                llvm::Value* done =
-                    callN("xyo_gpu_repeat", i32t,
-                          {ctxArg, gpuProgPtr(gp, blk->id), n});
-                b.CreateCondBr(b.CreateICmpNE(done, ci32(0)), merge,
-                               head);
+            // 「カウンタ + append」ループなら par-for を試す（warp 実行中のみ）。
+            // 失敗（0 返却）時は従来の CPU ループへ落ちる。
+            const bool triedParFor = tryEmitParFor(blk, n, head, merge);
+            if (!triedParFor) {
+                if (gp) {
+                    llvm::Value* done =
+                        callN("xyo_gpu_repeat", i32t,
+                              {ctxArg, gpuProgPtr(gp, blk->id), n});
+                    b.CreateCondBr(b.CreateICmpNE(done, ci32(0)), merge,
+                                   head);
+                } else {
+                    b.CreateBr(head);
+                }
             } else {
-                b.CreateBr(head);
+                // par-for は head（逐次フォールバック）と merge へ既に分岐済み
+                b.SetInsertPoint(head);
             }
             b.SetInsertPoint(head);
             llvm::Value* i = b.CreateLoad(f64t, iv);
@@ -2020,6 +2369,8 @@ struct Codegen {
         }
 
         if (op == "control_forever") {
+            // forever の本体は必ず 1 回は走るのでガード不要
+            emitHoistedSetters(hoistableSetters(blk), nullptr);
             BasicBlock* bodyBB = BasicBlock::Create(lc, "", fn);
             BasicBlock* merge = BasicBlock::Create(lc, "", fn);
             b.CreateBr(bodyBB);
@@ -2267,8 +2618,10 @@ struct Codegen {
             llvm::Value* yv = emitInputOf(blk, "Y");
             llvm::Value* nxv = emitToNumF64(xv);
             llvm::Value* nyv = emitToNumF64(yv);
-            emitSetXY(nxv, nyv,
-                      [&]{ call3("xyo_mot_gotoxy", voidt, ctxArg, xv, yv); });
+            emitSetXY(nxv, nyv, [&] {
+                if (boxedMotion) call3("xyo_mot_gotoxy", voidt, ctxArg, xv, yv);
+                else call3("xyo_mot_setxy_num", voidt, ctxArg, nxv, nyv);
+            });
             return;
         }
 
@@ -2477,6 +2830,80 @@ struct Codegen {
         }
     }
 
+    /// Resolve stable Variable* handles once per native invocation, after all
+    /// top-entry initializers (which can resize Thread::jitVarSlots). Slots are
+    /// never rewritten during this invocation: compat runs the interpreter,
+    /// native procedures reuse this script's slots, and yield resumes the same
+    /// fiber. This is NOT value/list-pointer hoisting and makes no alias claim.
+    void hoistVarSlotPointers() {
+        // Indices belong to this script, NOT the shared AOT Module. Restrict
+        // ownership explicitly, also excluding any earlier failed AOT emit.
+        std::set<Function*> owned{entryFn};
+        for (auto& [key, proc] : procFns) owned.insert(proc);
+        for (Function* pf : parFns) owned.insert(pf);
+        for (Function* f : owned) {
+            if (!f || f->empty()) continue;
+            std::vector<std::pair<LoadInst*, uint64_t>> loads;
+            for (BasicBlock& bb : *f) {
+                for (Instruction& instruction : bb) {
+                    auto* load = dyn_cast<LoadInst>(&instruction);
+                    if (!load) continue;
+                    MDNode* marker = load->getMetadata("xyo.varslot");
+                    if (!marker) continue;
+                    auto* wrapped = marker->getNumOperands() == 1
+                        ? dyn_cast<ConstantAsMetadata>(marker->getOperand(0).get())
+                        : nullptr;
+                    auto* index = wrapped
+                        ? dyn_cast<ConstantInt>(wrapped->getValue()) : nullptr;
+                    // Strip even in A/B reload mode: subsequent shared-module
+                    // emits must never reinterpret another script's indices.
+                    load->setMetadata("xyo.varslot", nullptr);
+                    if (!index || index->getZExtValue() >= numVarSlots ||
+                        load->getType() != ptrt) {
+                        fail = true;
+                        return;
+                    }
+                    loads.emplace_back(load, index->getZExtValue());
+                }
+            }
+            if (loads.empty() || slotReload) continue;
+            BasicBlock& entry = f->getEntryBlock();
+            auto insert = entry.getFirstInsertionPt();
+            bool hasInit = false;
+            for (Instruction& instruction : entry) {
+                auto* call = dyn_cast<CallInst>(&instruction);
+                Function* callee = call ? call->getCalledFunction() : nullptr;
+                if (callee && callee->getName() == "xyo_varslot_init") {
+                    insert = instruction.getIterator();
+                    ++insert;
+                    hasInit = true;
+                }
+            }
+            if ((f == entryFn && !hasInit) || insert == entry.end() ||
+                f->arg_empty()) {
+                fail = true;
+                return;
+            }
+            IRBuilder<> ib(&entry, insert);
+            llvm::Value* array = ib.CreateLoad(ptrt,
+                ib.CreateConstGEP1_32(i8t, f->getArg(0), kVarSlotDataOff),
+                "varslots");
+            std::map<uint64_t, llvm::Value*> handles;
+            for (auto [load, index] : loads) {
+                auto [it, added] = handles.emplace(index, nullptr);
+                if (added) {
+                    llvm::Value* slot = ib.CreateGEP(ptrt, array, ci64(index));
+                    it->second = ib.CreateLoad(ptrt, slot, "varslot");
+                }
+                load->replaceAllUsesWith(it->second);
+            }
+            // Gather first, RAUW second, erase last: shared old GEP/load chains
+            // may still feed other marked loads until all replacements exist.
+            for (auto [load, index] : loads)
+                RecursivelyDeleteTriviallyDeadInstructions(load);
+        }
+    }
+
     struct PendingProc {
         Function* f;
         Block* def;
@@ -2484,6 +2911,52 @@ struct Codegen {
         std::vector<std::u16string> names;
     };
     std::vector<PendingProc> pendingProcs;
+
+    /// par-for の本体関数を埋める。カウンタは反復ローカルへ差し替え、
+    /// append は `base+iter` 番目のスロット書き込みになる。
+    void emitPendingParFors() {
+        while (!pendingParFors.empty()) {
+            PendingParFor pp = std::move(pendingParFors.back());
+            pendingParFors.pop_back();
+            Function* savedFn = fn;
+            llvm::Value* savedCtx = ctxArg;
+            auto savedArgs = argIndex;
+            auto savedProcArgs = curProcArgs;
+            auto savedKnown = knownNum;
+            const bool savedInProc = inProc;
+            fn = pp.f;
+            exitBB = nullptr;
+            argIndex.clear();
+            knownNum.clear();
+            inProc = false;
+            curProcArgs.clear();
+            BasicBlock* entry = BasicBlock::Create(lc, "", pp.f);
+            b.SetInsertPoint(entry);
+            ctxArg = pp.f->getArg(0);
+            // 反復カウンタ: init + iter*delta を Value bits で持つローカル
+            AllocaInst* ctrA = b.CreateAlloca(i64t, nullptr, "pf_ctr");
+            b.CreateStore(b.CreateBitCast(pp.f->getArg(2), i64t), ctrA);
+            varOverride[pp.plan.counterField->id] = ctrA;
+            ParForCtx pc;
+            pc.lists = pp.f->getArg(3);
+            pc.bases = pp.f->getArg(4);
+            pc.iter = pp.f->getArg(1);
+            for (size_t i = 0; i < pp.plan.lists.size(); ++i)
+                pc.index[pp.plan.lists[i]->id] = int(i);
+            parFor = &pc;
+            emitChainBlocks(chainOf(pp.plan.bodyHead->id));
+            if (!bbDone(b.GetInsertBlock())) b.CreateRetVoid();
+            if (verifyFunction(*pp.f, &llvm::errs())) fail = true;
+            parFor = nullptr;
+            varOverride.clear();
+            fn = savedFn;
+            ctxArg = savedCtx;
+            argIndex = std::move(savedArgs);
+            curProcArgs = std::move(savedProcArgs);
+            knownNum = std::move(savedKnown);
+            inProc = savedInProc;
+        }
+    }
 
     void emitPendingProcedures() {
         while (!pendingProcs.empty()) {
@@ -2497,6 +2970,8 @@ struct Codegen {
             argIndex.clear();
             knownNum.clear();
             inProc = true;
+            const bool savedFnWarp = curFnWarp;
+            curFnWarp = pp.warp;
             curProcArgs.clear();
             for (size_t i = 0; i < pp.names.size(); ++i) {
                 argIndex[pp.names[i]] = int64_t(i);
@@ -2523,6 +2998,7 @@ struct Codegen {
             argIndex = std::move(savedArgs);
             curProcArgs = std::move(savedProcArgs);
             inProc = false;
+            curFnWarp = savedFnWarp;
             if (fail) return;
         }
     }
@@ -2590,6 +3066,7 @@ bool jitEmitScript(llvm::Module& mod, llvm::LLVMContext& lc, Runtime& runtime,
         cg.b.CreateRetVoid();
     }
     cg.emitPendingProcedures();
+    cg.emitPendingParFors();
     if (cg.fail) return false;
     cg.elideLeafProcFrames();
 
@@ -2604,6 +3081,8 @@ bool jitEmitScript(llvm::Module& mod, llvm::LLVMContext& lc, Runtime& runtime,
         }
     }
     cg.inlineSmallProcCalls();
+    cg.hoistVarSlotPointers();
+    if (cg.fail) return false;
 
     if (std::getenv("XYO_JIT_DUMP")) {
         llvm::errs() << "--- module for " << f->getName() << " (bbs="
@@ -2614,6 +3093,7 @@ bool jitEmitScript(llvm::Module& mod, llvm::LLVMContext& lc, Runtime& runtime,
 
     pendingFnNames.push_back(f->getName().str());
     out.entry = nullptr;  // JIT アドレス解決後に埋める
+    out.mainThread = cg.mainThread;
     // mayYield = entry から到達可能な関数のいずれかが yield 点を持つか
     {
         std::unordered_map<llvm::Function*, int> memo;

@@ -4,6 +4,9 @@
 //   xyo run <project.sb3> [--frames N]
 //   xyo play <project.sb3> [--scale N] [--turbo]   SDL2 ウィンドウで実行
 //   xyo dump <project.sb3>          ブロック一覧をダンプ
+//   xyo analyze <project.sb3>       実行せず構造を解析（並列性・warp候補・ループ内アンチパターン）
+//   xyo minify <in.sb3> [-o out.sb3] sb3 を小さくする（zip 圧縮 + ID 短縮）
+//   xyo rewrite <in.sb3> [-o out.sb3] 最適化しやすい形へ書き換える（warp 化・一時変数）
 //   xyo test <fixture.sb3|dir>      execute フィクスチャ（SAY pass/fail/end）
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -34,14 +37,19 @@
 #include "core/fileio.hpp"
 #include "core/slist.hpp"
 #include "core/sstr.hpp"
+#include "analysis/project_analysis.hpp"
 #include "engine/runtime.hpp"
 #include "load/sb3.hpp"
+#include "load/sb3_minify.hpp"
+#include "load/sb3_rewrite.hpp"
+#include "load/sb3_save.hpp"
 #include "model/blocks.hpp"
 #include "model/target.hpp"
+#include "jit/jit.hpp"
 #ifdef XYO_JIT
 #include "aot/aot.hpp"
-#include "jit/jit.hpp"
 #endif
+#include "wasm/host_bridge.hpp"
 
 using namespace xyo;
 
@@ -49,18 +57,46 @@ using namespace xyo;
 /// `--aot <obj>`: 事前コンパイル済みオブジェクトをロードする。
 static const char* g_aotObj = nullptr;
 #endif
+/// `--danger`: スレッドごとの実行時間予算（warp 500ms）を外す危険モード。
+/// 環境変数 `XYO_DANGER` は Runtime 構築時に読まれる（こちらは上書き）。
+static bool g_danger = false;
+
+/// ロード直後の Runtime に CLI の危険モードを反映する。
+static void applyDangerMode(Runtime& rt) {
+    if (g_danger) rt.dangerMode = true;
+}
 
 static int usage() {
     std::fprintf(stderr,
         "usage:\n"
-        "  xyo run <project.sb3> [--frames N] [--aot obj]\n"
+        "  xyo run <project.sb3> [--frames N] [--aot obj]"
+        " [--jit hotspot|eager|off] [--danger]\n"
         "  xyo play <project.sb3> [--scale N] [--turbo] [--fps N]"
-        " [--gpu-realtime ray|path]\n"
+        " [--gpu-realtime ray|path] [--danger]\n"
         "  xyo aot <project.sb3> (-o <out> | --obj <file>)  "
         "事前コンパイル（実験的）\n"
         "  xyo gui [dir]                   ランチャー GUI（引数なしでも起動）\n  xyo edit <project.sb3>             ビルトインエディタ\n"
         "  xyo dump <project.sb3>\n"
-        "  xyo test <fixture.sb3|dir> [--aot obj]\n");
+        "  xyo analyze <project.sb3> [--dot out.dot] [--top N] [--scripts N]\n"
+        "      実行せずに構造を解析（並列性・直列化キー・warp化候補・ループ内アンチパターン）\n"
+        "      --dot: workerSafe スクリプトの衝突グラフを Graphviz DOT で出力\n"
+        "      --top: 衝突キーの表示件数（既定 20）/ --scripts: スクリプト表の件数（0=全部）\n"
+        "  xyo minify <in.sb3> [-o out.sb3] [--aggressive]"
+        " [--strip-comments]\n"
+        "  xyo rewrite <in.sb3> [-o out.sb3] [--no-warp] [--no-inline-temps]\n"
+        "              [--warp-min N] [--report]\n"
+        "      sb3 を小さくする（zip 圧縮 + ブロック ID 短縮 +"
+        " 未参照アセット削除）\n"
+        "      --aggressive: 未使用の変数/リスト/ブロードキャストも削除\n"
+        "  xyo test <fixture.sb3|dir> [--aot obj]"
+        " [--jit hotspot|eager|off] [--danger]  （既定 eager）\n"
+        "  --jit: hotspot=インタプリタ→ホットなスクリプトだけ JIT（既定）,\n"
+        "         eager=全スクリプトを spawn 時にコンパイル（テスト/ベンチ用）,"
+        " off=インタプリタのみ\n"
+        "  --danger: スレッドごとの実行時間予算（warp 500ms）を外す危険モード。\n"
+        "         1 フレームで終わらないスクリプトが描画/他スレッドへ譲らず\n"
+        "         走り続ける（アプリが固まる）— 計測・変換検証専用。\n"
+        "         XYO_DANGER=1 でも有効（既定 off）。\n");
     return 1;
 }
 
@@ -140,11 +176,19 @@ static void printLoadInfo(Runtime& rt, const Sb3LoadResult& r) {
     }
 }
 
+static const char* g_saveAfterRun = nullptr;
+
 /// ロード済み Runtime をヘッドレス実行する（cmdRun と AOT 実行で共有）。
 static int runLoaded(Runtime& rt, const Sb3LoadResult* r, int maxFrames) {
     if (r) printLoadInfo(rt, *r);
     rt.greenFlag();
     bool finished = rt.runUntilDone(maxFrames > 0 ? maxFrames : 1000000);
+    if (g_saveAfterRun) {
+        if (saveSb3File(rt, g_saveAfterRun))
+            std::printf("saved: %s\n", g_saveAfterRun);
+        else
+            std::fprintf(stderr, "save failed: %s\n", g_saveAfterRun);
+    }
     dumpVarsIfRequested(rt);
     std::printf("%s\n", finished ? "done" : "frame limit reached");
     return finished ? 0 : 2;
@@ -161,6 +205,7 @@ static int cmdRun(const char* path, int maxFrames) {
         std::fprintf(stderr, "load failed: %s\n", r.error.c_str());
         return 1;
     }
+    applyDangerMode(rt);
 #ifdef XYO_JIT
     applyAotObject(rt, g_aotObj, data.data(), data.size());
 #endif
@@ -197,6 +242,172 @@ static int cmdDump(const char* path) {
     return 0;
 }
 
+// --- xyo analyze: 実行しない構造解析 ------------------------------------
+static int cmdAnalyze(int argc, char** argv) {
+    const char* path = argv[2];
+    std::string dotPath;
+    analysis::Options opt;
+    for (int i = 3; i < argc; ++i) {
+        if ((!std::strcmp(argv[i], "--dot") || !std::strcmp(argv[i], "-o")) &&
+            i + 1 < argc)
+            dotPath = argv[++i];
+        else if (std::strcmp(argv[i], "--top") == 0 && i + 1 < argc)
+            opt.topConflicts = size_t(std::atoi(argv[++i]));
+        else if (std::strcmp(argv[i], "--scripts") == 0 && i + 1 < argc)
+            opt.topScripts = size_t(std::atoi(argv[++i]));
+        else
+            return usage();
+    }
+    bool ok;
+    std::vector<uint8_t> data = readFile(path, ok);
+    if (!ok) { std::fprintf(stderr, "cannot read %s\n", path); return 1; }
+    Runtime rt;
+    Sb3LoadResult r = loadSb3File(rt, data.data(), data.size());
+    if (!r.ok) {
+        std::fprintf(stderr, "load failed: %s\n", r.error.c_str());
+        return 1;
+    }
+    analysis::Report rep = analysis::analyzeProject(rt, path, opt);
+    std::string text = analysis::formatText(rep, opt);
+    std::fwrite(text.data(), 1, text.size(), stdout);
+    if (!dotPath.empty()) {
+        std::string dot = analysis::formatDot(rep);
+        std::ofstream f(pathFromUtf8(dotPath), std::ios::binary);
+        if (!f) {
+            std::fprintf(stderr, "cannot write %s\n", dotPath.c_str());
+            return 1;
+        }
+        f.write(dot.data(), std::streamsize(dot.size()));
+        if (!f) {
+            std::fprintf(stderr, "cannot write %s\n", dotPath.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "analyze: dependency graph -> %s\n", dotPath.c_str());
+    }
+    return 0;
+}
+
+// --- xyo minify: sb3 のサイズ削減 ---------------------------------------
+static std::string defaultMinifiedPath(const char* in) {
+    std::string s = in;
+    const size_t slash = s.find_last_of("/\\");
+    const size_t dot = s.find_last_of('.');
+    if (dot != std::string::npos && dot > 0 &&
+        (slash == std::string::npos || dot > slash) &&
+        dot + 1 < s.size()) {
+        s.insert(dot, ".min");
+    } else {
+        s += ".min.sb3";
+    }
+    return s;
+}
+
+/// `xyo rewrite <in.sb3> [-o out.sb3] [--no-warp] [--no-inline-temps]
+///  [--warp-min N] [--report]`
+/// 意味を変えない範囲で「機械的に最適化しやすい形」へ書き換える。
+static int cmdRewrite(int argc, char** argv) {
+    const char* in = argv[2];
+    std::string out;
+    Sb3RewriteOptions opt;
+    bool report = false;
+    for (int i = 3; i < argc; ++i) {
+        if ((!std::strcmp(argv[i], "-o") ||
+             !std::strcmp(argv[i], "--output")) &&
+            i + 1 < argc)
+            out = argv[++i];
+        else if (!std::strcmp(argv[i], "--no-warp"))
+            opt.warp = false;
+        else if (!std::strcmp(argv[i], "--no-inline-temps"))
+            opt.inlineTemps = false;
+        else if (!std::strcmp(argv[i], "--warp-min") && i + 1 < argc)
+            opt.warpMinBlocks = size_t(std::atoi(argv[++i]));
+        else if (!std::strcmp(argv[i], "--minify"))
+            opt.minify = true;
+        else if (!std::strcmp(argv[i], "--aggressive"))
+            opt.minifyAggressive = true, opt.minify = true;
+        else if (!std::strcmp(argv[i], "--report"))
+            report = true;
+        else
+            return usage();
+    }
+    if (out.empty()) {
+        std::string s(in);
+        if (s.size() > 4 && s.substr(s.size() - 4) == ".sb3")
+            s.resize(s.size() - 4);
+        out = s + ".opt.sb3";
+    }
+    Sb3RewriteResult r = rewriteSb3File(in, out.c_str(), opt);
+    if (!r.ok) {
+        std::fprintf(stderr, "rewrite failed: %s\n", r.error.c_str());
+        return 1;
+    }
+    const Sb3RewriteStats& s = r.stats;
+    std::printf("rewrite: %s -> %s\n", in, out.c_str());
+    std::printf("  projects: %zu procedures scanned, %zu warp-ized\n",
+                s.procsScanned, s.procsWarped);
+    std::printf("  temps inlined: %zu\n", s.tempsInlined);
+    std::printf("  project.json: %zu -> %zu bytes, output: %zu bytes\n",
+                s.projectJsonIn, s.projectJsonOut, s.outputBytes);
+    if (report)
+        for (const std::string& l : s.log) std::fprintf(stderr, "  %s\n", l.c_str());
+    return 0;
+}
+
+static int cmdMinify(int argc, char** argv) {
+    const char* in = argv[2];
+    std::string out;
+    Sb3MinifyOptions opt;
+    for (int i = 3; i < argc; ++i) {
+        if ((!std::strcmp(argv[i], "-o") ||
+             !std::strcmp(argv[i], "--output")) &&
+            i + 1 < argc)
+            out = argv[++i];
+        else if (!std::strcmp(argv[i], "--aggressive"))
+            opt.dropUnusedVariables = true;
+        else if (!std::strcmp(argv[i], "--strip-comments"))
+            opt.stripComments = true;
+        else if (!std::strcmp(argv[i], "--keep-ids"))
+            opt.compactIds = false;
+        else if (!std::strcmp(argv[i], "--keep-assets"))
+            opt.dropUnusedAssets = false;
+        else if (!std::strcmp(argv[i], "--keep-orphans"))
+            opt.dropOrphanBlocks = false;
+        else if (!std::strcmp(argv[i], "--level") && i + 1 < argc)
+            opt.level = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--store"))
+            opt.level = 0;
+        else
+            return usage();
+    }
+    if (out.empty()) out = defaultMinifiedPath(in);
+    if (opt.level < 0) opt.level = 0;
+    if (opt.level > 9) opt.level = 9;
+
+    Sb3MinifyResult r = minifySb3File(in, out.c_str(), opt);
+    if (!r.ok) {
+        std::fprintf(stderr, "minify failed: %s\n", r.error.c_str());
+        return 1;
+    }
+    const Sb3MinifyStats& s = r.stats;
+    const double pct = s.inputBytes
+                           ? 100.0 * double(s.outputBytes) / double(s.inputBytes)
+                           : 0.0;
+    std::printf("minify: %s -> %s\n", in, out.c_str());
+    std::printf("  size: %zu -> %zu bytes (%.1f%%)\n", s.inputBytes,
+                s.outputBytes, pct);
+    std::printf("  project.json: %zu -> %zu bytes\n", s.projectJsonIn,
+                s.projectJsonOut);
+    std::printf("  blocks: %zu -> %zu, comments: %zu -> %zu,"
+                " variables: %zu -> %zu\n",
+                s.blocksBefore, s.blocksAfter, s.commentsBefore,
+                s.commentsAfter, s.variablesBefore, s.variablesAfter);
+    std::printf("  assets: %zu -> %zu (dropped %zu, deduped %zu),"
+                " zip: %zu compressed / %zu stored\n",
+                s.assetsBefore, s.assetsAfter, s.assetsDropped,
+                s.assetsDeduped, s.zipCompressed, s.zipStored);
+    return 0;
+}
+
 // --- 適合性テスト: integration/execute.js 相当 --------------------------
 // SAY "pass ..." / "fail ..." / "plan N" / "end" を収集して採点する。
 struct TestResult {
@@ -217,6 +428,7 @@ static TestResult runFixture(const std::string& path) {
         res.firstFail = "load: " + r.error;
         return res;
     }
+    applyDangerMode(rt);
 #ifdef XYO_JIT
     applyAotObject(rt, g_aotObj, data.data(), data.size());
 #endif
@@ -274,6 +486,9 @@ static TestResult runFixture(const std::string& path) {
 }
 
 static int cmdTest(const char* path) {
+    // フィクスチャ検証は「全スクリプトをコンパイルした JIT」との差分を
+    // 見るためのツールなので、--jit 未指定なら従来動作（eager）にする。
+    if (!jitModeExplicit()) setJitMode(JitMode::Eager);
     namespace fs = std::filesystem;
     std::vector<std::string> files;
     if (fs::is_directory(path)) {
@@ -485,6 +700,7 @@ static int playLoaded(Runtime& rt, const std::string& title, int scale,
         }
     }
 done:
+    dumpVarsIfRequested(rt);
     return 0;
 }
 
@@ -501,6 +717,7 @@ int xyoShellPlay(const char* path, const char* aotObjPath, int scale,
         std::fprintf(stderr, "load failed: %s\n", r.error.c_str());
         return 1;
     }
+    applyDangerMode(rt);
 #ifdef XYO_JIT
     applyAotObject(rt, aotObjPath ? aotObjPath : g_aotObj, data.data(),
                    data.size());
@@ -570,13 +787,13 @@ static int cmdAot(const char* path, const char* out, const char* objOut) {
 }
 
 /// AOT 実行ファイルとして起動された場合の実行。
-/// `app [run] [--frames N] [--scale N] [--fps N] [--turbo]`
+/// `app [run] [--frames N] [--scale N] [--fps N] [--turbo] [--danger]`
 static int runEmbedded(const std::vector<uint8_t>& sb3,
                        const std::vector<uint8_t>& object, uint64_t hash,
                        int argc, char** argv) {
     bool headless = false;
     int maxFrames = 0, scale = 2, fps = -1;
-    bool turbo = false;
+    bool turbo = false, danger = false;
     int i = 1;
     if (i < argc && std::strcmp(argv[i], "run") == 0) {
         headless = true;
@@ -591,6 +808,8 @@ static int runEmbedded(const std::vector<uint8_t>& sb3,
             fps = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--turbo"))
             turbo = true;
+        else if (!std::strcmp(argv[i], "--danger"))
+            danger = true;
         else
             return usage();
     }
@@ -600,6 +819,7 @@ static int runEmbedded(const std::vector<uint8_t>& sb3,
         std::fprintf(stderr, "load failed: %s\n", r.error.c_str());
         return 1;
     }
+    if (danger) rt.dangerMode = true;
     if (rt.jit) {
         std::string why;
         if (!rt.jit->loadAot(rt, object.data(), object.size(), hash, &why))
@@ -666,6 +886,9 @@ int main(int argc, char** argv) {
             return runEmbedded(sb3, object, hash, argc, argv);
     }
 #endif
+    // wasm JIT ブリッジの自己テスト（Emscripten ビルドでのみ実処理）
+    if (argc >= 2 && std::strcmp(argv[1], "wasm-selftest") == 0)
+        return xyo_wasm_selftest();
     // 引数なし = GUI ランチャー（ダブルクリック起動向け）
     if (argc < 2) return guiMain(nullptr);
     if (argc < 3) {
@@ -691,6 +914,21 @@ int main(int argc, char** argv) {
         }
         else if (std::strcmp(argv[i], "--turbo") == 0)
             turbo = true;
+        else if (std::strcmp(argv[i], "--danger") == 0)
+            g_danger = true;
+        else if (std::strncmp(argv[i], "--jit=", 6) == 0) {
+            JitMode m;
+            if (!parseJitMode(argv[i] + 6, &m)) return usage();
+            setJitMode(m);
+        }
+        else if (std::strcmp(argv[i], "--jit") == 0 && i + 1 < argc) {
+            JitMode m;
+            if (!parseJitMode(argv[++i], &m)) return usage();
+            setJitMode(m);
+        }
+        else if (std::strcmp(argv[i], "--save") == 0 && i + 1 < argc) {
+            g_saveAfterRun = argv[++i];
+        }
 #ifdef XYO_JIT
         else if (std::strcmp(argv[i], "--aot") == 0 && i + 1 < argc)
             g_aotObj = argv[++i];
@@ -716,7 +954,10 @@ int main(int argc, char** argv) {
 #endif
     if (std::strcmp(cmd, "gui") == 0) return guiMain(argv[2]);
     if (std::strcmp(cmd, "dump") == 0) return cmdDump(argv[2]);
-    if (std::strcmp(cmd, "edit") == 0) return editorMain(argv[2]);
+    if (std::strcmp(cmd, "analyze") == 0) return cmdAnalyze(argc, argv);
+    if (std::strcmp(cmd, "minify") == 0) return cmdMinify(argc, argv);
+    if (std::strcmp(cmd, "rewrite") == 0) return cmdRewrite(argc, argv);
+    if (std::strcmp(cmd, "edit") == 0) return editorMain(argv[2], g_danger);
     if (std::strcmp(cmd, "test") == 0) return cmdTest(argv[2]);
     return usage();
 }

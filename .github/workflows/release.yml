@@ -29,6 +29,7 @@ jobs:
             -DXYO_BUILD_TESTS=OFF \
             -DXYO_LLVM_MODE=llvm-config \
             -DLLVM_CONFIG=/usr/lib/llvm-18/bin/llvm-config \
+            -DXYO_REQUIRE_SDL2=ON \
             -DXYO_STATIC_LLVM=ON
           cmake --build build -j"$(nproc)"
           echo "--- libLLVM に依存していないこと ---"
@@ -111,7 +112,7 @@ jobs:
 
 
   windows:
-    name: Windows リリースビルド（JIT / 完全静的）
+    name: Windows リリースビルド（JIT / SDL2 / 完全静的）
     runs-on: windows-latest
     defaults:
       run:
@@ -125,6 +126,7 @@ jobs:
           update: false
           install: >-
             zip
+            python
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ninja
@@ -133,18 +135,22 @@ jobs:
             mingw-w64-x86_64-zstd
             mingw-w64-x86_64-ncurses
             mingw-w64-x86_64-libxml2
+            mingw-w64-x86_64-SDL2
 
-      - name: Configure + build（JIT 有効 / LLVM・libstdc++ 静的）
+      - name: Configure + build（JIT 有効 / SDL2・LLVM・libstdc++ 静的）
         run: |
           cmake -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DXYO_JIT=ON -DXYO_LLVM_MODE=llvm-config \
             -DXYO_STATIC=ON -DXYO_STATIC_LLVM=ON \
-            -DXYO_SDL2=OFF -DXYO_BUILD_TESTS=OFF
+            -DXYO_SDL2=ON -DXYO_REQUIRE_SDL2=ON \
+            -DXYO_BUILD_TESTS=OFF
           cmake --build build-win -j"$(nproc)"
           strip -s build-win/xyo.exe
           ls -la build-win/xyo.exe
+          echo "--- SDL2.dll に依存していないこと（静的リンク） ---"
+          objdump -p build-win/xyo.exe | grep -ci "DLL Name: SDL2.dll" | grep -q "^0$"
 
-      - name: Smoke（JIT で run / AOT 書き出し）
+      - name: Smoke（JIT で run / AOT 書き出し / play）
         run: |
           ./build-win/xyo.exe run examples/play_demo.sb3 --frames 30
           echo "--- JIT コンパイル数 ---"
@@ -154,6 +160,10 @@ jobs:
           if grep -q "JIT session error" jit-err.txt; then
             echo "==== JIT シンボル解決に失敗 ===="; cat jit-err.txt; exit 1
           fi
+          echo "--- play（dummy ドライバ） ---"
+          export SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy
+          XYO_EXIT_FRAMES=10 XYO_SHOT=shot.ppm ./build-win/xyo.exe play examples/play_demo.sb3
+          test -s shot.ppm && ls -l shot.ppm
 
       - name: パッケージ
         run: |

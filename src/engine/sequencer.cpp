@@ -63,21 +63,20 @@ void jitEntry(void* arg) {
     cs->entry(c);
 }
 
-/// JitCtx プール — broadcast/clone の大量スレッド生成でアロケーションを
-/// 削減。Thread 本体は ownedThreads で生存するが ctx/fiber は終了時に
-/// 即返却する。並列 worker からも呼ばれるため mutex 保護。
+/// Finished contexts contain no live roots and can be reused by whichever
+/// worker completed the script (fibers may migrate). Shard the free list by
+/// native thread instead of contending twice per script on one global mutex.
+struct JitCtxFreeList {
+    std::vector<JitCtx*> entries;
+    ~JitCtxFreeList() { for (JitCtx* c : entries) delete c; }
+};
 std::vector<JitCtx*>& jitCtxPool() {
-    static std::vector<JitCtx*> p;
-    return p;
-}
-std::mutex& jitCtxMtx() {
-    static std::mutex m;
-    return m;
+    static thread_local JitCtxFreeList p;
+    return p.entries;
 }
 constexpr size_t kJitCtxPoolCap = 64;
 
 JitCtx* acquireJitCtx() {
-    std::lock_guard lk(jitCtxMtx());
     auto& p = jitCtxPool();
     if (!p.empty()) { JitCtx* c = p.back(); p.pop_back(); return c; }
     return new JitCtx{};
@@ -85,13 +84,19 @@ JitCtx* acquireJitCtx() {
 void releaseJitCtx(JitCtx* c) {
     if (!c) return;
     *c = JitCtx{};
-    std::lock_guard lk(jitCtxMtx());
     auto& p = jitCtxPool();
     if (p.size() < kJitCtxPoolCap) p.push_back(c);
     else delete c;
 }
 
 } // namespace
+
+bool Sequencer::warpBudgetExhausted(const Thread& thread) const {
+    // dangerMode では予算が無い — 時計を読まずに false を返す（interp の
+    // warp ループは毎反復ここを通るため、steady_clock の読みを消す価値がある）。
+    if (runtime.dangerMode) return false;
+    return thread.warpTimer.timeElapsed() > runtime.warpTimeMs;
+}
 
 std::vector<Thread*> Sequencer::stepThreads() {
     std::vector<Thread*> doneThreads;
@@ -100,6 +105,7 @@ std::vector<Thread*> Sequencer::stepThreads() {
     timer.start();
     size_t numActiveThreads = SIZE_MAX;
     bool ranFirstTick = false;
+    const bool allowParallel = parallelEnabled();
 
     while (!runtime.threads.empty() && numActiveThreads > 0 &&
            timer.timeElapsed() < WORK_TIME &&
@@ -121,13 +127,16 @@ std::vector<Thread*> Sequencer::stepThreads() {
             }
             if (activeThread->status == STATUS_RUNNING ||
                 activeThread->status == STATUS_YIELD) {
-                if (parallelEnabled() && parallelEligible(*activeThread)) {
+                const AccessSet* access = allowParallel
+                    ? parallelAccessFor(*activeThread) : nullptr;
+                if (access) {
                     // 並列バッチに溜める — flush は次の serial スレッドの
                     // 直前に必ず行うため、先行スレッドの効果は後続へ
                     // 逐次スケジュールと同じ順序で見える。
                     // 帳簿（active 計数・stopped 判定）は flush 時に
                     // 実行後の状態で行う。
                     parBatch_.push_back(activeThread);
+                    parSets_.push_back(access);
                 } else {
                     ParFlush fr = flushParBatch();
                     stoppedThread |= fr.stopped;
@@ -183,9 +192,31 @@ void Sequencer::stepThread(Thread& thread) {
     stepThreadBound(thread, 0);
 }
 
+namespace {
+/// インタプリタが実行したブロック数を数え、関数を抜けるときに
+/// HotSpot のプロファイルへ加算する。JIT compat 評価（minDepth > 0）と
+/// JIT 実行中は対象外。
+struct InterpBlockCounter {
+    Runtime* rt = nullptr;
+    const void* top = nullptr;
+    uint64_t n = 0;
+    ~InterpBlockCounter() {
+        if (n && rt && rt->jit && top)
+            rt->jit->noteInterpBlocks(top, n);
+    }
+};
+} // namespace
+
 /// minDepth: この深さ以下のスタックは触らない（JIT compat 評価の境界）。
 /// 0 = 従来通りスタックが空になるまで。
 void Sequencer::stepThreadBound(Thread& thread, size_t minDepth) {
+    const bool countBlocks =
+        minDepth == 0 && !thread.isCompiled && runtime.jit &&
+        thread.topBlockPtr != nullptr;
+    InterpBlockCounter blockCounter{
+        countBlocks ? &runtime : nullptr,
+        countBlocks ? static_cast<const void*>(thread.topBlockPtr) : nullptr,
+        0};
     std::string currentBlockId = thread.peekStack();
     if (currentBlockId.empty()) {
         thread.popStack();
@@ -206,12 +237,13 @@ void Sequencer::stepThreadBound(Thread& thread, size_t minDepth) {
             retireThread(thread);
         } else {
             execute(*this, thread);
+            if (countBlocks) ++blockCounter.n;
         }
         thread.blockGlowInFrame = currentBlockId;
 
         if (thread.status == STATUS_YIELD) {
             thread.status = STATUS_RUNNING;
-            if (isWarpMode && thread.warpTimer.timeElapsed() <= WARP_TIME) {
+            if (isWarpMode && !warpBudgetExhausted(thread)) {
                 continue;
             }
             return;
@@ -241,8 +273,7 @@ void Sequencer::stepThreadBound(Thread& thread, size_t minDepth) {
             isWarpMode = stackFrame->warpMode;
 
             if (stackFrame->isLoop) {
-                if (!isWarpMode ||
-                    thread.warpTimer.timeElapsed() > WARP_TIME) {
+                if (!isWarpMode || warpBudgetExhausted(thread)) {
                     return;
                 }
                 continue;
@@ -270,7 +301,7 @@ void Sequencer::stepToProcedure(Thread& thread, const std::string& procedureCode
     const bool isRecursive = thread.isRecursiveCall(procedureCode);
     thread.pushStack(definition);
     if (thread.peekStackFrame()->warpMode &&
-        thread.warpTimer.timeElapsed() > WARP_TIME) {
+        warpBudgetExhausted(thread)) {
         thread.status = STATUS_YIELD;
     } else {
         const Block* definitionBlock = thread.target->blocks->getBlock(definition);
@@ -370,10 +401,10 @@ void Sequencer::retireThread(Thread& thread) {
 bool Sequencer::parallelEnabled() const {
     static const bool enabled = std::getenv("XYO_PAR") == nullptr ||
                                 std::string(std::getenv("XYO_PAR")) != "0";
-    // renderer 存在時は target フィールド書込が renderer コールバック
-    // （非スレッドセーフ前提）を同期呼出するため並列化しない。
-    // ヘッドレス CLI では renderer==nullptr なので影響なし。
-    return enabled && runtime.jit && !runtime.renderer;
+    // Affinity is a per-script effect, not a property of the whole Runtime.
+    // Graphical/IO-mutating scripts remain serial barriers; independent pure
+    // computation may run on workers while a renderer is attached.
+    return enabled && runtime.jit;
 }
 
 /// このスレッドを並列バッチへ入れてよいか。
@@ -382,12 +413,18 @@ bool Sequencer::parallelEnabled() const {
 /// (= worker) のスタックへ戻るだけなので、中断中のスレッドは
 /// 他スレッドと並行しても逐次実行と同じ可視性になる。
 bool Sequencer::parallelEligible(Thread& t) const {
-    if (!t.isCompiled || !t.target || t.stackClick || t.updateMonitor)
-        return false;
+    return parallelAccessFor(t) != nullptr;
+}
+
+const AccessSet* Sequencer::parallelAccessFor(Thread& t) const {
+    if (!runtime.jit || !t.isCompiled || !t.target || t.stackClick || t.updateMonitor)
+        return nullptr;
     auto* cs = static_cast<const CompiledScript*>(t.compiled);
-    if (!cs || !cs->entry) return false;
+    // GPU helpers may invoke the renderer or shared compute backends, even in
+    // a script whose Scratch-level effects are purely numeric.
+    if (!cs || !cs->entry || cs->mainThread || !cs->gpuProgs.empty()) return nullptr;
     const AccessSet* as = runtime.jit->accessFor(t, runtime);
-    return as && as->safe();
+    return as && as->workerSafe() ? as : nullptr;
 }
 
 namespace {
@@ -409,8 +446,10 @@ void runGroup(void* p) {
 Sequencer::ParFlush Sequencer::flushParBatch() {
     ParFlush r;
     if (parBatch_.empty()) return r;
-    std::vector<Thread*> batch;
-    batch.swap(parBatch_);
+    // Retain batch storage across scheduler passes; no eligible script can
+    // spawn/re-enter the scheduler while this batch is being drained.
+    auto& batch = parBatch_;
+    auto& sets = parSets_;
 
     auto finish = [&]() -> ParFlush {
         for (Thread* t : batch) {
@@ -418,6 +457,8 @@ Sequencer::ParFlush Sequencer::flushParBatch() {
             if (t->stack.empty() || t->status == STATUS_DONE)
                 r.stopped = true;
         }
+        batch.clear();
+        sets.clear();
         return r;
     };
 
@@ -426,21 +467,19 @@ Sequencer::ParFlush Sequencer::flushParBatch() {
         return finish();
     }
 
-    std::vector<const AccessSet*> sets;
-    sets.reserve(batch.size());
-    for (Thread* t : batch) {
-        const AccessSet* as = runtime.jit->accessFor(*t, runtime);
-        if (!as || !as->safe()) {
-            // 解析結果が unsafe — 保守的に全て直列
-            for (Thread* x : batch) jitStepThread(*x);
-            return finish();
-        }
-        sets.push_back(as);
+    std::vector<std::vector<size_t>> groups;
+    static const char* graphDump = std::getenv("XYO_DEPGRAPH");
+    if (graphDump && *graphDump) {
+        // Full edges and their human-readable reasons are diagnostic work.
+        DepGraph g = buildDepGraph(sets);
+        dumpDepGraph(g, batch);
+        groups = g.groups();
+    } else {
+        groups = buildDepGroups(sets);
     }
-
-    DepGraph g = buildDepGraph(sets);
-    dumpDepGraph(g, batch);
-    std::vector<std::vector<size_t>> groups = g.groups();
+    ++parStats_.batches;
+    parStats_.threads += batch.size();
+    parStats_.groups += groups.size();
     if (prof().enabled) {
         prof().parThreads += batch.size();
         prof().parGroups += groups.size();
@@ -462,10 +501,14 @@ Sequencer::ParFlush Sequencer::flushParBatch() {
     // worker スレッド上で Gc::collect が走らないよう collect を遅延。
     // 走査中に変数/SList が生えても sweep がルートを壊さないよう、
     // 並列区間は collect を起こさずフェーズ終了後に必要なら回収する。
-    Gc::get().setDeferred(true);
-    parPool_->run(tasks.data(), tasks.size());
-    Gc::get().setDeferred(false);
-    Gc::get().collectIfNeeded();
+    bool canCollect;
+    {
+        Gc::DeferCollect defer;
+        canCollect = !defer.prev;
+        ++parStats_.dispatches;
+        parPool_->run(tasks.data(), tasks.size());
+    }
+    if (canCollect) Gc::get().collectIfNeeded();
     return finish();
 }
 

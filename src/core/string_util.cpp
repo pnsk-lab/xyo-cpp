@@ -18,8 +18,7 @@ SStr* sstrFromAscii(std::string_view sv) {
         Gc::get().alloc(GcType::Str, sizeof(SStr) + (sv.size() + 1) * 2));
     s->len = static_cast<uint32_t>(sv.size());
     s->hash = 0;
-    s->numState = 0;
-    s->rgbState = 0;
+    s->initCaches();
     for (size_t i = 0; i < sv.size(); ++i) s->data()[i] = static_cast<char16_t>(sv[i]);
     s->data()[sv.size()] = 0;
     return s;
@@ -31,8 +30,7 @@ SStr* sstrConcat(std::u16string_view a, std::u16string_view b) {
                         sizeof(SStr) + (a.size() + b.size() + 1) * 2));
     s->len = static_cast<uint32_t>(a.size() + b.size());
     s->hash = 0;
-    s->numState = 0;
-    s->rgbState = 0;
+    s->initCaches();
     std::memcpy(s->data(), a.data(), a.size() * 2);
     std::memcpy(s->data() + a.size(), b.data(), b.size() * 2);
     s->data()[s->len] = 0;
@@ -45,8 +43,7 @@ SStr* sstrConcatAscii(std::u16string_view a, std::string_view b) {
                         sizeof(SStr) + (a.size() + b.size() + 1) * 2));
     s->len = static_cast<uint32_t>(a.size() + b.size());
     s->hash = 0;
-    s->numState = 0;
-    s->rgbState = 0;
+    s->initCaches();
     std::memcpy(s->data(), a.data(), a.size() * 2);
     for (size_t i = 0; i < b.size(); ++i)
         s->data()[a.size() + i] = static_cast<char16_t>(b[i]);

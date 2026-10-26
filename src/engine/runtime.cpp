@@ -2,6 +2,8 @@
 #include "runtime.hpp"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 
 #include "../core/cast.hpp"
 #include "../rt/runtime_helpers.hpp"
@@ -13,6 +15,11 @@ namespace xyo {
 
 /// コアブロックパッケージのプリミティブ/ハットを登録（blocks/ 側で定義）
 void registerCoreBlocks(Runtime& rt);
+
+bool dangerModeFromEnv() {
+    const char* v = std::getenv("XYO_DANGER");
+    return v != nullptr && *v != 0 && std::strcmp(v, "0") != 0;
+}
 
 Runtime::Runtime()
     : sequencer(std::make_unique<Sequencer>(*this)),
@@ -379,6 +386,15 @@ void Runtime::disposeTarget(Target* target) {
     if (it == targets.end()) return;
     target->dispose();
     targets.erase(it);
+    // editingTarget が消えたターゲットを指すと addMonitorScript が freed
+    // ターゲットへスレッドを生成する（モニタ UAF）。次のスプライトへ移す。
+    if (editingTarget == target) {
+        editingTarget = nullptr;
+        for (Target* t : targets) {
+            if (!t->isStage) { editingTarget = t; break; }
+        }
+        if (!editingTarget && !targets.empty()) editingTarget = targets[0];
+    }
     if (onTargetRemoved) onTargetRemoved(target);
     delete target;
 }

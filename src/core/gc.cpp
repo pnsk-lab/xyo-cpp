@@ -7,6 +7,8 @@
 #ifdef _WIN32
 #include <windows.h>
 #include "../engine/fiber.hpp"
+#elif defined(__EMSCRIPTEN__)
+#include <emscripten/stack.h>
 #else
 #include <pthread.h>
 #endif
@@ -195,6 +197,19 @@ void Gc::collect() {
             }
             pthread_attr_destroy(&attr);
         }
+#elif defined(__EMSCRIPTEN__)
+        // WASM: スタックは下方向成長。現 SP（alloca(0)）から base までを
+        // ワード走査する（Linux 経路と同じ「jmp_buf を含む全ローカルが
+        // 範囲に入る」方針）。emscripten_stack_get_base は
+        // <emscripten/stack.h>（Emscripten のスタック管理 API）。
+        {
+            uintptr_t lo = reinterpret_cast<uintptr_t>(__builtin_alloca(0));
+            uintptr_t hi = reinterpret_cast<uintptr_t>(
+                emscripten_stack_get_base());
+            if (lo < hi)
+                scanRange(reinterpret_cast<void*>(lo),
+                          reinterpret_cast<void*>(hi));
+        }
 #endif
     }
 
@@ -203,6 +218,7 @@ void Gc::collect() {
     // sweep
     GcHeader** prev = &allObjects_;
     size_t live = 0;
+    size_t listBytes = 0;
     for (GcHeader* h = allObjects_; h; ) {
         GcHeader* next = h->next;
         if (h->mark) {
@@ -210,6 +226,16 @@ void Gc::collect() {
             *prev = h;
             prev = &h->next;
             live += sizeof(GcHeader) + h->size;
+            // SList の items バッファは Gc::alloc を通らず malloc で
+            // 管理している。これを live に数えないと、巨大リストを
+            // 持つプロジェクトで「文字列を少し確保するたびに全リストを
+            // 走査する GC」が頻発する（voxelRenderer では 1 回 17ms ×
+            // 数百回が支配的になる）。cap を外部メモリとして算入し、
+            // 次回閾値を live 比例で引き上げる。
+            if (h->type == GcType::List) {
+                auto* list = reinterpret_cast<SList*>(h + 1);
+                listBytes += size_t(list->cap) * sizeof(Value);
+            }
         } else {
             objSet_.erase(h);
             destroyPayload(h);
@@ -225,9 +251,11 @@ void Gc::collect() {
         pageSet_.insert(reinterpret_cast<uintptr_t>(h) >> 12);
         pageSet_.insert(reinterpret_cast<uintptr_t>(h + 1) >> 12);
     }
-    bytesAllocated_ = live;
-    // ヒープ倍増方針: live の 2 倍 or 2MiB の大きい方
-    size_t next = live * 2;
+    bytesAllocated_ = live + listBytes;
+    // ヒープ倍増方針: (GC オブジェクト + リストバッファ) の 2 倍 or
+    // 2MiB の大きい方。リストが育つほど GC 間隔を広げ、走査コストに
+    // 見合う量のゴミを溜めてから回収する。
+    size_t next = (live + listBytes) * 2;
     threshold_ = next > (2 << 20) ? next : (2 << 20);
     collecting_ = false;
 }

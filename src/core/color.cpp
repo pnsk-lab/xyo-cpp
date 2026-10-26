@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 namespace xyo::color {
 
@@ -34,12 +35,30 @@ std::optional<int> hexToDecimal(std::string_view hex) {
 
 std::string rgbToHex(Rgb rgb) { return decimalToHex(rgbToDecimal(rgb)); }
 
+namespace {
+const bool g_hsvFloorGeneric = std::getenv("XYO_HSV_FLOOR_GENERIC") != nullptr;
+}
+
 Rgb hsvToRgb(Hsv hsv) {
-    double h = std::fmod(hsv.h, 360.0);
-    if (h < 0) h += 360;
+    // fmod は範囲外のときだけ呼ぶ（libm 呼び出しは ~9ns）。
+    // [0,360) の h では結果が現行とビット一致することを全 24bit 色で確認済み。
+    double h = hsv.h;
+    if (!(h >= 0.0 && h < 360.0)) {
+        h = std::fmod(h, 360.0);
+        if (h < 0) h += 360;
+    }
     double s = std::max(0.0, std::min(hsv.s, 1.0));
     double v = std::max(0.0, std::min(hsv.v, 1.0));
-    int i = static_cast<int>(std::floor(h / 60));
+    // Achromatic inputs have p == q == t == v for every finite hue.
+    // Keep normalization/clamping above in their original order; a nonfinite
+    // normalized hue must retain the old path rather than bypass its behavior.
+    if (s == 0.0 && std::isfinite(h)) {
+        // Clamping makes v*255 finite and nonnegative: truncation equals floor.
+        const double scaled = v * 255;
+        int gray = static_cast<int>(g_hsvFloorGeneric ? std::floor(scaled) : scaled);
+        return {gray, gray, gray};
+    }
+    int i = static_cast<int>(h / 60);
     double f = h / 60 - i;
     double p = v * (1 - s), q = v * (1 - s * f), t = v * (1 - s * (1 - f));
     double r, g, b;
@@ -51,6 +70,13 @@ Rgb hsvToRgb(Hsv hsv) {
     case 5: r = v; g = p; b = q; break;
     default: r = v; g = t; b = p; break;
     }
+    // For finite normalized hue, i is 0..6 and f is in [0,1). Ordered s/v
+    // clamps put all RGB products in [0,1], so each scaled channel is in
+    // [0,255]. Integer truncation therefore gives exactly the same floor.
+    // Keep all preceding operations/grouping and the nonfinite legacy path.
+    if (!g_hsvFloorGeneric && std::isfinite(h))
+        return {static_cast<int>(r * 255), static_cast<int>(g * 255),
+                static_cast<int>(b * 255)};
     return {static_cast<int>(std::floor(r * 255)),
             static_cast<int>(std::floor(g * 255)),
             static_cast<int>(std::floor(b * 255))};
@@ -64,7 +90,11 @@ Hsv rgbToHsv(Rgb rgb) {
     if (x != v) {
         double f = (r == x) ? g - b : (g == x) ? b - r : r - g;
         double i = (r == x) ? 3 : (g == x) ? 5 : 1;
-        h = std::fmod((i - f / (v - x)) * 60, 360.0);
+        // この式の値は数学的に [0,360) に収まる（全 24bit 色で確認済み）。
+        // fmod を省き、丸め誤差ぶんだけ条件分岐で正規化する。
+        h = (i - f / (v - x)) * 60;
+        if (h < 0) h += 360;
+        else if (h >= 360) h -= 360;
         s = (v - x) / v;
     }
     return {h, s, v};

@@ -82,8 +82,15 @@ struct AccessSet {
     bool spawn = false;
     /// 未解析/compat/動的ターゲット解決/実行時変数生成 → 逐次実行を強制
     bool unknown = false;
+    /// sensing_of のように任意の変数を動的に読む op を含む。
+    /// minify の変数使用解析は静的に確定できないため保守側へ倒す。
+    bool varDynamic = false;
+    /// Renderer/target-update callbacks or mutable IO caches: caller thread only,
+    /// even if the explicit memory keys do not conflict with another script.
+    bool mainThread = false;
 
     bool safe() const { return !spawn && !unknown; }
+    bool workerSafe() const { return safe() && !mainThread; }
     /// 書き込みキーが相手の読み/書きと交差するか（読み同士は衝突しない）
     bool conflicts(const AccessSet& o) const {
         for (const MemKey& w : writes)
@@ -99,11 +106,35 @@ std::string describeKey(const MemKey& k);
 
 // --- 解析 -----------------------------------------------------------------
 
+/// 解析がスレッドを逐次実行へ回した理由（レポート用・解析結果には影響しない）。
+struct AccessNote {
+    enum class Kind : uint8_t { Unknown = 0, Spawn = 1, MainThread = 2, VarDynamic = 3 };
+    Kind kind = Kind::Unknown;
+    std::string opcode;   // 原因ブロックの opcode（不明なら空）
+    std::string detail;   // "unresolved variable" 等の補足
+};
+
 /// スクリプトのアクセス集合を静的解析。top はハット/先頭ブロック —
 /// top 自身は評価されない（startHats が処理済み）ため top->next から走査。
 /// 例外は投げない。未解決要素は unknown フラグで表現される。
+/// notes を渡すと逐次実行の理由を最大 8 件（opcode 単位で重複排除）追記する。
 AccessSet analyzeScript(Runtime& rt, Target& target, Blocks& blocks,
-                        const Block* top);
+                        const Block* top,
+                        std::vector<AccessNote>* notes = nullptr);
+
+/// プロジェクト全体の変数使用（minify --aggressive 用）。
+/// 全スクリプトを analyzeScript に通し、JIT/並列スケジューラと同一の
+/// 解決規則（id → 自ターゲット → ステージ、name → 同様）で Variable* を
+/// 集める。トップレベルの変数/リスト reporter（script ではない）と
+/// モニタも使用として扱う。
+struct VariableUsage {
+    std::unordered_set<const Variable*> used;
+    /// sensing_of 等、変数参照を静的に確定できないスクリプトがあった
+    bool dynamic = false;
+    bool ok = false;
+    size_t scripts = 0;
+};
+VariableUsage analyzeVariableUsage(Runtime& rt);
 
 // --- 衝突グラフ -----------------------------------------------------------
 
@@ -122,6 +153,12 @@ struct DepGraph {
 
 /// バッチ内スレッド群の衝突グラフを構築（O(n²) ペア判定、n は小さい前提）
 DepGraph buildDepGraph(const std::vector<const AccessSet*>& sets);
+
+/// グラフ/ラベルを生成せず同じ連結成分を求める（通常スケジュール用）。
+/// メモリキー別の writer を索引化し、読み同士は結合しない。
+/// グループ内・グループ間の順序は buildDepGraph(sets).groups() と同じ。
+std::vector<std::vector<size_t>> buildDepGroups(
+    const std::vector<const AccessSet*>& sets);
 
 /// DOT 形式ダンプ。names[i] はノード名（"Sprite:hats.opcode" 等）
 std::string depGraphToDot(const DepGraph& g,

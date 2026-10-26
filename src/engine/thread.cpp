@@ -145,13 +145,24 @@ bool Thread::isRecursiveCall(const std::string& procedureCode) const {
 
 void Thread::tryCompile(const Block* topHint) {
     triedToCompile = true;
-    static const bool disabled = std::getenv("XYO_JIT_DISABLE") != nullptr;
+    Runtime* rt = target ? target->runtime : nullptr;
+    if (!rt || !rt->jit || !jitEnabled() || !blockContainer) return;
+    const Block* top =
+        topHint ? topHint : blockContainer->getBlock(topBlock);
+    if (!top) return;
+    topBlockPtr = top;
     static const bool verbose = std::getenv("XYO_JIT_VERBOSE") != nullptr;
-    if (disabled) return;
-    if (!target || !target->runtime || !target->runtime->jit) return;
-    if (verbose) std::fprintf(stderr,
-        "xyo-jit: tryCompile top=%s target=%s\n", topBlock.c_str(),
-        target->id.c_str());
+
+    // HotSpot: 呼び出し回数・解釈実行ブロック数・スクリプト形状から
+    // 今回のスレッドを JIT で走らせるか決める（Eager は常に JIT）。
+    if (!rt->jit->decideCompile(*this, top)) {
+        if (verbose)
+            std::fprintf(stderr, "xyo-jit: interp top=%s\n", topBlock.c_str());
+        return;
+    }
+    if (verbose)
+        std::fprintf(stderr, "xyo-jit: compile top=%s target=%s\n",
+                     topBlock.c_str(), target->id.c_str());
     struct CProf {
         bool enabled = std::getenv("XYO_PROF") != nullptr;
         double ns = 0; uint64_t n = 0;
@@ -165,8 +176,7 @@ void Thread::tryCompile(const Block* topHint) {
     std::chrono::steady_clock::time_point t0;
     if (cp.enabled) t0 = std::chrono::steady_clock::now();
     const CompiledScript* cs =
-        target->runtime->jit->compile(*this, *target->runtime,
-                                      *target->runtime->sequencer, topHint);
+        rt->jit->compile(*this, *rt, *rt->sequencer, top);
     if (cp.enabled) {
         cp.ns += std::chrono::duration<double, std::nano>(
             std::chrono::steady_clock::now() - t0).count();

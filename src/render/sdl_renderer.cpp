@@ -20,8 +20,17 @@
 #include <deque>
 #include <unordered_map>
 
+// M_PI は ISO C++ 標準ではない（mingw の <cmath> では未定義）
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 #ifdef XYO_HAVE_RSVG
 #include <librsvg/rsvg.h>
+#else
+// librsvg が無いビルド（Windows 等）の SVG フォールバック。
+// 実体（*_IMPLEMENTATION）は src/render/stb_impl.cpp にある。
+#include "../../third_party/nanosvgrast.h"
 #endif
 
 #if defined(XYO_PEN_GL)
@@ -45,6 +54,137 @@
 
 namespace xyo {
 
+// ===================================================== ペン層プロファイル ====
+// XYO_PENPROF=1 でストローク/フラッシュ/readback/変換/upload/present の
+// 内訳を終了時に stderr へ出す。計測は単一スレッド前提の素朴な累算。
+namespace {
+
+struct PenProf {
+    bool on = false;
+    // 回数
+    uint64_t strokes = 0;      // penStroke 呼び出し
+    uint64_t rasterPx = 0;     // CPU ラスタが触れた画素
+    uint64_t quads = 0;        // GPU バッチへ積んだストローク
+    uint64_t flushes = 0;      // FBO への glDrawElements 回数
+    uint64_t readbacks = 0;    // FBO → CPU 転送回数
+    uint64_t convPx = 0;       // premult→straight 変換画素
+    uint64_t uploads = 0;      // SDL_UpdateTexture 回数
+    uint64_t frames = 0;       // draw() 回数
+    uint64_t records = 0;      // GPU レコード描画のレコード数
+    uint64_t rcFlushes = 0, fwdFlushes = 0;
+    // 時間 (ms)
+    double strokeMs = 0;       // penStroke 全体
+    double rasterMs = 0;       // CPU ラスタ（penGpu()==false 経路）
+    double quadMs = 0;         // quad 生成
+    double flushMs = 0;        // GPU バッチ描画
+    double readbackMs = 0;     // glReadPixels + 行反転
+    double convertMs = 0;      // premult→straight
+    double uploadMs = 0;       // SDL_UpdateTexture
+    double copyMs = 0;         // SDL_RenderCopy（ペン層）
+    double drawMs = 0;         // draw() 全体
+    double presentMs = 0;      // SDL_RenderPresent
+};
+
+PenProf g_penProf;
+struct PenProfDump {
+    ~PenProfDump() {
+        if (!g_penProf.on) return;
+        const PenProf& p = g_penProf;
+        std::fprintf(stderr,
+            "PENPROF strokes=%llu rasterPx=%llu quads=%llu flushes=%llu "
+            "readbacks=%llu convPx=%llu uploads=%llu frames=%llu "
+            "records=%llu\n",
+            (unsigned long long)p.strokes, (unsigned long long)p.rasterPx,
+            (unsigned long long)p.quads, (unsigned long long)p.flushes,
+            (unsigned long long)p.readbacks,
+            (unsigned long long)p.convPx, (unsigned long long)p.uploads,
+            (unsigned long long)p.frames, (unsigned long long)p.records);
+        std::fprintf(stderr,
+            "PENPROF ms stroke=%.1f raster=%.1f quad=%.1f flush=%.1f "
+            "readback=%.1f convert=%.1f upload=%.1f copy=%.1f draw=%.1f "
+            "present=%.1f\n",
+            p.strokeMs, p.rasterMs, p.quadMs, p.flushMs, p.readbackMs,
+            p.convertMs, p.uploadMs, p.copyMs, p.drawMs, p.presentMs);
+    }
+} g_penProfDump;
+
+bool penProfInit() {
+    g_penProf.on = std::getenv("XYO_PENPROF") != nullptr;
+    return g_penProf.on;
+}
+const bool g_penProfOn = penProfInit();
+
+struct PenTimer {
+    bool on;
+    double* acc;
+    std::chrono::steady_clock::time_point t0;
+    PenTimer(double* a, bool always = false)
+        : on(always || g_penProfOn), acc(a) {
+        if (on) t0 = std::chrono::steady_clock::now();
+    }
+    ~PenTimer() {
+        if (!on) return;
+        *acc += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
+    }
+};
+
+} // namespace
+
+// ペン経路の環境変数フラグ。関数ローカル static だと呼び出しごとに
+// スレッド安全な初期化ガード（guard 変数のロード＋分岐）が入るため、
+// ファイルスコープで起動時に 1 度だけ評価する。
+const bool g_penLog = std::getenv("XYO_PENLOG") != nullptr;
+const bool g_penSkip = std::getenv("XYO_PENSKIP") != nullptr;
+FILE* g_penTrace = []() -> FILE* {
+    const char* p = std::getenv("XYO_PENTRACE");
+    return p ? std::fopen(p, "wb") : nullptr;
+}();
+// Fold diagnostic selection once, rather than testing four flags per point.
+// XYO_PEN_POINT_GENERIC=1 is an exact-path A/B switch (not a quality toggle).
+const bool g_penPointGeneric = g_penProfOn || g_penLog || g_penTrace ||
+    g_penSkip || std::getenv("XYO_PEN_POINT_GENERIC") != nullptr;
+
+/// これだけ即時ラスタしたら遅延バッチへ切り替える（順序は保たれる）。
+/// これだけ即時ラスタしたら遅延バッチへ切り替える（順序は保たれる）。
+constexpr uint32_t kPenBatchStart = 256;
+/// オーバードロー推定用の被覆タイル（px）。粗いほど安い。
+constexpr int kPenTile = 64;
+constexpr int kPenTileX = 8;   // penW_ <= 8*64
+
+/// 0..255 への丸め。`std::lround` は -O2 でも PLT 呼び出しになるため、
+/// ホットループでは等価な inline 版を使う（v>=0 では trunc(v+0.5) が
+/// round-half-away-from-zero と一致する）。
+static inline uint8_t penTo255(double v) {
+    if (!(v > 0.0)) return 0;
+    if (v >= 255.0) return 255;
+    return static_cast<uint8_t>(static_cast<long>(v + 0.5));
+}
+
+/// 統計のスナップショット（XYO_PENPROF が無効でも常時集計する）。
+PenStats penStats() {
+    const PenProf& p = g_penProf;
+    PenStats s;
+    s.strokes = p.strokes;     s.rasterPx = p.rasterPx;
+    s.quads = p.quads;         s.flushes = p.flushes;
+    s.readbacks = p.readbacks; s.convPx = p.convPx;
+    s.uploads = p.uploads;     s.frames = p.frames;
+    s.records = p.records;
+    s.rcFlushes = p.rcFlushes; s.fwdFlushes = p.fwdFlushes;
+    s.strokeMs = p.strokeMs;   s.rasterMs = p.rasterMs;
+    s.quadMs = p.quadMs;       s.flushMs = p.flushMs;
+    s.readbackMs = p.readbackMs; s.convertMs = p.convertMs;
+    s.uploadMs = p.uploadMs;   s.copyMs = p.copyMs;
+    s.drawMs = p.drawMs;       s.presentMs = p.presentMs;
+    return s;
+}
+
+void penStatsReset() {
+    const bool on = g_penProf.on;
+    g_penProf = PenProf{};
+    g_penProf.on = on;
+}
+
 #if defined(XYO_PEN_GL)
 // GPU ペン層の状態（実体はこの TU 内のみ）。定義はメソッド実装と
 // 同じ場所ではなく不完全型のままデストラクタ等で使えないため
@@ -63,9 +203,24 @@ struct SdlRenderer::GlPen {
     bool fboDirty = false;   // FBO が penPx_ より新しい（readback 必要）
     bool shared = false;
     bool sdlTexDirty = false;
+    // SDL テクスチャ直接描画（interop）: penTex_ の GL テクスチャを
+    // ペン FBO のカラーアタッチメントにして readback/convert/upload を
+    // 丸ごと省く。SDL コンテキストと共有できたときだけ有効。
+    bool interop = false;
+    GLuint upTex = 0;        // penTex_ の GL テクスチャ名（SDL 管理）
     GLuint upFbo = 0, upVao = 0;
     GLuint upProg2d = 0, upProgRect = 0;
-    ~GlPen() { std::free(v); std::free(ix); }
+    // ---- per-stroke レコード展開（GL3.3 core）----
+    // 1 ストローク = 10 float のインスタンス属性。6 頂点は VS が
+    // gl_VertexID から生成する。per-vertex クアッド（40 float + 6 index）
+    // に比べ CPU 側の書き込みと転送量が ~2.5x 少ない。
+    bool useRecords = false;
+    GLuint recProg = 0, recVbo = 0, recVao = 0;
+    GLint recUSize = -1, recUHalf = -1;
+    float* rec = nullptr;
+    size_t recLen = 0, recCap = 0;   // recLen は float 数
+    size_t recStrokes = 0;
+    ~GlPen() { std::free(v); std::free(ix); std::free(rec); }
 };
 
 /// GPU 並列スクリプト実行の状態（GL4.3 compute）。
@@ -196,6 +351,10 @@ bool SdlRenderer::init(Runtime& rt, int scale) {
     stageH_ = rt.stageHeight;
     scale_ = std::max(1, scale);
 
+    // Windows の SDL2 は SDL_MAIN_NEEDED でビルドされており、SDL_main を
+    // 使わない（SDL_MAIN_HANDLED）アプリは SDL_SetMainReady() を呼ばないと
+    // SDL_InitSubSystem が "Application didn't initialize properly" で失敗する。
+    SDL_SetMainReady();
     if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
         std::fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return false;
@@ -217,7 +376,12 @@ bool SdlRenderer::init(Runtime& rt, int scale) {
     }
     SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
     recomputeViewport();
+    initTargetsAndUi();
+    return true;
+}
 
+/// init/initEmbedded 共通: drawable 生成・コールバック・カーソル・ask。
+void SdlRenderer::initTargetsAndUi() {
     for (Target* t : rt_->targets) {
         if (t->isStage) createDrawableForTarget(t, "backdrop");
         else if (t->isRenderable()) createDrawableForTarget(t, "sprite");
@@ -251,7 +415,54 @@ bool SdlRenderer::init(Runtime& rt, int scale) {
             SDL_StopTextInput();
         }
     };
+}
+
+/// 埋め込みモード（エディタ）: renderer を共有し、自前ウィンドウは作らない。
+/// draw() は clear/present せず stageRect_ の領域にだけ描く。
+bool SdlRenderer::initEmbedded(Runtime& rt, SDL_Renderer* renderer) {
+    if (!renderer) return false;
+    rt_ = &rt;
+    stageW_ = rt.stageWidth;
+    stageH_ = rt.stageHeight;
+    scale_ = 1;
+    embedded_ = true;
+    renderer_ = renderer;
+    SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
+    // stageRect_ は setStageRect でセットされるまで 0（描画しない）。
+    stageRect_ = IRect{0, 0, 0, 0};
+    flagRect_[0] = flagRect_[1] = flagRect_[2] = flagRect_[3] = 0;
+    stopRect_[0] = stopRect_[1] = stopRect_[2] = stopRect_[3] = 0;
+    initTargetsAndUi();
     return true;
+}
+
+void SdlRenderer::setStageRect(const IRect& r) {
+    stageRect_ = r;
+    // 埋め込みでは緑旗/停止はエディタ側が描くので chrome は無効。
+    flagRect_[0] = flagRect_[1] = flagRect_[2] = flagRect_[3] = 0;
+    stopRect_[0] = stopRect_[1] = stopRect_[2] = stopRect_[3] = 0;
+}
+
+SDL_Texture* SdlRenderer::spriteTexture(Target* t, double* lw, double* lh,
+                                        double* rcx, double* rcy) {
+    if (!t || !renderer_) return nullptr;
+    Skin* s = skinForTarget(t);
+    if (!s || !s->tex) return nullptr;
+    if (lw) *lw = s->logicalW;
+    if (lh) *lh = s->logicalH;
+    if (rcx) *rcx = s->rcx;
+    if (rcy) *rcy = s->rcy;
+    return s->tex;
+}
+
+SDL_Texture* SdlRenderer::costumeTexture(const Costume* c, double* lw,
+                                         double* lh) {
+    if (!c || !renderer_) return nullptr;
+    Skin* s = decodeCostume(c);
+    if (!s || !s->tex) return nullptr;
+    if (lw) *lw = s->logicalW;
+    if (lh) *lh = s->logicalH;
+    return s->tex;
 }
 
 SdlRenderer::~SdlRenderer() {
@@ -275,6 +486,9 @@ SdlRenderer::~SdlRenderer() {
             if (g.vbo) glDeleteBuffers(1, &g.vbo);
             if (g.ebo) glDeleteBuffers(1, &g.ebo);
             if (g.prog) glDeleteProgram(g.prog);
+            if (g.recProg) glDeleteProgram(g.recProg);
+            if (g.recVbo) glDeleteBuffers(1, &g.recVbo);
+            if (g.recVao) glDeleteVertexArrays(1, &g.recVao);
             if (g.fbo) glDeleteFramebuffers(1, &g.fbo);
             if (g.tex) glDeleteTextures(1, &g.tex);
             if (glComp_) {
@@ -311,12 +525,17 @@ SdlRenderer::~SdlRenderer() {
     delete glComp_;
     glComp_ = nullptr;
 #endif
-    if (renderer_) SDL_DestroyRenderer(renderer_);
-    if (window_) SDL_DestroyWindow(window_);
-    SDL_QuitSubSystem(SDL_INIT_VIDEO);
+    if (!embedded_) {
+        if (renderer_) SDL_DestroyRenderer(renderer_);
+        if (window_) SDL_DestroyWindow(window_);
+        SDL_QuitSubSystem(SDL_INIT_VIDEO);
+    }
+    renderer_ = nullptr;
+    window_ = nullptr;
 }
 
 void SdlRenderer::recomputeViewport() {
+    if (!window_) return;
     int w = 0, h = 0;
     SDL_GetWindowSize(window_, &w, &h);
     double s = std::min(w / double(stageW_), h / double(stageH_));
@@ -375,11 +594,41 @@ SdlRenderer::Skin* SdlRenderer::decodeCostume(const Costume* c) {
 
     if (c->dataFormat == "svg") {
 #ifndef XYO_HAVE_RSVG
-        // librsvg の無いビルド（Windows 等）は SVG を失敗として
-        // キャッシュする — ビットマップコスチュームは描画できる。
-        return fail();
+        // librsvg の無いビルド（Windows 等）は nanosvg でラスタ化する。
+        // <text>/<tspan> は描画されない（nanosvg の制約）が、Scratch の
+        // コスチュームは図形が主なので空白になるよりは良い。
+        std::string xml(reinterpret_cast<const char*>(c->data.data()),
+                        c->data.size());
+        NSVGimage* img = nsvgParse(xml.data(), "px", 96.0f);
+        if (!img) return fail();
+        double rs = 2.0 * std::max(1.0, c->bitmapResolution);
+        double rw = double(img->width) * rs, rh = double(img->height) * rs;
+        if (!(std::isfinite(rs) && rs > 0 && std::isfinite(rw) &&
+              std::isfinite(rh) && rw > 0 && rh > 0) ||
+            rw > 8192.0 || rh > 8192.0 ||
+            rw * rh > 64.0 * 1024.0 * 1024.0) {
+            nsvgDelete(img);
+            return fail();
+        }
+        skin->w = static_cast<int>(std::ceil(rw));
+        skin->h = static_cast<int>(std::ceil(rh));
+        skin->scale = rs;
+        skin->px.assign(static_cast<size_t>(skin->w) * skin->h * 4, 0);
+        NSVGrasterizer* rast = nsvgCreateRasterizer();
+        if (!rast) {
+            nsvgDelete(img);
+            return fail();
+        }
+        // nanosvgrast の出力は非乗算（straight）RGBA8 = Skin::px の約束
+        nsvgRasterize(rast, img, 0, 0, static_cast<float>(rs),
+                      skin->px.data(), skin->w, skin->h, skin->w * 4);
+        nsvgDeleteRasterizer(rast);
+        nsvgDelete(img);
+        // SVG の rotationCenter は論理 px（= svg px）
+        skin->rcx = c->rotationCenterX;
+        skin->rcy = c->rotationCenterY;
 #else
-        // nanosvg は NUL 終端文字列を要求
+        // librsvg 経路: (data, size) を直接渡す（NUL 終端は不要）。
         std::string xml(reinterpret_cast<const char*>(c->data.data()),
                         c->data.size());
         GError* err = nullptr;
@@ -613,7 +862,8 @@ bool SdlRenderer::skinPxAt(const Drawable& d, double px, double py,
 // 背面→前面の全レイヤ（backdrop → pen → sprite）を合成サンプル
 bool SdlRenderer::stageColorAt(double px, double py, int skipId,
                                uint8_t out[4]) const {
-    // GPU ペン層の未描画バッチを反映してから penPx_ を読む
+    // 未描画バッチ（CPU 遅延 / GPU クアッド）を反映してから penPx_ を読む
+    const_cast<SdlRenderer*>(this)->penFlushCpuBatch();
     const_cast<SdlRenderer*>(this)->penSyncCpu();
     // 前面から順に最初の不透明ピクセルを採る
     std::vector<const Drawable*> order;
@@ -712,16 +962,113 @@ bool SdlRenderer::hasDrawable(int drawableID) const {
 void SdlRenderer::getFencedPosition(int drawableID, double& x, double& y,
                                     bool fencing) const {
     if (!fencing) return;
-    const Drawable* d = drawableFor(drawableID);
-    if (!d || !d->target) return;
+    // 同一 drawable が連続で動く（ペン描画の典型）ので map 引きを 1 回に
+    // 抑える。destroyDrawable で必ず無効化する。
+    const Drawable* d;
+    if (drawableID == lastFenceId_ && lastFenceDrawable_) {
+        d = lastFenceDrawable_;
+    } else {
+        d = drawableFor(drawableID);
+        if (!d || !d->target) return;
+        lastFenceId_ = drawableID;
+        lastFenceDrawable_ = d;
+    }
     Target* t = d->target;
+    // 中央付近は clamp 余地なし — 位置が安全範囲内なら即返す。
+    // 安全範囲はステージ寸法に依存するので毎回 2 回の減算で求める。
+    if (d->fenceValid) {
+        const double fx = stageW_ / 2.0 - d->fenceInset -
+                          d->fenceMaxAbsRx - 1.0;
+        const double fy = stageH_ / 2.0 - d->fenceInset -
+                          d->fenceMaxAbsRy - 1.0;
+        if (x > -fx && x < fx && y > -fy && y < fy) return;
+    }
     double bounds[4] = {t->x, t->x, t->y, t->y};
-    if (skinForTarget(t)) getDrawableBounds(drawableID, bounds);
-    double inset = std::floor(
-        std::min(bounds[1] - bounds[0], bounds[2] - bounds[3]) / 2);
-    double sx = stageW_ / 2.0 - std::min(15.0, inset);
-    double sy = stageH_ / 2.0 - std::min(15.0, inset);
-    double dx = x - t->x, dy = y - t->y;
+    // 4 隅の回転後オフセットは (costume, size, direction, rotation style)
+    // のみに依存 — 移動のたびに skin 引き・cos/sin・4 隅変換をやらない。
+    // bounds の合成順序は元実装（cx+rx → scratchX）と同一に保つ。
+    const Costume* c = t->getCurrentCostume();
+    if (c) {
+        static const bool oldFence =
+            std::getenv("XYO_PEN_FENCE_OLD") != nullptr;
+        if (oldFence) {
+            getDrawableBounds(drawableID, bounds);
+        } else {
+            if (!d->fenceValid || d->fenceCostume != c ||
+                d->fenceSize != t->size || d->fenceDir != t->direction ||
+                d->fenceW != 0 || d->fenceRot != t->rotationStyle) {
+                const Skin* s = skinForTarget(t);
+                d->fenceValid = false;
+                if (s) {
+                    DrawXform f;
+                    if (xformFor(*d, *s, f)) {
+                        const double k = t->size / 100.0;
+                        const double corners[4][2] = {
+                            {-s->rcx, -s->rcy},
+                            {s->logicalW - s->rcx, -s->rcy},
+                            {-s->rcx, s->logicalH - s->rcy},
+                            {s->logicalW - s->rcx, s->logicalH - s->rcy},
+                        };
+                        for (int i = 0; i < 4; ++i) {
+                            const double lx =
+                                corners[i][0] * f.dirScaleX * k;
+                            const double ly = corners[i][1] * k;
+                            d->fenceRx[i] = lx * f.cos - ly * f.sin;
+                            d->fenceRy[i] = lx * f.sin + ly * f.cos;
+                        }
+                        // 4 隅の min/max と位置非依存のフェンス幅を前計算
+                        double minRx = 1e9, maxRx = -1e9;
+                        double minRy = 1e9, maxRy = -1e9;
+                        for (int i = 0; i < 4; ++i) {
+                            minRx = std::min(minRx, d->fenceRx[i]);
+                            maxRx = std::max(maxRx, d->fenceRx[i]);
+                            minRy = std::min(minRy, d->fenceRy[i]);
+                            maxRy = std::max(maxRy, d->fenceRy[i]);
+                        }
+                        const double relW = maxRx - minRx;
+                        const double relH = maxRy - minRy;
+                        const double inset2 = std::floor(
+                            std::min(relW, relH) / 2);
+                        d->fenceMinRx = minRx;
+                        d->fenceMaxRx = maxRx;
+                        d->fenceMinRy = minRy;
+                        d->fenceMaxRy = maxRy;
+                        d->fenceInset = std::min(15.0, inset2);
+                        d->fenceMaxAbsRx = std::max(std::abs(minRx),
+                                                    std::abs(maxRx));
+                        d->fenceMaxAbsRy = std::max(std::abs(minRy),
+                                                    std::abs(maxRy));
+                        d->fenceValid = true;
+                    }
+                }
+                d->fenceCostume = c;
+                d->fenceSize = t->size;
+                d->fenceDir = t->direction;
+                d->fenceRot = t->rotationStyle;
+            }
+            if (d->fenceValid) {
+                // min(cx + rx[i]) == cx + min(rx[i]) は丸め込みでも厳密。
+                // 前計算した min/max を使い、毎移動のループを省く。
+                const double cx = stageX(t->x), cy = stageY(t->y);
+                bounds[0] = scratchX(cx + d->fenceMinRx);
+                bounds[1] = scratchX(cx + d->fenceMaxRx);
+                bounds[2] = scratchY(cy + d->fenceMinRy);
+                bounds[3] = scratchY(cy + d->fenceMaxRy);
+            }
+        }
+    }
+    // inset は位置非依存（bounds の幅から決まる）— キャッシュ済み。
+    double sx, sy;
+    if (d->fenceValid) {
+        sx = stageW_ / 2.0 - d->fenceInset;
+        sy = stageH_ / 2.0 - d->fenceInset;
+    } else {
+        const double inset = std::floor(
+            std::min(bounds[1] - bounds[0], bounds[2] - bounds[3]) / 2);
+        sx = stageW_ / 2.0 - std::min(15.0, inset);
+        sy = stageH_ / 2.0 - std::min(15.0, inset);
+    }
+    const double dx = x - t->x, dy = y - t->y;
     if (bounds[1] + dx < -sx) x = std::ceil(t->x - (sx + bounds[1]));
     else if (bounds[0] + dx > sx) x = std::floor(t->x + (sx - bounds[0]));
     if (bounds[2] + dy < -sy) y = std::ceil(t->y - (sy + bounds[2]));
@@ -762,6 +1109,10 @@ double SdlRenderer::setDrawableOrder(int drawableID, double order,
 
 void SdlRenderer::destroyDrawable(int drawableID) {
     drawables_.erase(drawableID);
+    if (lastFenceId_ == drawableID) {
+        lastFenceId_ = -1;
+        lastFenceDrawable_ = nullptr;
+    }
 }
 
 void SdlRenderer::emitVisualChange(Target*) {
@@ -921,18 +1272,15 @@ void SdlRenderer::penBlendPremult(uint8_t* p, const float rgba[4],
     if (sa <= 0.0) return;
     if (sa >= 1.0) {
         for (int i = 0; i < 3; ++i)
-            p[i] = static_cast<uint8_t>(
-                std::lround(std::clamp(double(rgba[i]), 0.0, 1.0) * 255.0));
+            p[i] = penTo255(std::clamp(double(rgba[i]), 0.0, 1.0) * 255.0);
         p[3] = 255;
         return;
     }
     double om = 1.0 - sa;
     for (int i = 0; i < 3; ++i)
-        p[i] = static_cast<uint8_t>(std::clamp(
-            std::lround(std::clamp(double(rgba[i]), 0.0, 1.0) * sa * 255.0 +
-                        p[i] * om), 0L, 255L));
-    p[3] = static_cast<uint8_t>(
-        std::clamp(std::lround(sa * 255.0 + p[3] * om), 0L, 255L));
+        p[i] = penTo255(std::clamp(double(rgba[i]), 0.0, 1.0) * sa * 255.0 +
+                        p[i] * om);
+    p[3] = penTo255(sa * 255.0 + p[3] * om);
 }
 
 void SdlRenderer::penBlendPx(int x, int y, const uint8_t c[4]) {
@@ -1016,6 +1364,47 @@ void main() {
 }
 )GLSL";
 
+// per-stroke レコード展開用（GLSL 330 core）。インスタンス属性 10 float:
+//   aP0 = (fx0, fy0, fdx, fdy)
+//   aP1 = (L, width)
+//   aColor = (r, g, b, a)
+// 6 頂点は gl_VertexID から生成する。CPU 側のカクテル（nx,ny,m,角）は
+// 従来のクアッド生成と同一の式をそのまま VS へ移したもの。
+const char* kPenRecVs = R"GLSL(#version 330 core
+layout(location=0) in vec4 aP0;
+layout(location=1) in vec2 aP1;
+layout(location=2) in vec4 aColor;
+uniform vec2 uSize;
+uniform vec2 uHalf;
+out vec2 vUV;
+out vec2 vMeta;
+out vec4 vColor;
+void main() {
+    float fdx = aP0.z, fdy = aP0.w;
+    float L = aP1.x, width = aP1.y;
+    float dx = fdx, dy = -fdy;
+    const float eps = 1e-3;
+    float basisX = (abs(dx) < eps && abs(dy) < eps) ? eps : dx;
+    float denom = max(L, eps);
+    float nx = basisX / denom, ny = dy / denom;
+    float ax = aP0.x + uHalf.x;
+    float ay = uHalf.y - aP0.y;
+    float radius = width * 0.5;
+    float m = radius + 1.0;
+    // 頂点列は CPU 側クアッドと同じ (0,1,2, 2,1,3):
+    //   c: 0=(u0,v0) 1=(u1,v0) 2=(u0,v1) 3=(u0,v1) 4=(u1,v0) 5=(u1,v1)
+    int c = gl_VertexID % 6;
+    float ui = (c == 1 || c == 4 || c == 5) ? 1.0 : 0.0;
+    float vj = (c == 2 || c == 3 || c == 5) ? 1.0 : 0.0;
+    float u = (ui > 0.5) ? (L + m) : -m;
+    float v = (vj > 0.5) ? m : -m;
+    vec2 pos = vec2(ax, ay) + u * vec2(nx, ny) + v * vec2(-ny, nx);
+    gl_Position = vec4(pos.x / uSize.x * 2.0 - 1.0,
+                       1.0 - pos.y / uSize.y * 2.0, 0.0, 1.0);
+    vUV = vec2(u, v); vMeta = vec2(L, radius); vColor = aColor;
+}
+)GLSL";
+
 GLuint penCompileShader(GLenum type, const char* src) {
     GLuint s = glCreateShader(type);
     glShaderSource(s, 1, &src, nullptr);
@@ -1093,6 +1482,14 @@ bool SdlRenderer::initGlPen() {
         }
         if (probe) glDeleteTextures(1, &probe);
     }
+    if (std::getenv("XYO_DEBUG") || std::getenv("XYO_PENPROF")) {
+        const char* ven = reinterpret_cast<const char*>(glGetString(GL_VENDOR));
+        const char* ren = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
+        const char* ver = reinterpret_cast<const char*>(glGetString(GL_VERSION));
+        std::fprintf(stderr, "GL pen: %s | %s | %s | shared=%d\n",
+                     ven ? ven : "?", ren ? ren : "?", ver ? ver : "?",
+                     int(g.shared));
+    }
 
     // シェーダ（core 3.3 → 330、その他は 120 を順に試す）
     const char* vsrc[2] = {kPenVsCore, kPenVsCompat};
@@ -1131,6 +1528,9 @@ bool SdlRenderer::initGlPen() {
         if (g.vbo) glDeleteBuffers(1, &g.vbo);
         if (g.ebo) glDeleteBuffers(1, &g.ebo);
         if (g.vao) glDeleteVertexArrays(1, &g.vao);
+        if (g.recProg) glDeleteProgram(g.recProg);
+        if (g.recVbo) glDeleteBuffers(1, &g.recVbo);
+        if (g.recVao) glDeleteVertexArrays(1, &g.recVao);
         if (g.prog) glDeleteProgram(g.prog);
         if (sdlGlCtx_) SDL_GL_MakeCurrent(window_, sdlGlCtx_);
         SDL_GL_DeleteContext(glPen_->ctx);
@@ -1155,6 +1555,55 @@ bool SdlRenderer::initGlPen() {
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) !=
         GL_FRAMEBUFFER_COMPLETE) return fail();
 
+    // ---- SDL テクスチャ直接描画（interop）----
+    // SDL_GL_BindTexture で penTex_ の GL テクスチャ名を取り、それを
+    // ペン FBO のカラーアタッチメントに差し替える。以降のフラッシュは
+    // SDL がそのまま表示するテクスチャへ直接書き込まれるため、
+    // 毎フレームの readback + premult→straight 変換 + SDL_UpdateTexture が
+    // 不要になる（CPU 読者が現れたときだけ readback する）。
+    const char* penInteropEnv = std::getenv("XYO_PEN_INTEROP");
+    const bool wantInterop = !(penInteropEnv && penInteropEnv[0] == '0');
+    if (wantInterop && g.shared && penTex_ && sdlGlCtx_ &&
+        SDL_GL_MakeCurrent(window_, sdlGlCtx_) == 0) {
+        GLint prevTex = 0;
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex);
+        if (SDL_GL_BindTexture(penTex_, nullptr, nullptr) == 0) {
+            GLint id = 0;
+            glGetIntegerv(GL_TEXTURE_BINDING_2D, &id);
+            SDL_GL_UnbindTexture(penTex_);
+            glBindTexture(GL_TEXTURE_2D, GLuint(prevTex));
+            if (id > 0 && SDL_GL_MakeCurrent(window_, g.ctx) == 0) {
+                glBindFramebuffer(GL_FRAMEBUFFER, g.fbo);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                       GL_TEXTURE_2D, GLuint(id), 0);
+                if (glCheckFramebufferStatus(GL_FRAMEBUFFER) ==
+                    GL_FRAMEBUFFER_COMPLETE) {
+                    g.upTex = GLuint(id);
+                    // ペン層は premultiplied RGBA8。SDL 側の合成を
+                    // premultiplied-over に切り替える（straight と解釈すると
+                    // 半透明部分が暗くなる）。
+                    SDL_BlendMode pm = SDL_ComposeCustomBlendMode(
+                        SDL_BLENDFACTOR_ONE,
+                        SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+                        SDL_BLENDOPERATION_ADD, SDL_BLENDFACTOR_ONE,
+                        SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+                        SDL_BLENDOPERATION_ADD);
+                    if (pm != SDL_BLENDMODE_INVALID &&
+                        SDL_SetTextureBlendMode(penTex_, pm) == 0) {
+                        g.interop = true;
+                    }
+                }
+                if (!g.interop) {
+                    // 失敗したら元の自前テクスチャへ戻す
+                    glFramebufferTexture2D(GL_FRAMEBUFFER,
+                                           GL_COLOR_ATTACHMENT0,
+                                           GL_TEXTURE_2D, g.tex, 0);
+                }
+            }
+        }
+        SDL_GL_MakeCurrent(window_, g.ctx);
+    }
+
     glGenBuffers(1, &g.vbo);
     glGenBuffers(1, &g.ebo);
     if (glGenVertexArrays) {
@@ -1170,6 +1619,59 @@ bool SdlRenderer::initGlPen() {
         glVertexAttribPointer(a, a == 3 ? 4 : 2, GL_FLOAT, GL_FALSE,
                               stride, base + (a == 3 ? 6 : a * 2) * 4);
     }
+    // ---- per-stroke レコード展開（GL3.3 core のみ）----
+    // 1 ストローク 10 float のインスタンス属性から VS が 6 頂点を生成する。
+    // per-vertex クアッドより CPU 書き込みと転送が少ない。コンパイルに
+    // 失敗したら従来のクアッド経路を使う。
+    if (glVertexAttribDivisor && glDrawArraysInstanced) {
+        GLuint rvs = penCompileShader(GL_VERTEX_SHADER, kPenRecVs);
+        GLuint rfs = penCompileShader(GL_FRAGMENT_SHADER, kPenFsCore);
+        if (rvs && rfs) {
+            g.recProg = glCreateProgram();
+            glAttachShader(g.recProg, rvs);
+            glAttachShader(g.recProg, rfs);
+            glBindAttribLocation(g.recProg, 0, "aP0");
+            glBindAttribLocation(g.recProg, 1, "aP1");
+            glBindAttribLocation(g.recProg, 2, "aColor");
+            glLinkProgram(g.recProg);
+            GLint rok = GL_FALSE;
+            glGetProgramiv(g.recProg, GL_LINK_STATUS, &rok);
+            if (!rok) {
+                glDeleteProgram(g.recProg);
+                g.recProg = 0;
+            }
+        }
+        if (rvs) glDeleteShader(rvs);
+        if (rfs) glDeleteShader(rfs);
+        if (g.recProg) {
+            g.recUSize = glGetUniformLocation(g.recProg, "uSize");
+            g.recUHalf = glGetUniformLocation(g.recProg, "uHalf");
+            glGenBuffers(1, &g.recVbo);
+            glGenVertexArrays(1, &g.recVao);
+            glBindVertexArray(g.recVao);
+            glBindBuffer(GL_ARRAY_BUFFER, g.recVbo);
+            const GLsizei rstride = 10 * sizeof(float);
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, rstride,
+                                  reinterpret_cast<const void*>(0));
+            glVertexAttribDivisor(0, 1);
+            glEnableVertexAttribArray(1);
+            glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, rstride,
+                                  reinterpret_cast<const void*>(16));
+            glVertexAttribDivisor(1, 1);
+            glEnableVertexAttribArray(2);
+            glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, rstride,
+                                  reinterpret_cast<const void*>(24));
+            glVertexAttribDivisor(2, 1);
+            glBindVertexArray(0);
+            const char* recEnv = std::getenv("XYO_PEN_REC");
+            g.useRecords = !(recEnv && recEnv[0] == '0');
+            if (std::getenv("XYO_DEBUG"))
+                std::fprintf(stderr, "GL pen: records=%d\n",
+                             int(g.useRecords));
+        }
+    }
+
     glViewport(0, 0, penW_, penH_);
     glClearColor(0, 0, 0, 0);
     glClear(GL_COLOR_BUFFER_BIT);
@@ -1181,12 +1683,37 @@ bool SdlRenderer::initGlPen() {
 
 // ストロークを quad（2 三角形）としてバッチへ積む。
 // CPU パスと同じ座標系: A=(ax,ay)、方向 T=(nx,ny)、法線 N=(-ny,nx)。
-void SdlRenderer::penStrokeGpu(const float rgba[4], float width,
-                               float fx0, float fy0, float fdx, float fdy) {
+// Kept separate from quad generation: the record path needs no quad temporaries
+// or profiling timer. Both point submission and generic lines use this layout.
+inline void SdlRenderer::penAppendRecord(const float rgba[4], float width,
+                                         float fx0, float fy0, float fdx,
+                                         float fdy, float L) {
     GlPen& g = *glPen_;
+    if (g.recLen + 10 > g.recCap) {
+        size_t nc = g.recCap ? g.recCap * 2 : (1u << 20);
+        g.rec = static_cast<float*>(std::realloc(g.rec, nc * sizeof(float)));
+        g.recCap = nc;
+    }
+    float* p = g.rec + g.recLen;
+    p[0] = fx0; p[1] = fy0; p[2] = fdx; p[3] = fdy;
+    p[4] = L; p[5] = width;
+    p[6] = rgba[0]; p[7] = rgba[1]; p[8] = rgba[2]; p[9] = rgba[3];
+    g.recLen += 10;
+    ++g.recStrokes;
+    ++g_penProf.quads;
+    if (g.recStrokes >= 100000u) penFlushGpu();
+}
+
+void SdlRenderer::penStrokeGpu(const float rgba[4], float width,
+                               float fx0, float fy0, float fdx, float fdy,
+                               float L) {
+    GlPen& g = *glPen_;
+    PenTimer ptimer(&g_penProf.quadMs);
     float dx = fdx, dy = -fdy;
-    float L = std::hypot(fdx, fdy);
-    if (!std::isfinite(L)) return;
+    if (g.useRecords) {
+        penAppendRecord(rgba, width, fx0, fy0, fdx, fdy, L);
+        return;
+    }
     const float eps = 1e-3f;
     float basisX = (std::fabs(dx) < eps && std::fabs(dy) < eps)
                        ? eps : dx;
@@ -1229,6 +1756,7 @@ void SdlRenderer::penStrokeGpu(const float rgba[4], float width,
     q[0] = base;     q[1] = base + 1; q[2] = base + 2;
     q[3] = base + 2; q[4] = base + 1; q[5] = base + 3;
     g.ixLen += 6;
+    ++g_penProf.quads;
     // 過剰なバッチ膨張を抑制（~2M 頂点で途中フラッシュ）
     if (g.vLen > 20u * 1000 * 10) penFlushGpu();
 }
@@ -1237,10 +1765,34 @@ void SdlRenderer::penStrokeGpu(const float rgba[4], float width,
 void SdlRenderer::penFlushGpu() {
     if (!penGpu()) return;
     GlPen& g = *glPen_;
-    if (g.vLen == 0) return;
+    if (g.vLen == 0 && g.recLen == 0) return;
+    PenTimer ptimer(&g_penProf.flushMs, true);
+    ++g_penProf.flushes;
     if (SDL_GL_MakeCurrent(window_, g.ctx) != 0) return;
     glBindFramebuffer(GL_FRAMEBUFFER, g.fbo);
     glViewport(0, 0, penW_, penH_);
+    if (g.recLen) {
+        // per-stroke レコード経路: 10 float × ストロークを 1 回で描く
+        glUseProgram(g.recProg);
+        glUniform2f(g.recUSize, float(penW_), float(penH_));
+        glUniform2f(g.recUHalf, float(stageW_ / 2), float(stageH_ / 2));
+        glBindBuffer(GL_ARRAY_BUFFER, g.recVbo);
+        glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(g.recLen * sizeof(float)),
+                     g.rec, GL_STREAM_DRAW);
+        if (g.recVao) glBindVertexArray(g.recVao);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        glDrawArraysInstanced(GL_TRIANGLES, 0, 6,
+                              GLsizei(g.recStrokes));
+        g_penProf.records += g.recStrokes;
+        g.recLen = 0;
+        g.recStrokes = 0;
+        g.fboDirty = true;
+        g.sdlTexDirty = true;
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        if (sdlGlCtx_) SDL_GL_MakeCurrent(window_, sdlGlCtx_);
+        return;
+    }
     glUseProgram(g.prog);
     glUniform2f(g.uSize, float(penW_), float(penH_));
     glBindBuffer(GL_ARRAY_BUFFER, g.vbo);
@@ -1276,10 +1828,12 @@ void SdlRenderer::penFlushGpu() {
 // FBO を penPx_ へ readback する（fboDirty 時のみ）。
 // GL の readback は下→上なので行を反転して CPU バッファへ。
 void SdlRenderer::penSyncCpu() {
-    if (!penGpu()) return;
+    if (!penGpu()) { penFlushCpuBatch(); return; }
     GlPen& g = *glPen_;
     penFlushGpu();
     if (!g.fboDirty) return;
+    PenTimer ptimer(&g_penProf.readbackMs, true);
+    ++g_penProf.readbacks;
     if (SDL_GL_MakeCurrent(window_, g.ctx) != 0) return;
     glBindFramebuffer(GL_FRAMEBUFFER, g.fbo);
     const size_t row = static_cast<size_t>(penW_) * 4;
@@ -2108,7 +2662,13 @@ std::string nativeVariant(const std::string& src, int capture) {
 } // namespace
 
 bool SdlRenderer::penUploadGpu() {
-    return false;
+    // interop 有効時: ペン FBO は SDL テクスチャそのものなので、
+    // 未描画バッチを流すだけで表示経路の readback / 変換 / upload が不要。
+    if (!penGpu()) return false;
+    GlPen& g = *glPen_;
+    if (!g.interop) return false;
+    penFlushGpu();
+    return true;
 }
 
 bool SdlRenderer::gpuExecNative(gpu::NativeRequest& req) {
@@ -2577,7 +3137,7 @@ bool SdlRenderer::initGlPen() { return false; }
 void SdlRenderer::penFlushGpu() {}
 void SdlRenderer::penSyncCpu() {}
 void SdlRenderer::penStrokeGpu(const float[4], float, float, float,
-                               float, float) {}
+                               float, float, float) {}
 bool SdlRenderer::initGlCompute() { return false; }
 bool SdlRenderer::penUploadGpu() { return false; }
 
@@ -2592,57 +3152,103 @@ void SdlRenderer::getFenceRect(int, double out[4]) const {
 }
 #endif
 
+namespace {
+// Shared by the generic stroke and the GPU point specialization. The offset
+// depends on the original double diameter, not its float-rounded width.
+inline bool penOrigin(double diameter, double x, double y,
+                      float& width, float& fx, float& fy) {
+    double d = diameter;
+    if (!(d > 0.0) && !(d < 0.0)) d = 1.0;
+    width = static_cast<float>(d);
+    if (!std::isfinite(width) || width < 0.0f) return false;
+    const double offset = (d == 1.0 || d == 3.0) ? 0.5 : 0.0;
+    fx = static_cast<float>(x + offset);
+    fy = static_cast<float>(y + offset);
+    return std::isfinite(fx) && std::isfinite(fy);
+}
+}
+
 void SdlRenderer::penStroke(const float rgba[4], double diameter,
                             double x0, double y0, double x1, double y1) {
-    static const bool penlog = std::getenv("XYO_PENLOG") != nullptr;
-    static const bool penprof = std::getenv("XYO_PENPROF") != nullptr;
-    static const bool penskip = std::getenv("XYO_PENSKIP") != nullptr;
-    if (penskip) return;
-    static std::chrono::nanoseconds penAcc{};
-    static uint64_t penCalls = 0, penPixels = 0;
-    static struct PenProfDump {
-        ~PenProfDump() {
-            std::fprintf(stderr,
-                "PENPROF strokes=%llu pixels=%llu time=%.3fs (%.1fns/px)\n",
-                (unsigned long long)penCalls, (unsigned long long)penPixels,
-                penAcc.count() / 1e9,
-                penPixels ? double(penAcc.count()) / penPixels : 0.0);
-        }
-    } penProfDump;
+    if (g_penSkip) return;
+    ++g_penProf.strokes;
     struct PenGuard {
-        bool on; std::chrono::steady_clock::time_point t0;
+        bool on;
+        bool raster = false;
+        std::chrono::steady_clock::time_point t0;
         uint64_t px = 0;
-        PenGuard(bool o) : on(o) {
+        PenGuard() : on(g_penProfOn) {
             if (on) t0 = std::chrono::steady_clock::now();
         }
         ~PenGuard() {
             if (!on) return;
-            penAcc += std::chrono::steady_clock::now() - t0;
-            ++penCalls;
-            penPixels += px;
+            const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t0)
+                                  .count();
+            g_penProf.strokeMs += ms;
+            g_penProf.rasterPx += px;
+            if (raster) g_penProf.rasterMs += ms;
         }
-    } penGuard(penprof);
-    if (penlog)
+    } penGuard;
+    if (g_penLog)
         std::fprintf(stderr, "PEN d=%.6f (%.6f,%.6f)->(%.6f,%.6f) a=%.3f\n",
                      diameter, x0, y0, x1, y1, double(rgba[3]));
-    double d = diameter;
-    if (!(d > 0.0) && !(d < 0.0)) d = 1.0;
-    double width = double(static_cast<float>(d));
-    if (!std::isfinite(width) || width < 0.0) return;
-    double offset = (d == 1.0 || d == 3.0) ? 0.5 : 0.0;
-    float fx0 = static_cast<float>(x0 + offset);
-    float fy0 = static_cast<float>(y0 + offset);
+    // XYO_PENTRACE=<path>: 実プロジェクトのストローク列をベンチ用に保存する。
+    // 形式: d x0 y0 x1 y1 r g b a（1 行 1 ストローク）
+    FILE* traceF = g_penTrace;
+    if (traceF)
+        std::fprintf(traceF,
+                     "%.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+                     diameter, x0, y0, x1, y1, double(rgba[0]),
+                     double(rgba[1]), double(rgba[2]), double(rgba[3]));
+    float width, fx0, fy0;
+    if (!penOrigin(diameter, x0, y0, width, fx0, fy0)) return;
     float fdx = static_cast<float>(x1 - x0);
     float fdy = static_cast<float>(y1 - y0);
-    if (!std::isfinite(fx0) || !std::isfinite(fy0) || !std::isfinite(fdx) ||
-        !std::isfinite(fdy)) return;
+    if (!std::isfinite(fdx) || !std::isfinite(fdy)) return;
+    if (penGpu()) {
+        // GPU 経路の L は float で十分（hypotf の PLT 呼び出しを避ける。
+        // 入力は ±数百 px なので sqrt でオーバーフローしない）。
+        const float fL = __builtin_sqrtf(fdx * fdx + fdy * fdy);
+        if (!std::isfinite(fL)) return;
+        penStrokeGpu(rgba, static_cast<float>(width), fx0, fy0, fdx, fdy, fL);
+        return;
+    }
     double dx = double(fdx), dy = -double(fdy);
     double L = double(static_cast<float>(std::hypot(x1 - x0, y1 - y0)));
     if (!std::isfinite(L)) return;
-    if (penGpu()) {
-        penStrokeGpu(rgba, static_cast<float>(width), fx0, fy0, fdx, fdy);
+    // CPU ラスタ: 逆順合成バッチへ積む（auto ではフラッシュ時に方式選択）。
+    PenRec rec;
+    rec.rgba[0] = rgba[0]; rec.rgba[1] = rgba[1];
+    rec.rgba[2] = rgba[2]; rec.rgba[3] = rgba[3];
+    rec.width = static_cast<float>(width);
+    rec.fx0 = fx0; rec.fy0 = fy0; rec.fdx = fdx; rec.fdy = fdy;
+    rec.L = static_cast<float>(L);
+    // 適応判定: probe 中は即時ラスタしつつ被覆統計を取る。オーバードローが
+    // 高いと分かったら遅延バッチ（逆順合成）へ切り替える。低ければ即時の
+    // まま（バッチのオーバーヘッドを払わない）。順序はどちらでも保たれる。
+    penRcEnv();
+    // 少数本は即時ラスタ（遅延の利得がなく、微小描画・テストの同期性を
+    // 保つ）。一定本数を超えたらバッチへ切り替え、フラッシュ時に
+    // オーバードロー推定で逆順合成か前向き合成を選ぶ。
+    if (penRcMode_ == 1 ||
+        (penRcMode_ != 0 && penImmediate_ >= kPenBatchStart)) {
+        penBatchPush(rec);
         return;
     }
+    ++penImmediate_;
+    penGuard.raster = true;
+    penStrokeRaster(rec);
+}
+
+// CPU ラスタ本体（前向き逐次合成）。引数は penStroke で正規化済み。
+void SdlRenderer::penStrokeRaster(const PenRec& rec) {
+    const float* rgba = rec.rgba;
+    const double width = double(rec.width);
+    const float fx0 = rec.fx0, fy0 = rec.fy0;
+    const float fdx = rec.fdx, fdy = rec.fdy;
+    double dx = double(fdx), dy = -double(fdy);
+    double L = double(rec.L);
     const double eps = double(static_cast<float>(1e-3));
     double basisX = (std::abs(dx) < eps && std::abs(dy) < eps) ? eps : dx;
     double denom = std::max(L, eps);
@@ -2733,14 +3339,10 @@ void SdlRenderer::penStroke(const float rgba[4], double diameter,
             p[0] = sr8; p[1] = sg8; p[2] = sb8; p[3] = 255;
             return;
         }
-        p[0] = static_cast<uint8_t>(std::clamp(
-            std::lround(srcR + p[0] * om1), 0L, 255L));
-        p[1] = static_cast<uint8_t>(std::clamp(
-            std::lround(srcG + p[1] * om1), 0L, 255L));
-        p[2] = static_cast<uint8_t>(std::clamp(
-            std::lround(srcB + p[2] * om1), 0L, 255L));
-        p[3] = static_cast<uint8_t>(
-            std::clamp(std::lround(sa255 + p[3] * om1), 0L, 255L));
+        p[0] = penTo255(srcR + p[0] * om1);
+        p[1] = penTo255(srcG + p[1] * om1);
+        p[2] = penTo255(srcB + p[2] * om1);
+        p[3] = penTo255(sa255 + p[3] * om1);
     };
 
     const double D = radius + 0.5;    // cov>0 になる半径
@@ -2761,7 +3363,7 @@ void SdlRenderer::penStroke(const float rgba[4], double diameter,
                 std::max(0.0, ax - hx - 0.5)));
             const int rx1 = static_cast<int>(std::floor(
                 std::min(double(penW_ - 1), ax + hx - 0.5)));
-            penGuard.px += static_cast<uint64_t>(rx1 - rx0 + 1);
+            if (g_penProfOn) g_penProf.rasterPx += uint64_t(rx1 - rx0 + 1);
             uint8_t* row =
                 &penPx_[(static_cast<size_t>(y) * penW_) * 4];
             for (int x = rx0; x <= rx1; ++x) {
@@ -2785,7 +3387,7 @@ void SdlRenderer::penStroke(const float rgba[4], double diameter,
     for (int y = iy0; y <= iy1; ++y) {
         const double dY = y + 0.5 - ay;
         double dX = ix0 + 0.5 - ax;   // +1 刻みは double で厳密
-        penGuard.px += static_cast<uint64_t>(ix1 - ix0 + 1);
+        if (g_penProfOn) g_penProf.rasterPx += uint64_t(ix1 - ix0 + 1);
         uint8_t* row = &penPx_[(static_cast<size_t>(y) * penW_) * 4];
         for (int x = ix0; x <= ix1; ++x, dX += 1.0) {
             const double along = (nx * dX + ny * dY) * inv;
@@ -2810,11 +3412,219 @@ void SdlRenderer::penStroke(const float rgba[4], double diameter,
     }
 }
 
+
+// ================================================ 遅延バッチ / 逆順合成 ======
+// 逆順合成の実体。penPx_ の現在内容を「最古の層」として扱い、新規ストロークを
+// 新しい順に (T,P) 半群で合成する。T が閾値を下回った画素は以降の（古い）
+// ストロークの寄与が無視できるためスキップし、行内の全画素が閾値を下回れば
+// その行ごとスキップする（幾何計算も省く）。
+void SdlRenderer::penRasterReverse() {
+    const int W = penW_, H = penH_;
+    if (W <= 0 || H <= 0 || penBatch_.empty()) return;
+    const size_t np = size_t(W) * size_t(H);
+    const float eps = penRcEps_;
+    if (penAcc_.size() != np * 4) penAcc_.assign(np * 4, 0.0f);
+    else std::fill(penAcc_.begin(), penAcc_.end(), 0.0f);
+    for (size_t i = 3; i < penAcc_.size(); i += 4) penAcc_[i] = 1.0f;
+    if (penRowOpen_.size() != size_t(H)) penRowOpen_.assign(size_t(H), 0);
+    for (int y = 0; y < H; ++y) penRowOpen_[y] = W;
+
+    const double epsG = double(static_cast<float>(1e-3));
+    for (size_t si = penBatch_.size(); si-- > 0;) {
+        const PenRec& rec = penBatch_[si];
+        const float* rgba = rec.rgba;
+        const float a1 = std::clamp(rgba[3], 0.0f, 1.0f);
+        if (a1 <= 0.0f) continue;
+        const float cr = std::clamp(rgba[0], 0.0f, 1.0f);
+        const float cg = std::clamp(rgba[1], 0.0f, 1.0f);
+        const float cb = std::clamp(rgba[2], 0.0f, 1.0f);
+        const double width = double(rec.width);
+        double dx = double(rec.fdx), dy = -double(rec.fdy);
+        double L = double(rec.L);
+        double basisX =
+            (std::abs(dx) < epsG && std::abs(dy) < epsG) ? epsG : dx;
+        double denom = std::max(L, epsG);
+        double nx = basisX / denom, ny = dy / denom;
+        double nn = nx * nx + ny * ny;
+        if (!(nn > 0.0) || !std::isfinite(nn)) continue;
+        double inv = 1.0 / nn;
+        double ax = stageX(double(rec.fx0)), ay = stageY(double(rec.fy0));
+        double bx = ax + nx * L, by = ay + ny * L;
+        double radius = width * 0.5;
+        double support = (radius + 0.5) * std::hypot(nx, ny);
+        if (!std::isfinite(support)) continue;
+        double xlo = std::min(ax, bx) - support - 0.5;
+        double xhi = std::max(ax, bx) + support - 0.5;
+        double ylo = std::min(ay, by) - support - 0.5;
+        double yhi = std::max(ay, by) + support - 0.5;
+        if (xhi < 0.0 || xlo >= double(W) || yhi < 0.0 ||
+            ylo >= double(H)) continue;
+        int ix0 = static_cast<int>(std::ceil(std::max(0.0, xlo)));
+        int ix1 = static_cast<int>(
+            std::floor(std::min(double(W - 1), xhi)));
+        int iy0 = static_cast<int>(std::ceil(std::max(0.0, ylo)));
+        int iy1 = static_cast<int>(
+            std::floor(std::min(double(H - 1), yhi)));
+        if (ix0 > ix1 || iy0 > iy1) continue;
+        const double D = radius + 0.5;
+        for (int y = iy0; y <= iy1; ++y) {
+            int32_t open = penRowOpen_[size_t(y)];
+            if (open <= 0) continue;   // 行シール: 幾何計算ごとスキップ
+            const double dY = y + 0.5 - ay;
+            double dX = ix0 + 0.5 - ax;
+            float* row = &penAcc_[size_t(y) * size_t(W) * 4];
+            for (int x = ix0; x <= ix1; ++x, dX += 1.0) {
+                float* acc = row + size_t(x) * 4;
+                const float T = acc[3];
+                if (T < eps) continue;
+                const double along = (nx * dX + ny * dY) * inv;
+                const double perp = (-ny * dX + nx * dY) * inv;
+                const double al = along - std::clamp(along, 0.0, L);
+                const double dist =
+                    (al == 0.0) ? std::fabs(perp)
+                                : std::hypot(al, perp);
+                const double cov = D - dist;
+                if (cov <= 0.0) continue;
+                const float a =
+                    a1 * float(std::min(cov, 1.0));
+                const float Tn = T * (1.0f - a);
+                const float w = T * a;
+                acc[0] += w * cr;
+                acc[1] += w * cg;
+                acc[2] += w * cb;
+                acc[3] = Tn;
+                if (Tn < eps && --open <= 0) {
+                    // 以降の（古い）ストロークはこの行に寄与しない。
+                    // 残りは T<eps 判定でスキップされる。
+                }
+            }
+            penRowOpen_[size_t(y)] = open;
+        }
+    }
+    // F = A + T * B（B = 既存層）。premultiplied RGBA8 で書き戻す。
+    for (size_t i = 0; i < np; ++i) {
+        const float T = penAcc_[i * 4 + 3];
+        const uint8_t* b = &penPx_[i * 4];
+        const float br = float(b[0]) * (1.0f / 255.0f);
+        const float bg = float(b[1]) * (1.0f / 255.0f);
+        const float bb = float(b[2]) * (1.0f / 255.0f);
+        penPx_[i * 4 + 0] =
+            penTo255(double(penAcc_[i * 4 + 0] + T * br) * 255.0);
+        penPx_[i * 4 + 1] =
+            penTo255(double(penAcc_[i * 4 + 1] + T * bg) * 255.0);
+        penPx_[i * 4 + 2] =
+            penTo255(double(penAcc_[i * 4 + 2] + T * bb) * 255.0);
+        // alpha も合成する: a = (1-T) + T * a_B。T=1（未被覆）で
+        // alpha_B を保つ（1-T だけだと既存層の alpha を消してしまう）。
+        penPx_[i * 4 + 3] = penTo255(
+            double((1.0f - T) + T * (float(b[3]) * (1.0f / 255.0f))) *
+            255.0);
+    }
+    penDirty_ = true;
+}
+
+void SdlRenderer::penRcEnv() {
+    if (penRcInit_) return;
+    penRcInit_ = true;
+    const char* e = std::getenv("XYO_PEN_RC");
+    if (e && e[0] == '0' && e[1] == '\0') penRcMode_ = 0;
+    else if (e && e[0] == '1' && e[1] == '\0') penRcMode_ = 1;
+    else penRcMode_ = -1;
+    if (const char* v = std::getenv("XYO_PEN_EPS")) {
+        const double d = std::atof(v);
+        if (d > 0.0 && d < 1.0) penRcEps_ = float(d);
+    }
+}
+
+void SdlRenderer::penBatchPush(const PenRec& r) {
+    penRcEnv();
+    if (penRcMode_ == 0) {   // 明示的に前向き固定
+        penStrokeRaster(r);
+        return;
+    }
+    if (penBatch_.capacity() == 0) penBatch_.reserve(4096);
+    penBatch_.push_back(r);
+    const double rad = double(r.width) * 0.5;
+    penBatchArea_ += double(r.L) * double(r.width) +
+                     3.141592653589793 * rad * rad;
+    {   // バッチ AABB（平均オーバードロー推定用）。タイル走査より安い。
+        const double ex = stageX(double(r.fx0) + double(r.fdx));
+        const double ey = stageY(double(r.fy0) + double(r.fdy));
+        const double sx = stageX(double(r.fx0));
+        const double sy = stageY(double(r.fy0));
+        const double m = rad + 1.0;
+        penBatchBx0_ = std::min(penBatchBx0_, std::min(sx, ex) - m);
+        penBatchBy0_ = std::min(penBatchBy0_, std::min(sy, ey) - m);
+        penBatchBx1_ = std::max(penBatchBx1_, std::max(sx, ex) + m);
+        penBatchBy1_ = std::max(penBatchBy1_, std::max(sy, ey) + m);
+    }
+    // バッチ上限（ヒープ保護）: 面積 12 画面分 or 40 万本
+    if (penBatch_.size() >= 400000u ||
+        penBatchArea_ > 12.0 * double(penW_) * double(penH_))
+        penFlushCpuBatch();
+}
+
+void SdlRenderer::penFlushCpuBatch() {
+    if (penBatch_.empty()) return;
+    PenTimer t(&g_penProf.rasterMs, true);
+    bool rc;
+    if (penRcMode_ == 1) rc = true;
+    else if (penRcMode_ == 0) rc = false;
+    else {
+        // 被覆面積の合計 / バッチ AABB。狭い領域への高密度描画ほど大きく
+        // なる（画面全体に対する比率だと密な局所描画を過小評価する）。
+        const double bw = std::max(1.0, penBatchBx1_ - penBatchBx0_);
+        const double bh = std::max(1.0, penBatchBy1_ - penBatchBy0_);
+        const double overlap = penBatchArea_ / (bw * bh);
+        const double avgArea =
+            penBatchArea_ / double(std::max<size_t>(1, penBatch_.size()));
+        // 逆順合成が勝つ条件（実測から）:
+        //  - 重なりが深い（同じ画素を何度も塗る）
+        //  - 1 本が小さい（ストローク毎の固定費が支配的で、逆順合成の
+        //    単純なカプセル評価＋一括書き戻しの方が安い）
+        // 長い線を 1 回ずつ引くだけ（三角形塗りつぶし等）は前向きが速い。
+        rc = penBatch_.size() >= 64u &&
+             (overlap >= 4.0 || avgArea < 64.0);
+        if (std::getenv("XYO_PEN_RC_DEBUG"))
+            std::fprintf(stderr,
+                         "pen adapt: n=%zu area=%.0f bbox=%.0fx%.0f "
+                         "overlap=%.2f avg=%.1f -> %s\n",
+                         penBatch_.size(), penBatchArea_, bw, bh, overlap,
+                         avgArea, rc ? "reverse" : "forward");
+    }
+    if (rc) {
+        penRasterReverse();
+        ++penRcFlushes_;
+        if (std::getenv("XYO_PEN_RC_DEBUG"))
+            std::fprintf(stderr, "pen flush RC n=%zu area=%.0f\n",
+                         penBatch_.size(), penBatchArea_);
+    } else {
+        for (const PenRec& r : penBatch_) penStrokeRaster(r);
+        ++penFwdFlushes_;
+    }
+    penBatch_.clear();
+    penBatchArea_ = 0;
+    penImmediate_ = 0;
+    penBatchBx0_ = penBatchBy0_ = 1e30;
+    penBatchBx1_ = penBatchBy1_ = -1e30;
+}
+
 void SdlRenderer::penPoint(int skin, const float rgba[4], double diameter,
                            double x, double y) {
     if (skin != penSkinId_) return;
     penEnsure();
-    penStroke(rgba, diameter, x, y, x, y);
+#if defined(XYO_PEN_GL)
+    // penDown-heavy projects (3D2) submit one point per pixel. Keep that path
+    // out of generic line/CPU-raster prologues, delta validation and sqrt.
+    // Diagnostics deliberately retain the fully instrumented generic path.
+    if (penGpu() && glPen_->useRecords && !g_penPointGeneric) {
+        ++g_penProf.strokes;
+        float width, fx, fy;
+        if (penOrigin(diameter, x, y, width, fx, fy))
+            penAppendRecord(rgba, width, fx, fy, 0.0f, 0.0f, 0.0f);
+    } else
+#endif
+        penStroke(rgba, diameter, x, y, x, y);
     penDirty_ = true;
 }
 
@@ -2826,14 +3636,22 @@ void SdlRenderer::penLine(int skin, const float rgba[4], double diameter,
     penDirty_ = true;
 }
 
+
 void SdlRenderer::penClear(int skin) {
     if (skin != penSkinId_) return;
     penEnsure();
+    penBatch_.clear();   // 消去されるので未描画バッチは破棄
+    penBatchArea_ = 0;
+    penImmediate_ = 0;
+    penBatchBx0_ = penBatchBy0_ = 1e30;
+    penBatchBx1_ = penBatchBy1_ = -1e30;
 #if defined(XYO_PEN_GL)
     if (penGpu()) {
         GlPen& g = *glPen_;
         g.vLen = 0;   // 先行ストロークは消去されるので描画不要
         g.ixLen = 0;
+        g.recLen = 0;
+        g.recStrokes = 0;
         g.fboDirty = false;
         g.sdlTexDirty = true;
         if (SDL_GL_MakeCurrent(window_, g.ctx) == 0) {
@@ -2852,6 +3670,7 @@ void SdlRenderer::penClear(int skin) {
 void SdlRenderer::penStamp(int skin, int drawableID) {
     if (skin != penSkinId_) return;
     penEnsure();
+    penFlushCpuBatch();   // CPU 遅延バッチを先に反映
     penSyncCpu();   // GPU バッチを先に描画して penPx_ を最新化
     Drawable* d = drawableFor(drawableID);
     if (!d || !d->target || !d->target->visible) return;
@@ -2879,7 +3698,8 @@ void SdlRenderer::penStamp(int skin, int drawableID) {
         for (int y = 0; y < penH_; ++y)
             std::memcpy(&flip[static_cast<size_t>(penH_ - 1 - y) * row],
                         &penPx_[static_cast<size_t>(y) * row], row);
-        glBindTexture(GL_TEXTURE_2D, glPen_->tex);
+        glBindTexture(GL_TEXTURE_2D,
+                      glPen_->interop ? glPen_->upTex : glPen_->tex);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, penW_, penH_, GL_RGBA,
                         GL_UNSIGNED_BYTE, flip.data());
@@ -2894,8 +3714,18 @@ void SdlRenderer::penStamp(int skin, int drawableID) {
 
 void SdlRenderer::draw() {
     if (!renderer_) return;
-    SDL_SetRenderDrawColor(renderer_, 0x6e, 0x80, 0x8f, 255);
-    SDL_RenderClear(renderer_);
+    if (embedded_ && (stageRect_.w <= 0 || stageRect_.h <= 0)) return;
+    PenTimer pdraw(&g_penProf.drawMs, true);
+    ++g_penProf.frames;
+    if (!embedded_) {
+        SDL_SetRenderDrawColor(renderer_, 0x6e, 0x80, 0x8f, 255);
+        SDL_RenderClear(renderer_);
+    } else {
+        // 埋め込み: ステージ領域へだけ描く（周囲の UI を上書きしない）
+        SDL_Rect clip{stageRect_.x, stageRect_.y, stageRect_.w,
+                      stageRect_.h};
+        SDL_RenderSetClipRect(renderer_, &clip);
+    }
     drawStageArea();
 
     // 描画順: backdrop → pen → sprites（order 昇順）
@@ -2918,10 +3748,14 @@ void SdlRenderer::draw() {
     // Scratch ではモニタはステージ canvas の上に載る HTML オーバーレイ
     // なので、green flag/stop や ask バーより後に描く。
     drawAskBar();
-    drawUiChrome();
+    if (!embedded_) drawUiChrome();
     drawMonitors();
+    if (embedded_) SDL_RenderSetClipRect(renderer_, nullptr);
     if (frameCapture_) frameCapture_();
-    SDL_RenderPresent(renderer_);
+    if (!embedded_) {
+        PenTimer ppres(&g_penProf.presentMs, true);
+        SDL_RenderPresent(renderer_);
+    }
 }
 
 static SDL_Rect sdlRect(const IRect& r) {
@@ -2973,28 +3807,51 @@ void SdlRenderer::drawDrawable(Drawable& d) {
 
 void SdlRenderer::drawPenLayer() {
     if (!penTex_) return;
+    penFlushCpuBatch();   // 遅延バッチを penPx_ へ反映
+    // gpuDirect: ペン FBO が SDL テクスチャそのもの（interop）。readback も
+    // premult→straight 変換も SDL_UpdateTexture も不要。
+    bool gpuDirect = false;
 #if defined(XYO_PEN_GL)
-    if (!penUploadGpu())
+    gpuDirect = penUploadGpu();
+    if (!gpuDirect) penSyncCpu();
+#else
+    penSyncCpu();   // GPU バッチが残っていれば FBO へ描画し penPx_ へ戻す
 #endif
-    {
-        penSyncCpu();   // GPU バッチが残っていれば FBO へ描画し penPx_ へ戻す
-    }
-    if (penDirty_) {
-        for (size_t i = 0; i < penPx_.size(); i += 4) {
-            uint8_t a = penPx_[i + 3];
-            uint8_t* q = &penUploadPx_[i];
-            if (a == 255) { std::memcpy(q, &penPx_[i], 4); continue; }
-            if (a == 0) { std::memset(q, 0, 4); continue; }
-            for (int c = 0; c < 3; ++c)
-                q[c] = static_cast<uint8_t>(
-                    std::min(255, (penPx_[i + c] * 255 + a / 2) / a));
-            q[3] = a;
+    if (penDirty_ && !gpuDirect) {
+        {
+            PenTimer pconv(&g_penProf.convertMs, true);
+            g_penProf.convPx += penPx_.size() / 4;
+            for (size_t i = 0; i < penPx_.size(); i += 4) {
+                uint8_t a = penPx_[i + 3];
+                uint8_t* q = &penUploadPx_[i];
+                if (a == 255) { std::memcpy(q, &penPx_[i], 4); continue; }
+                if (a == 0) { std::memset(q, 0, 4); continue; }
+                for (int c = 0; c < 3; ++c)
+                    q[c] = static_cast<uint8_t>(
+                        std::min(255, (penPx_[i + c] * 255 + a / 2) / a));
+                q[3] = a;
+            }
         }
-        SDL_UpdateTexture(penTex_, nullptr, penUploadPx_.data(), penW_ * 4);
+        {
+            PenTimer pup(&g_penProf.uploadMs, true);
+            ++g_penProf.uploads;
+            SDL_UpdateTexture(penTex_, nullptr, penUploadPx_.data(),
+                              penW_ * 4);
+        }
         penDirty_ = false;
     }
     SDL_Rect r = sdlRect(stageRect_);
-    SDL_RenderCopy(renderer_, penTex_, nullptr, &r);
+    {
+        PenTimer pcopy(&g_penProf.copyMs, true);
+        // interop ではペン FBO がそのまま SDL テクスチャになる。GL の
+        // テクスチャ行 0 は画面下端なので、SDL 側で上下反転して描く
+        // （非 interop 経路は readback 時に CPU 側で反転済み）。
+        if (gpuDirect)
+            SDL_RenderCopyEx(renderer_, penTex_, nullptr, &r, 0.0, nullptr,
+                             SDL_FLIP_VERTICAL);
+        else
+            SDL_RenderCopy(renderer_, penTex_, nullptr, &r);
+    }
 }
 
 SDL_Texture* SdlRenderer::textTexture(const std::u16string& s, int px,

@@ -45,10 +45,11 @@ public:
     int workers() const { return int(workers_.size()); }
 
     /// tasks[0..n) を並列実行して全完了までブロックする。
-    /// 呼び出しスレッドも drain に参加する。
+    /// 呼び出しスレッドも drain に参加する。One dispatcher only: run()
+    /// must not be called concurrently or recursively on the same pool.
     void run(const Task* tasks, size_t n) {
         if (n == 0) return;
-        if (workers_.empty()) {          // 単一コア — 直列
+        if (n == 1 || workers_.empty()) { // no dispatch for a single task
             for (size_t i = 0; i < n; ++i) tasks[i].fn(tasks[i].arg);
             return;
         }
@@ -58,7 +59,10 @@ public:
             cur_ = b;
             ++gen_;
         }
-        cv_.notify_all();
+        // The caller already participates. Do not wake seven workers just
+        // for a two-task batch; sleepers can safely skip completed generations.
+        if (n - 1 >= workers_.size()) cv_.notify_all();
+        else for (size_t i = 0; i < n - 1; ++i) cv_.notify_one();
         drain(*b);
         {
             std::unique_lock lk(m_);

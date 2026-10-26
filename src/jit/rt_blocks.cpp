@@ -49,9 +49,10 @@ Value VS(std::u16string_view s) {
                      : Value::string(SStr::create(s));
 }
 
-constexpr double kWarpTimeMs = 500.0;
 bool isStuck(JitCtx* c) {
-    return c->sequencer->timer.timeElapsed() > kWarpTimeMs;
+    // dangerMode は予算が無い（時計も読まない）。
+    if (c->runtime->dangerMode) return false;
+    return c->sequencer->timer.timeElapsed() > c->runtime->warpTimeMs;
 }
 
 std::u16string u16(Value v) {
@@ -240,6 +241,12 @@ void xyo_pen_setcolor(JitCtx* c, uint64_t color) {
     XYO_RT_PROF(kPen);
     penrt::setColorToColor(c->target, toV(color));
 }
+/// penSetColorToColorCore の PenState 直接版。生成コードは penState 非
+/// null を確認済みなので target 解決を省ける。色確定は往復キャッシュ。
+void xyo_pen_setcolor_ps(void* ps, uint64_t color) {
+    XYO_RT_PROF(kPen);
+    penrt::setColorToColorState(*static_cast<PenState*>(ps), toV(color));
+}
 void xyo_pen_changeparam(JitCtx* c, uint64_t param, uint64_t v) {
     XYO_RT_PROF(kPen);
     SStr* s = cast::toString(toV(param));
@@ -254,7 +261,12 @@ void xyo_pen_setparam(JitCtx* c, uint64_t param, uint64_t v) {
                       s ? s->view() : std::u16string_view{},
                       toV(v), false);
 }
+/// テスト用カウンタ: pen set size の実行回数（ループ不変 setter の
+/// ホイストが効いているかを検証する）。
+int64_t xyo_pen_size_calls = 0;
+
 void xyo_pen_setsize(JitCtx* c, uint64_t v) {
+    ++xyo_pen_size_calls;
     XYO_RT_PROF(kPen);
     penrt::size(c->target, c->runtime, toV(v), false);
 }
@@ -283,6 +295,13 @@ void xyo_mot_movesteps(JitCtx* c, uint64_t steps) {
 void xyo_mot_gotoxy(JitCtx* c, uint64_t x, uint64_t y) {
     XYO_RT_PROF(kPen);
     c->target->setXY(cast::toNumber(toV(x)), cast::toNumber(toV(y)));
+}
+// JIT has already evaluated inputs and performed Scratch toNumber conversion.
+// Do not re-cast coordinates here: arithmetic with existing +/-Inf or NaN
+// positions may itself produce NaN, which Target::setXY must see unchanged.
+void xyo_mot_setxy_num(JitCtx* c, double x, double y) {
+    XYO_RT_PROF(kBlocks);
+    c->target->setXY(x, y);
 }
 void xyo_mot_goto(JitCtx* c, uint64_t to) {
     XYO_RT_PROF(kPen);

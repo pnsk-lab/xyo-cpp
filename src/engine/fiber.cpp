@@ -3,10 +3,14 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#elif defined(__EMSCRIPTEN__) || defined(__wasm32__)
+// WASM: ネイティブ stack switch は不可。Phase A は interp 専用で fiber は
+// 実行されないため、malloc ベースのダミー領域 + abort スタブでコンパイルを通す。
 #else
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -42,6 +46,14 @@ Fiber::Fiber(FiberEntry entry, void* arg, size_t stackReserve)
     }
     DWORD old;
     VirtualProtect(base, page, PAGE_NOACCESS, &old);
+#elif defined(__EMSCRIPTEN__) || defined(__wasm32__)
+    // WASM: 領域は未使用（resume は abort）だが、stackBase_ が非 null である
+    // 約束（FiberPool::acquire の null チェック）を保つため malloc で埋める。
+    void* base = std::malloc(total);
+    if (!base) {
+        stackBase_ = nullptr;
+        return;
+    }
 #else
     void* base = mmap(nullptr, total, PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -68,6 +80,8 @@ Fiber::~Fiber() {
 #ifdef _WIN32
         VirtualFree(static_cast<uint8_t*>(stackBase_) - stackReserve_ - 4096,
                     0, MEM_RELEASE);
+#elif defined(__EMSCRIPTEN__) || defined(__wasm32__)
+        std::free(static_cast<uint8_t*>(stackBase_) - stackReserve_ - 4096);
 #else
         munmap(static_cast<uint8_t*>(stackBase_) - stackReserve_ - 4096,
                stackReserve_ + 4096);
@@ -159,6 +173,22 @@ void FiberPool::release(Fiber* f) {
 }
 
 } // namespace xyo
+
+#if defined(__EMSCRIPTEN__) || defined(__wasm32__)
+// WASM: アセンブリによるコンテキストスイッチは存在しない。Phase A は
+// interp 専用で fiber は実行されないが、リンクのためシンボルだけ用意する。
+// 呼ばれたら即 abort（サイレントにハングさせない）。
+extern "C" void xyo_fiber_switch(xyo::FiberRegs*, xyo::FiberRegs*) {
+    std::fprintf(stderr,
+                 "xyo: fiber switch is unavailable in WASM (interp-only "
+                 "build; JIT wasm needs Phase C)\n");
+    std::abort();
+}
+extern "C" void xyo_fiber_trampoline() {
+    std::fprintf(stderr, "xyo: fiber trampoline is unavailable in WASM\n");
+    std::abort();
+}
+#endif
 
 /// ファイバの実体のエントリ。戻らない —— 終了時はスケジューラへ最終スイッチ。
 extern "C" [[noreturn]] void xyo_fiber_main(xyo::Fiber* f) {

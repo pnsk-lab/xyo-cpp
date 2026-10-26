@@ -4,6 +4,9 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -29,6 +32,79 @@ struct Block;
 struct ExecContext;
 struct Variable;
 class Fiber;
+
+// --- 実行モード -------------------------------------------------------
+//
+// HotSpot（既定）: スクリプトはインタプリタで開始し、呼び出し回数と
+// 解釈実行したブロック数で JIT コンパイルを判定する。AOT（`xyo aot` /
+// `--aot`）は明示指定時のみ使用する。Eager は従来動作（spawn 時に
+// 全スクリプトをコンパイル）で、テスト/ベンチ用。
+//
+// ティアは 1 段（インタプリタ → 最適化 JIT）。LLVM の O1/インライン
+// 無しの「速い C1」は実測でコンパイル時間が O2 の 6% しか短縮できず
+// （IR emit が支配的）、C1→C2 の二重 emit が数秒の追加コストになる
+// ため採用していない。
+enum class JitMode { Off, HotSpot, Eager };
+
+/// "off" | "interp" | "hotspot" | "eager" を解析する。
+inline bool parseJitMode(const char* s, JitMode* out) {
+    if (!s || !out) return false;
+    if (!std::strcmp(s, "off") || !std::strcmp(s, "interp") ||
+        !std::strcmp(s, "disable")) {
+        *out = JitMode::Off;
+        return true;
+    }
+    if (!std::strcmp(s, "hotspot") || !std::strcmp(s, "hot")) {
+        *out = JitMode::HotSpot;
+        return true;
+    }
+    if (!std::strcmp(s, "eager")) {
+        *out = JitMode::Eager;
+        return true;
+    }
+    return false;
+}
+
+namespace detail {
+struct JitModeState {
+    JitMode mode = JitMode::HotSpot;
+    bool explicitSet = false;
+};
+/// プロセス全体の実行モード。環境変数は初回参照時に一度だけ読む。
+inline JitModeState& jitModeState() {
+    static JitModeState st = [] {
+        JitModeState s;
+        if (std::getenv("XYO_JIT_DISABLE")) {
+            s.mode = JitMode::Off;
+            s.explicitSet = true;
+            return s;
+        }
+        if (const char* e = std::getenv("XYO_JIT_MODE")) {
+            JitMode m;
+            if (parseJitMode(e, &m)) {
+                s.mode = m;
+                s.explicitSet = true;
+            } else {
+                std::fprintf(stderr,
+                             "xyo-jit: unknown XYO_JIT_MODE '%s' "
+                             "(hotspot|eager|off)\n", e);
+            }
+        }
+        return s;
+    }();
+    return st;
+}
+} // namespace detail
+
+inline JitMode jitMode() { return detail::jitModeState().mode; }
+inline void setJitMode(JitMode m) {
+    detail::jitModeState().mode = m;
+    detail::jitModeState().explicitSet = true;
+}
+inline bool jitModeExplicit() {
+    return detail::jitModeState().explicitSet;
+}
+inline bool jitEnabled() { return jitMode() != JitMode::Off; }
 
 // --- JIT ABI ------------------------------------------------------------
 
@@ -95,6 +171,9 @@ struct CompiledScript {
     std::unordered_map<std::string, ScriptFn> procedures;
     /// 生成コード内に yield 点が存在するか。false なら fiber なしで同期実行可。
     bool mayYield = true;
+    /// Compat/reporter fallbacks or AOT-owned GPU programs require the caller
+    /// thread even when opcode-level dependency analysis looks compute-only.
+    bool mainThread = false;
     /// GPU 並列ループプログラム（生成コードがポインタで参照するため
     /// モジュールと同寿命でここが所有）。生成コードが実際に参照する
     /// のは `ParallelLoop::program`。
@@ -116,9 +195,29 @@ public:
                                   Sequencer& sequencer,
                                   const Block* topHint = nullptr);
 
+    /// HotSpot のコンパイル判定。spawn ごとに 1 回呼ぶ。プロファイル
+    /// （呼び出し回数・解釈実行ブロック数）を更新し、今回のスレッドを
+    /// JIT で走らせるなら true を返す。
+    bool decideCompile(Thread& thread, const Block* top);
+
+    /// インタプリタが実行したブロック数を記録する（HotSpot の
+    /// ホットネス判定用）。top はスクリプトのトップ Block*。
+    void noteInterpBlocks(const void* top, uint64_t blocks);
+
+    /// 指定スクリプトのプロファイル（診断用 — XYO_JIT_VERBOSE 等）。
+    struct ScriptStats {
+        uint64_t invocations = 0;
+        uint64_t interpBlocks = 0;
+        bool compiled = false;
+        bool aot = false;
+        bool hasLoop = false;
+    };
+    bool scriptStats(const void* top, ScriptStats* out) const;
+
     /// スレッドの依存解析結果 — (topBlock, target) 単位でキャッシュ。
     /// 結果は常に非 null の AccessSet*（解析不能要素は unknown フラグで
-    /// 表現）。並列実行可否は `set->safe()` + `!cs->mayYield` で判定。
+    /// 表現）。並列実行可否は workerSafe() と GPU 呼出しの有無で判定。
+    /// yield する fiber も、GC を遅延したバッチ内では並列実行できる。
     const AccessSet* accessFor(const Thread& thread, Runtime& runtime);
 
     /// AOT オブジェクト（`xyo aot` が生成）をロードし、slot に実
@@ -137,8 +236,33 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
-    /// トップ Block* → CompiledScript（Block は Blocks 所有でポインタ安定）
-    std::unordered_map<const void*, std::unique_ptr<CompiledScript>> cache_;
+
+    /// トップ Block* ごとのコンパイル結果。ティアごとに保持し、実行中
+    /// スレッドが参照中の旧ティアのコードを破棄しない（JIT コードは
+    /// エンジンと同寿命）。
+    struct ScriptEntry {
+        std::unique_ptr<CompiledScript> code;
+        bool aot = false;
+    };
+    /// HotSpot のホットネス（トップ Block* 単位）。
+    struct ScriptProfile {
+        std::string id;                 // 診断表示用（トップブロック id）
+        uint64_t invocations = 0;
+        uint64_t interpBlocks = 0;
+        /// 0=未走査 1=ループ無し 2=ループ有り（スクリプト内に
+        /// control_forever/repeat/while/for_each が到達可能か）
+        uint8_t hasLoop = 0;
+        /// 到達可能ブロック数の目安（走査時の上限で飽和）。
+        /// 巨大な直線スクリプトを解釈のまま放置しないための判定に使う。
+        uint32_t nodeCount = 0;
+    };
+    /// トップ Block* → コンパイル結果（Block は Blocks 所有でポインタ安定）
+    std::unordered_map<const void*, ScriptEntry> cache_;
+    std::unordered_map<const void*, ScriptProfile> profiles_;
+    /// スクリプトの静的走査（初回のみ）。戻り値は hasLoop（0/1/2）、
+    /// *nodes に到達可能ブロック数の目安を返す。
+    uint8_t scanScriptLoop(Blocks& blocks, const Block* top,
+                           uint32_t* nodes);
     /// コンパイル失敗/対象外の topBlock（再試行しない — spawn 毎に
     /// compile が呼ばれるためヒット経路を安く保つ）
     std::unordered_set<const void*> failed_;

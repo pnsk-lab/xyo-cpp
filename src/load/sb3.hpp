@@ -34,4 +34,10 @@ Sb3LoadResult loadSb3File(Runtime& runtime, const uint8_t* data, size_t size);
 Sb3LoadResult loadSb2(Runtime& runtime, const JsonValue& json,
                       const ZipReader* zip);
 
+/// バックパック用: `{"head": id, "blocks": {...}}` 形式の断片を out へ読み込む。
+/// ブロック id は全て新規採番され、内部参照（next/inputs/parent）も張り替える。
+/// 返り値は新規 id の一覧（作成順）、headOut には新しい head id。
+std::vector<std::string> loadBlocksFragment(class Blocks& out, const JsonValue& fragment,
+                                            std::string* headOut);
+
 } // namespace xyo

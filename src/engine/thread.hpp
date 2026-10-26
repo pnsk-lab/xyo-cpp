@@ -124,6 +124,9 @@ public:
     Value justReported = Value::undefined();
 
     // --- JIT 領域（isCompiled のときのみ意味を持つ）---
+    /// トップ Block*（HotSpot のプロファイルキー / インタプリタ
+    /// ブロック数の記録先）。tryCompile で解決する。
+    const Block* topBlockPtr = nullptr;
     bool triedToCompile = false;
     bool isCompiled = false;
     bool executableHat = false;

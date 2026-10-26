@@ -19,6 +19,10 @@
 
 namespace xyo {
 
+/// 環境変数 `XYO_DANGER` が真値（未設定・`0`・空以外）なら true。
+/// Runtime::dangerMode の既定値（`--danger` は構築後に上書きする）。
+bool dangerModeFromEnv();
+
 class Gc;
 class JitEngine;
 struct Sequencer;
@@ -184,6 +188,18 @@ public:
     int stageWidth = 480;
     int stageHeight = 360;
     int maxClones = 300;
+
+    /// warp スレッドが 1 ティック内で連続実行できる時間予算（ms）。
+    /// TurboWarp の `WARP_TIME`(500ms) 相当 — 超えると他スレッドへ譲る。
+    /// dangerMode では判定自体を飛ばす（予算が無い）。
+    double warpTimeMs = 500.0;
+    /// 危険モード（`XYO_DANGER=1` / `--danger`）: **スレッドごとの実行時間
+    /// 予算を外す**。warp スクリプトは 1 ティックで終わらなくても他スレッド
+    /// や描画に譲らず走り続けるため、アプリが固まる（最悪ハングする）。
+    /// 長い計算を 1 フレームで走らせたい計測・変換検証専用。既定 off。
+    /// **実行開始（最初の spawn/コンパイル）前に決めること** — JIT は
+    /// このフラグを前提に warp ループの yield 点を落としたコードを吐く。
+    bool dangerMode = dangerModeFromEnv();
 
     // --- 外部インターフェース ---
     RendererAPI* renderer = nullptr;

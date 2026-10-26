@@ -353,6 +353,25 @@ static void test_gc() {
 extern int test_e2e_main();
 extern int test_pen();
 extern int test_aot_main();
+extern int test_wasm_emit_main();
+extern int test_wasm_compile_main();
+extern int test_minify_main();
+extern int test_deps_main();
+extern int test_analysis_main();
+extern int test_parfor_main();
+extern int test_pen_hoist_main();
+extern int test_rewrite_main();
+extern int test_parallel_strings_main();
+extern int test_scheduler_main();
+extern int test_equality_literal_main();
+extern int test_color_fast_main();
+extern int test_motion_numeric_main();
+extern int test_slot_hoist_main();
+extern int test_list_codegen_bounds_main();
+extern int test_nan_codegen_main();
+extern int test_literal_context_main();
+extern int test_danger_main();
+extern int test_list_string_intern_main();
 int main() {
     test_toNumber();
     test_toBoolean();
@@ -371,5 +390,30 @@ int main() {
     int e2eFail = test_e2e_main();
     int penFail = test_pen();
     int aotFail = test_aot_main();
-    return (g_fail + e2eFail + penFail + aotFail) ? 1 : 0;
+    int wasmEmitFail = test_wasm_emit_main();
+    int wasmCompileFail = test_wasm_compile_main();
+    int minifyFail = test_minify_main();
+    int depsFail = test_deps_main();
+    int analysisFail = test_analysis_main();
+    int parforFail = test_parfor_main();
+    int penHoistFail = test_pen_hoist_main();
+    int rewriteFail = test_rewrite_main();
+    int parallelStringsFail = test_parallel_strings_main();
+    int schedulerFail = test_scheduler_main();
+    int equalityLiteralFail = test_equality_literal_main();
+    int colorFastFail = test_color_fast_main();
+    int motionNumericFail = test_motion_numeric_main();
+    int slotHoistFail = test_slot_hoist_main();
+    int listCodegenBoundsFail = test_list_codegen_bounds_main();
+    int nanCodegenFail = test_nan_codegen_main();
+    int literalContextFail = test_literal_context_main();
+    int dangerFail = test_danger_main();
+    int listStringInternFail = test_list_string_intern_main();
+    return (g_fail + e2eFail + penFail + aotFail + wasmEmitFail +
+            wasmCompileFail + minifyFail + depsFail + analysisFail + parforFail + penHoistFail + rewriteFail +
+            parallelStringsFail + schedulerFail +
+            equalityLiteralFail + colorFastFail + motionNumericFail + slotHoistFail +
+            listCodegenBoundsFail + nanCodegenFail + literalContextFail + dangerFail + listStringInternFail)
+               ? 1
+               : 0;
 }

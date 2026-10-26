@@ -3,6 +3,8 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <ctime>
 
 #ifndef M_PI
@@ -10,6 +12,63 @@
 #endif
 
 namespace xyo::rt {
+
+namespace {
+
+/// `item # of` / `contains` の走査量（`XYO_LISTSTATS=1` で終了時に stderr）。
+/// 「値→最初の index」索引を入れる価値があるかの判断材料。
+struct ListScanStats {
+    bool on = false;
+    uint64_t calls = 0;
+    uint64_t elems = 0;    // 実際に比較した要素数
+    uint64_t found = 0;
+    uint64_t posSum = 0;   // ヒット位置の合計（早期ヒット率の目安）
+
+    ListScanStats() {
+        const char* v = std::getenv("XYO_LISTSTATS");
+        on = v && v[0] != '0';
+    }
+};
+
+ListScanStats& stats() {
+    static ListScanStats s;
+    return s;
+}
+
+struct StatsPrinter {
+    ~StatsPrinter() {
+        ListScanStats& s = stats();
+        if (!s.on || !s.calls) return;
+        std::fprintf(stderr,
+                     "liststats: calls=%llu scanned=%llu avg=%.1f found=%llu "
+                     "avg_pos=%.1f\n",
+                     (unsigned long long)s.calls,
+                     (unsigned long long)s.elems,
+                     double(s.elems) / double(s.calls),
+                     (unsigned long long)s.found,
+                     s.found ? double(s.posSum) / double(s.found) : 0.0);
+    }
+};
+StatsPrinter g_printer;
+
+inline void noteCall() {
+    ListScanStats& s = stats();
+    if (s.on) ++s.calls;
+}
+
+inline void noteScanned(uint32_t n) {
+    ListScanStats& s = stats();
+    if (s.on) s.elems += n;
+}
+
+inline void noteHit(uint32_t pos) {
+    ListScanStats& s = stats();
+    if (!s.on) return;
+    ++s.found;
+    s.posSum += pos;
+}
+
+}  // namespace
 
 // --- 比較 ---
 
@@ -253,20 +312,36 @@ static bool sameValueZero(Value a, Value b) {
 }
 
 bool listContains(SList* list, Value item) {
+    noteCall();
     // indexOf(SameValueZero) fast path → Cast.compare===0 走査（JS 版と同じ順序）
     for (uint32_t i = 0; i < list->len; ++i) {
-        if (sameValueZero(list->items[i], item)) return true;
+        if (sameValueZero(list->items[i], item)) {
+            noteScanned(i + 1);
+            noteHit(i + 1);
+            return true;
+        }
     }
     for (uint32_t i = 0; i < list->len; ++i) {
-        if (compareEqual(list->items[i], item)) return true;
+        if (compareEqual(list->items[i], item)) {
+            noteScanned(list->len + i + 1);
+            noteHit(i + 1);
+            return true;
+        }
     }
+    noteScanned(2 * list->len);
     return false;
 }
 
 double listIndexOf(SList* list, Value item) {
+    noteCall();
     for (uint32_t i = 0; i < list->len; ++i) {
-        if (compareEqual(list->items[i], item)) return i + 1;
+        if (compareEqual(list->items[i], item)) {
+            noteScanned(i + 1);
+            noteHit(i + 1);
+            return i + 1;
+        }
     }
+    noteScanned(list->len);
     return 0;
 }
 

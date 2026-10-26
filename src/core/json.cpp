@@ -173,35 +173,43 @@ struct Parser {
     }
 };
 
+void appendEscaped(std::string& out, const std::string& s) {
+    out += '"';
+    for (unsigned char uc : s) {
+        const char c = char(uc);
+        switch (c) {
+        case '"': out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default:
+            if (uc < 0x20) {
+                char buf[8];
+                std::snprintf(buf, sizeof(buf), "\\u%04x", uc);
+                out += buf;
+            } else {
+                out += c;
+            }
+        }
+    }
+    out += '"';
+}
+
 void stringifyInto(std::string& out, const JsonValue& v) {
     if (v.isNull()) { out += "null"; return; }
     if (v.isBool()) { out += v.asBool() ? "true" : "false"; return; }
     if (v.isNumber()) {
-        char buf[32];
-        std::snprintf(buf, sizeof(buf), "%.17g", v.asNumber());
-        out += buf;
+        // 最短の round-trip 表現（%.17g より短く、値は厳密に一致する）。
+        // JSON に NaN/Infinity は無いので null にする（JSON.stringify 準拠）。
+        char buf[64];
+        auto r = std::to_chars(buf, buf + sizeof(buf), v.asNumber());
+        if (r.ec == std::errc()) out.append(buf, r.ptr);
+        else out += "null";
         return;
     }
     if (v.isString()) {
-        out += '"';
-        for (char c : v.asString()) {
-            switch (c) {
-            case '"': out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            default:
-                if ((unsigned char)c < 0x20) {
-                    char buf[8];
-                    std::snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c);
-                    out += buf;
-                } else {
-                    out += c;
-                }
-            }
-        }
-        out += '"';
+        appendEscaped(out, v.asString());
         return;
     }
     if (v.isArray()) {
@@ -220,9 +228,8 @@ void stringifyInto(std::string& out, const JsonValue& v) {
     for (auto& [k, e] : v.asObject()) {
         if (!first) out += ',';
         first = false;
-        out += '"';
-        out += k;
-        out += "\":";
+        appendEscaped(out, k);
+        out += ':';
         stringifyInto(out, e);
     }
     out += '}';

@@ -3,6 +3,7 @@
 // char16_t データは構造体直後に続く（len + 1 文字ぶん確保し NUL 終端）。
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -15,7 +16,8 @@ struct SStr {
     uint32_t len;
     uint32_t hash;   // lazy; 0 = 未計算
     /// jsnum::toNumber 結果のメモ（文字列は不変なので一度だけパース）。
-    /// numState: 0=未計算, 1=数値, 2=NaN。
+    /// numState: 0=未計算, 1=数値, 2=NaN, 3=比較では非数値の0,
+    /// 4=Infinity リテラル（cast.cpp と codegen.cpp の判定と同期）。
     double numCache;
     uint32_t numState;
     /// "#RRGGBB" パース結果のメモ（toRgbColorObject 用）。
@@ -24,6 +26,41 @@ struct SStr {
     uint32_t rgbCache;
     uint32_t rgbState;
     // char16_t data[len+1] がここに続く
+
+    // Keep the plain-field ABI used by JIT/AOT offsets, but access published
+    // caches atomically: independent scripts can share the same immutable SStr.
+    // Concurrent publishers compute identical payload/state from its contents.
+    // Payloads must also be atomic (a late publisher can overlap a reader).
+    uint32_t loadNumState() {
+        return std::atomic_ref(numState).load(std::memory_order_acquire);
+    }
+    double loadNumCache() {
+        return std::atomic_ref(numCache).load(std::memory_order_relaxed);
+    }
+    void publishNumCache(double value, uint32_t state) {
+        std::atomic_ref(numCache).store(value, std::memory_order_relaxed);
+        std::atomic_ref(numState).store(state, std::memory_order_release);
+    }
+    uint32_t loadRgbState() {
+        return std::atomic_ref(rgbState).load(std::memory_order_acquire);
+    }
+    uint32_t loadRgbCache() {
+        return std::atomic_ref(rgbCache).load(std::memory_order_relaxed);
+    }
+    void publishRgbCache(uint32_t value, uint32_t state) {
+        std::atomic_ref(rgbCache).store(value, std::memory_order_relaxed);
+        std::atomic_ref(rgbState).store(state, std::memory_order_release);
+    }
+    // Called only before publication. JIT list-index lowering may load the
+    // payload speculatively even when state is zero, so initialize both.
+    void initCaches() {
+        numCache = 0;
+        numState = 0;
+        rgbCache = 0;
+        rgbState = 0;
+    }
+    static_assert(std::atomic_ref<double>::required_alignment <= alignof(double));
+    static_assert(std::atomic_ref<uint32_t>::required_alignment <= alignof(uint32_t));
 
     char16_t* data() { return reinterpret_cast<char16_t*>(this + 1); }
     const char16_t* data() const { return reinterpret_cast<const char16_t*>(this + 1); }
@@ -34,8 +71,7 @@ struct SStr {
             Gc::get().alloc(GcType::Str, sizeof(SStr) + (sv.size() + 1) * 2));
         s->len = static_cast<uint32_t>(sv.size());
         s->hash = 0;
-        s->numState = 0;
-    s->rgbState = 0;
+        s->initCaches();
         std::memcpy(s->data(), sv.data(), sv.size() * 2);
         s->data()[sv.size()] = 0;
         return s;

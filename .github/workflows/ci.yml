@@ -38,7 +38,8 @@ jobs:
       - name: Configure
         run: |
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DLLVM_CONFIG="/usr/lib/llvm-${LLVM_MAJOR}/bin/llvm-config"
+            -DLLVM_CONFIG="/usr/lib/llvm-${LLVM_MAJOR}/bin/llvm-config" \
+            -DXYO_REQUIRE_SDL2=ON
 
       - name: Build
         run: cmake --build build -j"$(nproc)"
@@ -109,10 +110,41 @@ jobs:
             echo "==== JIT シンボル解決に失敗 ===="; cat jit-err.txt; exit 1
           fi
 
+  # librsvg を持たないビルド = Windows と同じ SVG バックエンド（nanosvg）。
+  # Windows では実行しにくいので、レンダラ回帰テストを Linux で回して
+  # フォールバック経路を常時検証する。
+  linux-norsvg:
+    name: Linux (SDL2 / librsvg なし = nanosvg フォールバック)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 依存パッケージ（LLVM 18, SDL2 のみ / librsvg は入れない）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config zlib1g-dev \
+            libgl-dev llvm-18-dev llvm-18 libsdl2-dev
+
+      - name: Configure（-DXYO_RSVG=OFF / SDL2 必須）
+        run: |
+          cmake -B build-norsvg -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DXYO_LLVM_MODE=llvm-config \
+            -DLLVM_CONFIG=/usr/lib/llvm-18/bin/llvm-config \
+            -DXYO_RSVG=OFF -DXYO_REQUIRE_SDL2=ON
+
+      - name: Build（レンダラ回帰テスト）
+        run: cmake --build build-norsvg --target xyo-render-tests -j"$(nproc)"
+
+      - name: レンダラ回帰（SDL dummy / nanosvg フォールバック）
+        run: |
+          export SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy
+          ./build-norsvg/tests/xyo-render-tests
+
   # Windows で JIT を有効にする（MSYS2 の mingw-w64 LLVM を使う）。
   # zig クロスでは LLVM for Windows が無いため interp のみだった。
   windows-jit:
-    name: Windows JIT（MSYS2 mingw LLVM）
+    name: Windows JIT / SDL2（MSYS2 mingw LLVM）
     runs-on: windows-latest
     defaults:
       run:
@@ -125,6 +157,7 @@ jobs:
           msystem: MINGW64
           update: false
           install: >-
+            python
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ninja
@@ -133,6 +166,7 @@ jobs:
             mingw-w64-x86_64-zstd
             mingw-w64-x86_64-ncurses
             mingw-w64-x86_64-libxml2
+            mingw-w64-x86_64-SDL2
 
       - name: LLVM の確認（静的アーカイブの有無）
         run: |
@@ -144,15 +178,16 @@ jobs:
           llvm-config --link-static --libs core orcjit native passes 2>&1 | head -c 300
           echo
 
-      - name: Configure + build（JIT 有効）
+      - name: Configure + build（JIT 有効 / SDL2 有効）
         run: |
           cmake -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DXYO_JIT=ON -DXYO_LLVM_MODE=config \
-            -DXYO_SDL2=OFF -DXYO_BUILD_TESTS=OFF
+            -DXYO_SDL2=ON -DXYO_REQUIRE_SDL2=ON \
+            -DXYO_BUILD_TESTS=OFF
           cmake --build build-win -j"$(nproc)"
           ls -la build-win/xyo.exe
 
-      - name: スモーク（JIT が実際にコンパイルすること / AOT）
+      - name: スモーク（JIT が実際にコンパイルすること / AOT / play）
         run: |
           ./build-win/xyo.exe run examples/play_demo.sb3 --frames 30
           echo "--- JIT コンパイル数 ---"
@@ -162,13 +197,18 @@ jobs:
           if grep -q "JIT session error" jit-err.txt; then
             echo "==== JIT シンボル解決に失敗 ===="; cat jit-err.txt; exit 1
           fi
+          echo "--- play（dummy ドライバ / SDL2 が入っていること） ---"
+          export SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy
+          XYO_EXIT_FRAMES=10 XYO_SHOT=shot.ppm ./build-win/xyo.exe play examples/play_demo.sb3
+          test -s shot.ppm && ls -l shot.ppm
 
-      - name: 完全静的 xyo.exe（LLVM 静的 + -static）
+      - name: 完全静的 xyo.exe（LLVM 静的 + -static / SDL2 も静的リンク）
         run: |
           cmake -B build-win-static -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DXYO_JIT=ON -DXYO_LLVM_MODE=llvm-config \
             -DXYO_STATIC=ON -DXYO_STATIC_LLVM=ON \
-            -DXYO_SDL2=OFF -DXYO_BUILD_TESTS=OFF
+            -DXYO_SDL2=ON -DXYO_REQUIRE_SDL2=ON \
+            -DXYO_BUILD_TESTS=OFF
           cmake --build build-win-static -j"$(nproc)"
           ls -la build-win-static/xyo.exe
           ./build-win-static/xyo.exe run examples/play_demo.sb3 --frames 30
@@ -177,6 +217,13 @@ jobs:
           if grep -q "JIT session error" jit-err-s.txt; then
             echo "==== JIT シンボル解決に失敗（静的） ===="; cat jit-err-s.txt; exit 1
           fi
+          echo "--- SDL2.dll に依存していないこと（静的リンク） ---"
+          objdump -p build-win-static/xyo.exe | grep -ci "DLL Name: SDL2.dll" | grep -q "^0$"
+          echo "--- play（dummy ドライバ） ---"
+          export SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy
+          XYO_EXIT_FRAMES=10 XYO_SHOT=shot-static.ppm \
+            ./build-win-static/xyo.exe play examples/play_demo.sb3
+          test -s shot-static.ppm && ls -l shot-static.ppm
 
   windows:
     name: Windows (zig クロス、headless)

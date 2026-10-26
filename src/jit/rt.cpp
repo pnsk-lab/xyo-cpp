@@ -32,8 +32,6 @@ namespace xyo {
 
 namespace {
 
-constexpr double kWarpTimeMs = 500.0;
-
 Value toV(uint64_t bits) { Value v; v.bits = bits; return v; }
 uint64_t toB(Value v) { return v.bits; }
 
@@ -47,8 +45,11 @@ BlockUtility& jitUtil(JitCtx* c) {
 }
 
 bool isStuck(JitCtx* c) {
-    // JS jsexecute: sequencer.timer.timeElapsed() > 500（tick 単位でリセット）
-    return c->sequencer->timer.timeElapsed() > kWarpTimeMs;
+    // JS jsexecute: sequencer.timer.timeElapsed() > 500（tick 単位でリセット）。
+    // dangerMode はスレッドごとの時間予算そのものが無いので時計も読まない
+    // （warp ループの yield 点はそもそも IR から消えている）。
+    if (c->runtime->dangerMode) return false;
+    return c->sequencer->timer.timeElapsed() > c->runtime->warpTimeMs;
 }
 
 /// var 系ヘルパ別カウンタ（XYO_PROF 時に内容を表示）
@@ -171,14 +172,22 @@ int32_t xyo_eq(uint64_t a, uint64_t b) {
     if (a == b) return 1;   // 同 bits は常に等値（kNan 含む）
     {
         Value va = toV(a), vb = toV(b);
+        // 数値同士は compare の文字列/ゼロ判定を全部飛ばす。
+        // 描画ループの色比較などホットパスで支配的（voxelRenderer の
+        // display は 1 フレームに数千回）。
+        if (va.isNumber() && vb.isNumber()) {
+            double x = va.asNumberUnchecked();
+            double y = vb.asNumberUnchecked();
+            return x == y ? 1 : 0;
+        }
         if (va.isString() && vb.isString() && va.asStrPtr() &&
             vb.asStrPtr()) {
             // numState は文字列内容の純関数 — 異なる state は
             // 必ず異なる内容 = 非等値（compare の文字列比較をスキップ）。
             // ただし Infinity リテラル（state4）は "infinity" 等の
             // case 違い（state2）と等しいためショートカット不可。
-            uint32_t s1 = va.asStrPtr()->numState;
-            uint32_t s2 = vb.asStrPtr()->numState;
+            uint32_t s1 = va.asStrPtr()->loadNumState();
+            uint32_t s2 = vb.asStrPtr()->loadNumState();
             if (s1 && s2 && s1 != s2 && s1 != 4 && s2 != 4) return 0;
         }
     }

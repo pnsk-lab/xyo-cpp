@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "../core/gc.hpp"
@@ -37,6 +38,40 @@ constexpr int PRIM_TEXT = 10;
 constexpr int PRIM_BROADCAST = 11;
 constexpr int PRIM_VAR = 12;
 constexpr int PRIM_LIST = 13;
+
+// Transient exact-UTF-8 sharing for initial list values only. Keys are owned,
+// but SStr pointers are borrowed: this cache is not a GC root and must never
+// free them. loadSb3's DeferCollect protects them until targets are installed;
+// the cache is destroyed before that defer guard is released.
+class InitialListStrings {
+public:
+    InitialListStrings() {
+        const char* env = std::getenv("XYO_SB3_LIST_INTERN");
+        enabled_ = !env || std::string_view(env) != "0";
+    }
+
+    SStr* get(const std::string& key) {
+        if (!enabled_) return SStr::create(utf8ToU16(key));
+        // Hits must keep working even after an admission budget is exhausted.
+        auto it = strings_.find(key);
+        if (it != strings_.end()) return it->second;
+        if (strings_.size() >= kMaxEntries || key.size() > kMaxKeyLength ||
+            key.size() > kMaxKeyBytes - keyBytes_)
+            return SStr::create(utf8ToU16(key));
+        SStr* value = SStr::create(utf8ToU16(key));
+        strings_.emplace(key, value);
+        keyBytes_ += key.size();
+        return value;
+    }
+
+private:
+    static constexpr size_t kMaxEntries = 4096;
+    static constexpr size_t kMaxKeyBytes = 1024 * 1024;
+    static constexpr size_t kMaxKeyLength = 4096;
+    bool enabled_;
+    size_t keyBytes_ = 0;
+    std::unordered_map<std::string, SStr*> strings_;
+};
 
 uint32_t g_uidCounter = 0;
 std::string newUid() {
@@ -233,7 +268,9 @@ void deserializeBlocks(const JsonValue& blocksObj,
             m.tagName = mut.get("tagName").asString();
             if (m.tagName.empty()) m.tagName = "mutation";
             for (const auto& [k, v] : mut.asObject()) {
-                if (k == "tagName" || k == "children") continue;
+                // children は sb3 では配列（procedures では常に空）。JSON 文字列として
+                // 保持し、serializer が配列へ戻す — これで round-trip が一致する。
+                if (k == "tagName") continue;
                 m.attrs[k] = mutationAttr(v);
             }
             b.mutation = std::make_unique<Mutation>(std::move(m));
@@ -391,7 +428,8 @@ void loadAsset(ZipReader const* zip, const std::string& md5,
 
 Target* loadTargetObject(Runtime& runtime, const JsonValue& obj,
                          const ZipReader* zip, int layerOrder,
-                         std::vector<std::string>& extIds) {
+                         std::vector<std::string>& extIds,
+                         InitialListStrings& listStrings) {
     if (!obj.has("name")) return nullptr;
 
     auto sprite = std::make_unique<Sprite>(&runtime);
@@ -460,6 +498,14 @@ Target* loadTargetObject(Runtime& runtime, const JsonValue& obj,
         }
     }
 
+    // ブロックコメント（blockId → text）。エディタのコメント表示・保存で使う。
+    for (const auto& [cid, c] : obj.get("comments").asObject()) {
+        std::string bid = c.get("blockId").asString();
+        std::string text = c.get("text").asString();
+        if (bid.empty() || text.empty()) continue;
+        if (Block* b = spritePtr->blocks->getBlock(bid)) b->comment = text;
+    }
+
     // ターゲットプロパティ
     if (obj.has("tempo")) target->tempo = obj.get("tempo").asNumber();
     if (obj.has("volume")) target->volume = obj.get("volume").asNumber();
@@ -498,7 +544,7 @@ Target* loadTargetObject(Runtime& runtime, const JsonValue& obj,
                 v.list->push(Value::boolean(item.asBool()));
             else
                 v.list->push(Value::string(
-                    SStr::create(utf8ToU16(item.asString()))));
+                    listStrings.get(item.asString())));
         }
         target->variables.emplace(v.id, std::move(v));
     }
@@ -715,6 +761,7 @@ Sb3LoadResult loadSb3(Runtime& runtime, const std::string& projectJson,
     // そこへ格納した SStr/SList が GC から到達不能に見える。
     // collect を遅延させ、全てがルートへ接続されてから回収可能にする。
     Gc::DeferCollect gcDefer;
+    InitialListStrings listStrings;
     Sb3LoadResult result;
     JsonValue json = jsonParse(projectJson);
     if (!json.isObject()) {
@@ -745,7 +792,7 @@ Sb3LoadResult loadSb3(Runtime& runtime, const std::string& projectJson,
     for (const JsonValue* tobj : sorted) {
         int li = int(parsed.size());   // layerOrder = parse 順
         Target* t = loadTargetObject(runtime, *tobj, zip, li,
-                                     result.extensionIds);
+                                     result.extensionIds, listStrings);
         int po = 0;
         for (size_t i = 0; i < targetObjs.size(); ++i)
             if (&targetObjs[i] == tobj) po = int(i);
@@ -780,9 +827,53 @@ Sb3LoadResult loadSb3(Runtime& runtime, const std::string& projectJson,
     return result;
 }
 
+std::vector<std::string> loadBlocksFragment(Blocks& out, const JsonValue& fragment,
+                                            std::string* headOut) {
+    std::vector<std::string> ids;
+    if (!fragment.isObject()) return ids;
+    if (headOut) *headOut = fragment.get("head").asString();
+    const JsonValue& blocksObj = fragment.has("blocks") ? fragment.get("blocks") : fragment;
+    std::unordered_map<std::string, BlockJson> all;
+    std::vector<std::string> order;
+    deserializeBlocks(blocksObj, all, order);
+    fixSporkCompatibility(all);
+    // 旧 id → 新 id（断片を複数回貼り付けても衝突しないように）。
+    // newUid() の連番はプロジェクト読込時にも使われるため、out 内に同じ id が
+    // あれば createBlock が既存ブロックを上書きしてしまう — out に無い id が
+    // 出るまで回す。
+    std::unordered_map<std::string, std::string> remap;
+    for (const std::string& id : order) {
+        std::string nid;
+        do { nid = newUid(); } while (out.getBlock(nid));
+        remap[id] = nid;
+    }
+    auto mapId = [&](const std::string& s) -> std::string {
+        if (s.empty()) return "";
+        auto it = remap.find(s);
+        return it == remap.end() ? std::string() : it->second;
+    };
+    for (const std::string& id : order) {
+        auto it = all.find(id);
+        if (it == all.end()) continue;
+        BlockJson& bj = it->second;   // BlockJson は unique_ptr を持ちコピー不可 — 参照で書き換える
+        bj.id = mapId(id);
+        bj.next = mapId(bj.next);
+        bj.parent = mapId(bj.parent);
+        for (auto& [name, bs] : bj.inputs) {
+            bs.first = mapId(bs.first);
+            bs.second = mapId(bs.second);
+        }
+        bj.topLevel = false;
+        Block b = makeBlock(bj);
+        ids.push_back(b.id);
+        out.createBlock(std::move(b));
+    }
+    if (headOut && !headOut->empty()) *headOut = mapId(*headOut);
+    return ids;
+}
+
 Sb3LoadResult loadSb3File(Runtime& runtime, const uint8_t* data,
-                          size_t size) {
-    Sb3LoadResult result;
+                          size_t size) {    Sb3LoadResult result;
     ZipReader zip;
     if (!ZipReader::open(data, size, zip)) {
         result.error = "zip open failed";

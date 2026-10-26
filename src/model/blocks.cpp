@@ -151,18 +151,21 @@ std::string Blocks::getProcedureDefinition(const std::string& proccode) {
     if (it != cache_.procedureDefinitions.end()) {
         return it->second;   // 空文字列 = null キャッシュ
     }
+    // 同一 proccode の定義が複数ある場合、TW は「最初の出現」を選ぶ。
+    // blocks_ は unordered_map でイテレーション順が実装依存（libstdc++ と
+    // libc++ で異なる）なので、ロード順 seq の最小を選んで決定的にする。
+    const Block* best = nullptr;
     for (auto& [id, block] : blocks_) {
-        if (block.opcode == "procedures_definition") {
-            const Block* inner = customBlockInternal(*this, &block);
-            if (inner && inner->mutation &&
-                inner->mutation->attr("proccode") == proccode) {
-                cache_.procedureDefinitions[proccode] = id;
-                return id;
-            }
-        }
+        if (block.opcode != "procedures_definition") continue;
+        const Block* inner = customBlockInternal(*this, &block);
+        if (!inner || !inner->mutation ||
+            inner->mutation->attr("proccode") != proccode)
+            continue;
+        if (!best || block.seq < best->seq) best = &block;
     }
-    cache_.procedureDefinitions[proccode] = {};
-    return {};
+    std::string result = best ? best->id : std::string{};
+    cache_.procedureDefinitions[proccode] = result;
+    return result;
 }
 
 bool Blocks::getProcedureParamNamesIdsAndDefaults(
@@ -170,17 +173,21 @@ bool Blocks::getProcedureParamNamesIdsAndDefaults(
     std::vector<std::u16string>& names,
     std::vector<std::string>& ids,
     std::vector<Value>& defaults) {
+    // getProcedureDefinition と同じ基準（同一 proccode は seq 最小の
+    // プロトタイプ = 最初の定義に属するもの）を選ぶ。
+    Block* best = nullptr;
     for (auto& [id, block] : blocks_) {
         if (block.opcode == "procedures_prototype" && block.mutation &&
             block.mutation->attr("proccode") == proccode) {
-            block.mutation->parseArgs();
-            names = block.mutation->argumentNames;
-            ids = block.mutation->argumentIds;
-            defaults = block.mutation->argumentDefaults;
-            return true;
+            if (!best || block.seq < best->seq) best = &block;
         }
     }
-    return false;
+    if (!best) return false;
+    best->mutation->parseArgs();
+    names = best->mutation->argumentNames;
+    ids = best->mutation->argumentIds;
+    defaults = best->mutation->argumentDefaults;
+    return true;
 }
 
 void Blocks::populateProcedureCache() {
@@ -330,6 +337,7 @@ void Blocks::createBlock(Block block) {
     if (blocks_.count(block.id)) return;
     bool top = block.topLevel;
     std::string id = block.id;
+    block.seq = ++seqCounter_;   // ロード/追加順（順序依存解決の基準）
     blocks_.emplace(id, std::move(block));
     if (top) addScript(id);
     resetCache();
@@ -361,6 +369,16 @@ void Blocks::addScript(const std::string& topBlockId) {
 void Blocks::deleteScript(const std::string& topBlockId) {
     for (auto it = scripts_.begin(); it != scripts_.end(); ++it)
         if (*it == topBlockId) { scripts_.erase(it); return; }
+}
+
+void Blocks::restoreState(std::unordered_map<std::string, Block> blocks,
+                          std::vector<std::string> scripts) {
+    blocks_ = std::move(blocks);
+    scripts_ = std::move(scripts);
+    // 復元後の最大 seq より大きい値へ進める（新規追加が必ず後順になるよう）
+    for (const auto& [id, b] : blocks_)
+        if (b.seq > seqCounter_) seqCounter_ = b.seq;
+    resetCache();
 }
 
 void Blocks::resetCache() {

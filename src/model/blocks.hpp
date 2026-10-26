@@ -130,6 +130,11 @@ struct Block {
     std::string targetId;  // モニタブロック用
     std::optional<Mutation> mutation;
     std::string comment;
+    /// Blocks へのロード/追加順（1 起点・単調増加）。TW の JS オブジェクトは
+    /// 挿入順でイテレートするため、「同一 proccode の最初の定義」等の
+    /// 順序依存解決を blocks_（unordered_map）の実装依存順ではなく
+    /// この seq で決定的に行う。
+    uint64_t seq = 0;
 };
 
 /// BlocksRuntimeCache.RuntimeScriptCache — startHats 用トップブロック情報。
@@ -183,6 +188,13 @@ public:
 
     void createBlock(Block block);
     void deleteBlock(const std::string& blockId);
+    /// トップレベルスクリプトの登録/解除（エディタのブロック編集で使用）
+    void addScript(const std::string& topBlockId);
+    void deleteScript(const std::string& topBlockId);
+    /// エディタの undo/redo 用: blocks と scripts を丸ごと差し替える。
+    /// seqCounter_ は復元後の最大 seq より大きい値へ進める。
+    void restoreState(std::unordered_map<std::string, Block> blocks,
+                      std::vector<std::string> scripts);
     void resetCache();
     void runAllMonitored(Runtime& rt);
 
@@ -193,6 +205,8 @@ public:
 private:
     std::unordered_map<std::string, Block> blocks_;
     std::vector<std::string> scripts_;
+    /// createBlock ごとに増えるロード/追加順カウンタ（Block::seq の源）
+    uint64_t seqCounter_ = 0;
 
     struct Cache {
         std::unordered_map<std::string, InputSet> inputs;
@@ -206,9 +220,6 @@ private:
 
 private:
     mutable Cache cache_;   // 遅延構築キャッシュ（const メソッドからも充填）
-
-    void addScript(const std::string& topBlockId);
-    void deleteScript(const std::string& topBlockId);
 
 public:
     /// GC マーク用にキャッシュを公開

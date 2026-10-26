@@ -48,18 +48,19 @@ static double numberOrNaNImpl(Value v) {
         // 4=Infinity リテラル（"infinity" のような case 違いは
         //   state2 になるが文字列比較では等しい — state ショートカット
         //   で誤って非等値にしないため別 state にする）
-        if (s->numState == 0) {
+        uint32_t state = s->loadNumState();
+        if (state == 0) {
             double d = jsnum::toNumber(s->view());
-            s->numCache = d;
-            if (std::isnan(d)) s->numState = 2;
-            else if (d == 0 && strIsNotActuallyZero(s)) s->numState = 3;
+            if (std::isnan(d)) state = 2;
+            else if (d == 0 && strIsNotActuallyZero(s)) state = 3;
             else if (std::isinf(d) && isInfinityLiteral(s->view()))
-                s->numState = 4;
-            else s->numState = 1;
+                state = 4;
+            else state = 1;
+            s->publishNumCache(d, state);
         }
-        return s->numState == 2
+        return state == 2
                    ? std::numeric_limits<double>::quiet_NaN()
-                   : s->numCache;
+                   : s->loadNumCache();
     }
     if (v.isColor()) {
         // JS では [r,g,b] 配列 → "r,g,b" → Number → NaN
@@ -239,8 +240,7 @@ int32_t listIndex(Value index, uint32_t length) {
                         v = v * 10 + uint64_t(c - u'0');
                     }
                     if (digits) {
-                        s->numCache = static_cast<double>(v);
-                        s->numState = 1;
+                        s->publishNumCache(static_cast<double>(v), 1);
                         if (v < 1 || v > length) return -1;
                         return static_cast<int32_t>(v) - 1;
                     }
@@ -274,25 +274,26 @@ Rgba toRgbColorObject(Value v) {
             // 文字列は不変 — "#RRGGBB" パース結果を SStr 内にメモ
             // （utf8 変換アロケートを再実行しない）。
             // rgbState: 1=rgbCache 有効, 2='#' 始まりでない
-            if (s->rgbState == 1) {
-                uint32_t c = s->rgbCache;
+            uint32_t state = s->loadRgbState();
+            if (state == 1) {
+                uint32_t c = s->loadRgbCache();
                 return {int((c >> 16) & 0xFF), int((c >> 8) & 0xFF),
                         int(c & 0xFF), int((c >> 24) & 0xFF)};
             }
-            if (s->rgbState == 0) {
+            if (state == 0) {
                 if (s->len >= 1 && s->data()[0] == u'#') {
                     std::string utf8 = SStr::toUtf8(s->view());
                     auto rgb = color::hexToRgb(utf8);
                     Rgba out = rgb ? Rgba{rgb->r, rgb->g, rgb->b, 255}
                                    : Rgba{0, 0, 0, 255};
-                    s->rgbCache = uint32_t(out.a) << 24 |
+                    uint32_t packed = uint32_t(out.a) << 24 |
                                   uint32_t(out.r) << 16 |
                                   uint32_t(out.g) << 8 |
                                   uint32_t(out.b);
-                    s->rgbState = 1;
+                    s->publishRgbCache(packed, 1);
                     return out;
                 }
-                s->rgbState = 2;    // '#' 以外 → toNumber decimal 経路
+                s->publishRgbCache(0, 2);    // '#' 以外 → toNumber decimal 経路
             }
         }
     }

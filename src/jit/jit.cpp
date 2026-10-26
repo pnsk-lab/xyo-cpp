@@ -12,6 +12,8 @@
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Passes/PassBuilder.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
@@ -98,6 +100,7 @@ uint64_t xyo_list_contents(JitCtx*, const char*, const char16_t*);
 void xyo_var_monitor(JitCtx*, const char*, int32_t);
 void xyo_mot_movesteps(JitCtx*, uint64_t);
 void xyo_mot_gotoxy(JitCtx*, uint64_t, uint64_t);
+void xyo_mot_setxy_num(JitCtx*, double, double);
 void xyo_mot_goto(JitCtx*, uint64_t);
 void xyo_mot_turnright(JitCtx*, uint64_t);
 void xyo_mot_turnleft(JitCtx*, uint64_t);
@@ -174,6 +177,7 @@ void xyo_pen_down(JitCtx*);
 void xyo_pen_clear(JitCtx*);
 void xyo_pen_stamp(JitCtx*);
 void xyo_pen_setcolor(JitCtx*, uint64_t);
+void xyo_pen_setcolor_ps(void*, uint64_t);
 void xyo_pen_changeparam(JitCtx*, uint64_t, uint64_t);
 void xyo_pen_setparam(JitCtx*, uint64_t, uint64_t);
 void xyo_pen_setsize(JitCtx*, uint64_t);
@@ -181,6 +185,12 @@ void xyo_pen_changesize(JitCtx*, uint64_t);
 void xyo_pen_recolor(JitCtx*);
 void xyo_pen_paramnum(JitCtx*, int32_t, int32_t, double);
 int32_t xyo_gpu_repeat(JitCtx*, const void*, double);
+// par-for（並列 append ループ）— parfor_rt.cpp
+void xyo_list_reserve(void* list, int64_t newLen);
+void xyo_par_slot(void* list, int64_t idx, int64_t bits);
+int xyo_par_for(JitCtx*, int64_t trip, double init, double delta,
+                void** lists, int64_t* bases, int64_t nl,
+                void (*body)(JitCtx*, int64_t, double, void**, int64_t*));
 }
 
 namespace {
@@ -219,6 +229,7 @@ const std::pair<const char*, void*> kRtSymbols[] = {
     {"xyo_pen_clear", (void*)&xyo_pen_clear},
     {"xyo_pen_stamp", (void*)&xyo_pen_stamp},
     {"xyo_pen_setcolor", (void*)&xyo_pen_setcolor},
+    {"xyo_pen_setcolor_ps", (void*)&xyo_pen_setcolor_ps},
     {"xyo_pen_changeparam", (void*)&xyo_pen_changeparam},
     {"xyo_pen_setparam", (void*)&xyo_pen_setparam},
     {"xyo_pen_setsize", (void*)&xyo_pen_setsize},
@@ -226,6 +237,9 @@ const std::pair<const char*, void*> kRtSymbols[] = {
     {"xyo_pen_recolor", (void*)&xyo_pen_recolor},
     {"xyo_pen_paramnum", (void*)&xyo_pen_paramnum},
     {"xyo_gpu_repeat", (void*)&xyo_gpu_repeat},
+    {"xyo_list_reserve", (void*)&xyo_list_reserve},
+    {"xyo_par_slot", (void*)&xyo_par_slot},
+    {"xyo_par_for", (void*)&xyo_par_for},
     {"xyo_arg_get", (void*)&xyo_arg_get},
     {"xyo_rt_wait", (void*)&xyo_rt_wait},
     {"xyo_stop_all", (void*)&xyo_stop_all},
@@ -256,6 +270,7 @@ const std::pair<const char*, void*> kRtSymbols[] = {
     {"xyo_var_monitor", (void*)&xyo_var_monitor},
     {"xyo_mot_movesteps", (void*)&xyo_mot_movesteps},
     {"xyo_mot_gotoxy", (void*)&xyo_mot_gotoxy},
+    {"xyo_mot_setxy_num", (void*)&xyo_mot_setxy_num},
     {"xyo_mot_goto", (void*)&xyo_mot_goto},
     {"xyo_mot_turnright", (void*)&xyo_mot_turnright},
     {"xyo_mot_turnleft", (void*)&xyo_mot_turnleft},
@@ -476,13 +491,181 @@ JitEngine::JitEngine() {
     });
 }
 
+namespace {
+
+/// HotSpot のしきい値（環境変数で調整可能）。
+struct HotParams {
+    uint64_t invocations = 3;    // 呼び出し回数で JIT
+    uint64_t blocks = 4096;      // 解釈実行したブロック数で JIT
+    uint64_t size = 5000;        // 到達可能ブロック数がこれ以上なら初回 JIT
+    bool loopCompile = true;     // ループを含むスクリプトは初回 JIT
+    bool stats = false;          // 終了時にホットネス表を出力
+
+    static uint64_t envU64(const char* n, uint64_t d) {
+        const char* e = std::getenv(n);
+        if (!e || !*e) return d;
+        return std::strtoull(e, nullptr, 10);
+    }
+    static bool envOn(const char* n, bool d) {
+        const char* e = std::getenv(n);
+        if (!e) return d;
+        return !(e[0] == '0' || e[0] == 'n' || e[0] == 'N' ||
+                 e[0] == 'f' || e[0] == 'F');
+    }
+    HotParams() {
+        invocations = envU64("XYO_HOT_INVOCATIONS", invocations);
+        blocks = envU64("XYO_HOT_BLOCKS", blocks);
+        size = envU64("XYO_HOT_SIZE", size);
+        loopCompile = envOn("XYO_HOT_LOOP", loopCompile);
+        stats = envOn("XYO_HOT_STATS", stats);
+    }
+};
+const HotParams& hotParams() { static HotParams p; return p; }
+
+} // namespace
+
 JitEngine::~JitEngine() {
+    if (hotParams().stats && !profiles_.empty()) {
+        struct Row {
+            uint64_t inv, blocks;
+            const std::string* id;
+            bool jit, aot, loop;
+        };
+        std::vector<Row> rows;
+        rows.reserve(profiles_.size());
+        for (auto& [top, p] : profiles_) {
+            auto cit = cache_.find(top);
+            bool jit = false;
+            bool aot = false;
+            if (cit != cache_.end()) {
+                aot = cit->second.aot;
+                jit = cit->second.code != nullptr;
+            }
+            rows.push_back({p.invocations, p.interpBlocks, &p.id, jit, aot,
+                            p.hasLoop == 2});
+        }
+        std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) {
+            return a.inv > b.inv ||
+                   (a.inv == b.inv && a.blocks > b.blocks);
+        });
+        std::fprintf(stderr,
+                     "[hot] %-32s %8s %10s %5s %4s %s\n", "script", "inv",
+                     "interp", "jit", "aot", "loop");
+        for (const Row& r : rows)
+            std::fprintf(stderr, "[hot] %-32s %8llu %10llu %5s %4d %d\n",
+                         r.id ? r.id->c_str() : "?",
+                         (unsigned long long)r.inv,
+                         (unsigned long long)r.blocks,
+                         r.jit ? "yes" : "-", int(r.aot), int(r.loop));
+    }
     Gc::get().removeRootProvider(this);
     if (impl_) Gc::get().removeRootProvider(impl_.get());
     impl_.reset();
 }
 
 bool JitEngine::ok() const { return impl_ && impl_->jit; }
+
+uint8_t JitEngine::scanScriptLoop(Blocks& blocks, const Block* top,
+                                  uint32_t* nodes) {
+    if (nodes) *nodes = 0;
+    if (!top) return 1;
+    static const std::unordered_set<std::string> kLoops = {
+        "control_forever", "control_repeat", "control_repeat_until",
+        "control_while", "control_for_each",
+    };
+    std::unordered_set<const Block*> seen;
+    std::vector<const Block*> work;
+    auto push = [&](const Block* b) {
+        if (b && seen.insert(b).second) work.push_back(b);
+    };
+    push(top);
+    size_t guard = 0;
+    while (!work.empty()) {
+        // 走査不能な巨大グラフはループ扱い（= 初回 JIT）で安全側に倒す
+        if (++guard > 200000) {
+            if (nodes) *nodes = 200001;
+            return 2;
+        }
+        const Block* b = work.back();
+        work.pop_back();
+        if (kLoops.count(b->opcode)) return 2;
+        if (!b->next.empty()) push(blocks.getBlock(b->next));
+        for (auto& kv : b->inputs.items) {
+            const BlockInput& in = kv.second;
+            if (!in.block.empty()) push(blocks.getBlock(in.block));
+            if (!in.shadow.empty()) push(blocks.getBlock(in.shadow));
+        }
+        // 手続き呼び出しの本体も到達可能 — ホットループが手続き側に
+        // あるスクリプトを取りこぼさない。
+        if (b->opcode == "procedures_call" && b->mutation) {
+            const std::string& pc = b->mutation->attr("proccode");
+            if (!pc.empty()) {
+                const std::string def = blocks.getProcedureDefinition(pc);
+                if (!def.empty()) push(blocks.getBlock(def));
+            }
+        }
+    }
+    if (nodes) *nodes = uint32_t(guard);
+    return 1;
+}
+
+bool JitEngine::decideCompile(Thread& thread, const Block* top) {
+    const JitMode mode = jitMode();
+    if (mode == JitMode::Off || !top) return false;
+
+    auto it = cache_.find(top);
+    if (it != cache_.end() && it->second.code) return true;  // 既に JIT/AOT
+    if (failed_.count(top)) return false;
+
+    ScriptProfile& p = profiles_[top];
+    if (p.id.empty()) p.id = thread.topBlock;
+    ++p.invocations;
+
+    if (mode == JitMode::Eager) return true;
+
+    if (p.hasLoop == 0 && thread.blockContainer)
+        p.hasLoop = scanScriptLoop(*thread.blockContainer, top,
+                                   &p.nodeCount);
+
+    // ループを含むスクリプトは単発でも長時間走り得る。OSR を持たない
+    // 以上あとから昇格できないため、初回から JIT する
+    // （XYO_HOT_LOOP=0 で無効化できる）。巨大な直線スクリプトも
+    // 解釈のまま一度だけ走らせると高くつくので同様に初回 JIT。
+    const bool loopCompile = hotParams().loopCompile && p.hasLoop == 2;
+    const bool large = p.nodeCount >= hotParams().size;
+    const bool hot = p.invocations >= hotParams().invocations ||
+                     p.interpBlocks >= hotParams().blocks;
+    if (!loopCompile && !large && !hot) return false;
+
+    if (std::getenv("XYO_JIT_VERBOSE"))
+        std::fprintf(stderr,
+                     "xyo-jit: hot %s (%s) inv=%llu blocks=%llu loop=%d\n",
+                     thread.topBlock.c_str(), top->opcode.c_str(),
+                     (unsigned long long)p.invocations,
+                     (unsigned long long)p.interpBlocks,
+                     int(p.hasLoop == 2));
+    return true;
+}
+
+void JitEngine::noteInterpBlocks(const void* top, uint64_t blocks) {
+    if (!top || !blocks) return;
+    profiles_[top].interpBlocks += blocks;
+}
+
+bool JitEngine::scriptStats(const void* top, ScriptStats* out) const {
+    if (!top || !out) return false;
+    auto pit = profiles_.find(top);
+    auto cit = cache_.find(top);
+    if (pit == profiles_.end() && cit == cache_.end()) return false;
+    out->invocations = pit != profiles_.end() ? pit->second.invocations : 0;
+    out->interpBlocks = pit != profiles_.end() ? pit->second.interpBlocks : 0;
+    out->hasLoop = pit != profiles_.end() && pit->second.hasLoop == 2;
+    if (cit != cache_.end()) {
+        out->aot = cit->second.aot;
+        out->compiled = cit->second.code != nullptr;
+    }
+    return true;
+}
 
 const CompiledScript* JitEngine::compile(Thread& thread, Runtime& runtime,
                                          Sequencer& sequencer,
@@ -500,9 +683,6 @@ const CompiledScript* JitEngine::compile(Thread& thread, Runtime& runtime,
             "xyo-jit: no top block %s\n", topId.c_str());
         return nullptr;
     }
-    auto it = cache_.find(top);
-    if (it != cache_.end()) return it->second.get();
-    if (failed_.count(top)) return nullptr;
     // edge-activated hat はコンパイルしない（ハット評価は interpreter 側）
     if (runtime.getIsEdgeActivatedHat(top->opcode)) {
         if (verbose) std::fprintf(stderr,
@@ -511,6 +691,11 @@ const CompiledScript* JitEngine::compile(Thread& thread, Runtime& runtime,
         return nullptr;
     }
 
+    ScriptEntry& entry = cache_[top];
+    if (entry.code) return entry.code.get();
+    if (failed_.count(top)) return nullptr;
+
+    const auto tStart = std::chrono::steady_clock::now();
     auto cs = std::make_unique<CompiledScript>();
     std::vector<std::string> fnNames;
     std::map<std::string, std::string> procNameMap;
@@ -525,7 +710,7 @@ const CompiledScript* JitEngine::compile(Thread& thread, Runtime& runtime,
             llvmc::tripleArg(impl_->jit->getTargetTriple()));
         emitOk = jitEmitScript(*mod, *lc, runtime, thread.target, blocks,
                                topId, entryName, *cs, impl_->pinned, fnNames,
-                               procNameMap);
+                               procNameMap, nullptr);
         if (emitOk) {
             // O2 相当の最適化 — varSlotData/alloca の昇格・冗長
             // タグチェック除去・式共有を行わないと生成コードが数倍遅い
@@ -573,11 +758,16 @@ const CompiledScript* JitEngine::compile(Thread& thread, Runtime& runtime,
         cs->procedures[vkey] = reinterpret_cast<ScriptFn>(a->getValue());
     }
 
-    auto [slot, inserted] = cache_.emplace(top, std::move(cs));
-    if (std::getenv("XYO_JIT_VERBOSE"))
-        std::fprintf(stderr, "xyo-jit: compiled %s (%s)\n",
-                     topId.c_str(), entryName.c_str());
-    return slot->second.get();
+    CompiledScript* raw = cs.get();
+    entry.code = std::move(cs);
+    if (verbose) {
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - tStart)
+                              .count();
+        std::fprintf(stderr, "xyo-jit: compiled %s (%s, %.1fms)\n",
+                     topId.c_str(), top->opcode.c_str(), ms);
+    }
+    return raw;
 }
 
 /// AOT オブジェクトをロードしてスクリプトをキャッシュへ登録する。
@@ -721,6 +911,10 @@ bool JitEngine::loadAot(Runtime& runtime, const void* object, size_t size,
         auto cs = std::make_unique<CompiledScript>();
         cs->entry = es->toPtr<ScriptFn>();
         cs->mayYield = sj.get("mayYield").asBool();
+        // Older objects lack affinity metadata (and may contain plain string
+        // cache loads). Keep them serial; new objects also pin compat/GPU work.
+        cs->mainThread = !sj.has("mainThread") ||
+            sj.get("mainThread").asBool() || !impl_->aotGpuProgs.empty();
         for (const JsonValue& pj : sj.get("procs").asArray()) {
             auto ps = impl_->jit->lookup(pj.at(1).asString());
             if (!ps) {
@@ -735,7 +929,11 @@ bool JitEngine::loadAot(Runtime& runtime, const void* object, size_t size,
         const Block* top = owner->blocks ? owner->blocks->getBlock(topId)
                                          : nullptr;
         if (!top) continue;   // 実行されないスクリプト — 登録不要
-        cache_[top] = std::move(cs);
+        // AOT は全スクリプトを最適化済みで事前コンパイルしたもの —
+        // 通常のコンパイルキャッシュへ登録し、再コンパイルしない。
+        ScriptEntry& entry = cache_[top];
+        entry.code = std::move(cs);
+        entry.aot = true;
         ++nScripts;
     }
 
@@ -749,6 +947,7 @@ bool JitEngine::loadAot(Runtime& runtime, const void* object, size_t size,
 
 void JitEngine::invalidate() {
     cache_.clear();
+    profiles_.clear();
     failed_.clear();
     accessCache_.clear();
 }
