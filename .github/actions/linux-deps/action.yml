@@ -1,0 +1,49 @@
+name: Linux dependencies
+description: >-
+  CI の Linux ジョブで使う apt パッケージを入れる。基本ツール（cmake/ninja/
+  pkg-config/zlib）に加えて、extra のパッケージと任意の LLVM を入れる。
+  新しい LLVM は apt.llvm.org から入れる（Ubuntu 同梱の llvm-18-dev だけが
+  静的アーカイブを持つため、静的リンク用はそちらを使う）。
+inputs:
+  llvm:
+    description: 入れる LLVM の major バージョン（空なら入れない）
+    required: false
+    default: ""
+  llvm_apt:
+    description: apt.llvm.org のリポジトリを追加してから llvm を入れる（true/false）
+    required: false
+    default: "false"
+  extra:
+    description: 追加で入れる apt パッケージ（スペース区切り）
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: apt パッケージ
+      shell: bash
+      env:
+        LLVM_VERSION: ${{ inputs.llvm }}
+        LLVM_FROM_APT_LLVM_ORG: ${{ inputs.llvm_apt }}
+        EXTRA_PACKAGES: ${{ inputs.extra }}
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        # EXTRA_PACKAGES は意図的に単語分割する（複数パッケージを渡すため）。
+        # shellcheck disable=SC2086
+        sudo apt-get install -y --no-install-recommends \
+          build-essential cmake ninja-build pkg-config zlib1g-dev \
+          wget gnupg ca-certificates $EXTRA_PACKAGES
+        if [ "$LLVM_FROM_APT_LLVM_ORG" = "true" ]; then
+          codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb http://apt.llvm.org/$codename/ llvm-toolchain-$codename-$LLVM_VERSION main" \
+            | sudo tee /etc/apt/sources.list.d/llvm.list >/dev/null
+          sudo apt-get update
+        fi
+        if [ -n "$LLVM_VERSION" ]; then
+          sudo apt-get install -y --no-install-recommends \
+            "llvm-$LLVM_VERSION-dev" "llvm-$LLVM_VERSION"
+          "/usr/lib/llvm-$LLVM_VERSION/bin/llvm-config" --version
+        fi
