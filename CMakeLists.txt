@@ -313,6 +313,9 @@ endif()
 
 # --- 同梱フォント（Scratch の Arial 系メトリクス: Liberation Sans, OFL）---
 # TTF を C++ 配列へ埋め込む（XYO_FONT 未指定時に使う既定フォント）。
+# 埋め込みは cmake/embed_binary.cmake が行う（python 不要 — MSYS2 の python3 は
+# POSIX パスを解釈するため、ビルド時のパス変換に依存しない）。
+set(XYO_EMBED_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary.cmake)
 set(XYO_FONT_INC_DIR ${CMAKE_CURRENT_BINARY_DIR}/font_data)
 file(MAKE_DIRECTORY ${XYO_FONT_INC_DIR})
 set(XYO_FONT_REGULAR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/LiberationSans-Regular.ttf)
@@ -320,13 +323,11 @@ set(XYO_FONT_BOLD ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/LiberationSans-B
 if(SDL2_FOUND AND EXISTS ${XYO_FONT_REGULAR} AND EXISTS ${XYO_FONT_BOLD})
   add_custom_command(
     OUTPUT ${XYO_FONT_INC_DIR}/xyo_fonts.inc
-    COMMAND ${CMAKE_COMMAND} -E env python3
-            ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_font.py
-            xyoFontRegular ${XYO_FONT_REGULAR}
-            xyoFontBold ${XYO_FONT_BOLD}
-            ${XYO_FONT_INC_DIR}/xyo_fonts.inc
-    DEPENDS ${XYO_FONT_REGULAR} ${XYO_FONT_BOLD}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_font.py
+    COMMAND ${CMAKE_COMMAND}
+            "-DXYO_EMBED_OUT=${XYO_FONT_INC_DIR}/xyo_fonts.inc"
+            "-DXYO_EMBED_ARGS=xyoFontRegular;${XYO_FONT_REGULAR};xyoFontBold;${XYO_FONT_BOLD}"
+            -P ${XYO_EMBED_SCRIPT}
+    DEPENDS ${XYO_FONT_REGULAR} ${XYO_FONT_BOLD} ${XYO_EMBED_SCRIPT}
     VERBATIM)
   target_sources(xyo PRIVATE ${XYO_FONT_INC_DIR}/xyo_fonts.inc)
   target_include_directories(xyo PRIVATE ${XYO_FONT_INC_DIR})
@@ -340,10 +341,9 @@ endif()
 
 # --- シェル ---
 if(XYO_BUILD_SHELL)
-  # editor.cpp が本体。SDL2 が無いビルドでは editor.cpp 内の #else スタブが
-  # 使われ、editor_default.cpp の弱い既定実装はフォールバック。
+  # editor.cpp が本体（SDL2 が無いビルドでは editor.cpp 内の #else スタブ）。
   add_executable(xyo-cli src/shell/main.cpp src/shell/gui.cpp
-                 src/shell/editor.cpp src/shell/editor_default.cpp
+                 src/shell/editor.cpp
                  src/blockly/shape.cpp src/blockly/layout.cpp
                  src/blockly/geom.cpp
                  src/blockly/label.cpp src/blockly/ops.cpp)
@@ -362,12 +362,11 @@ if(XYO_BUILD_SHELL)
       set(XYO_DEFPROJ_INC ${CMAKE_CURRENT_BINARY_DIR}/font_data/xyo_default_project.inc)
       add_custom_command(
         OUTPUT ${XYO_DEFPROJ_INC}
-        COMMAND ${CMAKE_COMMAND} -E env python3
-                ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_font.py
-                xyoDefaultProject ${CMAKE_CURRENT_SOURCE_DIR}/assets/default.sb3
-                ${XYO_DEFPROJ_INC}
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/assets/default.sb3
-                ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_font.py
+        COMMAND ${CMAKE_COMMAND}
+                "-DXYO_EMBED_OUT=${XYO_DEFPROJ_INC}"
+                "-DXYO_EMBED_ARGS=xyoDefaultProject;${CMAKE_CURRENT_SOURCE_DIR}/assets/default.sb3"
+                -P ${XYO_EMBED_SCRIPT}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/assets/default.sb3 ${XYO_EMBED_SCRIPT}
         VERBATIM)
       target_sources(xyo-cli PRIVATE ${XYO_DEFPROJ_INC})
       target_include_directories(xyo-cli PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/font_data)

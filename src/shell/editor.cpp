@@ -13,7 +13,6 @@
 #if defined(XYO_HAVE_SDL2) && !defined(__EMSCRIPTEN__)
 
 #include <SDL.h>
-#include <SDL_opengl.h>
 
 #include "ui/draw.hpp"
 #include "ui/font.hpp"
@@ -59,7 +58,7 @@
 #include "shell/theme.hpp"
 
 #ifdef XYO_HAVE_EMBEDDED_FONT
-// ビルド時に tools/embed_font.py が生成（Liberation Sans, OFL）
+// ビルド時に cmake/embed_binary.cmake が生成（Liberation Sans, OFL）
 #include "xyo_fonts.inc"
 #endif
 
@@ -6165,14 +6164,6 @@ int editorMain(const char* path, bool danger) {
     SDL_GetRendererInfo(ed.r, &rendererInfo);
     const bool gpu = (rendererInfo.flags & SDL_RENDERER_ACCELERATED) != 0;
     ed.gpuUi_ = gpu;
-    if (SDL_GL_GetCurrentContext()) {
-        auto getString = reinterpret_cast<decltype(&glGetString)>(
-            SDL_GL_GetProcAddress("glGetString"));
-        if (getString) {
-            const auto* device = getString(GL_RENDERER);
-            if (device) std::fprintf(stderr, "editor: GL device: %s\n", device);
-        }
-    }
     std::fprintf(stderr, "editor: native batched UI / %s / %s\n",
                  rendererInfo.name ? rendererInfo.name : "unknown",
                  gpu ? "GPU" : "software fallback");

@@ -290,11 +290,23 @@ void DrawList::AddImage(TextureID texture, Vec2 min, Vec2 max, Vec2 uv0, Vec2 uv
     if (!drawable(color) || !finite(min) || !finite(max) || !finite(uv0) || !finite(uv1) ||
         min.x==max.x || min.y==max.y || !reserveGeometry(4,6)) return;
     const Clip& c=clips_.back();
-    if (std::max(min.x,max.x)<c.x0 || std::min(min.x,max.x)>c.x1 ||
-        std::max(min.y,max.y)<c.y0 || std::min(min.y,max.y)>c.y1) return;
+    // Clip the quad (and its texture coordinates) here instead of leaving it to
+    // SDL: the software renderer corrupts textured geometry that straddles the
+    // clip rect (SDL 2.30; Ubuntu 24.04 ships it). Clipping an axis-aligned quad
+    // is exact, and the recorded batch then never crosses its own clip.
+    const float xa=std::clamp(std::min(min.x,max.x),c.x0,c.x1);
+    const float xb=std::clamp(std::max(min.x,max.x),c.x0,c.x1);
+    const float ya=std::clamp(std::min(min.y,max.y),c.y0,c.y1);
+    const float yb=std::clamp(std::max(min.y,max.y),c.y0,c.y1);
+    if (xb<=xa || yb<=ya) return;
+    const float su=(uv1.x-uv0.x)/(max.x-min.x);
+    const float sv=(uv1.y-uv0.y)/(max.y-min.y);
+    const Vec2 ta{xa,ya}, tb{xb,yb};
+    const Vec2 ua{uv0.x+(xa-min.x)*su,uv0.y+(ya-min.y)*sv};
+    const Vec2 ub{uv0.x+(xb-min.x)*su,uv0.y+(yb-min.y)*sv};
     auto first=indices_.size(); int base=int(vertices_.size());
-    vertex(min,color,uv0); vertex({max.x,min.y},color,{uv1.x,uv0.y});
-    vertex(max,color,uv1); vertex({min.x,max.y},color,{uv0.x,uv1.y});
+    vertex(ta,color,ua); vertex({tb.x,ta.y},color,{ub.x,ua.y});
+    vertex(tb,color,ub); vertex({ta.x,tb.y},color,{ua.x,ub.y});
     indices_.insert(indices_.end(),{base,base+1,base+2,base,base+2,base+3}); record(texture,first,std::size_t(base));
 }
 

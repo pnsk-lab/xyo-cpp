@@ -14,7 +14,7 @@
 namespace xyo {
 
 #ifdef XYO_HAVE_EMBEDDED_FONT
-// ビルド時に tools/embed_font.py が生成する（Liberation Sans, OFL）
+// ビルド時に cmake/embed_binary.cmake が生成する（Liberation Sans, OFL）
 #include "xyo_fonts.inc"
 #endif
 
