@@ -10,6 +10,11 @@
 #include <cstdio>
 #include <vector>
 
+// M_PI は ISO C++ の外（mingw の <cmath> には無い）。
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 #if defined(XYO_HAVE_SDL2) && !defined(__EMSCRIPTEN__)
 
 #include <SDL.h>

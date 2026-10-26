@@ -116,11 +116,10 @@ jobs:
       - name: Build（レンダラ回帰テスト）
         run: cmake --build build-norsvg --target xyo-render-tests -j"$(nproc)"
 
+      # ctest 経由で回す（テスト側の ENVIRONMENT = SDL dummy + XYO_JIT_MODE=eager
+      # を効かせるため。直接実行すると HotSpot のままで isCompiled 検査が落ちる）。
       - name: レンダラ回帰（SDL dummy / nanosvg）
-        env:
-          SDL_VIDEODRIVER: dummy
-          SDL_AUDIODRIVER: dummy
-        run: ./build-norsvg/tests/xyo-render-tests
+        run: ctest --test-dir build-norsvg -R xyo-render-tests --output-on-failure
 
   # Windows の JIT は MSYS2 の mingw-w64 LLVM（静的アーカイブ同梱）で検証する。
   # zig クロスでは LLVM for Windows が無く interp のみになるため。
