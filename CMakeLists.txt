@@ -191,11 +191,16 @@ if(XYO_GLSLC AND XYO_VULKAN_INCLUDE AND NOT EMSCRIPTEN)
   file(MAKE_DIRECTORY ${XYO_GPU_SPV_DIR})
   add_custom_command(
     OUTPUT ${XYO_GPU_SPV_DIR}/gpu_vm_spv.inc
+           ${XYO_GPU_SPV_DIR}/gpu_vm_headless_spv.inc
     COMMAND ${XYO_GLSLC} -mfmt=c -o ${XYO_GPU_SPV_DIR}/gpu_vm_spv.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/shaders/gpu_vm.comp
+    COMMAND ${XYO_GLSLC} -DXYO_GPU_NO_RECORDS=1 -mfmt=c
+            -o ${XYO_GPU_SPV_DIR}/gpu_vm_headless_spv.inc
             ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/shaders/gpu_vm.comp
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/shaders/gpu_vm.comp
     VERBATIM)
-  target_sources(xyo PRIVATE ${XYO_GPU_SPV_DIR}/gpu_vm_spv.inc)
+  target_sources(xyo PRIVATE ${XYO_GPU_SPV_DIR}/gpu_vm_spv.inc
+                             ${XYO_GPU_SPV_DIR}/gpu_vm_headless_spv.inc)
   target_compile_definitions(xyo PRIVATE XYO_GPU_VULKAN=1)
   target_include_directories(xyo PRIVATE
     ${XYO_GPU_SPV_DIR} ${XYO_VULKAN_INCLUDE})
@@ -284,7 +289,7 @@ if(SDL2_FOUND)
     target_compile_definitions(xyo PUBLIC XYO_PEN_GL=1)
     target_link_libraries(xyo PUBLIC PkgConfig::GLPC)
   endif()
-  message(STATUS "SDL2 found: 'xyo play' window renderer enabled")
+  message(STATUS "SDL2 found (${XYO_SDL2_LIB}): 'xyo play' window renderer enabled")
 else()
   message(STATUS "SDL2 not found: building without window renderer")
   if(XYO_REQUIRE_SDL2)

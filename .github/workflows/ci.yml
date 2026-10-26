@@ -176,8 +176,12 @@ jobs:
             -DXYO_BUILD_TESTS=OFF
           cmake --build build-win-static -j"$(nproc)"
           ls -l build-win-static/xyo.exe
-          echo "--- SDL2.dll に依存していないこと（静的リンク） ---"
-          objdump -p build-win-static/xyo.exe | grep -ci "DLL Name: SDL2.dll" | grep -q "^0$"
+          echo "--- 依存 DLL ---"
+          objdump -p build-win-static/xyo.exe | grep -i "DLL Name" || true
+          if objdump -p build-win-static/xyo.exe | grep -qi "DLL Name: SDL2.dll"; then
+            echo "SDL2.dll に依存しています（静的リンクになっていない）"
+            exit 1
+          fi
 
       - name: Smoke（完全静的 — run / play）
         run: |
