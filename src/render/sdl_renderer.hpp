@@ -207,8 +207,10 @@ private:
     double scratchY(double py) const { return stageH_ / 2.0 - py; }
     /// ステージ論理 px の色を合成サンプル（タッチ判定用）。skipId 自身は除外。
     bool stageColorAt(double px, double py, int skipId, uint8_t out[4]) const;
+    /// スキン色のサンプル。ignoreVisibility は pen stamp 用 —
+    /// scratch-render の penStamp は ignoreVisibility:true で描く。
     bool skinPxAt(const Drawable& d, double stagePx, double stagePy,
-                  uint8_t out[4]) const;
+                  uint8_t out[4], bool ignoreVisibility = false) const;
 
     // --- 描画 ---
     void drawStageArea();
@@ -359,7 +361,7 @@ private:
     bool initGlPen();
     bool penGpu() const;
     void penFlushGpu();          // バッチを FBO へ描画（readback 無し）
-    void penSyncCpu();           // バッチ描画 + penPx_ へ readback
+    void penSyncCpu(bool forceReadback = false); // force is for GPU rollback tests
     void penStrokeGpu(const float rgba[4], float width,
                       float fx0, float fy0, float fdx, float fdy,
                       float L);
@@ -371,7 +373,8 @@ private:
     struct GlCompute;
     GlCompute* glComp_ = nullptr;
     bool initGlCompute();
-    std::vector<float> gpuLaneOut_;   // laneOut readback 用
+    std::vector<float> gpuLaneOut_;   // full laneOut readback, bounded at 512MiB
+    uint32_t gpuLastChunks_ = 0;      // last VM dispatch count (test diagnostics)
     bool penUploadGpu();
 
     // UI 状態

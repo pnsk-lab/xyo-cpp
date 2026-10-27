@@ -243,7 +243,11 @@ void Sequencer::stepThreadBound(Thread& thread, size_t minDepth) {
 
         if (thread.status == STATUS_YIELD) {
             thread.status = STATUS_RUNNING;
-            if (isWarpMode && !warpBudgetExhausted(thread)) {
+            // danger モードは時間予算が無いが、**明示 yield（待機系ブロック:
+            // wait / wait until / broadcast and wait 等）は尊重する** — これらは
+            // 他スレッドが進まないと条件が変わらず、回り続けても完了しない。
+            if (isWarpMode && !runtime.dangerMode &&
+                !warpBudgetExhausted(thread)) {
                 continue;
             }
             return;

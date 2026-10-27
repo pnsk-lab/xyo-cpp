@@ -72,12 +72,17 @@ float pop() { return st[--sp]; }
 void stroke(float x0, float y0, float x1, float y1) {
     if (isnan(x0) || isinf(x0) || isnan(y0) || isinf(y0) ||
         isnan(x1) || isinf(x1) || isnan(y1) || isinf(y1)) return;
+#ifndef XYO_GPU_NO_RECORDS
     if (recN < maxPerLane) {
         uint i = (lane * maxPerLane + recN) * 3u;
         recs[i] = vec4(x0, y0, x1, y1);
         recs[i + 1u] = vec4(penSize, rgba.r, rgba.g, rgba.b);
         recs[i + 2u] = vec4(rgba.a, 0.0, 0.0, 0.0);
     }
+#endif
+    // Headless Vulkan has no pen surface and never consumes recs. Keep the
+    // exact same finite-coordinate filter, count, guard and state/writeback
+    // semantics; only the unobserved record payload writes are compiled out.
     recN++;
 }
 void gotoXY(float nx, float ny) {
@@ -112,7 +117,9 @@ void main() {
     // ディスパッチは 64 単位で切り上げ — 範囲外レーンは即 return
     // （cnts/lout/recs への範囲外書き込み防止）
     if (lane >= uint(pr[15])) return;
-    iter = lane;
+    // Storage lane is local; the logical index may be rebased by GL chunks.
+    // Vulkan always initializes this extra parameter to zero.
+    iter = lane + uint(pr[27u + uint(pr[13])]);
     guarded = false;
     maxPerLane = uint(pr[14]);
     nWb = uint(pr[13]);

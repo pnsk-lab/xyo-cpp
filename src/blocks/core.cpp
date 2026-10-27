@@ -6,6 +6,8 @@
 //   util.ioQuery(...) → util.xxx() メソッド
 #include "core.hpp"
 
+#include "../core/v8math.hpp"
+
 #include <cmath>
 #include <ctime>
 #include <limits>
@@ -126,8 +128,8 @@ double clampEffect(const std::u16string& effect, double value) {
 
 void moveSteps(double steps, Target* t) {
     double radians = (M_PI * (90.0 - t->direction)) / 180.0;
-    double dx = steps * std::cos(radians);
-    double dy = steps * std::sin(radians);
+    double dx = steps * v8math::cos(radians);
+    double dy = steps * v8math::sin(radians);
     t->setXY(t->x + dx, t->y + dy);
 }
 
@@ -141,9 +143,9 @@ bool getTargetXY(Value targetName, Runtime& rt, double& tx, double& ty) {
             return true;
         }
         if (s && s->view() == u"_random_") {
-            tx = std::round(rt.stageWidth *
+            tx = jsnum::jsRound(rt.stageWidth *
                             (Rng::global().nextDouble() - 0.5));
-            ty = std::round(rt.stageHeight *
+            ty = jsnum::jsRound(rt.stageHeight *
                             (Rng::global().nextDouble() - 0.5));
             return true;
         }
@@ -293,7 +295,7 @@ Value opMod(const ArgValues& a, BlockUtility&) {
     return V(rt::mod(num(a, "NUM1"), num(a, "NUM2")));
 }
 Value opRound(const ArgValues& a, BlockUtility&) {
-    return V(std::round(num(a, "NUM")));
+    return V(jsnum::jsRound(num(a, "NUM")));
 }
 Value opMathop(const ArgValues& a, BlockUtility&) {
     std::u16string op = strLower(a, "OPERATOR");
@@ -303,16 +305,16 @@ Value opMathop(const ArgValues& a, BlockUtility&) {
     if (op == u"ceiling") return V(std::ceil(n));
     if (op == u"sqrt") return V(std::sqrt(n));
     if (op == u"sin")
-        return V(std::round(std::sin((M_PI * n) / 180.0) * 1e10) / 1e10);
+        return V(jsnum::jsRound(v8math::sin((M_PI * n) / 180.0) * 1e10) / 1e10);
     if (op == u"cos")
-        return V(std::round(std::cos((M_PI * n) / 180.0) * 1e10) / 1e10);
+        return V(jsnum::jsRound(v8math::cos((M_PI * n) / 180.0) * 1e10) / 1e10);
     if (op == u"tan") return V(rt::tanDeg(n));
-    if (op == u"asin") return V((std::asin(n) * 180.0) / M_PI);
-    if (op == u"acos") return V((std::acos(n) * 180.0) / M_PI);
-    if (op == u"atan") return V((std::atan(n) * 180.0) / M_PI);
-    if (op == u"ln") return V(std::log(n));
-    if (op == u"log") return V(std::log(n) / M_LN10);
-    if (op == u"e ^") return V(std::exp(n));
+    if (op == u"asin") return V((v8math::asin(n) * 180.0) / M_PI);
+    if (op == u"acos") return V((v8math::acos(n) * 180.0) / M_PI);
+    if (op == u"atan") return V((v8math::atan(n) * 180.0) / M_PI);
+    if (op == u"ln") return V(jsnum::jsLog(n));
+    if (op == u"log") return V(jsnum::jsLog(n) / M_LN10);
+    if (op == u"e ^") return V(v8math::exp(n));
     if (op == u"10 ^") return V(std::pow(10.0, n));
     return V(0.0);
 }
@@ -320,7 +322,7 @@ Value opMathop(const ArgValues& a, BlockUtility&) {
 // ============================================================= control ====
 
 Value ctlRepeat(const ArgValues& a, BlockUtility& u) {
-    double times = std::round(num(a, "TIMES"));
+    double times = jsnum::jsRound(num(a, "TIMES"));
     ExecContext& sf = u.stackFrame();
     if (!sf.hasLoopCounter) {
         sf.loopCounter = times;
@@ -594,8 +596,7 @@ Value dtInsertAtList(const ArgValues& a, BlockUtility& u) {
     if (!var) return Value::undefined();
     SList* list = listOf(var);
     double i = cast::toListIndexD(v(a, "INDEX"), list->len + 1.0, false);
-    if (i == cast::LIST_INVALID) return Value::undefined();
-    if (std::isnan(i)) i = 0;   // NaN → splice(NaN,0,item) → 先頭挿入
+    if (i == cast::LIST_INVALID || i < 1) return Value::undefined();
     list->insert0(static_cast<uint32_t>(i - 1), v(a, "ITEM"));
     list->monitorDirty = true;
     return Value::undefined();
@@ -605,8 +606,7 @@ Value dtReplaceItemOfList(const ArgValues& a, BlockUtility& u) {
     if (!var) return Value::undefined();
     SList* list = listOf(var);
     double i = cast::toListIndexD(v(a, "INDEX"), list->len, false);
-    if (i == cast::LIST_INVALID) return Value::undefined();
-    if (std::isnan(i)) return Value::undefined();   // value[NaN] — expando → no-op
+    if (i == cast::LIST_INVALID || i < 1) return Value::undefined();
     list->items[static_cast<uint32_t>(i - 1)] = v(a, "ITEM");
     list->monitorDirty = true;
     return Value::undefined();
@@ -616,7 +616,7 @@ Value dtItemOfList(const ArgValues& a, BlockUtility& u) {
     if (!var) return Value::emptyStr();
     SList* list = listOf(var);
     double i = cast::toListIndexD(v(a, "INDEX"), list->len, false);
-    if (i == cast::LIST_INVALID || std::isnan(i)) return Value::emptyStr();
+    if (i == cast::LIST_INVALID || i < 1) return Value::emptyStr();
     return list->items[static_cast<uint32_t>(i - 1)];
 }
 Value dtItemNumOfList(const ArgValues& a, BlockUtility& u) {
@@ -776,7 +776,7 @@ Value looksGoForwardBackwardLayers(const ArgValues& a, BlockUtility& u) {
     return Value::undefined();
 }
 Value looksGetSize(const ArgValues&, BlockUtility& u) {
-    return V(std::round(u.target()->size));
+    return V(jsnum::jsRound(u.target()->size));
 }
 Value looksCostumeNumberName(const ArgValues& a, BlockUtility& u) {
     Target* t = u.target();
@@ -831,7 +831,7 @@ Value motPointTowards(const ArgValues& a, BlockUtility& u) {
     } else if (towards.isString() && towards.asStrPtr() &&
                towards.asStrPtr()->view() == u"_random_") {
         u.target()->setDirection(
-            std::round(Rng::global().nextDouble() * 360) - 180);
+            jsnum::jsRound(Rng::global().nextDouble() * 360) - 180);
         return Value::undefined();
     } else {
         std::u16string name = toStr(towards);
@@ -842,7 +842,7 @@ Value motPointTowards(const ArgValues& a, BlockUtility& u) {
     }
     double dx = tx - u.target()->x;
     double dy = ty - u.target()->y;
-    double direction = 90.0 - (std::atan2(dy, dx) * 180.0 / M_PI);
+    double direction = 90.0 - (v8math::atan2(dy, dx) * 180.0 / M_PI);
     u.target()->setDirection(direction);
     return Value::undefined();
 }
@@ -905,13 +905,13 @@ Value motIfOnEdgeBounce(const ArgValues&, BlockUtility& u) {
     if (distBottom < minDist) { minDist = distBottom; nearest = "bottom"; }
     if (minDist > 0) return Value::undefined();
     double radians = (M_PI * (90.0 - t->direction)) / 180.0;
-    double dx = std::cos(radians);
-    double dy = -std::sin(radians);
+    double dx = v8math::cos(radians);
+    double dy = -v8math::sin(radians);
     if (nearest == "left") dx = std::max(0.2, std::fabs(dx));
     else if (nearest == "top") dy = std::max(0.2, std::fabs(dy));
     else if (nearest == "right") dx = -std::max(0.2, std::fabs(dx));
     else if (nearest == "bottom") dy = -std::max(0.2, std::fabs(dy));
-    double newDir = std::atan2(dy, dx) * 180.0 / M_PI + 90.0;
+    double newDir = v8math::atan2(dy, dx) * 180.0 / M_PI + 90.0;
     t->setDirection(newDir);
     double fx, fy;
     if (t->keepInFence(t->x, t->y, fx, fy)) t->setXY(fx, fy);

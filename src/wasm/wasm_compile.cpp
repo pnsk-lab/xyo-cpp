@@ -120,7 +120,8 @@ private:
             return;
         }
         case EK::Mod: {
-            // JS の % は fmod（被除数の符号）。a - trunc(a/b)*b。
+            // Scratch: r = n % m; if (r / m < 0) r += m;（JS の % そのもの
+            // ではない。負の剰余を m 側へ寄せる）。
             const uint32_t la = nextLocal(ValType::F64),
                            lb = nextLocal(ValType::F64),
                            lt = nextLocal(ValType::F64);
@@ -137,9 +138,22 @@ private:
             c_.localGet(lb);
             c_.f64Mul();
             c_.localSet(lt);
+            // lt = a - trunc(a/b)*b  (= JS %)
             c_.localGet(la);
             c_.localGet(lt);
             c_.f64Sub();
+            c_.localSet(lt);
+            // select(lt/lb < 0, lt+lb, lt)
+            c_.localGet(lt);
+            c_.localGet(lb);
+            c_.f64Add();
+            c_.localGet(lt);
+            c_.localGet(lt);
+            c_.localGet(lb);
+            c_.f64Div();
+            c_.f64Const(0.0);
+            c_.f64Lt();
+            c_.select();
             return;
         }
         case EK::Neg:
@@ -148,13 +162,64 @@ private:
             c_.f64Sub();
             return;
         case EK::Round:
-            // Math.round 相当（-0.5 の -0 は 0 と数値的に同じ）。
+            // JS Math.round（.5 は +Infinity 方向、-0 を保持）。
             emitExpr(e.a);
-            c_.f64Const(0.5);
-            c_.f64Add();
-            c_.f64Floor();
+            emitJsRoundF64();
             return;
         }
+    }
+
+    /// スタック上の f64 を JS Math.round し、f64 を 1 つ残す。
+    /// floor(x+0.5) だけでは 0.49999999999999994 が 1 になり、-0 も失う。
+    void emitJsRoundF64() {
+        const uint32_t a = nextLocal(ValType::F64),
+                       r = nextLocal(ValType::F64);
+        c_.localSet(a);
+        c_.localGet(a);
+        c_.f64Const(0.5);
+        c_.f64Add();
+        c_.f64Floor();
+        c_.localSet(r);
+        // |a| >= 2^52 -> a
+        c_.localGet(a);
+        c_.localGet(r);
+        c_.localGet(a);
+        c_.f64Const(4503599627370496.0);
+        c_.f64Ge();
+        c_.localGet(a);
+        c_.f64Const(-4503599627370496.0);
+        c_.f64Le();
+        c_.i32Or();
+        c_.select();
+        c_.localSet(r);
+        // 0 <= a < 0.5 -> +0
+        c_.f64Const(0.0);
+        c_.localGet(r);
+        c_.localGet(a);
+        c_.i64ReinterpretF64();
+        c_.i64Const(0);
+        c_.i64LtS();
+        c_.i32Eqz();
+        c_.localGet(a);
+        c_.f64Const(0.5);
+        c_.f64Lt();
+        c_.i32And();
+        c_.select();
+        c_.localSet(r);
+        // -0.5 <= a < 0 -> -0
+        c_.f64Const(-0.0);
+        c_.localGet(r);
+        c_.localGet(a);
+        c_.i64ReinterpretF64();
+        c_.i64Const(0);
+        c_.i64LtS();
+        c_.localGet(a);
+        c_.f64Const(-0.5);
+        c_.f64Ge();
+        c_.i32And();
+        c_.select();
+        c_.localSet(r);
+        c_.localGet(r);
     }
 
     void emitStmt(uint32_t idx) {
@@ -203,11 +268,9 @@ private:
             c_.if_();
             bail();
             c_.end();
-            // d = floor(x + 0.5)
+            // d = Math.round(x)
             c_.localGet(kTmp);
-            c_.f64Const(0.5);
-            c_.f64Add();
-            c_.f64Floor();
+            emitJsRoundF64();
             c_.localSet(kTmp);
             const uint32_t ln = nextLocal(ValType::I32),
                            li = nextLocal(ValType::I32);

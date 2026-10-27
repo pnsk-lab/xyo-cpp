@@ -135,7 +135,9 @@ void applyEffects(const uint8_t* src, int w, int h,
     const bool spatial = u.mosaic > 1 || u.pixelate > 0.001 ||
                          u.whirl != 0 || u.fisheye > 0.001;
     const bool colorize = u.color != 0 || u.brightness != 0;
-    const bool ghosted = u.ghost != 0;
+    // u.ghost は alpha 乗数（ghost 0 → 1.0、ghost 100 → 0.0）。
+    // 0 を「効果なし」と取り違えると ghost 100 が不透明になってしまう。
+    const bool ghosted = u.ghost < 0.999f;
 
     const double pixelCellsX = u.pixelate > 0.001 ? w / u.pixelate : 0;
     const double pixelCellsY = u.pixelate > 0.001 ? h / u.pixelate : 0;
@@ -199,7 +201,9 @@ void applyEffects(const uint8_t* src, int w, int h,
                 }
             }
             if (ghosted) {
-                rr *= u.ghost; gg *= u.ghost; bb *= u.ghost; aa *= u.ghost;
+                // SDL 側は straight-alpha 合成なので alpha だけを乗算する
+                // （RGB も乗算すると半透明時に暗く沈む）。
+                aa *= u.ghost;
             }
             uint8_t* o = &out[(static_cast<size_t>(y) * w + x) * 4];
             o[0] = static_cast<uint8_t>(std::clamp(rr + 0.5f, 0.f, 255.f));

@@ -1,0 +1,192 @@
+[
+ {
+  "i": 0,
+  "label": "len emoji",
+  "var": "p0"
+ },
+ {
+  "i": 1,
+  "label": "letter 1 emoji",
+  "var": "p1"
+ },
+ {
+  "i": 2,
+  "label": "letter 2 emoji",
+  "var": "p2"
+ },
+ {
+  "i": 3,
+  "label": "letter 3 emoji",
+  "var": "p3"
+ },
+ {
+  "i": 4,
+  "label": "letter 1.5 abc",
+  "var": "p4"
+ },
+ {
+  "i": 5,
+  "label": "letter 2.999 abc",
+  "var": "p5"
+ },
+ {
+  "i": 6,
+  "label": "letter NaN abc",
+  "var": "p6"
+ },
+ {
+  "i": 7,
+  "label": "letter Inf abc",
+  "var": "p7"
+ },
+ {
+  "i": 8,
+  "label": "letter -Inf abc",
+  "var": "p8"
+ },
+ {
+  "i": 9,
+  "label": "letter 0 abc",
+  "var": "p9"
+ },
+ {
+  "i": 10,
+  "label": "letter 4 abc",
+  "var": "p10"
+ },
+ {
+  "i": 11,
+  "label": "letter 2 of 12345",
+  "var": "p11"
+ },
+ {
+  "i": 12,
+  "label": "letter '2' abc",
+  "var": "p12"
+ },
+ {
+  "i": 13,
+  "label": "letter 'a' abc",
+  "var": "p13"
+ },
+ {
+  "i": 14,
+  "label": "letter -0",
+  "var": "p14"
+ },
+ {
+  "i": 15,
+  "label": "letter 1 -1e-9",
+  "var": "p15"
+ },
+ {
+  "i": 16,
+  "label": "len ''",
+  "var": "p16"
+ },
+ {
+  "i": 17,
+  "label": "len 1e21",
+  "var": "p17"
+ },
+ {
+  "i": 18,
+  "label": "len e-acute",
+  "var": "p18"
+ },
+ {
+  "i": 19,
+  "label": "len e+combining",
+  "var": "p19"
+ },
+ {
+  "i": 20,
+  "label": "len ZWJ family",
+  "var": "p20"
+ },
+ {
+  "i": 21,
+  "label": "len lone hi",
+  "var": "p21"
+ },
+ {
+  "i": 22,
+  "label": "len -0",
+  "var": "p22"
+ },
+ {
+  "i": 23,
+  "label": "len 0.000001",
+  "var": "p23"
+ },
+ {
+  "i": 24,
+  "label": "contains emoji",
+  "var": "p24"
+ },
+ {
+  "i": 25,
+  "label": "contains ''",
+  "var": "p25"
+ },
+ {
+  "i": 26,
+  "label": "contains 123,2",
+  "var": "p26"
+ },
+ {
+  "i": 27,
+  "label": "contains aBc,bc",
+  "var": "p27"
+ },
+ {
+  "i": 28,
+  "label": "contains 1e21",
+  "var": "p28"
+ },
+ {
+  "i": 29,
+  "label": "contains '',''",
+  "var": "p29"
+ },
+ {
+  "i": 30,
+  "label": "contains 0.1,'0.1'",
+  "var": "p30"
+ },
+ {
+  "i": 31,
+  "label": "join 0.1 0.2",
+  "var": "p31"
+ },
+ {
+  "i": 32,
+  "label": "join 1e21 ''",
+  "var": "p32"
+ },
+ {
+  "i": 33,
+  "label": "join -0 ''",
+  "var": "p33"
+ },
+ {
+  "i": 34,
+  "label": "join emoji",
+  "var": "p34"
+ },
+ {
+  "i": 35,
+  "label": "join lone hi",
+  "var": "p35"
+ },
+ {
+  "i": 36,
+  "label": "join 0/0 ''",
+  "var": "p36"
+ },
+ {
+  "i": 37,
+  "label": "len join astral",
+  "var": "p37"
+ }
+]

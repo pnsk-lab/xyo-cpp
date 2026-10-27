@@ -1,4 +1,7 @@
 // danger モード（スレッドごとの実行時間予算を外す）の意味論テスト。
+// CPU ループの yield checkpoint を対象とするため、この suite 内だけ GPU
+// offload を無効にする。GPU 適格ループは CPU checkpoint を通らず全反復を
+// 完了し得るため、GPU の有無でこの CPU 予算テストの結果を変えない。
 //
 // - 通常モード: warp 手続きのループは予算（既定 500ms）を使い切ると
 //   yield して他スレッドへ譲る — 数パスでは終わらない。
@@ -11,9 +14,14 @@
 // danger 側は +inf なので同じ設定でも最後まで走る。
 // 観測は `stepThread`（= yield するまでの 1 パス）で行い、WORK_TIME で
 // 1 ティック内に何度も再開する `step()` のループは使わない。
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
+#include <memory>
 #include <string>
+#include <thread>
 
 #include "core/cast.hpp"
 #include "engine/runtime.hpp"
@@ -23,6 +31,8 @@
 #include "load/sb3.hpp"
 #include "model/target.hpp"
 #include "model/variable.hpp"
+
+extern "C" int32_t xyo_wait_should_yield(xyo::JitCtx*);
 
 namespace {
 using namespace xyo;
@@ -35,6 +45,25 @@ void check(bool ok, const char* name) {
         std::printf("FAIL danger: %s\n", name);
     }
 }
+
+// Restore the caller's GPU setting instead of changing later GPU suites.
+struct GpuEnvGuard {
+    std::string previous;
+    bool existed;
+    GpuEnvGuard() : existed(std::getenv("XYO_GPU") != nullptr) {
+        if (existed) previous = std::getenv("XYO_GPU");
+        put("0");
+    }
+    static void put(const char* value) {
+#ifdef _WIN32
+        _putenv_s("XYO_GPU", value ? value : "");
+#else
+        if (value) setenv("XYO_GPU", value, 1);
+        else unsetenv("XYO_GPU");
+#endif
+    }
+    ~GpuEnvGuard() { put(existed ? previous.c_str() : nullptr); }
+};
 
 constexpr int kIterations = 20000;
 
@@ -122,10 +151,116 @@ const char* modeName(JitMode m) {
     return m == JitMode::Off ? "interp" : "jit";
 }
 
+/// warp 手続き内で `broadcast and wait` → `wait until v > 0` → done=1。
+/// 受信側は非 warp で `wait 0.05` してから v=1 を書く（他スレッドが
+/// 進まないと待機が解けない構図）。
+std::string waitProjectJson() {
+    const std::string mut =
+        "{\"tagName\":\"mutation\",\"children\":[],\"proccode\":\"go\","
+        "\"argumentids\":\"[]\",\"argumentnames\":\"[]\","
+        "\"argumentdefaults\":\"[]\",\"warp\":\"true\"}";
+    const std::string blocks =
+        "{\"hat\":{\"opcode\":\"event_whenflagclicked\",\"next\":\"call\","
+        "\"parent\":null,\"inputs\":{},\"fields\":{},\"topLevel\":true,"
+        "\"shadow\":false,\"x\":0,\"y\":0},"
+        "\"call\":{\"opcode\":\"procedures_call\",\"next\":null,"
+        "\"parent\":\"hat\",\"inputs\":{},\"fields\":{},\"topLevel\":false,"
+        "\"shadow\":false,\"mutation\":" + mut + "},"
+        "\"def\":{\"opcode\":\"procedures_definition\",\"next\":\"bw\","
+        "\"parent\":null,\"inputs\":{\"custom_block\":[1,\"proto\"]},"
+        "\"fields\":{},\"topLevel\":true,\"shadow\":false,\"x\":0,\"y\":400},"
+        "\"proto\":{\"opcode\":\"procedures_prototype\",\"next\":null,"
+        "\"parent\":\"def\",\"inputs\":{},\"fields\":{},\"topLevel\":false,"
+        "\"shadow\":true,\"mutation\":" + mut + "},"
+        "\"bw\":{\"opcode\":\"event_broadcastandwait\",\"next\":\"wu\","
+        "\"parent\":\"def\",\"inputs\":{\"BROADCAST_INPUT\":[1,[11,\"msg\",\"msg-id\"]]},"
+        "\"fields\":{},\"topLevel\":false,\"shadow\":false},"
+        "\"wu\":{\"opcode\":\"control_wait_until\",\"next\":\"done\","
+        "\"parent\":\"bw\",\"inputs\":{\"CONDITION\":[2,\"gt\"]},\"fields\":{},"
+        "\"topLevel\":false,\"shadow\":false},"
+        "\"gt\":{\"opcode\":\"operator_gt\",\"next\":null,\"parent\":\"wu\","
+        "\"inputs\":{\"OPERAND1\":[3,\"varv\",[4,\"0\"]],\"OPERAND2\":[1,[4,\"0\"]]},"
+        "\"fields\":{},\"topLevel\":false,\"shadow\":false},"
+        "\"varv\":{\"opcode\":\"data_variable\",\"next\":null,\"parent\":\"gt\","
+        "\"inputs\":{},\"fields\":{\"VARIABLE\":[\"v\",\"v\"]},\"topLevel\":false,"
+        "\"shadow\":false},"
+        "\"done\":{\"opcode\":\"data_setvariableto\",\"next\":null,"
+        "\"parent\":\"wu\",\"inputs\":{\"VALUE\":[1,[4,\"1\"]]},"
+        "\"fields\":{\"VARIABLE\":[\"done\",\"done\"]},\"topLevel\":false,"
+        "\"shadow\":false},"
+        "\"rhat\":{\"opcode\":\"event_whenbroadcastreceived\",\"next\":\"rwait\","
+        "\"parent\":null,\"inputs\":{},\"fields\":{\"BROADCAST_OPTION\":[\"msg\",\"msg-id\"]},"
+        "\"topLevel\":true,\"shadow\":false,\"x\":300,\"y\":0},"
+        "\"rwait\":{\"opcode\":\"control_wait\",\"next\":\"rset\","
+        "\"parent\":\"rhat\",\"inputs\":{\"DURATION\":[1,[4,\"0.05\"]]},\"fields\":{},"
+        "\"topLevel\":false,\"shadow\":false},"
+        "\"rset\":{\"opcode\":\"data_setvariableto\",\"next\":null,"
+        "\"parent\":\"rwait\",\"inputs\":{\"VALUE\":[1,[4,\"1\"]]},"
+        "\"fields\":{\"VARIABLE\":[\"v\",\"v\"]},\"topLevel\":false,\"shadow\":false}}";
+    return "{\"targets\":["
+           "{\"isStage\":true,\"name\":\"Stage\",\"variables\":{},\"lists\":{},"
+           "\"broadcasts\":{\"msg-id\":\"msg\"},\"blocks\":{},\"comments\":{},"
+           "\"costumes\":[],\"sounds\":[],\"currentCostume\":0,\"volume\":100,"
+           "\"layerOrder\":0},"
+           "{\"isStage\":false,\"name\":\"S\",\"variables\":{\"done\":[\"done\",0],"
+           "\"v\":[\"v\",0]},\"lists\":{},\"broadcasts\":{},\"blocks\":" + blocks +
+           ",\"comments\":{},\"costumes\":[],\"sounds\":[],\"currentCostume\":0,"
+           "\"volume\":100,\"visible\":true,\"x\":0,\"y\":0,\"size\":100,"
+           "\"direction\":90,\"draggable\":false,\"rotationStyle\":\"all around\","
+           "\"layerOrder\":1}],"
+           "\"monitors\":[],\"extensions\":[],\"meta\":{\"semver\":\"3.0.0\"}}";
+}
+
+/// fn を別スレッドで実行し、ms 以内に終わらなければ false（ハング検出）。
+/// タイムアウト時のフラグと fn のコピーはヒープに置く（detach したスレッドが
+/// 呼出し側のスタックを触らないようにする）。
+bool runWithin(std::function<void()> fn, int ms) {
+    auto* done = new std::atomic<bool>(false);
+    std::thread th([fn, done]() mutable {
+        fn();
+        done->store(true);
+    });
+    for (int waited = 0; waited <= ms; waited += 10) {
+        if (done->load()) {
+            th.join();
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    th.detach();
+    return false;
+}
+
+/// danger でも warp 内の待機系が完了すること（ハングしないこと）。
+void testWarpWaits(JitMode mode) {
+    setJitMode(mode);
+    std::shared_ptr<Runtime> rt(new Runtime);
+    if (!loadSb3(*rt, waitProjectJson(), nullptr).ok) {
+        check(false, "load wait project");
+        return;
+    }
+    rt->dangerMode = true;
+    rt->greenFlag();
+    const bool finished = runWithin([rt]() { rt->runUntilDone(10000); }, 5000);
+    if (!finished)
+        std::printf("  %s: warp waits did not finish (deadlock?)\n",
+                    modeName(mode));
+    check(finished, "danger keeps warp waits live (no deadlock)");
+    if (!finished) return;   // 結果は判定しない（ランタイムはリーク）
+    Target* sp = rt->getSpriteTargetByName(u"S");
+    Variable* done = sp ? sp->lookupVariableById("done") : nullptr;
+    Variable* v = sp ? sp->lookupVariableById("v") : nullptr;
+    check(done && cast::toNumber(done->value) == 1,
+          "warp wait-until proceeded after the broadcast");
+    check(v && cast::toNumber(v->value) == 1,
+          "broadcast receiver ran while the warp sender waited");
+}
+
 } // namespace
 
 /// テストランナ（tests/unit/test_cast.cpp の main）から呼ばれる。
 int test_danger_main() {
+    GpuEnvGuard gpuDisabled;
     const JitMode modes[] = {JitMode::Off, JitMode::Eager};
     for (JitMode mode : modes) {
         // 予算あり: 数パスでは終わらない（予算切れで yield して譲る）。
@@ -166,6 +301,29 @@ int test_danger_main() {
                 check(false, "load project (run to completion)");
             }
         }
+    }
+
+    // 待機系は danger でも譲る（ハングしない）— interp / JIT 両方。
+    for (JitMode mode : modes) testWarpWaits(mode);
+
+    // 待機 yield の判定（テスト用フック）: 通常 warp は stuck 時のみ、
+    // danger の warp は常に、非 warp は常に譲る。
+    {
+        Runtime rt;
+        rt.sequencer->timer.start();
+        JitCtx c{};
+        c.runtime = &rt;
+        c.sequencer = rt.sequencer.get();
+        c.isWarp = 1;
+        rt.dangerMode = false;
+        check(xyo_wait_should_yield(&c) == 0,
+              "normal warp waits yield only when stuck");
+        rt.dangerMode = true;
+        check(xyo_wait_should_yield(&c) == 1,
+              "danger warp waits always yield");
+        c.isWarp = 0;
+        check(xyo_wait_should_yield(&c) == 1,
+              "non-warp waits always yield");
     }
 
     // 環境変数の既定値（XYO_DANGER）— POSIX のみ検証する。

@@ -39,12 +39,14 @@ struct SList {
     }
     /// 0-based インデックスで挿入
     void insert0(uint32_t i, Value v) {
+        if (i > len) return;              // defensive: callers pass 1-based-1
         ensure(len + 1);
         std::memmove(items + i + 1, items + i, (len - i) * sizeof(Value));
         items[i] = v;
         ++len;
     }
     void erase0(uint32_t i) {
+        if (i >= len) return;             // defensive: never memmove past len
         std::memmove(items + i, items + i + 1, (len - i - 1) * sizeof(Value));
         --len;
     }

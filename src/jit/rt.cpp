@@ -14,6 +14,7 @@
 #include "../core/cast.hpp"
 #include "../core/slist.hpp"
 #include "../core/sstr.hpp"
+#include "../core/v8math.hpp"
 #include "../engine/block_utility.hpp"
 #include "../engine/fiber.hpp"
 #include "../engine/runtime.hpp"
@@ -46,10 +47,17 @@ BlockUtility& jitUtil(JitCtx* c) {
 
 bool isStuck(JitCtx* c) {
     // JS jsexecute: sequencer.timer.timeElapsed() > 500（tick 単位でリセット）。
-    // dangerMode はスレッドごとの時間予算そのものが無いので時計も読まない
-    // （warp ループの yield 点はそもそも IR から消えている）。
+    // dangerMode はスレッドごとの時間予算そのものが無いので時計も読まない。
     if (c->runtime->dangerMode) return false;
     return c->sequencer->timer.timeElapsed() > c->runtime->warpTimeMs;
+}
+
+/// 待機系（`wait`/`wait until`/`broadcast and wait` 等）の yield 判定。
+/// 時間予算とは別物で、**他スレッドが進まないと待機が完了しない**ため、
+/// danger モードでも待機中は譲る（そうしないと warp 内の待機はハングする）。
+/// 通常モードの warp では従来通り stuck（500ms 窓）でのみ譲る。
+bool waitShouldYield(JitCtx* c) {
+    return !c->isWarp || c->runtime->dangerMode || isStuck(c);
 }
 
 /// var 系ヘルパ別カウンタ（XYO_PROF 時に内容を表示）
@@ -99,6 +107,17 @@ void xyo_yield(JitCtx* c) {
 
 int32_t xyo_is_stuck(JitCtx* c) { return isStuck(c) ? 1 : 0; }
 
+/// 待機系の yield 判定（テスト/診断用）。
+int32_t xyo_wait_should_yield(JitCtx* c) {
+    return waitShouldYield(c) ? 1 : 0;
+}
+
+/// `wait until` ループ用の yield 点 — 待機中は danger でも譲る。
+void xyo_wait_yield(JitCtx* c) {
+    XYO_RT_PROF(kLoopY);
+    if (waitShouldYield(c)) xyo_yield(c);
+}
+
 /// loop 末尾の yield 点 — non-warp なら常に、warp なら stuck 時のみ
 void xyo_loop_yield(JitCtx* c) {
     XYO_RT_PROF(kLoopY);
@@ -144,12 +163,21 @@ uint64_t xyo_mod(uint64_t a, uint64_t b) {
     XYO_RT_PROF(kArith);
     const double n = cast::toNumber(toV(a));
     const double m = cast::toNumber(toV(b));
-    // JS mod: ((n % m) + m) % m — Scratch の剰余は常に正
+    // scratch-vm: r = n % m; if (r / m < 0) r += m;（-0 は保持）
     double r = std::fmod(n, m);
-    r = std::fmod(r + m, m);
-    if (r == 0) r = 0.0;  // -0 正規化
+    if (r / m < 0) r += m;
     return toB(Value::numCanonical(r));
 }
+
+double xyo_log(double x) {
+    XYO_RT_PROF(kArith);
+    return jsnum::jsLog(x);
+}
+
+double xyo_asin(double x) { return v8math::asin(x); }
+double xyo_acos(double x) { return v8math::acos(x); }
+double xyo_atan(double x) { return v8math::atan(x); }
+double xyo_exp(double x) { return v8math::exp(x); }
 
 int32_t xyo_lt(uint64_t a, uint64_t b) {
     XYO_RT_PROF(kArith);
@@ -225,21 +253,21 @@ double xyo_mathop(JitCtx*, int32_t fn, double x) {
     case 1: return std::floor(x);
     case 2: return std::ceil(x);
     case 3: return std::sqrt(x);
-    case 4: return std::round(std::sin(kPi * x / 180.0) * 1e10) / 1e10;
-    case 5: return std::round(std::cos(kPi * x / 180.0) * 1e10) / 1e10;
+    case 4: return jsnum::jsRound(v8math::sin(kPi * x / 180.0) * 1e10) / 1e10;
+    case 5: return jsnum::jsRound(v8math::cos(kPi * x / 180.0) * 1e10) / 1e10;
     case 6: {
         // MathUtil.tan: %360、±90/270 は ±Infinity、他は 1e10 丸め
         double a = std::fmod(x, 360.0);
         if (a == -270.0 || a == 90.0) return INFINITY;
         if (a == -90.0 || a == 270.0) return -INFINITY;
-        return std::round(std::tan(kPi * a / 180.0) * 1e10) / 1e10;
+        return jsnum::jsRound(std::tan(kPi * a / 180.0) * 1e10) / 1e10;
     }
-    case 7: return std::asin(x) * 180.0 / kPi;
-    case 8: return std::acos(x) * 180.0 / kPi;
-    case 9: return std::atan(x) * 180.0 / kPi;
-    case 10: return std::log(x);
-    case 11: return std::log(x) / 2.302585092994046;
-    case 12: return std::exp(x);
+    case 7: return v8math::asin(x) * 180.0 / kPi;
+    case 8: return v8math::acos(x) * 180.0 / kPi;
+    case 9: return v8math::atan(x) * 180.0 / kPi;
+    case 10: return jsnum::jsLog(x);
+    case 11: return jsnum::jsLog(x) / 2.302585092994046;
+    case 12: return v8math::exp(x);
     case 13: return std::pow(10.0, x);
     default: return 0.0;
     }
@@ -247,8 +275,8 @@ double xyo_mathop(JitCtx*, int32_t fn, double x) {
 
 double xyo_round(double x) {
     XYO_RT_PROF(kArith);
-    // Scratch round: .5 は正方向（JS Math.round 相当）
-    return std::round(x) + 0.0;
+    // Scratch round: JS Math.round（.5 は +Infinity 方向、-0 を保持）
+    return jsnum::jsRound(x);
 }
 
 // --- 変数 --------------------------------------------------------------
@@ -259,11 +287,12 @@ Variable* xyo_jitVar(JitCtx* c, const char* id, const char16_t* name,
     XYO_RT_PROF(kVar);
     if (RTProf::get().enabled) ++g_varCtrs[0];
     auto& cache = c->thread->jitVarCache;
-    auto it = cache.find(id);
+    JitVarCacheKey key{id, name, list};
+    auto it = cache.find(key);
     if (it != cache.end()) return it->second;
     Variable* v = list ? c->target->lookupOrCreateList(id, name)
                        : c->target->lookupOrCreateVariable(id, name);
-    cache.emplace(id, v);
+    cache.emplace(key, v);
     return v;
 }
 
@@ -321,7 +350,7 @@ void xyo_rt_wait(JitCtx* c, double secs) {
     c->runtime->redrawRequested = true;
     if (!c->isWarp) xyo_yield(c);
     while (t.timeElapsed() < ms) {
-        if (!c->isWarp || isStuck(c)) xyo_yield(c);
+        if (waitShouldYield(c)) xyo_yield(c);
     }
 }
 
@@ -384,7 +413,7 @@ void xyo_broadcast_wait_v(JitCtx* c, uint64_t v) {
             }
         }
         if (!waiting) break;
-        if (!allWaiting && c->isWarp && !isStuck(c)) continue;
+        if (!allWaiting && c->isWarp && !waitShouldYield(c)) continue;
         // yield / yieldTick — status はスレッドに立ててから fiber 中断
         c->thread->status =
             allWaiting ? STATUS_YIELD_TICK : STATUS_YIELD;
@@ -440,7 +469,7 @@ uint64_t xyo_rt_compat(JitCtx* c, const BlockCached* op) {
         if (t->status != STATUS_YIELD && t->status != STATUS_YIELD_TICK) break;
         if (t->status == STATUS_YIELD) {
             t->status = STATUS_RUNNING;
-            if (!c->isWarp || isStuck(c)) xyo_yield(c);
+            if (waitShouldYield(c)) xyo_yield(c);
         } else {
             xyo_yield(c);
         }

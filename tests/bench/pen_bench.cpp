@@ -538,7 +538,31 @@ int benchProject(const std::string& path, int frames, int scale,
         (unsigned long long)(parAfter.threads - parBefore.threads),
         (unsigned long long)(parAfter.groups - parBefore.groups));
     // Readback/screenshot cost is deliberately outside the measured interval.
-    if (!shot.empty() && !ren.savePPM(shot.c_str())) return 2;
+    // Optional presentation-only normalization of a wall-clock monitor. Do not
+    // change the underlying Scratch variable or execute another Runtime step:
+    // the final scene/pen buffer must remain exactly as measured. A second
+    // renderer draw updates only the snapshot, after all timing/stats capture.
+    if (!shot.empty()) {
+        if (const char* name = std::getenv("XYO_BENCH_SHOT_MONITOR")) {
+            unsigned matches = 0;
+            for (auto& [id, monitor] : rt.monitorState.records) {
+                auto it = monitor.params.find("VARIABLE");
+                if (monitor.visible && monitor.opcode == "data_variable" &&
+                    (id == name || (it != monitor.params.end() &&
+                                   SStr::toUtf8(it->second) == name))) {
+                    monitor.value = Value::num(0);
+                    ++matches;
+                }
+            }
+            std::printf("PROJECT snapshot_monitor_matches=%u\n", matches);
+            if (matches != 1) {
+                std::fprintf(stderr, "snapshot monitor must match exactly one visible variable\n");
+                return 2;
+            }
+            ren.SdlRenderer::draw();
+        }
+        if (!ren.savePPM(shot.c_str())) return 2;
+    }
     if (active != frames) {
         std::fprintf(stderr, "project timed interval exhausted inactive-step bound\n");
         return 2;

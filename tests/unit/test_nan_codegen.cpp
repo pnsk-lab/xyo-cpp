@@ -9,6 +9,7 @@
 #include "core/cast.hpp"
 #include "core/gc.hpp"
 #include "core/json.hpp"
+#include "core/v8math.hpp"
 #include "core/slist.hpp"
 #include "core/sstr.hpp"
 #include "engine/runtime.hpp"
@@ -51,6 +52,14 @@ E mathop(const std::string& name, E input) {
     return std::make_shared<Expr>(Expr{'m', name, input, {}});
 }
 Value text(const std::string& s) { return Value::string(SStr::fromUtf8(s)); }
+double jsRoundRef(double x) {
+    if (!std::isfinite(x) || x == 0.0) return x;
+    if (x > 0.0 && x < 0.5) return 0.0;
+    if (x < 0.0 && x >= -0.5) return -0.0;
+    if (x >= 4503599627370496.0 || x <= -4503599627370496.0) return x;
+    return std::floor(x + 0.5);
+}
+
 Value arithmetic(char op, Value a, Value b) {
     const double x = cast::toNumber(a), y = cast::toNumber(b);
     switch (op) {
@@ -66,18 +75,39 @@ Value evaluate(const E& e, Value x, Value y) {
     if (e->op == 'l') return text(e->literal);
     if (e->op == 'n') return Value::num(cast::toNumber(text(e->literal)));
     Value a = evaluate(e->left, x, y);
+    if (e->op == 'r')
+        return Value::numCanonical(jsRoundRef(cast::toNumber(a)));
     if (e->op == 'm') {
         // Independent public-cast/std math reference, not xyo_mathop. Handle
         // unary nodes before touching right: every emitted reporter is a tree.
         const double n = cast::toNumber(a);
+        constexpr double kPi = 3.14159265358979323846;
         double result;
         if (e->literal == "abs") result = std::fabs(n);
         else if (e->literal == "floor") result = std::floor(n);
         else if (e->literal == "ceiling") result = std::ceil(n);
+        else if (e->literal == "sin")
+            result = jsRoundRef(std::sin((kPi * n) / 180.0) * 1e10) / 1e10;
+        else if (e->literal == "cos")
+            result = jsRoundRef(std::cos((kPi * n) / 180.0) * 1e10) / 1e10;
+        else if (e->literal == "asin") result = v8math::asin(n) * 180.0 / kPi;
+        else if (e->literal == "acos") result = v8math::acos(n) * 180.0 / kPi;
+        else if (e->literal == "atan") result = v8math::atan(n) * 180.0 / kPi;
+        else if (e->literal == "e ^") result = v8math::exp(n);
+        else if (e->literal == "10 ^") result = std::pow(10.0, n);
+        else if (e->literal == "ln") result = jsnum::jsLog(n);
+        else if (e->literal == "log")
+            result = jsnum::jsLog(n) / 2.302585092994046;
         else result = std::sqrt(n);
         return Value::numCanonical(result);
     }
     Value b = evaluate(e->right, x, y);
+    if (e->op == 'M') {
+        const double n = cast::toNumber(a), m = cast::toNumber(b);
+        double r = std::fmod(n, m);
+        if (r / m < 0) r += m;
+        return Value::numCanonical(r);
+    }
     return arithmetic(e->op, a, b);
 }
 const std::vector<std::string>& literals() {
@@ -135,6 +165,35 @@ std::vector<E> expressions() {
     out.push_back(binary('*', literal("-0"), literal("-Infinity")));
     out.push_back(binary('/', literal("0"), literal("0")));
     out.push_back(binary('/', literal("Infinity"), literal("Infinity")));
+    // Scratch mod: (n % m) + (m if (n % m) / m < 0). Cover the operands where
+    // the old ((n%m)+m)%m lowering diverged (Infinity / huge / denormal).
+    for (const char* d : {"Infinity", "-Infinity", "1e21", "-1e21", "1",
+                          "-1", "5e-324", "0"}) {
+        out.push_back(binary('M', variable('x'), literal(d)));
+        out.push_back(binary('M', literal(d), variable('x')));
+    }
+    out.push_back(binary('M', literal("0"), literal("0")));
+    out.push_back(binary('M', literal("1e-7"), literal("1")));
+    out.push_back(binary('M', literal("-0"), literal("1")));
+    // JS Math.round: negative halves and signed zero.
+    for (const char* v : {"-0.5", "-1.5", "-2.5", "0.5", "1.5", "2.5",
+                          "-0.4", "-0", "0.49999999999999994"})
+        out.push_back(std::make_shared<Expr>(Expr{'r', {}, literal(v), {}}));
+    out.push_back(std::make_shared<Expr>(Expr{'r', {}, variable('x'), {}}));
+    // Huge argument: Scratch's (pi*x)/180 overflows to sin/cos(NaN).
+    out.push_back(mathop("sin", literal("1e308")));
+    out.push_back(mathop("cos", literal("1e308")));
+    out.push_back(mathop("sin", variable('x')));
+    out.push_back(mathop("cos", variable('x')));
+    // fdlibm log path (interp / JIT / AOT must agree with V8's last digit).
+    out.push_back(mathop("ln", literal("3")));
+    out.push_back(mathop("log", literal("3")));
+    out.push_back(mathop("asin", literal("1e-7")));
+    out.push_back(mathop("acos", literal("0.5")));
+    out.push_back(mathop("atan", literal("1")));
+    out.push_back(mathop("e ^", literal("0.33089555746090094")));
+    out.push_back(mathop("e ^", variable('x')));
+    out.push_back(mathop("10 ^", literal("3")));
     return out;
 }
 std::string blockRef(const std::string& id) { return "[2,\"" + id + "\"]"; }
@@ -158,6 +217,11 @@ struct Graph {
         if (e->op == 'x' || e->op == 'y') return read(std::string(1, e->op));
         if (e->op == 'l') return "[1,[10," + jsonStringify(JsonValue(e->literal)) + "]]";
         if (e->op == 'n') return "[1,[4," + e->literal + "]]";
+        if (e->op == 'r') {
+            std::string input = emit(e->left), id = fresh();
+            add(id, "operator_round", "", "{\"NUM\":" + input + "}");
+            return blockRef(id);
+        }
         if (e->op == 'm') {
             std::string input = emit(e->left), id = fresh();
             add(id, "operator_mathop", "", "{\"NUM\":" + input + "}",
@@ -166,7 +230,8 @@ struct Graph {
         }
         std::string a = emit(e->left), b = emit(e->right), id = fresh();
         const char* op = e->op == '+' ? "operator_add" : e->op == '-' ? "operator_subtract" :
-                         e->op == '*' ? "operator_multiply" : "operator_divide";
+                         e->op == '*' ? "operator_multiply" :
+                         e->op == 'M' ? "operator_mod" : "operator_divide";
         add(id, op, "", "{\"NUM1\":" + a + ",\"NUM2\":" + b + "}");
         return blockRef(id);
     }

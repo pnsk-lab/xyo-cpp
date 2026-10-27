@@ -30,7 +30,7 @@ def ppm(path):
     return w, h, pixels
 
 
-def compare_images(off, on):
+def compare_images(off, on, mask_fps=True):
     w, h, a = ppm(off)
     wb, hb, b = ppm(on)
     assert (w, h) == (wb, hb) == (960, 720), 'FPS mask assumes scale=2'
@@ -39,7 +39,8 @@ def compare_images(off, on):
     # This project displays wall-clock FPS at the upper right. No scene pixel
     # may be excluded: narrow bounds cover only its known numeric label.
     # A fractional FPS glyph's antialiased edge can reach x=731 (Res=4).
-    outside = [(x, y) for x, y in points if not (618 <= x <= 731 and 54 <= y <= 69)]
+    outside = [(x, y) for x, y in points
+               if not mask_fps or not (618 <= x <= 731 and 54 <= y <= 69)]
     result = dict(different_pixels=len(points), outside_fps=len(outside),
                   bounds=([min(x for x, y in points), max(x for x, y in points),
                            min(y for x, y in points), max(y for x, y in points)]
@@ -55,6 +56,8 @@ def main():
     ap.add_argument('--output', type=Path, required=True)
     ap.add_argument('--backend', choices=['gl', 'cpu'], default='gl')
     ap.add_argument('--comparison', choices=['list-intern', 'math-box'], default='list-intern')
+    ap.add_argument('--normalize-fps', action='store_true',
+                    help='normalize only the FPS monitor after timing; require full-image identity')
     ap.add_argument('--cpu', type=int, default=12)
     ap.add_argument('--trials', type=int, default=5)
     args = ap.parse_args()
@@ -67,12 +70,15 @@ def main():
     manifest = dict(binary_sha256=digest, project_sha256=project_digest,
                     source_binary=str(args.binary.resolve()), cpu=args.cpu,
                     backend=args.backend, comparison=args.comparison,
+                    normalize_fps=args.normalize_fps,
                     frames=90, warmup_active_frames=60, trials=args.trials)
     (args.output / 'manifest.json').write_text(json.dumps(manifest, indent=2))
     base = {k: v for k, v in os.environ.items() if not k.startswith('XYO_')}
     base.update(SDL_VIDEODRIVER='offscreen', SDL_AUDIODRIVER='dummy',
                 XYO_SEED='1', XYO_BENCH_WARMUP_FRAMES='60',
                 XYO_BENCH_CPU=str(args.cpu))
+    if args.normalize_fps:
+        base['XYO_BENCH_SHOT_MONITOR'] = '@fps'
     if args.backend == 'cpu':
         base.update(XYO_PEN_CPU='1', SDL_RENDER_DRIVER='software')
     # Preserve an explicitly chosen GL vendor; don't require NVIDIA on other hosts.
@@ -97,6 +103,8 @@ def main():
             (args.output / f'{stem}.stderr').write_text(p.stderr)
             p.check_returncode()
             assert sha256(frozen) == digest
+            if args.normalize_fps and trial == 0:
+                assert 'PROJECT snapshot_monitor_matches=1' in p.stdout
             assert f'PROJECT pinned_main_cpu={args.cpu}' in p.stdout
             assert 'warmup_active=60 active=90 steps=90 draws=90' in p.stdout
             assert 'PROJECT par_batches=0 dispatches=0 threads=0 groups=0' in p.stdout
@@ -127,7 +135,8 @@ def main():
         < next(r['total_ms'] for r in rows if r['name'] == 'off' and r['res'] == 1 and r['trial'] == i)
         for i in range(args.trials))
     summary['images'] = {str(res): compare_images(
-        args.output / f'off-res{res}-trial0.ppm', args.output / f'on-res{res}-trial0.ppm')
+        args.output / f'off-res{res}-trial0.ppm', args.output / f'on-res{res}-trial0.ppm',
+        mask_fps=not args.normalize_fps)
         for res in [1, 4]}
     (args.output / 'summary.json').write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary, indent=2), flush=True)

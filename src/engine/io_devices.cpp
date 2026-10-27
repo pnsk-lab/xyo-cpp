@@ -122,7 +122,7 @@ bool Keyboard::getKeyIsDown(Value keyArg) {
 
 // ------------------------------------------------------------------ Mouse --
 
-static double roundToThree(double n) { return std::round(n * 1000.0) / 1000.0; }
+static double roundToThree(double n) { return jsnum::jsRound(n * 1000.0) / 1000.0; }
 
 void Mouse::postData(const PostData& data) {
     if (data.hasXY) {

@@ -2,12 +2,34 @@
 #include "sstr.hpp"
 
 #include <cstring>
+#include <vector>
 
 namespace xyo {
+
+struct CasePropRange { uint32_t lo, hi; };
+#include "case_props.inc"
 
 // 生成テーブル（BMP 小写化・大写化）
 #include "lower_table.inc"
 #include "upper_table.inc"
+
+static bool inRanges(const CasePropRange* r, size_t n, uint32_t cp) {
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (cp < r[mid].lo) hi = mid;
+        else if (cp > r[mid].hi) lo = mid + 1;
+        else return true;
+    }
+    return false;
+}
+
+static bool isCased(uint32_t cp) {
+    return inRanges(kCasedRanges, std::size(kCasedRanges), cp);
+}
+static bool isCaseIgnorable(uint32_t cp) {
+    return inRanges(kCaseIgnorableRanges, std::size(kCaseIgnorableRanges), cp);
+}
 
 SStr* sstrCreate(std::u16string_view sv) {
     return SStr::create(sv);
@@ -80,17 +102,70 @@ char16_t lowerUnit(char16_t c, char16_t* extra) {
 
 char32_t lowerCp(uint32_t cp, char16_t* extra) {
     *extra = 0;
-    if (cp > 0xFFFF) return cp;   // 非 BMP は現状そのまま（JS でも一部のみ mapping）
-    return lowerUnit(static_cast<char16_t>(cp), extra);
+    if (cp <= 0xFFFF) return lowerUnit(static_cast<char16_t>(cp), extra);
+    for (const auto& r : kLowerAstralRanges) {
+        if (cp >= r.lo && cp <= r.hi) return cp + r.delta;
+    }
+    return cp;
+}
+
+static void appendCp(std::u16string& out, uint32_t cp) {
+    if (cp <= 0xFFFF) {
+        out.push_back(static_cast<char16_t>(cp));
+    } else {
+        const uint32_t v = cp - 0x10000u;
+        out.push_back(static_cast<char16_t>(0xD800 + (v >> 10)));
+        out.push_back(static_cast<char16_t>(0xDC00 + (v & 0x3FF)));
+    }
 }
 
 std::u16string u16ToLower(std::u16string_view sv) {
+    // JS String.prototype.toLowerCase はコードポイント単位で畳み込み、
+    // Greek capital sigma は語末だけ final sigma (U+03C2) になる
+    // （Unicode Final_Sigma: 直前が Cased、直後が Cased でない）。
+    bool ascii = true;
+    for (char16_t c : sv) if (c >= 0x80) { ascii = false; break; }
+    if (ascii) return u16ToLowerAscii(sv);
+
+    std::vector<uint32_t> cps;
+    cps.reserve(sv.size());
+    for (size_t i = 0; i < sv.size();) {
+        const char16_t c = sv[i];
+        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < sv.size()) {
+            const char16_t d = sv[i + 1];
+            if (d >= 0xDC00 && d <= 0xDFFF) {
+                cps.push_back(0x10000u +
+                    (static_cast<uint32_t>(c - 0xD800) << 10) +
+                    static_cast<uint32_t>(d - 0xDC00));
+                i += 2;
+                continue;
+            }
+        }
+        cps.push_back(c);
+        ++i;
+    }
+
     std::u16string out;
     out.reserve(sv.size());
-    for (char16_t c : sv) {
-        char16_t extra;
-        char16_t l = lowerUnit(c, &extra);
-        out.push_back(l);
+    for (size_t i = 0; i < cps.size(); ++i) {
+        const uint32_t cp = cps[i];
+        char16_t extra = 0;
+        uint32_t l = lowerCp(cp, &extra);
+        if (cp == 0x03A3) {
+            bool casedBefore = false, casedAfter = false;
+            for (size_t j = i; j-- > 0;) {
+                if (isCaseIgnorable(cps[j])) continue;
+                casedBefore = isCased(cps[j]);
+                break;
+            }
+            for (size_t j = i + 1; j < cps.size(); ++j) {
+                if (isCaseIgnorable(cps[j])) continue;
+                casedAfter = isCased(cps[j]);
+                break;
+            }
+            if (casedBefore && !casedAfter) l = 0x03C2;  // ς
+        }
+        appendCp(out, l);
         if (extra) out.push_back(extra);
     }
     return out;

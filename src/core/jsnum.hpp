@@ -28,4 +28,10 @@ inline double toNumber(const char16_t* s, size_t len) {
 /// 文字が ES StrWhiteSpaceChar か（WhiteSpace ∪ LineTerminator）
 bool isStrWhiteSpace(char16_t c);
 
+/// JS Math.round（.5 は +Infinity 方向、-0 を保持）。
+double jsRound(double v);
+
+/// JS Math.log（V8 と同じ fdlibm 実装。glibc の log とは 1 ULP 違い得る）。
+double jsLog(double v);
+
 } // namespace xyo::jsnum

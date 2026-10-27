@@ -12,6 +12,66 @@
 
 namespace xyo::gpu {
 
+GlChunkPlan planGlChunks(const ExecRequest& req, uint64_t ssboLimit,
+                         uint32_t groupLimit, uint32_t forcedChunk,
+                         bool allowChunks, uint64_t scratchBytes) {
+    GlChunkPlan plan;
+    if (!req.lanes || req.lanes > (1u << 24) || !req.maxPerLane ||
+        req.maxPerLane > 2048 || req.nSlots > 96 || req.nWb > 128 ||
+        !req.codeLen || (req.codeLen & 1) || req.codeLen > 131072)
+        return plan;
+
+    constexpr uint64_t hostLimit = uint64_t(512) * 1024 * 1024;
+    constexpr uint64_t chunkLimit = uint64_t(256) * 1024 * 1024;
+    // All products below fit uint64_t after the structural checks above;
+    // nGlobals is uint32_t. Subtraction-before-addition handles scratchBytes,
+    // the sole unrestricted uint64_t input, without wraparound.
+    const uint64_t strideBytes = uint64_t(laneOutStride(req.nWb)) * 4;
+    plan.hostOutputBytes = uint64_t(req.lanes) * strideBytes;
+    if (plan.hostOutputBytes > hostLimit) return plan;
+    const uint64_t codeBytes = uint64_t(req.codeLen) * 4;
+    const uint64_t paramBytes = uint64_t(28 + req.nWb) * 4;
+    const uint64_t globalBytes = uint64_t(std::max(req.nGlobals, 1u)) * 4;
+    const uint64_t fixedBytes = codeBytes + paramBytes + globalBytes;
+    const uint64_t recLaneBytes = uint64_t(req.maxPerLane) * 48;
+    const uint64_t idLaneBytes = uint64_t(req.maxPerLane) * 8;
+    const uint64_t laneBytes = recLaneBytes + idLaneBytes + 8 + strideBytes;
+    uint64_t hardwareLanes = req.lanes;
+    if (ssboLimit) {
+        if (codeBytes > ssboLimit || paramBytes > ssboLimit ||
+            globalBytes > ssboLimit) return plan;
+        for (uint64_t bytes : {recLaneBytes, idLaneBytes, strideBytes,
+                               uint64_t(4)})
+            hardwareLanes = std::min(hardwareLanes, ssboLimit / bytes);
+    }
+    if (groupLimit)
+        hardwareLanes = std::min(hardwareLanes, uint64_t(groupLimit) * 64);
+    // Existing renderer conservatively permits INT_MAX / 12 records.
+    constexpr uint64_t maxRecords = uint64_t(2147483647) / 12;
+    hardwareLanes = std::min(hardwareLanes, maxRecords / req.maxPerLane);
+    if (forcedChunk) hardwareLanes = std::min(hardwareLanes,
+                                             uint64_t(forcedChunk));
+    auto fits = [&](uint64_t budget, uint64_t lanes) {
+        return fixedBytes <= budget && scratchBytes <= budget - fixedBytes &&
+               lanes <= (budget - fixedBytes - scratchBytes) / laneBytes;
+    };
+    if (hardwareLanes >= req.lanes && fits(hostLimit, req.lanes)) {
+        plan.ok = true;
+        plan.lanesPerChunk = req.lanes;
+        plan.chunkBufferBytes = fixedBytes + scratchBytes +
+                                uint64_t(req.lanes) * laneBytes;
+        return plan;
+    }
+    if (!allowChunks || !fits(chunkLimit, 1)) return plan;
+    const uint64_t lanes = std::min(hardwareLanes,
+        (chunkLimit - fixedBytes - scratchBytes) / laneBytes);
+    if (!lanes) return plan;
+    plan.ok = true;
+    plan.lanesPerChunk = uint32_t(lanes);
+    plan.chunkBufferBytes = fixedBytes + scratchBytes + lanes * laneBytes;
+    return plan;
+}
+
 namespace {
 
 constexpr int kMaxStack = 128;    // シェーダ st[] と一致

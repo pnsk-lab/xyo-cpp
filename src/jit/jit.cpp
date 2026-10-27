@@ -25,6 +25,8 @@
 #include "../blocks/pen_api.hpp"
 #include "../core/gc.hpp"
 #include "../core/json.hpp"
+#include "../core/jsnum.hpp"
+#include "../core/v8math.hpp"
 #include "../core/sstr.hpp"
 #include "../engine/runtime.hpp"
 #include "../engine/sequencer.hpp"
@@ -45,6 +47,8 @@ bool jitEmitScript(llvm::Module&, llvm::LLVMContext&, Runtime&, Target*,
 extern "C" {
 void xyo_yield(JitCtx*);
 int32_t xyo_is_stuck(JitCtx*);
+int32_t xyo_wait_should_yield(JitCtx*);
+void xyo_wait_yield(JitCtx*);
 void xyo_loop_yield(JitCtx*);
 double xyo_to_num(uint64_t);
 int32_t xyo_truthy(uint64_t);
@@ -56,6 +60,11 @@ uint64_t xyo_sub(uint64_t, uint64_t);
 uint64_t xyo_mul(uint64_t, uint64_t);
 uint64_t xyo_div(uint64_t, uint64_t);
 uint64_t xyo_mod(uint64_t, uint64_t);
+double xyo_log(double);
+double xyo_asin(double);
+double xyo_acos(double);
+double xyo_atan(double);
+double xyo_exp(double);
 int32_t xyo_lt(uint64_t, uint64_t);
 int32_t xyo_gt(uint64_t, uint64_t);
 int32_t xyo_eq(uint64_t, uint64_t);
@@ -199,6 +208,8 @@ namespace {
 const std::pair<const char*, void*> kRtSymbols[] = {
     {"xyo_yield", (void*)&xyo_yield},
     {"xyo_is_stuck", (void*)&xyo_is_stuck},
+    {"xyo_wait_should_yield", (void*)&xyo_wait_should_yield},
+    {"xyo_wait_yield", (void*)&xyo_wait_yield},
     {"xyo_loop_yield", (void*)&xyo_loop_yield},
     {"xyo_to_num", (void*)&xyo_to_num},
     {"xyo_truthy", (void*)&xyo_truthy},
@@ -219,6 +230,11 @@ const std::pair<const char*, void*> kRtSymbols[] = {
     {"xyo_random", (void*)&xyo_random},
     {"xyo_mathop", (void*)&xyo_mathop},
     {"xyo_round", (void*)&xyo_round},
+    {"xyo_log", (void*)&xyo_log},
+        {"xyo_asin", (void*)&xyo_asin},
+        {"xyo_acos", (void*)&xyo_acos},
+        {"xyo_atan", (void*)&xyo_atan},
+        {"xyo_exp", (void*)&xyo_exp},
     {"xyo_var_get", (void*)&xyo_var_get},
     {"xyo_var_set", (void*)&xyo_var_set},
     {"xyo_var_change", (void*)&xyo_var_change},
@@ -385,7 +401,11 @@ const std::vector<std::pair<const char*, void*>>& hostLibcallSymbols() {
         {"fmodf", (void*)(float (*)(float, float))std::fmod},
         {"pow", (void*)(double (*)(double, double))std::pow},
         {"powf", (void*)(float (*)(float, float))std::pow},
-        {"log", (void*)(double (*)(double))std::log},
+        {"log", (void*)(double (*)(double))xyo::jsnum::jsLog},
+        {"asin", (void*)(double (*)(double))xyo::v8math::asin},
+        {"acos", (void*)(double (*)(double))xyo::v8math::acos},
+        {"atan", (void*)(double (*)(double))xyo::v8math::atan},
+        {"exp", (void*)(double (*)(double))xyo::v8math::exp},
         {"logf", (void*)(float (*)(float))std::log},
         {"log2", (void*)(double (*)(double))std::log2},
         {"log10", (void*)(double (*)(double))std::log10},
@@ -393,13 +413,13 @@ const std::vector<std::pair<const char*, void*>>& hostLibcallSymbols() {
         {"exp2", (void*)(double (*)(double))std::exp2},
         {"sqrt", (void*)(double (*)(double))std::sqrt},
         {"sqrtf", (void*)(float (*)(float))std::sqrt},
-        {"sin", (void*)(double (*)(double))std::sin},
-        {"cos", (void*)(double (*)(double))std::cos},
+        {"sin", (void*)(double (*)(double))xyo::v8math::sin},
+        {"cos", (void*)(double (*)(double))xyo::v8math::cos},
         {"tan", (void*)(double (*)(double))std::tan},
         {"asin", (void*)(double (*)(double))std::asin},
         {"acos", (void*)(double (*)(double))std::acos},
         {"atan", (void*)(double (*)(double))std::atan},
-        {"atan2", (void*)(double (*)(double, double))std::atan2},
+        {"atan2", (void*)(double (*)(double, double))xyo::v8math::atan2},
         {"sinh", (void*)(double (*)(double))std::sinh},
         {"cosh", (void*)(double (*)(double))std::cosh},
         {"tanh", (void*)(double (*)(double))std::tanh},

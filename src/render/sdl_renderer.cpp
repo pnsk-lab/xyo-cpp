@@ -235,6 +235,8 @@ struct SdlRenderer::GlCompute {
     GLuint paramsB = 0, globalsB = 0, codeB = 0;
     GLuint recsB = 0, cntsB = 0, loutB = 0;
     GLuint idsB = 0, offsB = 0;   // draw-id stream / レーン別オフセット
+    GLuint txnTex = 0, txnFbo = 0; // private pen transaction for chunked VM
+    int txnW = 0, txnH = 0;
     GLint uSize = -1, uHalf = -1, uScale = -1, uMax = -1, uOrd = -1;
     GLint ordULanes = -1;
     size_t recCap = 0, cntCap = 0, loutCap = 0, idsCap = 0,
@@ -504,6 +506,8 @@ SdlRenderer::~SdlRenderer() {
                 if (c.detCs) glDeleteProgram(c.detCs);
                 if (c.rowCs) glDeleteProgram(c.rowCs);
                 if (c.ordCs) glDeleteProgram(c.ordCs);
+                if (c.txnFbo) glDeleteFramebuffers(1, &c.txnFbo);
+                if (c.txnTex) glDeleteTextures(1, &c.txnTex);
                 GLuint bs[] = {c.paramsB, c.globalsB, c.codeB,
                                c.recsB, c.cntsB, c.loutB,
                                c.idsB, c.offsB,
@@ -829,9 +833,9 @@ bool SdlRenderer::xformFor(const Drawable& d, const Skin& s,
 
 // stage 論理 px 座標 → skin texel RGBA。範囲外/透明は false。
 bool SdlRenderer::skinPxAt(const Drawable& d, double px, double py,
-                           uint8_t out[4]) const {
+                           uint8_t out[4], bool ignoreVisibility) const {
     Target* t = d.target;
-    if (!t || (!t->visible && !t->isStage)) return false;
+    if (!t || (!t->visible && !t->isStage && !ignoreVisibility)) return false;
     const Skin* s = skinForTarget(t);
     if (!s || !s->w) return false;
     DrawXform f;
@@ -1827,11 +1831,11 @@ void SdlRenderer::penFlushGpu() {
 
 // FBO を penPx_ へ readback する（fboDirty 時のみ）。
 // GL の readback は下→上なので行を反転して CPU バッファへ。
-void SdlRenderer::penSyncCpu() {
+void SdlRenderer::penSyncCpu(bool forceReadback) {
     if (!penGpu()) { penFlushCpuBatch(); return; }
     GlPen& g = *glPen_;
     penFlushGpu();
-    if (!g.fboDirty) return;
+    if (!g.fboDirty && !forceReadback) return;
     PenTimer ptimer(&g_penProf.readbackMs, true);
     ++g_penProf.readbacks;
     if (SDL_GL_MakeCurrent(window_, g.ctx) != 0) return;
@@ -1971,7 +1975,9 @@ void main() {
     // ディスパッチは 64 単位で切り上げ — 範囲外レーンは即 return
     // （cnts/lout/recs への範囲外書き込み防止）
     if (lane >= uint(pr[15])) return;
-    iter = lane;
+    // Local lane indexes bounded output storage; logical iteration stays
+    // global across chunks for RNG, OP_ITER, induction and carried pen state.
+    iter = lane + uint(pr[27u + uint(pr[13])]);
     guarded = false;
     maxPerLane = uint(pr[14]);
     nWb = uint(pr[13]);
@@ -2336,6 +2342,7 @@ bool SdlRenderer::initGlCompute() {
 }
 
 bool SdlRenderer::gpuExecParallel(gpu::ExecRequest& req) {
+    gpuLastChunks_ = 0;
     req.executed = false;
     req.laneOut = nullptr;
     req.overflow = false;
@@ -2358,23 +2365,14 @@ bool SdlRenderer::gpuExecParallel(gpu::ExecRequest& req) {
         if (!req.wbSlots || req.wbSlots[i] >= req.nSlots) return false;
     if (!req.lanes || !req.maxPerLane) return false;
     const uint32_t stride = gpu::laneOutStride(req.nWb);
-    // uint64 演算でオーバーフロー安全にサイズを検証
     const uint64_t codeBytes = uint64_t(req.codeLen) * 4;
-    const uint64_t paramBytes = uint64_t(20 + req.nWb + 7) * 4;
+    const uint64_t paramBytes = uint64_t(28 + req.nWb) * 4;
     const uint64_t globBytes =
         uint64_t(std::max<uint32_t>(req.nGlobals, 1)) * 4;
-    const uint64_t cntBytes = uint64_t(req.lanes) * 4;
-    const uint64_t loutBytes = uint64_t(req.lanes) * stride * 4;
-    const uint64_t maxRecs = uint64_t(req.lanes) * req.maxPerLane;
-    const uint64_t recBytes = maxRecs * 48;          // vec4*3
-    const uint64_t idsBytes = maxRecs * 8;           // uvec2
-    const uint64_t offsBytes = cntBytes;
-    const uint64_t totalBytes = codeBytes + paramBytes + globBytes +
-                                cntBytes + loutBytes + recBytes +
-                                idsBytes + offsBytes;
-    if (totalBytes > uint64_t(512) * 1024 * 1024) return false;
-    if (maxRecs * 6 > uint64_t(std::numeric_limits<GLsizei>::max()) / 2)
-        return false;   // 頂点数上限（余裕を持って拒否）
+    // Retain the full-output ABI but reject multi-GiB host allocations before
+    // touching GPU state. Existing single-dispatch requests already fit this.
+    const uint64_t hostOutBytes = uint64_t(req.lanes) * stride * 4;
+    if (hostOutBytes > uint64_t(512) * 1024 * 1024) return false;
     if (req.nGlobals && !req.globals) return false;
 
     penEnsure();
@@ -2384,17 +2382,42 @@ bool SdlRenderer::gpuExecParallel(gpu::ExecRequest& req) {
     GlCompute& c = *glComp_;
     GlPen& g = *glPen_;
 
-    const uint32_t groups = (req.lanes + 63) / 64;
-    if (c.ssboMax > 0 &&
-        int64_t(std::max(std::max(recBytes, loutBytes),
-                         std::max(std::max(idsBytes, codeBytes),
-                                  std::max(std::max(cntBytes, globBytes),
-                                           std::max(paramBytes,
-                                                    offsBytes))))) >
-            c.ssboMax)
+    uint32_t forceChunk = 0;
+    if (const char* text = std::getenv("XYO_GPU_GL_CHUNK_LANES")) {
+        char* end = nullptr;
+        const unsigned long n = std::strtoul(text, &end, 10);
+        if (end == text || *end || !n || n > (1u << 24)) return false;
+        forceChunk = uint32_t(n);
+    }
+    const char* batch = std::getenv("XYO_GPU_GL_BATCH");
+    const bool allowChunks = !batch || std::strcmp(batch, "0") != 0;
+    const uint64_t scratchBytes = uint64_t(penW_) * uint64_t(penH_) * 4;
+    const uint64_t ssboLimit = c.ssboMax > 0 ? uint64_t(c.ssboMax) : 0;
+    const uint32_t groupLimit = c.maxGroupsX > 0 ? uint32_t(c.maxGroupsX) : 0;
+    auto plan = gpu::planGlChunks(req, ssboLimit, groupLimit,
+                                 forceChunk, allowChunks, 0);
+    // A fitting single dispatch needs no scratch surface. Only reserve it
+    // once a transaction is actually required, preserving old near-limit fits.
+    if (plan.ok && plan.lanesPerChunk < req.lanes)
+        plan = gpu::planGlChunks(req, ssboLimit, groupLimit,
+                                 forceChunk, allowChunks, scratchBytes);
+    if (!plan.ok) {
+        if (std::getenv("XYO_GPU_DEBUG"))
+            std::fprintf(stderr, "gpu exec: capacity/hardware plan rejected lanes=%u chunking=%d\n",
+                         req.lanes, int(allowChunks));
         return false;
-    if (c.maxGroupsX > 0 && groups > uint32_t(c.maxGroupsX))
-        return false;
+    }
+    const uint32_t chunkMax = plan.lanesPerChunk;
+    const bool transactional = chunkMax < req.lanes;
+    const uint64_t maxRecs = uint64_t(chunkMax) * req.maxPerLane;
+    const uint64_t recBytes = maxRecs * 48;
+    const uint64_t idsBytes = maxRecs * 8;
+    const uint64_t cntCapBytes = uint64_t(chunkMax) * 4;
+    const uint64_t loutCapBytes = uint64_t(chunkMax) * stride * 4;
+    if (std::getenv("XYO_GPU_DEBUG") && transactional)
+        std::fprintf(stderr, "gpu exec: chunks lanes=%u chunk=%u buffer_bytes=%llu host_bytes=%llu\n",
+                     req.lanes, chunkMax, (unsigned long long)plan.chunkBufferBytes,
+                     (unsigned long long)plan.hostOutputBytes);
 
     penFlushGpu();   // 先行ストロークをレーン順で先に描画
 
@@ -2404,9 +2427,55 @@ bool SdlRenderer::gpuExecParallel(gpu::ExecRequest& req) {
         if (sdlGlCtx_) SDL_GL_MakeCurrent(window_, sdlGlCtx_);
     };
     gpuLaneOut_.resize(size_t(req.lanes) * stride);
+    // Exact-copy transaction: later guard/overflow/allocation failures must not
+    // leave a drawn prefix on the live pen surface before a full CPU fallback.
+    auto blitPen = [&](GLuint from, GLuint to) {
+        const GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+        const GLboolean srgb = glIsEnabled(GL_FRAMEBUFFER_SRGB);
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_FRAMEBUFFER_SRGB);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, from);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, to);
+        const bool complete =
+            glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE &&
+            glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+        if (complete)
+            glBlitFramebuffer(0, 0, penW_, penH_, 0, 0, penW_, penH_,
+                              GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        const bool ok = complete && glGetError() == GL_NO_ERROR;
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        if (scissor) glEnable(GL_SCISSOR_TEST);
+        if (srgb) glEnable(GL_FRAMEBUFFER_SRGB);
+        return ok;
+    };
+    if (transactional) {
+        // Retire previous draws before shrinking/reusing their SSBO storage.
+        glFinish();
+        if (!c.txnTex) glGenTextures(1, &c.txnTex);
+        if (!c.txnFbo) glGenFramebuffers(1, &c.txnFbo);
+        if (c.txnW != penW_ || c.txnH != penH_) {
+            glBindTexture(GL_TEXTURE_2D, c.txnTex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, penW_, penH_, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            glBindFramebuffer(GL_FRAMEBUFFER, c.txnFbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                   GL_TEXTURE_2D, c.txnTex, 0);
+            const bool complete = glCheckFramebufferStatus(GL_FRAMEBUFFER) ==
+                                  GL_FRAMEBUFFER_COMPLETE;
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            if (!complete || glGetError() != GL_NO_ERROR) {
+                c.txnW = c.txnH = 0;
+                restore(); return false;
+            }
+            c.txnW = penW_; c.txnH = penH_;
+        }
+        if (!blitPen(g.fbo, c.txnFbo)) { restore(); return false; }
+    }
 
-    // params（固定20 + wbSlot[] + 終端状態7）
-    std::vector<float> pr(20 + req.nWb + 7, 0.0f);
+    // params: fixed20 + wb slots + carried state7 + global lane base.
+    std::vector<float> pr(28 + req.nWb, 0.0f);
     pr[0] = req.startX; pr[1] = req.startY;
     pr[2] = req.penSize;
     pr[3] = req.penHSV[0]; pr[4] = req.penHSV[1];
@@ -2446,10 +2515,10 @@ bool SdlRenderer::gpuExecParallel(gpu::ExecRequest& req) {
     glBufferData(GL_SHADER_STORAGE_BUFFER, GLsizeiptr(codeBytes),
                  req.code, GL_STREAM_DRAW);
 
-    // 出力バッファ確保（容量が足りなければ再確保）。
-    // 総量は 512MB 上限済み — チャンク分割は未実装（単一 dispatch のみ）。
+    // Allocate one chunk, not the whole request. Shrink retained VM buffers
+    // when chunking so an earlier large request cannot evade the chunk budget.
     auto ensure = [&](GLuint buf, uint64_t need, size_t& cap) {
-        if (cap < need) {
+        if (cap < need || (transactional && cap != need)) {
             glBindBuffer(GL_SHADER_STORAGE_BUFFER, buf);
             glBufferData(GL_SHADER_STORAGE_BUFFER, GLsizeiptr(need),
                          nullptr, GL_STREAM_DRAW);
@@ -2457,11 +2526,12 @@ bool SdlRenderer::gpuExecParallel(gpu::ExecRequest& req) {
         }
     };
     ensure(c.recsB, recBytes, c.recCap);
-    ensure(c.cntsB, cntBytes, c.cntCap);
-    ensure(c.loutB, loutBytes, c.loutCap);
+    ensure(c.cntsB, cntCapBytes, c.cntCap);
+    ensure(c.loutB, loutCapBytes, c.loutCap);
     ensure(c.idsB, idsBytes, c.idsCap);
-    ensure(c.offsB, offsBytes, c.offsCap);
-    c.cntReadback.resize(req.lanes);
+    ensure(c.offsB, cntCapBytes, c.offsCap);
+    c.cntReadback.resize(chunkMax);
+    c.ordOffsets.resize(chunkMax);
     if (glGetError() != GL_NO_ERROR) {
         // 確保失敗を容量キャッシュが隠さないよう全リセット
         c.recCap = c.cntCap = c.loutCap = c.idsCap = c.offsCap = 0;
@@ -2469,89 +2539,111 @@ bool SdlRenderer::gpuExecParallel(gpu::ExecRequest& req) {
         return false;
     }
 
-    glUseProgram(c.cs);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, c.paramsB);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, c.codeB);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, c.recsB);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, c.cntsB);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, c.loutB);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, c.globalsB);
-    glDispatchCompute(groups, 1, 1);
-    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT |
-                    GL_BUFFER_UPDATE_BARRIER_BIT);
+    uint64_t allRecords = 0;
+    for (uint32_t base = 0; base < req.lanes;) {
+        const uint32_t count = std::min(chunkMax, req.lanes - base);
+        const uint32_t groups = (count + 63) / 64;
+        const uint64_t cntBytes = uint64_t(count) * 4;
+        const uint64_t loutBytes = uint64_t(count) * stride * 4;
+        const uint64_t offsBytes = cntBytes;
+        pr[15] = float(count);
+        pr[27 + req.nWb] = float(base);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, c.paramsB);
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, GLsizeiptr(paramBytes), pr.data());
+        glUseProgram(c.cs);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, c.paramsB);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, c.codeB);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, c.recsB);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, c.cntsB);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, c.loutB);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, c.globalsB);
+        glDispatchCompute(groups, 1, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT |
+                        GL_BUFFER_UPDATE_BARRIER_BIT);
 
-    // 溢れ・ガード検査 — 描画前に失敗判定する。
-    // cnts[lane] = recN | (guarded ? 0x80000000)
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, c.cntsB);
-    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
-                       GLsizeiptr(cntBytes), c.cntReadback.data());
-    // 排他的レーンオフセット（排順 id = (lane<<32)|stroke の natural
-    // 順序 — 一般ソート不要）。guarded/超過レーンはここで拒否。
-    c.ordOffsets.resize(req.lanes);
-    uint64_t totalRecords = 0;
-    bool countsOk = gpu::penOrderOffsets(c.cntReadback.data(), req.lanes,
-                                         req.maxPerLane,
-                                         c.ordOffsets.data(),
-                                         &totalRecords);
-    req.overflow = !countsOk;
-    if (!countsOk && std::getenv("XYO_DEBUG"))
-        std::fprintf(stderr, "gpu exec: stroke overflow/guard\n");
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, c.loutB);
-    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
-                       GLsizeiptr(loutBytes), gpuLaneOut_.data());
-    if (!countsOk || glGetError() != GL_NO_ERROR) {
-        restore();
-        return false;
-    }
+        ++gpuLastChunks_;
+        // Validate this chunk before drawing it to the private transaction.
+        // cnts[lane] = recN | (guarded ? 0x80000000)
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, c.cntsB);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                           GLsizeiptr(cntBytes), c.cntReadback.data());
+        // 排他的レーンオフセット（排順 id = (lane<<32)|stroke の natural
+        // 順序 — 一般ソート不要）。guarded/超過レーンはここで拒否。
+        uint64_t totalRecords = 0;
+        bool countsOk = gpu::penOrderOffsets(c.cntReadback.data(), count,
+                                             req.maxPerLane,
+                                             c.ordOffsets.data(),
+                                             &totalRecords);
+        req.overflow = !countsOk;
+        if (!countsOk && std::getenv("XYO_DEBUG"))
+            std::fprintf(stderr, "gpu exec: stroke overflow/guard\n");
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, c.loutB);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                           GLsizeiptr(loutBytes),
+                           gpuLaneOut_.data() + size_t(base) * stride);
+        if (!countsOk || glGetError() != GL_NO_ERROR) {
+            restore();
+            return false;
+        }
 
-    // draw-id stream の実体化: 1 レーン = 1 呼出しで
-    // ids[offs[lane]+stroke] = uvec2(stroke, lane)。readback なし。
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, c.offsB);
-    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, GLsizeiptr(offsBytes),
-                    c.ordOffsets.data());
-    glUseProgram(c.ordCs);
-    glUniform1ui(c.ordULanes, req.lanes);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, c.cntsB);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, c.idsB);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, c.offsB);
-    glDispatchCompute(groups, 1, 1);
-    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-    if (glGetError() != GL_NO_ERROR) { restore(); return false; }
+        // draw-id stream の実体化: 1 レーン = 1 呼出しで
+        // ids[offs[lane]+stroke] = uvec2(stroke, lane)。readback なし。
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, c.offsB);
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, GLsizeiptr(offsBytes),
+                        c.ordOffsets.data());
+        glUseProgram(c.ordCs);
+        glUniform1ui(c.ordULanes, count);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, c.cntsB);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, c.idsB);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, c.offsB);
+        glDispatchCompute(groups, 1, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        if (glGetError() != GL_NO_ERROR) { restore(); return false; }
 
-    // レコード描画: VS が compact な draw-id stream 経由で
-    // 逐次順にレコードを読みクアッド展開（実レコード数のみ — パッド分
-    // は描画しない）。
-    glBindFramebuffer(GL_FRAMEBUFFER, g.fbo);
-    glViewport(0, 0, penW_, penH_);
-    glUseProgram(c.rp);
-    glUniform2f(c.uSize, float(penW_), float(penH_));
-    glUniform2f(c.uHalf, float(stageW_ / 2), float(stageH_ / 2));
-    glUniform1f(c.uScale, float(penScale_));
-    glUniform1ui(c.uMax, req.maxPerLane);
-    glUniform1i(c.uOrd, 1);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, c.recsB);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, c.cntsB);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, c.idsB);
-    if (c.vao) glBindVertexArray(c.vao);
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-    if (glGetError() != GL_NO_ERROR) {
+        // レコード描画: VS が compact な draw-id stream 経由で
+        // 逐次順にレコードを読みクアッド展開（実レコード数のみ — パッド分
+        // は描画しない）。分割時は最後まで private FBO にのみ書く。
+        glBindFramebuffer(GL_FRAMEBUFFER, transactional ? c.txnFbo : g.fbo);
+        glViewport(0, 0, penW_, penH_);
+        glUseProgram(c.rp);
+        glUniform2f(c.uSize, float(penW_), float(penH_));
+        glUniform2f(c.uHalf, float(stageW_ / 2), float(stageH_ / 2));
+        glUniform1f(c.uScale, float(penScale_));
+        glUniform1ui(c.uMax, req.maxPerLane);
+        glUniform1i(c.uOrd, 1);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, c.recsB);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, c.cntsB);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, c.idsB);
+        if (c.vao) glBindVertexArray(c.vao);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        if (glGetError() != GL_NO_ERROR) {
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            restore();
+            return false;
+        }
+        if (totalRecords > 0)
+            glDrawArrays(GL_TRIANGLES, 0, GLsizei(totalRecords * 6));
+        if (glGetError() != GL_NO_ERROR) {
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            restore();
+            return false;
+        }
+        // Next chunk overwrites SSBOs read by this draw. Order those writes after
+        // all earlier shader reads, not only after earlier compute writes.
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        restore();
-        return false;
+        allRecords += totalRecords;
+        base += count;
     }
-    if (totalRecords > 0)
-        glDrawArrays(GL_TRIANGLES, 0, GLsizei(totalRecords * 6));
-    if (glGetError() != GL_NO_ERROR) {
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        restore();
-        return false;
+    // One publication only after every chunk has passed all guards and draws.
+    // GL context/device loss is not a recoverable CPU-fallback transaction.
+    if (transactional && !blitPen(c.txnFbo, g.fbo)) {
+        restore(); return false;
     }
     g.fboDirty = true;
     g.sdlTexDirty = true;
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-    req.nRecords = uint32_t(std::min<uint64_t>(totalRecords, UINT32_MAX));
+    req.nRecords = uint32_t(std::min<uint64_t>(allRecords, UINT32_MAX));
     req.laneOut = gpuLaneOut_.data();
     restore();
     req.executed = true;
@@ -3135,7 +3227,7 @@ void SdlRenderer::getFenceRect(int drawableID, double out[4]) const {
 bool SdlRenderer::penGpu() const { return false; }
 bool SdlRenderer::initGlPen() { return false; }
 void SdlRenderer::penFlushGpu() {}
-void SdlRenderer::penSyncCpu() {}
+void SdlRenderer::penSyncCpu(bool) {}
 void SdlRenderer::penStrokeGpu(const float[4], float, float, float,
                                float, float, float) {}
 bool SdlRenderer::initGlCompute() { return false; }
@@ -3673,7 +3765,10 @@ void SdlRenderer::penStamp(int skin, int drawableID) {
     penFlushCpuBatch();   // CPU 遅延バッチを先に反映
     penSyncCpu();   // GPU バッチを先に描画して penPx_ を最新化
     Drawable* d = drawableFor(drawableID);
-    if (!d || !d->target || !d->target->visible) return;
+    if (!d || !d->target) return;
+    // scratch-render の penStamp は _drawThese(..., {ignoreVisibility: true})
+    // なので、隠したスプライトでもスタンプは描かれる。ghost は
+    // スプライト描画と同じく適用される（ghost 100 なら何も残らない）。
     const Skin* s = skinForTarget(d->target);
     if (!s) return;
     double b[4];
@@ -3685,7 +3780,8 @@ void SdlRenderer::penStamp(int skin, int drawableID) {
     uint8_t px4[4];
     for (int y = y0; y < y1; ++y)
         for (int x = x0; x < x1; ++x) {
-            if (!skinPxAt(*d, x + 0.5, y + 0.5, px4)) continue;
+            if (!skinPxAt(*d, x + 0.5, y + 0.5, px4,
+                          /*ignoreVisibility=*/true)) continue;
             penBlendPx(static_cast<int>((x + 0.5) * penScale_),
                        static_cast<int>((y + 0.5) * penScale_), px4);
         }

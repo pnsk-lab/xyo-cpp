@@ -1,0 +1,142 @@
+[
+ {
+  "i": 1,
+  "label": "T.x position",
+  "var": "p1"
+ },
+ {
+  "i": 2,
+  "label": "T.y position",
+  "var": "p2"
+ },
+ {
+  "i": 3,
+  "label": "T.direction",
+  "var": "p3"
+ },
+ {
+  "i": 4,
+  "label": "T.costume #",
+  "var": "p4"
+ },
+ {
+  "i": 5,
+  "label": "T.costume name",
+  "var": "p5"
+ },
+ {
+  "i": 6,
+  "label": "T.size",
+  "var": "p6"
+ },
+ {
+  "i": 7,
+  "label": "T.volume",
+  "var": "p7"
+ },
+ {
+  "i": 8,
+  "label": "T.tv",
+  "var": "p8"
+ },
+ {
+  "i": 9,
+  "label": "T.tl",
+  "var": "p9"
+ },
+ {
+  "i": 10,
+  "label": "T.te",
+  "var": "p10"
+ },
+ {
+  "i": 11,
+  "label": "T.t1",
+  "var": "p11"
+ },
+ {
+  "i": 12,
+  "label": "T.gv",
+  "var": "p12"
+ },
+ {
+  "i": 13,
+  "label": "T.TV",
+  "var": "p13"
+ },
+ {
+  "i": 14,
+  "label": "T.missing",
+  "var": "p14"
+ },
+ {
+  "i": 15,
+  "label": "T.backdrop #",
+  "var": "p15"
+ },
+ {
+  "i": 16,
+  "label": "T.backdrop name",
+  "var": "p16"
+ },
+ {
+  "i": 17,
+  "label": "T.background #",
+  "var": "p17"
+ },
+ {
+  "i": 18,
+  "label": "T.list contents",
+  "var": "p18"
+ },
+ {
+  "i": 19,
+  "label": "Stage.backdrop #",
+  "var": "p19"
+ },
+ {
+  "i": 20,
+  "label": "Stage.backdrop name",
+  "var": "p20"
+ },
+ {
+  "i": 21,
+  "label": "Stage.volume",
+  "var": "p21"
+ },
+ {
+  "i": 22,
+  "label": "Stage.gv",
+  "var": "p22"
+ },
+ {
+  "i": 23,
+  "label": "Stage.tv",
+  "var": "p23"
+ },
+ {
+  "i": 24,
+  "label": "Stage.x position",
+  "var": "p24"
+ },
+ {
+  "i": 25,
+  "label": "Stage.out",
+  "var": "p25"
+ },
+ {
+  "i": 26,
+  "label": "Stage.OUT",
+  "var": "p26"
+ },
+ {
+  "i": 27,
+  "label": "missing target.x",
+  "var": "p27"
+ },
+ {
+  "i": 28,
+  "label": "self.x",
+  "var": "p28"
+ }
+]

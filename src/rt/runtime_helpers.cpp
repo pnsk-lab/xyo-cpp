@@ -166,11 +166,11 @@ double tanDeg(double angle) {
     angle = std::fmod(angle, 360.0);
     if (angle == -270.0 || angle == 90.0) return std::numeric_limits<double>::infinity();
     if (angle == -90.0 || angle == 270.0) return -std::numeric_limits<double>::infinity();
-    return std::round(std::tan((M_PI * angle) / 180.0) * 1e10) / 1e10;
+    return jsnum::jsRound(std::tan((M_PI * angle) / 180.0) * 1e10) / 1e10;
 }
 
 double limitPrecision(double v) {
-    double rounded = std::round(v);
+    double rounded = jsnum::jsRound(v);
     double delta = v - rounded;
     return std::abs(delta) < 1e-9 ? rounded : v;
 }
@@ -284,12 +284,10 @@ void listInsert(SList* list, Value idx, Value v) {
 }
 
 void listDelete(SList* list, Value idx) {
-    // data_deleteoflist — toListIndex(acceptAll=true)。NaN → splice(NaN-1,1)
-    // は JS で先頭要素を消す。
+    // data_deleteoflist — toListIndex(acceptAll=true)。
     double i = cast::toListIndexD(idx, list->len, true);
     if (i == cast::LIST_ALL) { list->clear(); return; }
-    if (i == cast::LIST_INVALID) return;
-    if (std::isnan(i)) i = 0;              // NaN-1 → splice(0,1)
+    if (i == cast::LIST_INVALID || i < 1) return;
     list->erase0(static_cast<uint32_t>(i - 1));
     list->monitorDirty = true;
 }
@@ -346,12 +344,14 @@ double listIndexOf(SList* list, Value item) {
 }
 
 Value listContents(SList* list) {
-    // TW jsexecute: `(listItem + '').length !== 1` — 文字列化して 1 文字の
-    // 要素だけなら join('')、さもなければ join(' ')。
-    // （Scratch 3 の typeof===string 判定からの意図的変更）
+    // scratch-vm getListContents: 全要素が「文字列かつ長さ 1」のときだけ
+    // join('')、さもなければ join(' ')。数値 1 は typeof が string ではない
+    // ので区切りが入る（TurboWarp コンパイラの (item + '').length 判定とは
+    // ここで異なる。公式 Scratch に合わせる）。
     bool allSingleLetters = true;
     for (uint32_t i = 0; i < list->len; ++i) {
-        SStr* s = cast::toString(list->items[i]);
+        const Value& it = list->items[i];
+        SStr* s = it.isString() ? it.asStrPtr() : nullptr;
         if (!s || s->len != 1) { allSingleLetters = false; break; }
     }
     std::u16string out;

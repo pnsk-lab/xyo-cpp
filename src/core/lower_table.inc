@@ -30,6 +30,9 @@ static const struct { char16_t lo, hi; int32_t delta; } kLowerRanges[] = {
     {0x24B6, 0x24CF, 26},
     {0x2C00, 0x2C2F, 48},
     {0xFF21, 0xFF3A, 32},
+    {0xA7CE, 0xA7CE, 1},
+    {0xA7D2, 0xA7D2, 1},
+    {0xA7D4, 0xA7D4, 1},
 };
 static const struct { char16_t cp, lo; } kLowerSingles[] = {
     {0x0100, 0x0101},
@@ -679,3 +682,20 @@ static const struct { char16_t cp, lo; } kLowerSingles[] = {
     {0xA7F5, 0xA7F6},
 };
 // U+0130 (I-dot) は i + U+0307 に展開（コード側で特別処理）
+// Astral (non-BMP) lowercase: {start, end, delta} (Unicode 16.0, verified
+// against V8's String.prototype.toLowerCase). These are all one-to-one maps;
+// Deseret, Osage, Adlam, Warang Citi, Medefaidrin, Vithkuqi, etc.
+static const struct { uint32_t lo, hi; int32_t delta; } kLowerAstralRanges[] = {
+    {0x10400, 0x10427, 40},
+    {0x104B0, 0x104D3, 40},
+    {0x10570, 0x1057A, 39},
+    {0x1057C, 0x1058A, 39},
+    {0x1058C, 0x10592, 39},
+    {0x10594, 0x10595, 39},
+    {0x10C80, 0x10CB2, 64},
+    {0x10D50, 0x10D65, 32},
+    {0x118A0, 0x118BF, 32},
+    {0x16E40, 0x16E5F, 32},
+    {0x16EA0, 0x16EB8, 27},
+    {0x1E900, 0x1E921, 34},
+};

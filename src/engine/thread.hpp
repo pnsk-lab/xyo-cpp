@@ -25,6 +25,27 @@ struct Runtime;
 class Thread;
 using ScriptFn = void (*)(JitCtx*);
 
+/// JIT の変数解決キャッシュキー。Scratch は (id → name) の順で解決するため、
+/// 同じ id でも name が異なれば別の Variable* になり得る。
+/// ポインタ同一性で比較する（codegen が id/name をインタン化する）。
+struct JitVarCacheKey {
+    const char* id = nullptr;
+    const char16_t* name = nullptr;
+    int list = 0;
+    bool operator==(const JitVarCacheKey& o) const {
+        return id == o.id && name == o.name && list == o.list;
+    }
+};
+struct JitVarCacheKeyHash {
+    size_t operator()(const JitVarCacheKey& k) const {
+        size_t h = std::hash<const void*>{}(k.id);
+        h ^= std::hash<const void*>{}(k.name) + 0x9e3779b97f4a7c15ull +
+             (h << 6) + (h >> 2);
+        h ^= size_t(k.list) * 0x94d049bb133111ebull;
+        return h;
+    }
+};
+
 // Thread.STATUS_*（値は固定）
 inline constexpr int STATUS_RUNNING = 0;
 inline constexpr int STATUS_PROMISE_WAIT = 1;
@@ -139,7 +160,7 @@ public:
     /// pin された id 文字列ポインタ（モジュールは JIT 生存中破棄されず
     /// 一意・安定）。Variable* は std::map ノードで安定、target は
     /// スレッド不変なので target 単位の解決として正しい。
-    std::unordered_map<const char*, Variable*> jitVarCache;
+    std::unordered_map<JitVarCacheKey, Variable*, JitVarCacheKeyHash> jitVarCache;
     /// 変数スロット配列 — idx → Variable*（JitCtx::varSlotData が
     /// data() を指す）。スクリプトエントリで xyo_varslot_init が埋める。
     std::vector<Variable*> jitVarSlots;

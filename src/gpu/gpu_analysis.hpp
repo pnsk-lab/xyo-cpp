@@ -11,6 +11,25 @@
 
 namespace xyo::gpu {
 
+struct ExecRequest;
+
+/// CPU-only GL allocation plan. Zero hardware limits mean unspecified.
+/// hostOutputBytes is the full legacy laneOut readback (capped at 512 MiB).
+/// chunkBufferBytes includes fixed buffers and scratchBytes, but not host memory.
+struct GlChunkPlan {
+    bool ok = false;
+    uint32_t lanesPerChunk = 0;
+    uint64_t hostOutputBytes = 0;
+    uint64_t chunkBufferBytes = 0;
+};
+
+/// Preserve a fitting single dispatch (512 MiB); otherwise use bounded chunks
+/// (256 MiB including scratch reserve). forcedChunk is a maximum, not a minimum.
+/// This checks sizes only; callers must still validate bytecode and pointers.
+GlChunkPlan planGlChunks(const ExecRequest& req, uint64_t ssboLimit,
+                         uint32_t groupLimit, uint32_t forcedChunk = 0,
+                         bool allowChunks = true, uint64_t scratchBytes = 0);
+
 /// コンパイル時の事前走査結果（slot id ではなく変数 id ベースで
 /// 集めて compile 側が slot へ写像する）
 struct BodyScan {

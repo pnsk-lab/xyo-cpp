@@ -673,6 +673,15 @@ static int playLoaded(Runtime& rt, const std::string& title, int scale,
     if (const char* e = std::getenv("XYO_EXIT_FRAMES"))
         exitFrames = std::atoi(e);
     const char* shot = std::getenv("XYO_SHOT");
+    // Opt-in benchmark automation: finish after a project's stop-all, not an
+    // arbitrary frame cutoff which could interrupt a large warp batch.
+    const bool exitOnStop = std::getenv("XYO_EXIT_ON_STOP") != nullptr;
+    bool projectStopped = false;
+    auto previousStopped = rt.onProjectStopped;
+    if (exitOnStop) rt.onProjectStopped = [&, previousStopped] {
+        if (previousStopped) previousStopped();
+        projectStopped = true;
+    };
     std::vector<InjectEvent> inject = parseInject(std::getenv("XYO_INJECT"));
     size_t injectIdx = 0;
 
@@ -689,7 +698,8 @@ static int playLoaded(Runtime& rt, const std::string& title, int scale,
         if (!ren.pollEvents()) break;
         rt.step();
         audio.update();   // 再生完了 wait の解決（メインスレッド必須）
-        if (exitFrames > 0 && frame + 1 >= exitFrames) {
+        if ((exitOnStop && projectStopped) ||
+            (exitFrames > 0 && frame + 1 >= exitFrames)) {
             if (shot) ren.savePPM(shot);
             break;
         }
@@ -700,6 +710,7 @@ static int playLoaded(Runtime& rt, const std::string& title, int scale,
         }
     }
 done:
+    if (exitOnStop) rt.onProjectStopped = std::move(previousStopped);
     dumpVarsIfRequested(rt);
     return 0;
 }

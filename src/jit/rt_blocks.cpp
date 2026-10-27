@@ -22,6 +22,7 @@
 #include "../blocks/core.hpp"
 #include "../blocks/pen_api.hpp"
 #include "../core/cast.hpp"
+#include "../core/v8math.hpp"
 #include "../core/rng.hpp"
 #include "../core/slist.hpp"
 #include "../core/sstr.hpp"
@@ -53,6 +54,11 @@ bool isStuck(JitCtx* c) {
     // dangerMode は予算が無い（時計も読まない）。
     if (c->runtime->dangerMode) return false;
     return c->sequencer->timer.timeElapsed() > c->runtime->warpTimeMs;
+}
+
+/// 待機系の yield 判定 — danger でも待機中は他スレッドへ譲る（rt.cpp と同義）。
+bool waitShouldYield(JitCtx* c) {
+    return !c->isWarp || c->runtime->dangerMode || isStuck(c);
 }
 
 std::u16string u16(Value v) {
@@ -91,7 +97,7 @@ void waitThreads(JitCtx* c, std::vector<Thread*>& started) {
             }
         }
         if (!waiting) break;
-        if (!allWaiting && c->isWarp && !isStuck(c)) continue;
+        if (!allWaiting && c->isWarp && !waitShouldYield(c)) continue;
         c->thread->status = allWaiting ? STATUS_YIELD_TICK : STATUS_YIELD;
         xyo_yield(c);
     }
@@ -333,7 +339,7 @@ void xyo_mot_pointtowards(JitCtx* c, uint64_t towards) {
         ty = rt->ioDevices.mouse.getScratchY();
     } else if (tw.isString() && tw.asStrPtr() &&
                tw.asStrPtr()->view() == u"_random_") {
-        t->setDirection(std::round(Rng::global().nextDouble() * 360) - 180);
+        t->setDirection(jsnum::jsRound(Rng::global().nextDouble() * 360) - 180);
         return;
     } else {
         Target* pt = rt->getSpriteTargetByName(u16(tw));
@@ -342,7 +348,7 @@ void xyo_mot_pointtowards(JitCtx* c, uint64_t towards) {
         ty = pt->y;
     }
     double dx = tx - t->x, dy = ty - t->y;
-    t->setDirection(90.0 - (std::atan2(dy, dx) * 180.0 / M_PI));
+    t->setDirection(90.0 - (v8math::atan2(dy, dx) * 180.0 / M_PI));
 }
 
 /// glide 内部で使う位置補間ループ（fiber 中断でフレーム毎に再開）
@@ -392,13 +398,13 @@ void xyo_mot_edgebounce(JitCtx* c) {
     if (distBottom < minDist) { minDist = distBottom; nearest = "bottom"; }
     if (minDist > 0) return;
     double radians = (M_PI * (90.0 - t->direction)) / 180.0;
-    double dx = std::cos(radians);
-    double dy = -std::sin(radians);
+    double dx = v8math::cos(radians);
+    double dy = -v8math::sin(radians);
     if (std::strcmp(nearest, "left") == 0) dx = std::max(0.2, std::fabs(dx));
     else if (std::strcmp(nearest, "top") == 0) dy = std::max(0.2, std::fabs(dy));
     else if (std::strcmp(nearest, "right") == 0) dx = -std::max(0.2, std::fabs(dx));
     else if (std::strcmp(nearest, "bottom") == 0) dy = -std::max(0.2, std::fabs(dy));
-    t->setDirection(std::atan2(dy, dx) * 180.0 / M_PI + 90.0);
+    t->setDirection(v8math::atan2(dy, dx) * 180.0 / M_PI + 90.0);
     double fx, fy;
     if (t->keepInFence(t->x, t->y, fx, fy)) t->setXY(fx, fy);
 }
@@ -526,7 +532,7 @@ void xyo_looks_fwdbacklayers(JitCtx* c, uint64_t n, uint64_t fb) {
 }
 uint64_t xyo_looks_size(JitCtx* c) {
     XYO_RT_PROF(kBlocks);
-    return toB(V(std::round(c->target->size)));
+    return toB(V(jsnum::jsRound(c->target->size)));
 }
 uint64_t xyo_looks_costumenumname(JitCtx* c, uint64_t numname) {
     XYO_RT_PROF(kBlocks);

@@ -1252,8 +1252,11 @@ static void test_live_gpu_off() {
 
 // tests/gpu/test_parallel.cpp — VM バイトコード経路のテスト群
 int test_parallel_gpu();
+int test_vulkan_headless();
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--vulkan-headless") == 0)
+        return test_vulkan_headless() ? 1 : 0;
     if (argc == 2 && std::strcmp(argv[1], "--parallel") == 0)
         return test_parallel_gpu() ? 1 : 0;
     test_compile_ray();
@@ -1275,6 +1278,7 @@ int main(int argc, char** argv) {
     test_live_inline_locals();
     test_live_gpu_off();
     g_fail += test_parallel_gpu();
+    g_fail += test_vulkan_headless();
     std::printf("gpu tests: %d checks, %d failures\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

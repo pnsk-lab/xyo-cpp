@@ -1,0 +1,177 @@
+[
+ {
+  "i": 0,
+  "label": "-- backdrop 'b2'",
+  "stack": true
+ },
+ {
+  "i": 1,
+  "label": "  -> 'b2'",
+  "var": "p1"
+ },
+ {
+  "i": 2,
+  "label": "  -> name 'b2'",
+  "var": "p2"
+ },
+ {
+  "i": 3,
+  "label": "-- backdrop 'B2'",
+  "stack": true
+ },
+ {
+  "i": 4,
+  "label": "  -> 'B2'",
+  "var": "p4"
+ },
+ {
+  "i": 5,
+  "label": "  -> name 'B2'",
+  "var": "p5"
+ },
+ {
+  "i": 6,
+  "label": "-- backdrop 'next'",
+  "stack": true
+ },
+ {
+  "i": 7,
+  "label": "  -> 'next'",
+  "var": "p7"
+ },
+ {
+  "i": 8,
+  "label": "  -> name 'next'",
+  "var": "p8"
+ },
+ {
+  "i": 9,
+  "label": "-- backdrop 'previous'",
+  "stack": true
+ },
+ {
+  "i": 10,
+  "label": "  -> 'previous'",
+  "var": "p10"
+ },
+ {
+  "i": 11,
+  "label": "  -> name 'previous'",
+  "var": "p11"
+ },
+ {
+  "i": 12,
+  "label": "-- backdrop ''",
+  "stack": true
+ },
+ {
+  "i": 13,
+  "label": "  -> ''",
+  "var": "p13"
+ },
+ {
+  "i": 14,
+  "label": "  -> name ''",
+  "var": "p14"
+ },
+ {
+  "i": 15,
+  "label": "-- backdrop '  '",
+  "stack": true
+ },
+ {
+  "i": 16,
+  "label": "  -> '  '",
+  "var": "p16"
+ },
+ {
+  "i": 17,
+  "label": "  -> name '  '",
+  "var": "p17"
+ },
+ {
+  "i": 18,
+  "label": "-- backdrop 1.5",
+  "stack": true
+ },
+ {
+  "i": 19,
+  "label": "  -> 1.5",
+  "var": "p19"
+ },
+ {
+  "i": 20,
+  "label": "  -> name 1.5",
+  "var": "p20"
+ },
+ {
+  "i": 21,
+  "label": "-- backdrop 'abc'",
+  "stack": true
+ },
+ {
+  "i": 22,
+  "label": "  -> 'abc'",
+  "var": "p22"
+ },
+ {
+  "i": 23,
+  "label": "  -> name 'abc'",
+  "var": "p23"
+ },
+ {
+  "i": 24,
+  "label": "-- backdrop num 3",
+  "stack": true
+ },
+ {
+  "i": 25,
+  "label": "  -> num 3",
+  "var": "p25"
+ },
+ {
+  "i": 26,
+  "label": "  -> name num 3",
+  "var": "p26"
+ },
+ {
+  "i": 27,
+  "label": "-- backdrop num 0",
+  "stack": true
+ },
+ {
+  "i": 28,
+  "label": "  -> num 0",
+  "var": "p28"
+ },
+ {
+  "i": 29,
+  "label": "  -> name num 0",
+  "var": "p29"
+ },
+ {
+  "i": 30,
+  "label": "-- backdrop num 1.5",
+  "stack": true
+ },
+ {
+  "i": 31,
+  "label": "  -> num 1.5",
+  "var": "p31"
+ },
+ {
+  "i": 32,
+  "label": "  -> name num 1.5",
+  "var": "p32"
+ },
+ {
+  "i": 33,
+  "label": "-- next backdrop",
+  "stack": true
+ },
+ {
+  "i": 34,
+  "label": "  -> after next backdrop",
+  "var": "p34"
+ }
+]

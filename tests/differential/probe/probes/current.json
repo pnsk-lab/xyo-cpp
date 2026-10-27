@@ -1,0 +1,67 @@
+[
+ {
+  "i": 0,
+  "label": "current year",
+  "var": "p0"
+ },
+ {
+  "i": 1,
+  "label": "current month",
+  "var": "p1"
+ },
+ {
+  "i": 2,
+  "label": "current date",
+  "var": "p2"
+ },
+ {
+  "i": 3,
+  "label": "current dayofweek",
+  "var": "p3"
+ },
+ {
+  "i": 4,
+  "label": "current hour",
+  "var": "p4"
+ },
+ {
+  "i": 5,
+  "label": "current minute",
+  "var": "p5"
+ },
+ {
+  "i": 6,
+  "label": "current second",
+  "var": "p6"
+ },
+ {
+  "i": 7,
+  "label": "timer >= 0",
+  "var": "p7"
+ },
+ {
+  "i": 8,
+  "label": "mousedown",
+  "var": "p8"
+ },
+ {
+  "i": 9,
+  "label": "keypressed space",
+  "var": "p9"
+ },
+ {
+  "i": 10,
+  "label": "username",
+  "var": "p10"
+ },
+ {
+  "i": 11,
+  "label": "loudness",
+  "var": "p11"
+ },
+ {
+  "i": 12,
+  "label": "mousex",
+  "var": "p12"
+ }
+]

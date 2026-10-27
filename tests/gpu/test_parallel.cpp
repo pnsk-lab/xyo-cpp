@@ -1522,7 +1522,10 @@ struct SdlRendererTestAccess {
     static const uint8_t* penPx(SdlRenderer& r) { return r.penPx_.data(); }
     static int penW(SdlRenderer& r) { return r.penW_; }
     static int penH(SdlRenderer& r) { return r.penH_; }
-    static void penSyncCpu(SdlRenderer& r) { r.penSyncCpu(); }
+    // Read the actual FBO even if a failed request left fboDirty false; a
+    // cached CPU image must not hide an accidentally published chunk prefix.
+    static void penSyncCpu(SdlRenderer& r) { r.penSyncCpu(true); }
+    static uint32_t chunks(SdlRenderer& r) { return r.gpuLastChunks_; }
 };
 }
 namespace {
@@ -1569,6 +1572,271 @@ void writePpm(const char* path, const uint8_t* px, int w, int h) {
     for (int i = 0; i < w * h; ++i)
         std::fwrite(px + i * 4, 1, 3, f);
     std::fclose(f);
+}
+
+// Scoped environment overrides: chunk controls are deliberately changed between
+// calls in one process, so this also catches accidentally cached getenv values.
+struct ScopedGpuEnv {
+    const char* name;
+    bool hadValue;
+    std::string previous;
+    ScopedGpuEnv(const char* key, const char* value) : name(key) {
+        const char* old = std::getenv(key);
+        hadValue = old != nullptr;
+        if (old) previous = old;
+        if (value) setenv(name, value, 1);
+        else unsetenv(name);
+    }
+    ~ScopedGpuEnv() {
+        if (hadValue) setenv(name, previous.c_str(), 1);
+        else unsetenv(name);
+    }
+};
+
+std::vector<uint8_t> livePenPixels(SdlRenderer& ren) {
+    TA::penSyncCpu(ren);
+    const size_t bytes = size_t(TA::penW(ren)) * TA::penH(ren) * 4;
+    const uint8_t* px = TA::penPx(ren);
+    return bytes ? std::vector<uint8_t>(px, px + bytes)
+                 : std::vector<uint8_t>();
+}
+
+// Raw bytecode keeps these tests tiny and isolates the executor's local storage
+// indices from logical ITER/RNG/lane-zero initialization. STOREVM exposes both
+// ITER and random values through the complete per-lane output, not just the
+// final target writeback.
+struct ChunkVmCode {
+    std::vector<uint32_t> code;
+    void op(gpu::Op instruction, uint32_t arg = 0) {
+        code.push_back(instruction); code.push_back(arg);
+    }
+    void push(float value) {
+        uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        op(gpu::OP_PUSH, bits);
+    }
+    size_t pc() const { return code.size() / 2; }
+    void jumpTarget(size_t jump, size_t target) {
+        code[jump * 2 + 1] = uint32_t(target);
+    }
+};
+
+ChunkVmCode chunkEqualityCode() {
+    ChunkVmCode b;
+    b.op(gpu::OP_ITER); b.op(gpu::OP_STOREVM, 0);
+    // Two random draws per lane make restarting a chunk's RNG easy to detect.
+    b.push(-100); b.push(100); b.op(gpu::OP_RAND);
+    b.push(0); b.push(1); b.op(gpu::OP_RAND); b.op(gpu::OP_ADD);
+    b.op(gpu::OP_STOREVM, 1u | (1u << 16));
+    // Observe incoming penDown/attributes before overwriting them. Only global
+    // lane zero uses dispatch state; each chunk's local lane zero must not.
+    b.push(0); b.push(0); b.op(gpu::OP_GOTOXY);
+    // This dot observes inherited attributes even for pen-up initial lanes.
+    b.op(gpu::OP_PENDOWN);
+    b.op(gpu::OP_PENUP);
+    b.push(8); b.op(gpu::OP_PENSIZE);
+    b.op(gpu::OP_ITER); b.push(10000); b.op(gpu::OP_MUL);
+    b.push(255); b.op(gpu::OP_ADD); b.op(gpu::OP_PENCOLN);
+    b.push(50); b.op(gpu::OP_PENCOLP, 3);
+    b.op(gpu::OP_PENDOWN);
+    b.push(8); b.push(0); b.op(gpu::OP_GOTOXY);
+    b.op(gpu::OP_PENUP);
+    b.op(gpu::OP_HALT);
+    return b;
+}
+
+ChunkVmCode chunkFailureCode(bool instructionGuard) {
+    ChunkVmCode b;
+    b.op(gpu::OP_ITER); b.op(gpu::OP_STOREVM, 0);
+    b.op(gpu::OP_PENUP);
+    b.push(0); b.push(0); b.op(gpu::OP_GOTOXY);
+    b.push(8); b.op(gpu::OP_PENSIZE);
+    b.push(16711680); b.op(gpu::OP_PENCOLN);
+    b.push(50); b.op(gpu::OP_PENCOLP, 3);
+    b.op(gpu::OP_PENDOWN); b.op(gpu::OP_PENUP);  // one visible dot
+    // Only global lane 7 fails: the first forced chunk (lanes 0..6) is valid.
+    b.op(gpu::OP_ITER); b.push(7); b.op(gpu::OP_EQ);
+    size_t skip = b.pc(); b.op(gpu::OP_JMPIF0);
+    if (instructionGuard) {
+        size_t loop = b.pc(); b.op(gpu::OP_JMP, uint32_t(loop));
+    } else {
+        b.op(gpu::OP_PENDOWN);  // second record exceeds maxPerLane=1
+    }
+    b.jumpTarget(skip, b.pc());
+    b.op(gpu::OP_HALT);
+    return b;
+}
+
+void test_live_vm_chunks() {
+    if (!liveGpu()) return;
+    ScopedGpuEnv batch("XYO_GPU_GL_BATCH", nullptr);
+    ScopedGpuEnv inheritedChunk("XYO_GPU_GL_CHUNK_LANES", nullptr);
+    Env e;
+    CHECK(e.ok);
+    if (!e.ok) return;
+    SdlRenderer ren;
+    const bool initialized = ren.init(e.rt, 1);
+    CHECK(initialized);
+    if (!initialized) return;
+    const int skin = ren.createPenSkin();
+    const float sentinel[4] = {0, 1, 0, 1};
+    auto resetPen = [&] {
+        ren.penClear(skin);
+        ren.penPoint(skin, sentinel, 5, -40, 20);
+    };
+    ChunkVmCode code = chunkEqualityCode();
+    const uint32_t slots[] = {0, 1};
+    gpu::ExecRequest prototype;
+    prototype.code = code.code.data(); prototype.codeLen = code.code.size();
+    prototype.nSlots = 2; prototype.nWb = 2; prototype.wbSlots = slots;
+    prototype.lanes = 131; prototype.maxPerLane = 8;
+    prototype.baseSeed = 0x5a123456u;
+    prototype.startX = -8; prototype.startY = 0;
+    prototype.penDown = true; prototype.penDownAll = false;
+    prototype.penSize = 3; prototype.penHSV[0] = 10;
+    prototype.endAttrMask = 31;
+    prototype.endAttr[0] = 11; prototype.endAttr[1] = 65;
+    prototype.endAttr[2] = 80; prototype.endAttr[3] = 70;
+    prototype.endAttr[4] = 50;
+    const size_t stride = gpu::laneOutStride(prototype.nWb);
+    std::vector<float> reference;
+    std::vector<uint8_t> referencePixels;
+    uint32_t referenceRecords = 0;
+    // Unforced, 7+...+5, and 65+65+1: includes entirely partial workgroups,
+    // full groups plus tails, and a final one-lane chunk.
+    for (const char* chunk : {static_cast<const char*>(nullptr), "7", "65"}) {
+        ScopedGpuEnv force("XYO_GPU_GL_CHUNK_LANES", chunk);
+        resetPen();
+        const auto initialPixels = livePenPixels(ren);
+        gpu::ExecRequest req = prototype;
+        const Rng before = Rng::global();
+        const bool ok = ren.gpuExecParallel(req);
+        CHECK(ok); CHECK(req.executed); CHECK(!req.overflow);
+        CHECK(req.laneOut != nullptr);
+        if (!ok || !req.executed || !req.laneOut) return;
+        CHECK_EQ(TA::chunks(ren), chunk ? (chunk[0] == '7' ? 19u : 3u) : 1u);
+        // GL PENDOWN emits only on an up-to-down transition: lane zero's
+        // incoming-down movement replaces the other lanes' initial dot.
+        CHECK_EQ(req.nRecords, 3u * req.lanes);
+        Rng expected = before, actual = Rng::global();
+        for (int i = 0; i < 4; ++i) CHECK_EQ(actual.next(), expected.next());
+        for (uint32_t lane = 0; lane < req.lanes; ++lane)
+            CHECK_EQ(req.laneOut[size_t(lane) * stride + 9], float(lane));
+        std::vector<uint8_t> pixels = livePenPixels(ren);
+        CHECK(!pixels.empty());
+        CHECK(pixels != initialPixels);
+        if (!chunk) {
+            reference.assign(req.laneOut, req.laneOut + stride * req.lanes);
+            referencePixels = pixels;
+            referenceRecords = req.nRecords;
+            CHECK(referenceRecords > req.lanes);
+        } else {
+            CHECK_EQ(req.nRecords, referenceRecords);
+            CHECK(std::memcmp(reference.data(), req.laneOut,
+                              reference.size() * sizeof(float)) == 0);
+            CHECK(pixels == referencePixels);
+        }
+    }
+
+    // At the helper boundary, all chunks share one seed and a successful
+    // dispatch advances the host RNG exactly once, not once per GPU chunk.
+    const Rng originalRng = Rng::global();
+    Rng expectedRng = originalRng;
+    expectedRng.next();
+    gpu::Program success;
+    success.code = code.code; success.nSlots = 2;
+    success.maxPerLane = 8; success.hasPenOps = true;
+    success.wbVars.push_back({"vv", u"v", 0, 0});
+    success.wbVars.push_back({"vn", u"n", 1, 1});
+    std::vector<uint8_t> helperPixels;
+    uint64_t helperRandom = 0;
+    for (const char* chunk : {static_cast<const char*>(nullptr), "7", "65"}) {
+        ScopedGpuEnv forced("XYO_GPU_GL_CHUNK_LANES", chunk);
+        Rng::global() = originalRng;
+        resetPen();
+        e.sp->x = -8; e.sp->y = 0;
+        e.sp->penState = std::make_unique<PenState>();
+        e.var("vv")->value = Value::num(-1);
+        e.var("vn")->value = Value::num(-1);
+        e.rt.renderer = &ren;
+        JitCtx ctx = makeCtx(e.rt, e.sp);
+        CHECK_EQ(xyo_gpu_repeat(&ctx, &success, 131), 1);
+        CHECK_EQ(TA::chunks(ren), chunk ? (chunk[0] == '7' ? 19u : 3u) : 1u);
+        CHECK_EQ(cast::toNumber(e.var("vv")->value), 130);
+        Rng actual = Rng::global(), expected = expectedRng;
+        for (int i = 0; i < 4; ++i) CHECK_EQ(actual.next(), expected.next());
+        const auto pixels = livePenPixels(ren);
+        if (!chunk) {
+            helperPixels = pixels;
+            helperRandom = e.var("vn")->value.bits;
+        } else {
+            CHECK(pixels == helperPixels);
+            CHECK_EQ(e.var("vn")->value.bits, helperRandom);
+        }
+        e.rt.renderer = nullptr;
+    }
+    Rng::global() = originalRng;
+
+    // Transaction failure must preserve a nonblank original pen surface even
+    // though the first chunk has already drawn into the private scratch FBO.
+    ScopedGpuEnv force("XYO_GPU_GL_CHUNK_LANES", "7");
+    for (bool guard : {false, true}) {
+        ChunkVmCode bad = chunkFailureCode(guard);
+        resetPen();
+        const auto originalPixels = livePenPixels(ren);
+        gpu::ExecRequest req;
+        req.code = bad.code.data(); req.codeLen = bad.code.size();
+        req.nSlots = 1; req.nWb = 1; req.wbSlots = slots;
+        req.lanes = 16; req.maxPerLane = 1;
+        const Rng before = Rng::global();
+        CHECK(!ren.gpuExecParallel(req));
+        CHECK(!req.executed); CHECK(req.overflow);
+        CHECK(req.laneOut == nullptr); CHECK_EQ(req.nRecords, 0u);
+        CHECK_EQ(TA::chunks(ren), 2u);
+        CHECK(livePenPixels(ren) == originalPixels);
+        Rng expected = before, actual = Rng::global();
+        for (int i = 0; i < 4; ++i) CHECK_EQ(actual.next(), expected.next());
+
+        // Exercise the real JIT helper, too: rejected later chunks must not
+        // commit writeback or consume the host dispatch seed. Call the helper
+        // directly so normal CPU fallback cannot hide an early partial commit.
+        gpu::Program program;
+        program.code = bad.code; program.nSlots = 1;
+        program.maxPerLane = 1; program.hasPenOps = true;
+        program.wbVars.push_back({"vv", u"v", 0, 0});
+        e.var("vv")->value = Value::num(123);
+        e.sp->x = 17; e.sp->y = -9;
+        if (!e.sp->penState) e.sp->penState = std::make_unique<PenState>();
+        const PenState pen = *e.sp->penState;
+        const auto* penPointer = e.sp->penState.get();
+        const auto moved = e.sp->onTargetMoved;
+        const auto variable = e.var("vv")->value.bits;
+        e.rt.renderer = &ren;
+        const bool redraw = e.rt.redrawRequested;
+        JitCtx ctx = makeCtx(e.rt, e.sp);
+        CHECK_EQ(xyo_gpu_repeat(&ctx, &program, 16), 0);
+        CHECK_EQ(TA::chunks(ren), 2u);
+        CHECK_EQ(e.sp->x, 17); CHECK_EQ(e.sp->y, -9);
+        CHECK_EQ(e.var("vv")->value.bits, variable);
+        CHECK(e.sp->penState.get() == penPointer);
+        CHECK(e.sp->onTargetMoved == moved);
+        CHECK_EQ(e.rt.redrawRequested, redraw);
+        const PenState& after = *e.sp->penState;
+        CHECK_EQ(after.penDown, pen.penDown);
+        CHECK_EQ(after.penSize, pen.penSize);
+        CHECK_EQ(after.color, pen.color);
+        CHECK_EQ(after.saturation, pen.saturation);
+        CHECK_EQ(after.brightness, pen.brightness);
+        CHECK_EQ(after.transparency, pen.transparency);
+        CHECK_EQ(after.shade, pen.shade);
+        CHECK_EQ(after.colorDirty, pen.colorDirty);
+        CHECK_EQ(after.lastSetColor, pen.lastSetColor);
+        CHECK(std::memcmp(after.rgba, pen.rgba, sizeof(pen.rgba)) == 0);
+        CHECK(livePenPixels(ren) == originalPixels);
+        actual = Rng::global(); expected = before;
+        for (int i = 0; i < 4; ++i) CHECK_EQ(actual.next(), expected.next());
+        e.rt.renderer = nullptr;
+    }
 }
 
 void test_live_vm() {
@@ -1680,6 +1948,7 @@ int test_parallel_gpu() {
     test_helper_unresolved();
     test_jit_nonfinite_bound();
     test_live_vm();
+    test_live_vm_chunks();
 #endif
     std::printf("parallel gpu tests: %d checks, %d failures\n",
                 p_checks, p_fail);

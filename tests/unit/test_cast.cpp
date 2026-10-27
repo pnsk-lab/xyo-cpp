@@ -297,9 +297,9 @@ static void test_rt_list() {
     list->push(s("b"));
     list->push(s("c"));
     CHECK_EQ(ts(rt::listContents(list)), "abc");
-    // 数値 1 → "1" は 1 文字 → join('') で "1"
+    // 数値 1 は typeof string ではない → join(' ') に切り替わる
     list->push(n(1));
-    CHECK_EQ(ts(rt::listContents(list)), "abc1");
+    CHECK_EQ(ts(rt::listContents(list)), "a b c 1");
     // 2 文字要素が混ざる → join(' ')
     list->push(s("xy"));
     CHECK_EQ(ts(rt::listContents(list)), "a b c 1 xy");
@@ -372,6 +372,8 @@ extern int test_nan_codegen_main();
 extern int test_literal_context_main();
 extern int test_danger_main();
 extern int test_list_string_intern_main();
+extern int test_gl_chunk_plan_main();
+extern int test_scratch_compat_main();
 int main() {
     test_toNumber();
     test_toBoolean();
@@ -409,11 +411,14 @@ int main() {
     int literalContextFail = test_literal_context_main();
     int dangerFail = test_danger_main();
     int listStringInternFail = test_list_string_intern_main();
+    int glChunkPlanFail = test_gl_chunk_plan_main();
+    int scratchCompatFail = test_scratch_compat_main();
     return (g_fail + e2eFail + penFail + aotFail + wasmEmitFail +
             wasmCompileFail + minifyFail + depsFail + analysisFail + parforFail + penHoistFail + rewriteFail +
             parallelStringsFail + schedulerFail +
             equalityLiteralFail + colorFastFail + motionNumericFail + slotHoistFail +
-            listCodegenBoundsFail + nanCodegenFail + literalContextFail + dangerFail + listStringInternFail)
+            listCodegenBoundsFail + nanCodegenFail + literalContextFail + dangerFail + listStringInternFail +
+            glChunkPlanFail + scratchCompatFail)
                ? 1
                : 0;
 }

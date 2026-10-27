@@ -1,0 +1,462 @@
+[
+ {
+  "i": 0,
+  "label": "-- set x 1e300",
+  "stack": true
+ },
+ {
+  "i": 1,
+  "label": "  set x 1e300",
+  "var": "p1"
+ },
+ {
+  "i": 2,
+  "label": "-- set x -1e300",
+  "stack": true
+ },
+ {
+  "i": 3,
+  "label": "  set x -1e300",
+  "var": "p3"
+ },
+ {
+  "i": 4,
+  "label": "-- set x 1000",
+  "stack": true
+ },
+ {
+  "i": 5,
+  "label": "  set x 1000",
+  "var": "p5"
+ },
+ {
+  "i": 6,
+  "label": "-- set x -1000",
+  "stack": true
+ },
+ {
+  "i": 7,
+  "label": "  set x -1000",
+  "var": "p7"
+ },
+ {
+  "i": 8,
+  "label": "-- set x 240",
+  "stack": true
+ },
+ {
+  "i": 9,
+  "label": "  set x 240",
+  "var": "p9"
+ },
+ {
+  "i": 10,
+  "label": "-- set x -240",
+  "stack": true
+ },
+ {
+  "i": 11,
+  "label": "  set x -240",
+  "var": "p11"
+ },
+ {
+  "i": 12,
+  "label": "-- set x NaN",
+  "stack": true
+ },
+ {
+  "i": 13,
+  "label": "  set x NaN",
+  "var": "p13"
+ },
+ {
+  "i": 14,
+  "label": "-- set x 1",
+  "stack": true
+ },
+ {
+  "i": 15,
+  "label": "  set x 1",
+  "var": "p15"
+ },
+ {
+  "i": 16,
+  "label": "-- set y 1e300",
+  "stack": true
+ },
+ {
+  "i": 17,
+  "label": "  set y 1e300",
+  "var": "p17"
+ },
+ {
+  "i": 18,
+  "label": "-- set y 1000",
+  "stack": true
+ },
+ {
+  "i": 19,
+  "label": "  set y 1000",
+  "var": "p19"
+ },
+ {
+  "i": 20,
+  "label": "-- set y -1000",
+  "stack": true
+ },
+ {
+  "i": 21,
+  "label": "  set y -1000",
+  "var": "p21"
+ },
+ {
+  "i": 22,
+  "label": "-- set y NaN",
+  "stack": true
+ },
+ {
+  "i": 23,
+  "label": "  set y NaN",
+  "var": "p23"
+ },
+ {
+  "i": 24,
+  "label": "-- set y 2",
+  "stack": true
+ },
+ {
+  "i": 25,
+  "label": "  set y 2",
+  "var": "p25"
+ },
+ {
+  "i": 26,
+  "label": "-- point 180.5",
+  "stack": true
+ },
+ {
+  "i": 27,
+  "label": "  point 180.5",
+  "var": "p27"
+ },
+ {
+  "i": 28,
+  "label": "-- point 181",
+  "stack": true
+ },
+ {
+  "i": 29,
+  "label": "  point 181",
+  "var": "p29"
+ },
+ {
+  "i": 30,
+  "label": "-- point 359",
+  "stack": true
+ },
+ {
+  "i": 31,
+  "label": "  point 359",
+  "var": "p31"
+ },
+ {
+  "i": 32,
+  "label": "-- point -180",
+  "stack": true
+ },
+ {
+  "i": 33,
+  "label": "  point -180",
+  "var": "p33"
+ },
+ {
+  "i": 34,
+  "label": "-- point -179.5",
+  "stack": true
+ },
+ {
+  "i": 35,
+  "label": "  point -179.5",
+  "var": "p35"
+ },
+ {
+  "i": 36,
+  "label": "-- point 360",
+  "stack": true
+ },
+ {
+  "i": 37,
+  "label": "  point 360",
+  "var": "p37"
+ },
+ {
+  "i": 38,
+  "label": "-- point 1e300",
+  "stack": true
+ },
+ {
+  "i": 39,
+  "label": "  point 1e300",
+  "var": "p39"
+ },
+ {
+  "i": 40,
+  "label": "-- point -1e300",
+  "stack": true
+ },
+ {
+  "i": 41,
+  "label": "  point -1e300",
+  "var": "p41"
+ },
+ {
+  "i": 42,
+  "label": "-- point 0.5",
+  "stack": true
+ },
+ {
+  "i": 43,
+  "label": "  point 0.5",
+  "var": "p43"
+ },
+ {
+  "i": 44,
+  "label": "-- point NaN",
+  "stack": true
+ },
+ {
+  "i": 45,
+  "label": "  point NaN",
+  "var": "p45"
+ },
+ {
+  "i": 46,
+  "label": "-- point 'abc'",
+  "stack": true
+ },
+ {
+  "i": 47,
+  "label": "  point 'abc'",
+  "var": "p47"
+ },
+ {
+  "i": 48,
+  "label": "-- point ''",
+  "stack": true
+ },
+ {
+  "i": 49,
+  "label": "  point ''",
+  "var": "p49"
+ },
+ {
+  "i": 50,
+  "label": "-- point 90",
+  "stack": true
+ },
+ {
+  "i": 51,
+  "label": "  point 90",
+  "var": "p51"
+ },
+ {
+  "i": 52,
+  "label": "-- turn right 90",
+  "stack": true
+ },
+ {
+  "i": 53,
+  "label": "  turn right 90",
+  "var": "p53"
+ },
+ {
+  "i": 54,
+  "label": "-- turn left 180",
+  "stack": true
+ },
+ {
+  "i": 55,
+  "label": "  turn left 180",
+  "var": "p55"
+ },
+ {
+  "i": 56,
+  "label": "-- turn right inf",
+  "stack": true
+ },
+ {
+  "i": 57,
+  "label": "  turn right inf",
+  "var": "p57"
+ },
+ {
+  "i": 58,
+  "label": "-- turn right NaN",
+  "stack": true
+ },
+ {
+  "i": 59,
+  "label": "  turn right NaN",
+  "var": "p59"
+ },
+ {
+  "i": 60,
+  "label": "-- style don't rotate",
+  "stack": true
+ },
+ {
+  "i": 61,
+  "label": "  style don't rotate",
+  "var": "p61"
+ },
+ {
+  "i": 62,
+  "label": "-- style then point 45",
+  "stack": true
+ },
+ {
+  "i": 63,
+  "label": "  style then point 45",
+  "var": "p63"
+ },
+ {
+  "i": 64,
+  "label": "-- style left-right",
+  "stack": true
+ },
+ {
+  "i": 65,
+  "label": "  style left-right",
+  "var": "p65"
+ },
+ {
+  "i": 66,
+  "label": "-- style then point 45",
+  "stack": true
+ },
+ {
+  "i": 67,
+  "label": "  style then point 45",
+  "var": "p67"
+ },
+ {
+  "i": 68,
+  "label": "-- style all around",
+  "stack": true
+ },
+ {
+  "i": 69,
+  "label": "  style all around",
+  "var": "p69"
+ },
+ {
+  "i": 70,
+  "label": "-- style then point 45",
+  "stack": true
+ },
+ {
+  "i": 71,
+  "label": "  style then point 45",
+  "var": "p71"
+ },
+ {
+  "i": 72,
+  "label": "-- size 150",
+  "stack": true
+ },
+ {
+  "i": 73,
+  "label": "  size 150",
+  "var": "p73"
+ },
+ {
+  "i": 74,
+  "label": "-- size 1000",
+  "stack": true
+ },
+ {
+  "i": 75,
+  "label": "  size 1000",
+  "var": "p75"
+ },
+ {
+  "i": 76,
+  "label": "-- size 50",
+  "stack": true
+ },
+ {
+  "i": 77,
+  "label": "  size 50",
+  "var": "p77"
+ },
+ {
+  "i": 78,
+  "label": "-- size 1",
+  "stack": true
+ },
+ {
+  "i": 79,
+  "label": "  size 1",
+  "var": "p79"
+ },
+ {
+  "i": 80,
+  "label": "-- size 0",
+  "stack": true
+ },
+ {
+  "i": 81,
+  "label": "  size 0",
+  "var": "p81"
+ },
+ {
+  "i": 82,
+  "label": "-- size -5",
+  "stack": true
+ },
+ {
+  "i": 83,
+  "label": "  size -5",
+  "var": "p83"
+ },
+ {
+  "i": 84,
+  "label": "-- size 10000",
+  "stack": true
+ },
+ {
+  "i": 85,
+  "label": "  size 10000",
+  "var": "p85"
+ },
+ {
+  "i": 86,
+  "label": "-- size NaN",
+  "stack": true
+ },
+ {
+  "i": 87,
+  "label": "  size NaN",
+  "var": "p87"
+ },
+ {
+  "i": 88,
+  "label": "-- size +10",
+  "stack": true
+ },
+ {
+  "i": 89,
+  "label": "  size +10",
+  "var": "p89"
+ },
+ {
+  "i": 90,
+  "label": "-- size '150.5'",
+  "stack": true
+ },
+ {
+  "i": 91,
+  "label": "  size '150.5'",
+  "var": "p91"
+ }
+]

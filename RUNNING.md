@@ -30,9 +30,10 @@ Linux 版は 2 種類あります。どちらも **LLVM は静的リンク**な�
   （warp 500ms）を外す危険モード**です。既定では warp スクリプトは 500ms
   走ると他のスレッド/描画へ譲りますが、`--danger` では 1 ティックで終わらない
   warp ループが譲らずに走り切ります（長い計算を 1 フレームで回す計測用）。
-  代償としてアプリが固まり、warp 内の `wait until` / `broadcast and wait` は
-  ハングし得ます。`run`/`play`/`test`/`edit` と AOT 実行ファイル
-  （`./app run --danger`）で使えます。
+  代償としてアプリが固まり得ます（止まらないのは純粋な計算ループだけ —
+  `wait` / `wait until` / `broadcast and wait` などの待機は danger でも他
+  スレッドへ譲るので停止します）。`run`/`play`/`test`/`edit` と AOT 実行
+  ファイル（`./app run --danger`）で使えます。
 
 - `ldd`/`readelf -d` で NEEDED が 0（glibc も静的）。どの x86-64 Linux でも動きます。
 - `play` / `gui`（ウィンドウ表示）は **含みません** — SDL2 を使うためです。

@@ -1,0 +1,322 @@
+[
+ {
+  "i": 0,
+  "label": "item 1 l1",
+  "var": "p0"
+ },
+ {
+  "i": 1,
+  "label": "item 1.9 l1",
+  "var": "p1"
+ },
+ {
+  "i": 2,
+  "label": "item 2.999 l1",
+  "var": "p2"
+ },
+ {
+  "i": 3,
+  "label": "item -0 l1",
+  "var": "p3"
+ },
+ {
+  "i": 4,
+  "label": "item NaN l1",
+  "var": "p4"
+ },
+ {
+  "i": 5,
+  "label": "item Inf l1",
+  "var": "p5"
+ },
+ {
+  "i": 6,
+  "label": "item -Inf l1",
+  "var": "p6"
+ },
+ {
+  "i": 7,
+  "label": "item 0 l1",
+  "var": "p7"
+ },
+ {
+  "i": 8,
+  "label": "item '2' l1",
+  "var": "p8"
+ },
+ {
+  "i": 9,
+  "label": "item 'last' l1",
+  "var": "p9"
+ },
+ {
+  "i": 10,
+  "label": "item 'all' l1",
+  "var": "p10"
+ },
+ {
+  "i": 11,
+  "label": "item 1 l3 (empty)",
+  "var": "p11"
+ },
+ {
+  "i": 12,
+  "label": "item 'last' l3",
+  "var": "p12"
+ },
+ {
+  "i": 13,
+  "label": "item 1 l4 (numbers)",
+  "var": "p13"
+ },
+ {
+  "i": 14,
+  "label": "item 3 l4",
+  "var": "p14"
+ },
+ {
+  "i": 15,
+  "label": "num# b in l1",
+  "var": "p15"
+ },
+ {
+  "i": 16,
+  "label": "num# B in l1",
+  "var": "p16"
+ },
+ {
+  "i": 17,
+  "label": "num# 1 in l4",
+  "var": "p17"
+ },
+ {
+  "i": 18,
+  "label": "num# '1' in l4",
+  "var": "p18"
+ },
+ {
+  "i": 19,
+  "label": "num# '1.0' in l4",
+  "var": "p19"
+ },
+ {
+  "i": 20,
+  "label": "num# '01' in l4",
+  "var": "p20"
+ },
+ {
+  "i": 21,
+  "label": "num# 0 in l4",
+  "var": "p21"
+ },
+ {
+  "i": 22,
+  "label": "num# '' in l1",
+  "var": "p22"
+ },
+ {
+  "i": 23,
+  "label": "num# 'x y' in l7",
+  "var": "p23"
+ },
+ {
+  "i": 24,
+  "label": "num# 0 in l8",
+  "var": "p24"
+ },
+ {
+  "i": 25,
+  "label": "has B l1",
+  "var": "p25"
+ },
+ {
+  "i": 26,
+  "label": "has '' l1",
+  "var": "p26"
+ },
+ {
+  "i": 27,
+  "label": "has 1 l4",
+  "var": "p27"
+ },
+ {
+  "i": 28,
+  "label": "has '1.0' l4",
+  "var": "p28"
+ },
+ {
+  "i": 29,
+  "label": "len l1",
+  "var": "p29"
+ },
+ {
+  "i": 30,
+  "label": "len l3",
+  "var": "p30"
+ },
+ {
+  "i": 31,
+  "label": "contents l1",
+  "var": "p31"
+ },
+ {
+  "i": 32,
+  "label": "contents l4",
+  "var": "p32"
+ },
+ {
+  "i": 33,
+  "label": "contents l3",
+  "var": "p33"
+ },
+ {
+  "i": 34,
+  "label": "contents l5",
+  "var": "p34"
+ },
+ {
+  "i": 35,
+  "label": "contents l7",
+  "var": "p35"
+ },
+ {
+  "i": 36,
+  "label": "contents l8",
+  "var": "p36"
+ },
+ {
+  "i": 37,
+  "label": "-- insert at 0",
+  "stack": true
+ },
+ {
+  "i": 38,
+  "label": "after insert 0",
+  "var": "p38"
+ },
+ {
+  "i": 39,
+  "label": "-- insert at 99",
+  "stack": true
+ },
+ {
+  "i": 40,
+  "label": "after insert 99",
+  "var": "p40"
+ },
+ {
+  "i": 41,
+  "label": "-- insert NaN",
+  "stack": true
+ },
+ {
+  "i": 42,
+  "label": "after insert NaN",
+  "var": "p42"
+ },
+ {
+  "i": 43,
+  "label": "-- insert 'last'",
+  "stack": true
+ },
+ {
+  "i": 44,
+  "label": "after insert last",
+  "var": "p44"
+ },
+ {
+  "i": 45,
+  "label": "-- delete Inf",
+  "stack": true
+ },
+ {
+  "i": 46,
+  "label": "after delete Inf",
+  "var": "p46"
+ },
+ {
+  "i": 47,
+  "label": "-- delete 0",
+  "stack": true
+ },
+ {
+  "i": 48,
+  "label": "after delete 0",
+  "var": "p48"
+ },
+ {
+  "i": 49,
+  "label": "-- delete -1",
+  "stack": true
+ },
+ {
+  "i": 50,
+  "label": "after delete -1",
+  "var": "p50"
+ },
+ {
+  "i": 51,
+  "label": "-- replace 0",
+  "stack": true
+ },
+ {
+  "i": 52,
+  "label": "after replace 0",
+  "var": "p52"
+ },
+ {
+  "i": 53,
+  "label": "-- replace NaN",
+  "stack": true
+ },
+ {
+  "i": 54,
+  "label": "after replace NaN",
+  "var": "p54"
+ },
+ {
+  "i": 55,
+  "label": "-- replace 99",
+  "stack": true
+ },
+ {
+  "i": 56,
+  "label": "after replace 99",
+  "var": "p56"
+ },
+ {
+  "i": 57,
+  "label": "-- delete 'all'",
+  "stack": true
+ },
+ {
+  "i": 58,
+  "label": "after delete all",
+  "var": "p58"
+ },
+ {
+  "i": 59,
+  "label": "len after all",
+  "var": "p59"
+ },
+ {
+  "i": 60,
+  "label": "-- add ''",
+  "stack": true
+ },
+ {
+  "i": 61,
+  "label": "contents after add ''",
+  "var": "p61"
+ },
+ {
+  "i": 62,
+  "label": "-- delete 'last'",
+  "stack": true
+ },
+ {
+  "i": 63,
+  "label": "contents after delete last",
+  "var": "p63"
+ }
+]

@@ -531,7 +531,7 @@ struct Codegen {
     /// fiber=nullptr での同期実行を壊すため新規 yield 追加時は必ず更新）。
     static bool helperMayYield(const char* n) {
         static const std::unordered_set<std::string_view> k = {
-            "xyo_loop_yield", "xyo_rt_wait", "xyo_stop_all",
+            "xyo_loop_yield", "xyo_wait_yield", "xyo_rt_wait", "xyo_stop_all",
             "xyo_stop_script", "xyo_broadcast_wait_v", "xyo_rt_compat",
             "xyo_rt_reporter", "xyo_mot_glidexy", "xyo_mot_glideto",
             "xyo_looks_saysecs", "xyo_looks_thinksecs",
@@ -813,6 +813,12 @@ struct Codegen {
     /// 挿入（全使用点を支配。proc 呼出しでは init は再実行されない）。
     llvm::Value* varSlot(const BlockField* f, bool isList) {
         std::string key = f->id;
+        key += '\x03';
+        if (f->value.isString() && f->value.asStrPtr()) {
+            const auto& n = f->value.asStrPtr()->view();
+            key.append(reinterpret_cast<const char*>(n.data()),
+                       n.size() * sizeof(char16_t));
+        }
         key += isList ? '\x01' : '\x02';
         auto [it, ins] = varSlotIdx.emplace(key, numVarSlots);
         if (ins) {
@@ -890,10 +896,12 @@ struct Codegen {
         case AOp::Mul: r = b.CreateFMul(fa, fb); break;
         case AOp::Div: r = b.CreateFDiv(fa, fb); break;
         case AOp::Mod: {
+            // scratch-vm: r = n % m; if (r / m < 0) r += m;
+            // ((n % m) + m) % m は m=Infinity で NaN、巨大 m で桁落ちする。
             llvm::Value* r0 = b.CreateFRem(fa, fb);
-            r = b.CreateFRem(b.CreateFAdd(r0, fb), fb);
-            r = b.CreateSelect(b.CreateFCmpOEQ(r, cf64(0.0)),
-                               cf64(0.0), r);
+            llvm::Value* signDiff =
+                b.CreateFCmpOLT(b.CreateFDiv(r0, fb), cf64(0.0));
+            r = b.CreateSelect(signDiff, b.CreateFAdd(r0, fb), r0);
             break;
         }
         }
@@ -976,8 +984,11 @@ struct Codegen {
         case 2: return uni(Intrinsic::ceil);
         case 3: return uni(Intrinsic::sqrt);
         case 4: case 5: {
-            // round(f(pi*x/180)*1e10)/1e10 — math-util 準拠
-            llvm::Value* rad = b.CreateFMul(x, cf64(kPi / 180.0));
+            // round(f(pi*x/180)*1e10)/1e10 — math-util 準拠。
+            // 掛け順は Scratch と同じ (pi*x)/180（x*(pi/180) だと
+            // x=1e308 で overflow せず sin/cos が NaN にならない）。
+            llvm::Value* rad =
+                b.CreateFDiv(b.CreateFMul(cf64(kPi), x), cf64(180.0));
             llvm::Value* v = b.CreateCall(
                 decl(fn == 4 ? "sin" : "cos", f64t, {f64t}), {rad});
             v = b.CreateUnaryIntrinsic(Intrinsic::round,
@@ -985,14 +996,18 @@ struct Codegen {
             return b.CreateFDiv(v, cf64(1e10));
         }
         case 7: case 8: case 9: {
-            llvm::Value* v = libm(fn == 7 ? "asin" : fn == 8 ? "acos" : "atan");
-            return b.CreateFMul(v, cf64(180.0 / kPi));
+            // Scratch: (asin(x) * 180) / pi。定数を先に畳まない。
+            // V8 の fdlibm と最終ビットまで一致させるため、libc ではなく
+            // v8math ヘルパを呼ぶ（interp と共通）。
+            const char* f = fn == 7 ? "xyo_asin" : fn == 8 ? "xyo_acos" : "xyo_atan";
+            return b.CreateFDiv(b.CreateFMul(call1(f, f64t, x), cf64(180.0)),
+                                cf64(kPi));
         }
-        case 10: return uni(Intrinsic::log);
+        case 10: return call1("xyo_log", f64t, x);
         case 11:
-            return b.CreateFDiv(uni(Intrinsic::log),
+            return b.CreateFDiv(call1("xyo_log", f64t, x),
                                 cf64(2.302585092994046));
-        case 12: return uni(Intrinsic::exp);
+        case 12: return call1("xyo_exp", f64t, x);
         case 13:
             return b.CreateCall(decl("pow", f64t, {f64t, f64t}),
                                 {cf64(10.0), x});
@@ -2037,9 +2052,9 @@ struct Codegen {
         }
         if (op == "operator_round") {
             llvm::Value* x = emitToNumF64(emitInputOf(blk, "NUM"));
-            return emitCanon(b.CreateFAdd(
-                b.CreateUnaryIntrinsic(Intrinsic::round, x),
-                cf64(0.0)));
+            // JS Math.round は .5 を +Infinity 方向へ丸め、-0 を保持する。
+            // llvm.round + 0.0 は負の .5 と -0 で Scratch と違う。
+            return emitCanon(call1("xyo_round", f64t, x));
         }
         if (op == "operator_mathop") {
             static const std::map<std::string, int32_t> ops = {
@@ -2502,7 +2517,10 @@ struct Codegen {
             llvm::Value* t = emitTruthyV(cond);
             b.CreateCondBr(t, done, waitBB);
             b.SetInsertPoint(waitBB);
-            emitLoopYield();
+            // 待機系の yield — danger モードでも他スレッドが進まないと
+            // 条件が変わらないため、通常のループ yield ではなく
+            // 「待機なら譲る」専用ヘルパを使う。
+            call1("xyo_wait_yield", voidt, ctxArg);
             b.CreateBr(head);
             b.SetInsertPoint(done);
             return;

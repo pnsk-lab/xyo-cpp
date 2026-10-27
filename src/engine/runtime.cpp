@@ -2,6 +2,7 @@
 #include "runtime.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 
@@ -325,7 +326,13 @@ int Runtime::runUntilDone(int maxSteps) {
 }
 
 void Runtime::updateCurrentMSecs() {
-    currentMSecs = Timer::stdNow();
+    // scratch-vm: runtime.currentMSecs = Date.now() (1 ms 精度)。
+    // Timer::stdNow() はサブ ms を持つため、Scratch の timer 値
+    // (整数 ms / 1000) に合わせて切り捨てる。ヘッドレスの step は
+    // 実時間より速く回るので、フレームごとに最低 1ms 進める
+    // (scratch-vm の 30fps では Date.now() が毎フレーム進む)。
+    double now = std::floor(Timer::stdNow());
+    currentMSecs = std::max(now, currentMSecs + 1.0);
 }
 
 void Runtime::processWaitQueue() {

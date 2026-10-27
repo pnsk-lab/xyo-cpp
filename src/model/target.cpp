@@ -218,7 +218,7 @@ void Target::setSize(double s) {
 
 void Target::setCostume(double index) {
     if (!sprite) return;
-    index = std::round(index);
+    index = jsnum::jsRound(index);
     if (!std::isfinite(index) || index == 0) index = 0;  // JS: !index → 0
     int n = int(sprite->costumes.size());
     if (n <= 0) { currentCostume = 0; return; }

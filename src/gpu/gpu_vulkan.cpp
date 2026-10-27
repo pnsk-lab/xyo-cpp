@@ -47,6 +47,12 @@ namespace {
 const uint32_t kGpuVmSpv[] =
 #include "gpu_vm_spv.inc"
     ;
+const uint32_t kHeadlessGpuVmSpv[] =
+#include "gpu_vm_headless_spv.inc"
+    ;
+// Vulkan never exposes/rasterizes stroke payloads. Retain the recorded variant
+// for same-binary diagnostics/A/B; pipeline choice is fixed for this process.
+const bool kKeepHeadlessRecords = std::getenv("XYO_GPU_VK_RECORDS") != nullptr;
 
 // ---- 動的ロードした関数ポインタ ------------------------------------
 struct VkApi {
@@ -446,8 +452,8 @@ bool initImpl() {
     VkShaderModule mod;
     VkShaderModuleCreateInfo sm = {
         .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .codeSize = sizeof(kGpuVmSpv),
-        .pCode    = kGpuVmSpv,
+        .codeSize = kKeepHeadlessRecords ? sizeof(kGpuVmSpv) : sizeof(kHeadlessGpuVmSpv),
+        .pCode    = kKeepHeadlessRecords ? kGpuVmSpv : kHeadlessGpuVmSpv,
     };
     if (vk.CreateShaderModule(g.dev, &sm, nullptr, &mod) != VK_SUCCESS)
         return false;
@@ -524,16 +530,27 @@ bool vulkanExecParallel(ExecRequest& req) {
     std::lock_guard<std::mutex> lk(g.mu);
 
     const uint32_t stride = laneOutStride(req.nWb);
-    const uint64_t paramBytes = (uint64_t)(20 + req.nWb) * 4;
+    // Shared ABI: fixed20 + wb slots + 7 carried fields + global lane base.
+    const uint64_t paramBytes = (uint64_t(28) + req.nWb) * 4;
     const uint64_t codeBytes  = (uint64_t)req.codeLen * 4;
     const uint64_t globBytes  = (uint64_t)std::max<uint32_t>(req.nGlobals, 1) * 4;
     const uint64_t cntBytes   = (uint64_t)req.lanes * 4;
     const uint64_t loutBytes  = (uint64_t)req.lanes * stride * 4;
-    const uint64_t recBytes   = (uint64_t)req.lanes * req.maxPerLane * 48;
+    // Binding 2 remains valid, but the headless shader cannot write it. Do not
+    // reserve lanes*maxPerLane records that nobody consumes: at 1M lanes this
+    // needlessly exceeded the 512MiB/SSBO limits and forced the whole loop CPU.
+    const uint64_t recBytes   = kKeepHeadlessRecords
+                                   ? uint64_t(req.lanes) * req.maxPerLane * 48
+                                   : 48;
     const uint64_t total = paramBytes + codeBytes + globBytes + cntBytes +
                            loutBytes + recBytes;
     if (!req.lanes || !req.code || !req.codeLen) return false;
-    if (total > uint64_t(512) * 1024 * 1024) return false;
+    if (total > uint64_t(512) * 1024 * 1024) {
+        if (std::getenv("XYO_GPU_DEBUG"))
+            std::fprintf(stderr, "xyo-gpu-vk: allocation budget exceeded total=%llu records=%llu\n",
+                         (unsigned long long)total, (unsigned long long)recBytes);
+        return false;
+    }
     if (req.nGlobals && !req.globals) return false;
     if (g.ssboMax &&
         int64_t(std::max({recBytes, loutBytes, codeBytes})) >
@@ -550,7 +567,7 @@ bool vulkanExecParallel(ExecRequest& req) {
         !ensureBuf(g.lout, loutBytes, true))
         return false;
 
-    // params（GL 版と同一パッキング: 固定20 + wbSlot[]）
+    // params（GL 版と同一パッキング: 固定20 + wbSlot[] + carried state）
     float* pr = (float*)g.params.map;
     pr[0] = req.startX; pr[1] = req.startY;
     pr[2] = req.penSize;
@@ -573,6 +590,11 @@ bool vulkanExecParallel(ExecRequest& req) {
     pr[19] = req.miscLimits ? 1.0f : 0.0f;
     for (uint32_t i = 0; i < req.nWb; ++i)
         pr[20 + i] = float(req.wbSlots ? req.wbSlots[i] : 0);
+    const uint32_t eb = 20 + req.nWb;
+    pr[eb] = req.penDownAll ? 1.0f : 0.0f;
+    pr[eb + 1] = float(req.endAttrMask);
+    for (int k = 0; k < 5; ++k) pr[eb + 2 + k] = req.endAttr[k];
+    pr[eb + 7] = 0.0f; // Vulkan is a single dispatch, with global base zero.
 
     std::memcpy(g.code.map, req.code, size_t(codeBytes));
     if (req.nGlobals)

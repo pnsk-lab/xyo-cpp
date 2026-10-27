@@ -215,6 +215,10 @@ double toListIndexD(Value index, double length, bool acceptAll) {
         d = numberOrNaNImpl(index);
     }
     d = std::floor(d);
+    // Cast.toNumber() は NaN を 0 に潰すので、scratch-vm の toListIndex は
+    // NaN を返さない（非数値は LIST_INVALID）。NaN を保持したまま返すと
+    // listDelete 側の NaN 特別扱いが壊れたインデックスを作る。
+    if (std::isnan(d)) return LIST_INVALID;
     if (d < 1 || d > length) return LIST_INVALID;
     return d;
 }

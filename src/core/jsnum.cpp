@@ -1,8 +1,11 @@
 // xyo-cpp: ECMAScript 準拠の数値↔文字列変換。
 #include "jsnum.hpp"
 
+#include <bit>
+#include <cstdint>
 #include <charconv>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -28,9 +31,11 @@ static double strtodC(const char* s) {
 std::string toString(double v) {
     if (std::isnan(v)) return "NaN";
     if (v == 0) return "0";                     // -0 もここ
-    // 整数 fast path: i64 に往復できる整数は ES 表記が十進整数
-    // （|v|<1e21 なら指数表記にならず 9.2e18<1e21<2^63）。往復探索を省略。
-    if (v > -9.2e18 && v < 9.2e18) {
+    // 整数 fast path: |v| <= 2^53 の整数は正確に表現でき、その十進整数が
+    // 最短 round-trip 表現になる。2^53 超では 2^57 の ...870 のように
+    // 正確な整数値と最短表現がずれるため、最短探索へ落とす。
+    constexpr double kMaxExactInt = 9007199254740992.0;  // 2^53
+    if (v >= -kMaxExactInt && v <= kMaxExactInt) {
         long long iv = static_cast<long long>(v);
         if (static_cast<double>(iv) == v) {
             char buf[24];
@@ -224,6 +229,97 @@ double toNumberAscii(std::string_view s) {
         sv = tmp;
     }
     return toNumber(sv);
+}
+
+double jsRound(double x) {
+    // ES Math.round: 有限なら floor(x + 0.5)。ただし
+    //   -0.5 <= x < 0     -> -0
+    //    0   <= x < 0.5   -> +0
+    //   |x| >= 2^52       -> x（端数が表現できない。x+0.5 の丸めで誤らない）
+    // とする。単純な floor(x+0.5) は 0.49999999999999994 を 1 にしてしまう。
+    if (!std::isfinite(x) || x == 0.0) return x;
+    if (x > 0.0 && x < 0.5) return 0.0;
+    if (x < 0.0 && x >= -0.5) return -0.0;
+    constexpr double kNoFraction = 4503599627370496.0;  // 2^52
+    if (x >= kNoFraction || x <= -kNoFraction) return x;
+    return std::floor(x + 0.5);
+}
+
+// fdlibm e_log.c の移植。元の著作権表示（permissive）を保持する:
+//
+// ====================================================
+// Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+//
+// Developed at SunSoft, a Sun Microsystems, Inc. business.
+// Permission to use, copy, modify, and distribute this
+// software is freely granted, provided that this notice
+// is preserved.
+// ====================================================
+//
+// V8 の Math.log と同じ結果をプラットフォーム非依存で返すため、
+// glibc の std::log は使わない（1 ULP 違うことがある）。
+double jsLog(double x) {
+    constexpr double ln2_hi = 6.93147180369123816490e-01;
+    constexpr double ln2_lo = 1.90821492927058770002e-10;
+    constexpr double two54 = 1.80143985094819840000e+16;
+    constexpr double Lg1 = 6.666666666666735130e-01;
+    constexpr double Lg2 = 3.999999999940941908e-01;
+    constexpr double Lg3 = 2.857142874366239149e-01;
+    constexpr double Lg4 = 2.222219843214978396e-01;
+    constexpr double Lg5 = 1.818357216161805012e-01;
+    constexpr double Lg6 = 1.531383769920937332e-01;
+    constexpr double Lg7 = 1.479819860511658591e-01;
+
+    uint64_t bits = std::bit_cast<uint64_t>(x);
+    int32_t hx = static_cast<int32_t>(bits >> 32);
+    uint32_t lx = static_cast<uint32_t>(bits);
+    int32_t k = 0;
+    if (hx < 0x00100000) {                      // x < 2^-1022
+        if ((static_cast<uint32_t>(hx & 0x7fffffff) | lx) == 0)
+            return -std::numeric_limits<double>::infinity();  // log(±0)
+        if (hx < 0) return std::numeric_limits<double>::quiet_NaN();
+        k -= 54;                                // subnormal: scale up
+        x *= two54;
+        bits = std::bit_cast<uint64_t>(x);
+        hx = static_cast<int32_t>(bits >> 32);
+    }
+    if (hx >= 0x7ff00000) return x + x;         // +Inf / NaN
+    k += (hx >> 20) - 1023;
+    hx &= 0x000fffff;
+    int32_t i = (hx + 0x95f64) & 0x100000;
+    bits = (bits & 0xffffffffull) |
+           (static_cast<uint64_t>(hx | (i ^ 0x3ff00000)) << 32);
+    x = std::bit_cast<double>(bits);            // normalize x or x/2
+    k += (i >> 20);
+    double f = x - 1.0;
+    if ((0x000fffff & (2 + hx)) < 3) {          // -2^-20 <= f < 2^-20
+        if (f == 0.0) {
+            if (k == 0) return 0.0;
+            const double dk = static_cast<double>(k);
+            return dk * ln2_hi + dk * ln2_lo;
+        }
+        double R = f * f * (0.5 - 0.33333333333333333 * f);
+        if (k == 0) return f - R;
+        const double dk = static_cast<double>(k);
+        return dk * ln2_hi - ((R - dk * ln2_lo) - f);
+    }
+    double s = f / (2.0 + f);
+    const double dk = static_cast<double>(k);
+    double z = s * s;
+    i = hx - 0x6147a;
+    double w = z * z;
+    int32_t j = 0x6b851 - hx;
+    double t1 = w * (Lg2 + w * (Lg4 + w * Lg6));
+    double t2 = z * (Lg1 + w * (Lg3 + w * (Lg5 + w * Lg7)));
+    i |= j;
+    double R = t2 + t1;
+    if (i > 0) {
+        const double hfsq = 0.5 * f * f;
+        if (k == 0) return f - (hfsq - s * (hfsq + R));
+        return dk * ln2_hi - ((hfsq - (s * (hfsq + R) + dk * ln2_lo)) - f);
+    }
+    if (k == 0) return f - s * (f - R);
+    return dk * ln2_hi - ((s * (f - R) - dk * ln2_lo) - f);
 }
 
 } // namespace xyo::jsnum
