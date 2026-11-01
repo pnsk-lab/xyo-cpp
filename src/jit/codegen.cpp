@@ -3,6 +3,7 @@
 // 値は i64 の NaN ボックス bit パターンとして受け渡しする。
 // 入力・スタック双方、未 lowering のものは compat 層へ落とす。
 #include "jit.hpp"
+#include "llvm_compat.hpp"
 #include "aot_emit.hpp"
 #include "parfor.hpp"
 
@@ -659,7 +660,7 @@ struct Codegen {
     /// llvm.fptosi.sat.i64.f64 — NaN/±Inf/範囲外で未定義動作にならず
     /// INT64_MIN/MAX に飽和する。リスト索引の整数境界検査に使う。
     llvm::Value* satToI64(llvm::Value* d) {
-        Function* f = Intrinsic::getOrInsertDeclaration(
+        Function* f = llvmc::intrinsicDeclaration(
             b.GetInsertBlock()->getModule(), Intrinsic::fptosi_sat,
             {i64t, f64t});
         return b.CreateCall(f, {d});
@@ -1398,7 +1399,7 @@ struct Codegen {
                 storeNumericPair(*pv, b.CreateBitCast(r, i64t), r);
                 b.CreateBr(merge);
                 b.SetInsertPoint(repair);
-                b.CreateCall(Intrinsic::getOrInsertDeclaration(&mod, Intrinsic::sideeffect));
+                b.CreateCall(llvmc::intrinsicDeclaration(&mod, Intrinsic::sideeffect));
                 b.CreateStore(cf64(0.0), pv->dslot);
                 b.CreateStore(ci64(val::kNan), pv->slot);
                 b.CreateBr(merge);
@@ -2276,7 +2277,7 @@ struct Codegen {
         auto* vt = llvm::FixedVectorType::get(f64t, 2);
         llvm::Value* vec = b.CreateInsertElement(
             llvm::UndefValue::get(vt), d, uint64_t(0));
-        auto* cvt = llvm::Intrinsic::getOrInsertDeclaration(
+        auto* cvt = llvmc::intrinsicDeclaration(
             &mod, llvm::Intrinsic::x86_sse2_cvttsd2si64);
         llvm::Value* i0 = b.CreateSub(b.CreateCall(cvt, {vec}), ci64(1));
         return {b.CreateICmpULT(i0, b.CreateZExt(len, i64t)), i0};
@@ -2997,7 +2998,7 @@ struct Codegen {
                 if (!e || e[0] != '0') {
                     // Do not turn a conditional numeric update into an FP
                     // blend on the loop-carried value's dependency chain.
-                    b.CreateCall(Intrinsic::getOrInsertDeclaration(&mod, Intrinsic::sideeffect));
+                    b.CreateCall(llvmc::intrinsicDeclaration(&mod, Intrinsic::sideeffect));
                 }
             }
             {

@@ -42,3 +42,4 @@ tests/bench/algos/out/
 tests/bench/algos/.logs/
 tests/bench/algos/results*.json
 tests/bench/algos/v8out/
+/.ghcache/

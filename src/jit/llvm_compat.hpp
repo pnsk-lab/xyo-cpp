@@ -7,9 +7,13 @@
 // ビルドできるようにここで吸収する。
 #pragma once
 
+#include <llvm/ADT/ArrayRef.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Config/llvm-config.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
+#include <llvm/IR/Function.h>
+#include <llvm/IR/Intrinsics.h>
+#include <llvm/IR/Module.h>
 #include <llvm/TargetParser/Triple.h>
 
 namespace xyo::llvmc {
@@ -32,6 +36,19 @@ inline void withContext(llvm::orc::ThreadSafeContext& tsc, Fn&& fn) {
 #else
     auto lock = tsc.getLock();
     fn(tsc.getContext());
+#endif
+}
+
+/// intrinsic の宣言を取得する（無ければモジュールへ追加）。
+/// LLVM 23 で getDeclaration から getOrInsertDeclaration に改名された。
+/// CMake が XYO_LLVM_GET_OR_INSERT を定義した場合だけ新しい名前を使う。
+inline llvm::Function* intrinsicDeclaration(
+        llvm::Module* m, llvm::Intrinsic::ID id,
+        llvm::ArrayRef<llvm::Type*> overloads = {}) {
+#if defined(XYO_LLVM_GET_OR_INSERT)
+    return llvm::Intrinsic::getOrInsertDeclaration(m, id, overloads);
+#else
+    return llvm::Intrinsic::getDeclaration(m, id, overloads);
 #endif
 }
 

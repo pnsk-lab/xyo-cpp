@@ -156,6 +156,35 @@ endif()
 if(XYO_JIT)
   target_compile_definitions(xyo PUBLIC XYO_JIT=1)
   target_include_directories(xyo SYSTEM PUBLIC ${LLVM_INCLUDE_DIRS})
+  # LLVM 23 では Intrinsic::getDeclaration が getOrInsertDeclaration に
+  # 改名された。18〜23 の差を吸収するため、宣言の有無をコンパイルで調べる。
+  # LLVM ヘッダは ABI チェック用のシンボルを要求するので、リンクせず
+  # 静的ライブラリとしてコンパイルだけを行う。
+  include(CheckCXXSourceCompiles)
+  set(_xyo_saved_try_type "${CMAKE_TRY_COMPILE_TARGET_TYPE}")
+  set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+  set(CMAKE_REQUIRED_INCLUDES ${LLVM_INCLUDE_DIRS})
+  set(CMAKE_REQUIRED_QUIET ON)
+  check_cxx_source_compiles([[
+    #include <llvm/ADT/ArrayRef.h>
+    #include <llvm/IR/Function.h>
+    #include <llvm/IR/Intrinsics.h>
+    #include <llvm/IR/Module.h>
+    #include <type_traits>
+    #include <utility>
+    int main() {
+      using Fn = decltype(llvm::Intrinsic::getOrInsertDeclaration(
+          std::declval<llvm::Module*>(), std::declval<llvm::Intrinsic::ID>(),
+          std::declval<llvm::ArrayRef<llvm::Type*>>()));
+      static_assert(std::is_same_v<Fn, llvm::Function*>);
+      return 0;
+    }
+  ]] XYO_LLVM_HAS_GET_OR_INSERT)
+  set(CMAKE_TRY_COMPILE_TARGET_TYPE "${_xyo_saved_try_type}")
+  unset(_xyo_saved_try_type)
+  if(XYO_LLVM_HAS_GET_OR_INSERT)
+    target_compile_definitions(xyo PUBLIC XYO_LLVM_GET_OR_INSERT=1)
+  endif()
   if(XYO_LLVM_LINK_DIRS)
     target_link_directories(xyo PUBLIC ${XYO_LLVM_LINK_DIRS})
   endif()
