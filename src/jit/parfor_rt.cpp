@@ -122,6 +122,13 @@ int xyo_par_for(xyo::JitCtx* ctx, int64_t trip, double init, double delta,
     // SList の len は uint32 — 収まらない規模は逐次へ
     for (int64_t k = 0; k < nl; ++k)
         if (uint64_t(bases[k]) + uint64_t(trip) > 0xFFFFFFF0ull) return 0;
+    // リスト長上限があるときは、予約で上限を超えるなら逐次（SList::push が
+    // 上限を見て落とす）へ戻す。
+    if (xyo::xyo_list_limit)
+        for (int64_t k = 0; k < nl; ++k)
+            if (uint64_t(bases[k]) + uint64_t(trip) >
+                uint64_t(xyo::xyo_list_limit))
+                return 0;
 
     // 予約は直列区間で（len/cap の共有書き込みを作らない）
     for (int64_t k = 0; k < nl; ++k)

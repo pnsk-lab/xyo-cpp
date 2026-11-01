@@ -29,12 +29,12 @@ SECOND[4] = [("4", "ins", "4"), ("5", "ins", "5"), ("6", "ins", "6"), ("×", "in
              ("nCr", "ins", "ncr("), ("nPr", "ins", "npr(")]
 
 GRAPH_KEYS = [
-    ("BACK", "back"), ("f(x)", "ask"), ("−", "zoomout"),
+    ("BACK", "back"), ("EQN", "ask"), ("−", "zoomout"),
     ("+", "zoomin"), ("RESET", "reset"), ("TRACE", "trace"),
 ]
 
 GLYPH_CHARS = [chr(c) for c in range(33, 127)] + ["×", "÷", "−"]
-GLYPH_NAMES = ["g%d" % ord(ch) for ch in GLYPH_CHARS]
+GLYPH_NAMES = ["glyph:" + ch for ch in GLYPH_CHARS]
 
 FROM_CHARS = ["π", "×", "÷", "−", "–", "—", "√", "∛", "²", "³",
               "！", "％", "（", "）", "，", "、", "。", "　",
@@ -83,7 +83,7 @@ def build_model():
         ("pa", 0), ("pb", 0), ("pOut2", 0),
         ("fi", 0), ("fv", 0), ("fac", 0), ("fargc", 0),
         ("uiCostume", "normal"),
-        ("dlText", ""), ("dlY", 0), ("dlSize", 100), ("dlAlign", 0),
+        ("dlOriginX", -224), ("dlText", ""), ("dlY", 0), ("dlSize", 100), ("dlAlign", 0),
         ("dlLen", 0), ("dlStart", 0), ("dlX", 0), ("dlI", 0),
         ("dlCh", ""), ("dlIdx", 0), ("dlAdv", 0), ("dlMax", 0),
         ("k", 0), ("px", 0), ("py", 0), ("penWasDown", 0),
@@ -95,7 +95,7 @@ def build_model():
         ("u1", 0), ("u2", 0), ("u3", 0), ("u4", 0), ("g2Out", 0), ("es", ""),
         ("haveResult", 0), ("gs", 0), ("glog", 0),
         ("pgs", 20), ("pgx", 0), ("pgy", 0), ("pbin", ""),
-        ("xval", 0), ("argc", 0), ("tok", ""), ("kind", ""), ("ins", ""),
+        ("xval", 0), ("yval", 0), ("parseOk", 0), ("graphCompiled", 0), ("argc", 0), ("tok", ""), ("kind", ""), ("ins", ""),
         ("nidx", 0), ("uidx", 0), ("msg", ""), ("busy", 0), ("col", 0), ("row", 0),
         ("savedAngleMode", "DEG"),
         ("aIm", 0), ("aJ", 0), ("aK", 0),
@@ -137,8 +137,10 @@ def build_model():
         ("upperChars", [chr(c) for c in range(65, 91)]),
         ("lowerChars", [chr(c) for c in range(97, 123)]),
         ("digits", [str(i) for i in range(10)]),
+        ("componentFunctions", "norm arg conj inv re real im imag jpart kpart".split()),
+        ("functionNames", "sin cos tan asin acos atan atan2 sinh cosh tanh asinh acosh atanh ln log log2 exp sqrt cbrt abs norm arg conj inv re real im imag jpart kpart floor ceil round sign trunc deg rad mod pow root ncr npr min max sum avg hypot gcd lcm rand randint gamma fact".split()),
         ("opChars", ["+", "-", "*", "/", "^", "%", "!"]),
-        ("constNames", ["pi", "e", "tau", "phi", "ans", "mem", "x", "i", "j", "k"]),
+        ("constNames", ["pi", "e", "tau", "phi", "ans", "mem", "x", "y", "i", "j", "k"]),
         ("keyKinds", [k for row in NORMAL for _, k, *_ in row]),
         ("keyInserts", [row[2] if len(row) > 2 else "" for r in NORMAL for row in r]),
         ("keyKinds2", [k for row in SECOND for _, k, *_ in row]),

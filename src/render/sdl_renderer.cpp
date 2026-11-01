@@ -595,6 +595,11 @@ SdlRenderer::Skin* SdlRenderer::decodeCostume(const Costume* c) {
     };
     auto skin = std::make_unique<Skin>();
     if (c->data.empty()) return fail();
+    // scratch-render は SVG の viewBox 幅・高さを「論理サイズ」とし、
+    // rotationCenter から viewBox の原点を引く（LLK/scratch-render#90）。
+    // ラスタライズ後の ceil された px 数を論理サイズにすると 0.3〜0.5px
+    // ずれ、フェンス位置が 1px 変わる。viewBox がある場合だけ上書きする。
+    double svgLogicalW = 0, svgLogicalH = 0;
 
     if (c->dataFormat == "svg") {
 #ifndef XYO_HAVE_RSVG
@@ -628,9 +633,21 @@ SdlRenderer::Skin* SdlRenderer::decodeCostume(const Costume* c) {
                       skin->px.data(), skin->w, skin->h, skin->w * 4);
         nsvgDeleteRasterizer(rast);
         nsvgDelete(img);
+        // viewBox の原点・寸法（nanosvg は原点を捨てるので XML から拾う）
+        double vbX = 0, vbY = 0, vbW = 0, vbH = 0;
+        {
+            size_t p = xml.find("viewBox");
+            if (p != std::string::npos) {
+                size_t q = xml.find_first_of("\"'", p);
+                if (q != std::string::npos)
+                    std::sscanf(xml.c_str() + q + 1, "%lf %lf %lf %lf",
+                                &vbX, &vbY, &vbW, &vbH);
+            }
+        }
         // SVG の rotationCenter は論理 px（= svg px）
-        skin->rcx = c->rotationCenterX;
-        skin->rcy = c->rotationCenterY;
+        skin->rcx = c->rotationCenterX - vbX;
+        skin->rcy = c->rotationCenterY - vbY;
+        if (vbW > 0 && vbH > 0) { svgLogicalW = vbW; svgLogicalH = vbH; }
 #else
         // librsvg 経路: (data, size) を直接渡す（NUL 終端は不要）。
         std::string xml(reinterpret_cast<const char*>(c->data.data()),
@@ -643,6 +660,19 @@ SdlRenderer::Skin* SdlRenderer::decodeCostume(const Costume* c) {
         if (!h) return fail();
         rsvg_handle_set_dpi(h, 96.0);
         double sw = 0, sh = 0;
+        double vbX = 0, vbY = 0, vbW = 0, vbH = 0;
+        {
+            gboolean hw = FALSE, hh = FALSE, hv = FALSE;
+            RsvgLength lw0, lh0;
+            RsvgRectangle vb0;
+            rsvg_handle_get_intrinsic_dimensions(h, &hw, &lw0, &hh, &lh0,
+                                                 &hv, &vb0);
+            if (hv && std::isfinite(vb0.width) && vb0.width > 0 &&
+                std::isfinite(vb0.height) && vb0.height > 0) {
+                vbX = vb0.x; vbY = vb0.y;
+                vbW = vb0.width; vbH = vb0.height;
+            }
+        }
         bool sized = rsvg_handle_get_intrinsic_size_in_pixels(h, &sw, &sh);
         if (!sized) {
             gboolean hasW, hasH, hasVb;
@@ -725,9 +755,11 @@ SdlRenderer::Skin* SdlRenderer::decodeCostume(const Costume* c) {
             }
         }
         cairo_surface_destroy(surf);
-        // SVG の rotationCenter は論理 px（=svg px）
-        skin->rcx = c->rotationCenterX;
-        skin->rcy = c->rotationCenterY;
+        // SVG の rotationCenter は論理 px（=svg px）。scratch-render は
+        // viewBox 原点を引いてテクスチャ座標へ直す。
+        skin->rcx = c->rotationCenterX - vbX;
+        skin->rcy = c->rotationCenterY - vbY;
+        if (vbW > 0 && vbH > 0) { svgLogicalW = vbW; svgLogicalH = vbH; }
 #endif // XYO_HAVE_RSVG
     } else {
         int w = 0, h = 0;
@@ -749,6 +781,10 @@ SdlRenderer::Skin* SdlRenderer::decodeCostume(const Costume* c) {
     }
     skin->logicalW = skin->w / skin->scale;
     skin->logicalH = skin->h / skin->scale;
+    if (svgLogicalW > 0 && svgLogicalH > 0) {
+        skin->logicalW = svgLogicalW;
+        skin->logicalH = svgLogicalH;
+    }
 
     skin->tex = SDL_CreateTexture(renderer_, SDL_PIXELFORMAT_RGBA32,
                                   SDL_TEXTUREACCESS_STATIC, skin->w, skin->h);
@@ -1191,6 +1227,14 @@ bool SdlRenderer::isTouchingDrawables(int drawableID, const int* others,
     return false;
 }
 
+// scratch-render の colorMatches 準拠: RGB をビットマスクで量子化して比較する
+// （R/G は上位 5bit、B は上位 4bit）。±5 の距離比較は AA 画素で結果が変わる。
+static inline bool colorMatches(uint8_t r, uint8_t g, uint8_t b, uint8_t tr,
+                                uint8_t tg, uint8_t tb) {
+    return (r & 0xF8) == (tr & 0xF8) && (g & 0xF8) == (tg & 0xF8) &&
+           (b & 0xF0) == (tb & 0xF0);
+}
+
 bool SdlRenderer::isTouchingColor(int drawableID, uint32_t rgb) {
     const Drawable* d = drawableFor(drawableID);
     if (!d || !d->target || !d->target->visible) return false;
@@ -1206,9 +1250,7 @@ bool SdlRenderer::isTouchingColor(int drawableID, uint32_t rgb) {
         for (int x = x0; x < x1; ++x) {
             if (!skinPxAt(*d, x + 0.5, y + 0.5, self)) continue;
             if (!stageColorAt(x + 0.5, y + 0.5, drawableID, behind)) continue;
-            if (std::abs(int(behind[0]) - tr) <= 5 &&
-                std::abs(int(behind[1]) - tg) <= 5 &&
-                std::abs(int(behind[2]) - tb) <= 5)
+            if (colorMatches(behind[0], behind[1], behind[2], tr, tg, tb))
                 return true;
         }
     return false;
@@ -1232,14 +1274,10 @@ bool SdlRenderer::colorTouchingColor(uint32_t color, uint32_t target,
     for (int y = y0; y < y1; ++y)
         for (int x = x0; x < x1; ++x) {
             if (!skinPxAt(*d, x + 0.5, y + 0.5, self)) continue;
-            if (std::abs(int(self[0]) - c1r) > 5 ||
-                std::abs(int(self[1]) - c1g) > 5 ||
-                std::abs(int(self[2]) - c1b) > 5)
+            if (!colorMatches(self[0], self[1], self[2], c1r, c1g, c1b))
                 continue;
             if (!stageColorAt(x + 0.5, y + 0.5, drawableID, behind)) continue;
-            if (std::abs(int(behind[0]) - c2r) <= 5 &&
-                std::abs(int(behind[1]) - c2g) <= 5 &&
-                std::abs(int(behind[2]) - c2b) <= 5)
+            if (colorMatches(behind[0], behind[1], behind[2], c2r, c2g, c2b))
                 return true;
         }
     return false;

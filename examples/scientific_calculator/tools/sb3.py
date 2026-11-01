@@ -461,8 +461,32 @@ def md5(data):
     return hashlib.md5(data.encode("utf-8")).hexdigest()
 
 
+def validate_project(project):
+    """A Scratch block is a tree node, never a shared expression/stack DAG."""
+    for target in project["targets"]:
+        blocks = target.get("blocks", {})
+        owners = {}
+        for bid, block in blocks.items():
+            if not isinstance(block, dict):
+                continue
+            refs = []
+            if block.get("next"):
+                refs.append((block["next"], "next"))
+            for key, value in block.get("inputs", {}).items():
+                for ref in value[1:]:
+                    if isinstance(ref, str):
+                        refs.append((ref, key))
+            for ref, key in refs:
+                if ref not in blocks:
+                    raise ValueError(f"{target['name']} {bid}.{key}: missing block {ref}")
+                if ref in owners:
+                    raise ValueError(f"{target['name']}: shared block {ref}: {owners[ref]} and {bid}.{key}")
+                owners[ref] = f"{bid}.{key}"
+
+
 def write_sb3(path, project, assets):
     """assets: dict filename-without-ext -> text content; ids become md5."""
+    validate_project(project)
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("project.json", json.dumps(project, ensure_ascii=False,
                                              separators=(",", ":")))

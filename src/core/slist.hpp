@@ -12,6 +12,11 @@
 
 namespace xyo {
 
+/// リスト長の上限（0 = 無制限、既定）。Scratch は 200000 で、
+/// 上限を超える insert は末尾を落として長さを保つ（Mistwarp 準拠）。
+/// `--list-limit N` / `XYO_LIST_LIMIT=N` で実行前に設定する。
+extern "C" uint32_t xyo_list_limit;
+
 struct SList {
     uint32_t len;
     uint32_t cap;
@@ -34,6 +39,7 @@ struct SList {
         items = static_cast<Value*>(std::realloc(items, cap * sizeof(Value)));
     }
     void push(Value v) {
+        if (xyo_list_limit && len >= xyo_list_limit) return;
         ensure(len + 1);
         items[len++] = v;
     }
@@ -44,6 +50,8 @@ struct SList {
         std::memmove(items + i + 1, items + i, (len - i) * sizeof(Value));
         items[i] = v;
         ++len;
+        // 上限を超えたら末尾を落とす（scratch の list limit と同じ挙動）
+        if (xyo_list_limit && len > xyo_list_limit) --len;
     }
     void erase0(uint32_t i) {
         if (i >= len) return;             // defensive: never memmove past len

@@ -34,8 +34,8 @@
 #include "editor.hpp"
 
 #include "core/cast.hpp"
-#include "core/fileio.hpp"
 #include "core/slist.hpp"
+#include "core/fileio.hpp"
 #include "core/sstr.hpp"
 #include "analysis/project_analysis.hpp"
 #include "engine/runtime.hpp"
@@ -94,6 +94,8 @@ static int usage() {
         "         eager=全スクリプトを spawn 時にコンパイル（テスト/ベンチ用）,"
         " off=インタプリタのみ\n"
         "  --danger: スレッドごとの実行時間予算（warp 500ms）を外す危険モード。\n"
+        "  --list-limit N: リスト長の上限（0 = 無制限、既定 0）。Scratch と同じ\n"
+        "         挙動にするなら 200000（XYO_LIST_LIMIT でも指定可）。\n"
         "         1 フレームで終わらないスクリプトが描画/他スレッドへ譲らず\n"
         "         走り続ける（アプリが固まる）— 計測・変換検証専用。\n"
         "         XYO_DANGER=1 でも有効（既定 off）。\n");
@@ -127,10 +129,85 @@ static void applyAotObject(Runtime& rt, const char* objPath,
 }
 #endif
 
+static void jsonEscapeTo(const std::string& s, std::string& out) {
+    out += '"';
+    for (unsigned char c : s) {
+        switch (c) {
+        case '"':  out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default:
+            if (c < 0x20) {
+                char buf[8];
+                std::snprintf(buf, sizeof buf, "\\u%04x", c);
+                out += buf;
+            } else {
+                out += static_cast<char>(c);
+            }
+        }
+    }
+    out += '"';
+}
+
 /// 検証用: XYO_DUMPVARS=1 で実行後の全変数/リストを決定的な順で出力。
 /// AOT / JIT / インタプリタの意味論一致検査に使う。
+/// `XYO_DUMPVARS=json` は同じ内容を JSON で出す（リスト項目に空白や改行が
+/// 含まれても切り分けられるようにするため）。
+static void dumpVarsJson(Runtime& rt) {
+    std::string out = "{";
+    bool firstTarget = true;
+    for (Target* t : rt.targets) {
+        const std::string tn = SStr::toUtf8(t->getName());
+        std::vector<std::string> ids;
+        ids.reserve(t->variables.size());
+        for (auto& [id, v] : t->variables) ids.push_back(id);
+        std::sort(ids.begin(), ids.end());
+        if (ids.empty()) continue;
+        if (!firstTarget) out += ',';
+        firstTarget = false;
+        out += "\n  ";
+        jsonEscapeTo(tn, out);
+        out += ": {";
+        bool first = true;
+        for (const std::string& id : ids) {
+            Variable& v = t->variables[id];
+            const std::string nm = SStr::toUtf8(v.name);
+            if (!first) out += ',';
+            first = false;
+            out += "\n    ";
+            jsonEscapeTo(nm, out);
+            out += ": ";
+            if (v.type == Variable::kListType) {
+                SList* l = v.list;
+                out += '[';
+                for (uint32_t i = 0; l && i < l->len; ++i) {
+                    if (i) out += ',';
+                    std::string item;
+                    SStr* s = cast::toString(l->items[i]);
+                    if (s) item = SStr::toUtf8(s->view());
+                    jsonEscapeTo(item, out);
+                }
+                out += ']';
+            } else {
+                SStr* s = cast::toString(v.value);
+                jsonEscapeTo(s ? SStr::toUtf8(s->view()) : std::string(), out);
+            }
+        }
+        out += "\n  }";
+    }
+    out += firstTarget ? "}\n" : "\n}\n";
+    std::fwrite(out.data(), 1, out.size(), stdout);
+}
+
 static void dumpVarsIfRequested(Runtime& rt) {
-    if (!std::getenv("XYO_DUMPVARS")) return;
+    const char* mode = std::getenv("XYO_DUMPVARS");
+    if (!mode) return;
+    if (std::strcmp(mode, "json") == 0) {
+        dumpVarsJson(rt);
+        return;
+    }
     for (Target* t : rt.targets) {
         const std::string tn = SStr::toUtf8(t->getName());
         std::vector<std::string> ids;
@@ -884,11 +961,38 @@ void winInit(WinArgs& out, int& argc, char**& argv) {
 } // namespace
 #endif
 
+/// リスト長の上限（0 = 無制限）。
+/// `--list-limit N` または `XYO_LIST_LIMIT=N` で指定する。Scratch 互換の
+/// 200000 を再現したいときは 200000 を渡す。
+static void applyListLimitConfig(int argc, char** argv) {
+    if (const char* e = std::getenv("XYO_LIST_LIMIT")) {
+        char* end = nullptr;
+        long n = std::strtol(e, &end, 10);
+        if (end != e && n >= 0 && n <= 0x7FFFFFFF)
+            xyo_list_limit = static_cast<uint32_t>(n);
+    }
+    for (int i = 1; i < argc; ++i) {
+        const char* a = argv[i];
+        const char* v = nullptr;
+        if (std::strcmp(a, "--list-limit") == 0 && i + 1 < argc)
+            v = argv[++i];
+        else if (std::strncmp(a, "--list-limit=", 13) == 0)
+            v = a + 13;
+        if (!v) continue;
+        char* end = nullptr;
+        long n = std::strtol(v, &end, 10);
+        if (end != v && n >= 0 && n <= 0x7FFFFFFF)
+            xyo_list_limit = static_cast<uint32_t>(n);
+    }
+}
+
 int main(int argc, char** argv) {
 #ifdef _WIN32
     WinArgs winArgs;
     winInit(winArgs, argc, argv);
 #endif
+    // 実行前設定（AOT 実行ファイルでも同じ経路で効かせる）
+    applyListLimitConfig(argc, argv);
 #ifdef XYO_JIT
     {
         std::vector<uint8_t> sb3, object;

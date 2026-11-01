@@ -4,6 +4,7 @@
 #include "llvm_compat.hpp"
 
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
+#include <llvm/ExecutionEngine/Orc/ObjectTransformLayer.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
@@ -13,6 +14,7 @@
 #include <llvm/Passes/PassBuilder.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -206,6 +208,8 @@ namespace {
 
 // 生成コードが直接参照する extern "C" シンボル
 const std::pair<const char*, void*> kRtSymbols[] = {
+    // リスト長上限（データシンボル: 生成コードが直接ロードする）
+    {"xyo_list_limit", (void*)&xyo::xyo_list_limit},
     {"xyo_yield", (void*)&xyo_yield},
     {"xyo_is_stuck", (void*)&xyo_is_stuck},
     {"xyo_wait_should_yield", (void*)&xyo_wait_should_yield},
@@ -477,6 +481,27 @@ JitEngine::JitEngine() {
         return;
     }
     auto jit = std::move(*jitOr);
+    // Inspect the exact JIT machine code, not an AOT approximation. Disabled
+    // by default; prefix-N.o files contain the objects before linking.
+    if (const char* p = std::getenv("XYO_JIT_DUMP_OBJECT")) {
+        if (p[0]) jit->getObjTransformLayer().setTransform(
+            [prefix = std::string(p)](std::unique_ptr<llvm::MemoryBuffer> object)
+                -> llvm::Expected<std::unique_ptr<llvm::MemoryBuffer>> {
+                static std::atomic<uint64_t> serial{0};
+                const std::string path = prefix + "-" +
+                    std::to_string(serial.fetch_add(1, std::memory_order_relaxed)) + ".o";
+                if (FILE* out = std::fopen(path.c_str(), "wb")) {
+                    const auto bytes = object->getBuffer();
+                    const size_t written = std::fwrite(bytes.data(), 1, bytes.size(), out);
+                    const int closed = std::fclose(out);
+                    if (written != bytes.size() || closed != 0)
+                        std::fprintf(stderr, "xyo-jit: incomplete object dump %s\n", path.c_str());
+                } else {
+                    std::fprintf(stderr, "xyo-jit: cannot dump object %s\n", path.c_str());
+                }
+                return std::move(object);
+            });
+    }
 
     auto& es = jit->getExecutionSession();
     llvm::orc::SymbolMap symbols;

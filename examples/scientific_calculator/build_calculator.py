@@ -13,7 +13,7 @@ import assets
 
 
 def glyph_name(ch):
-    return "g%d" % ord(ch)
+    return "glyph:" + ch
 
 
 def set_local(b, name, vid, value):
@@ -39,7 +39,7 @@ def click_hat(b, body, x, y):
     return h
 
 
-def build(path):
+def build(path, graph=None):
     m = build_model()
     for name in ("testExpr", "testMode", "testExpected", "testLog"):
         m.lists.pop(name, None)
@@ -57,8 +57,12 @@ def build(path):
         b.setv("ans", b.vnum(0)),
         b.setv("mem", b.vnum(0)),
         b.setv("inv", b.vnum(0)),
-        b.setv("graphExpr", b.vtext("sin(x)")),
+        b.setv("graphExpr", b.vtext(graph if graph is not None else "sin(x)")),
         b.setv("scale", b.vnum(20)),
+        b.setv("centerX", b.vnum(0)), b.setv("centerY", b.vnum(0)),
+        b.setv("graphCompiled", b.vnum(0)), b.setv("yval", b.vnum(0)),
+        *[b.setv(name + comp, b.vnum(0)) for name in ("ans", "mem")
+          for comp in ("Im", "J", "K")],
         b.setv("traceOn", b.vnum(0)),
         b.setv("traceValid", b.vnum(0)),
         b.setv("justEval", b.vnum(0)),
@@ -67,6 +71,9 @@ def build(path):
         b.setv("previewOk", b.vnum(0)),
         b.setv("xval", b.vnum(0)),
         b.setv("busy", b.vnum(0)),
+        *[b.setv(name, b.vnum(0)) for name in (
+            "graphDragActive", "graphDragMoved", "graphDragWasDown", "graphDragDown",
+            "graphDragPreviewCount", "graphDragReplotCount")],
         b.setv("glowSeq", b.vnum(0)),
         b.setv("uiCostume", b.vtext("normal")),
         b.op("looks_switchbackdropto", {"BACKDROP": b.vmenu(b.menu_backdrop("calc"))}),
@@ -78,6 +85,9 @@ def build(path):
         b.op("pen_clear"),
         b.call(p["drawDisplay"], []),
     ]
+    if graph is not None:
+        init += [b.setv("busy", b.vnum(1)), b.call(p["switchToGraph"], []),
+                 b.setv("busy", b.vnum(0))]
     flag_hat(b, init, 0, 0)
 
     # -------------------------------------------------------------- click logic
@@ -132,48 +142,97 @@ def build(path):
     ])
     click_hat(b, [b.call(onClick, [])], 0, 400)
 
+    # Poll global pointer state, so capture survives crossing curve/UI sprites
+    # and continues outside the plot until the button is released.
+    drag_poll = [
+        b.setv("graphDragDown", b.vblock(b.op("sensing_mousedown"))),
+        b.ifelse(b.eqn("graphDragActive", 1), [
+            b.ifelse(b.eqn("graphDragDown", 1),
+                     [b.call(p["graphDragMove"], [b.vblock(mx()), b.vblock(my())])],
+                     [b.call(p["graphDragEnd"], [])]),
+        ], [b.if_(b.and_(b.eqn("graphDragDown", 1), b.eqn("graphDragWasDown", 0)),
+                  [b.call(p["graphDragBegin"], [b.vblock(mx()), b.vblock(my())])])]),
+        b.setv("graphDragWasDown", b.vvar("graphDragDown")),
+        # This non-warp forever loop already yields once per Scratch frame.
+    ]
+    flag_hat(b, [b.forever(drag_poll)], 0, 600)
+
     # -------------------------------------------------------------- trace loop
     def join2(a, c):
         return b.vblock(b.join(a, c))
 
-    trace = [
-        b.ifelse(b.and_(b.eqv("screen", "graph"),
-                        b.and_(b.eqn("traceOn", 1), b.eqn("busy", 0))), [
-            b.setv("mx", mx()),
-            b.if_(b.lt(b.vvar("mx"), b.vnum(-235)), [b.setv("mx", b.vnum(-235))]),
-            b.if_(b.gt(b.vvar("mx"), b.vnum(235)), [b.setv("mx", b.vnum(235))]),
-            b.setv("traceX", b.vvar("mx")),
-            b.setv("xval", b.div(b.vvar("mx"), b.vvar("scale"))),
-            b.call(p["evaluate"], [b.vblock(b.var("graphExpr"))]),
-            b.call(p["fmt"], [b.vblock(b.div(b.vvar("mx"), b.vvar("scale")))]),
-            b.setv("txs", b.vvar("fmtOut")),
-            b.ifelse(b.eqn("err", 0), [
-                b.setv("ty", b.mul(b.vvar("result"), b.vvar("scale"))),
-                b.ifelse(b.and_(b.not_(b.lt(b.vvar("ty"), b.vnum(-135))),
-                                b.not_(b.gt(b.vvar("ty"), b.vnum(150)))),
-                         [b.setv("traceY", b.vvar("ty")),
-                          b.setv("traceValid", b.vnum(1))],
-                         [b.setv("traceValid", b.vnum(0))]),
-                b.call(p["fmt"], [b.vblock(b.var("result"))]),
-                b.setv("tys", b.vvar("fmtOut")),
-                b.setv("traceText", join2(
-                    b.vtext("x = "),
-                    join2(b.vvar("txs"),
-                          join2(b.vtext(",  y = "), b.vvar("tys"))))),
-            ], [
-                b.setv("traceValid", b.vnum(0)),
-                b.setv("traceText", join2(
-                    b.vtext("x = "),
-                    join2(b.vvar("txs"), b.vtext(",  y = undefined")))),
+    # Trace the nearest rendered segment, so implicit/multivalued curves work too.
+    for name in ("traceMouseX", "traceMouseY", "traceIndex", "traceBest", "traceDX", "traceDY",
+                 "traceD2", "traceT", "tracePX", "tracePY", "traceDistance", "traceWX", "traceWY"):
+        if name not in m.vars:
+            m.var(name, 0)
+    def item(name):
+        return b.vblock(b.list_item(name, b.vvar("traceIndex")))
+    trace_proc = b.defproc("traceNearest", [], True)
+    trace_proc.body([
+        b.setv("traceMouseX", mx()), b.setv("traceMouseY", my()),
+        b.setv("traceValid", b.vnum(0)), b.setv("traceBest", b.vnum(256)),
+        b.setv("traceIndex", b.vnum(1)),
+        b.repeat(b.vblock(b.list_len("graphSegX1")), [
+            b.setv("traceDX", b.sub(item("graphSegX2"), item("graphSegX1"))),
+            b.setv("traceDY", b.sub(item("graphSegY2"), item("graphSegY1"))),
+            b.setv("traceD2", b.add(b.mul(b.vvar("traceDX"), b.vvar("traceDX")),
+                                     b.mul(b.vvar("traceDY"), b.vvar("traceDY")))),
+            b.setv("traceT", b.vnum(0)),
+            b.if_(b.gt(b.vvar("traceD2"), b.vnum(0)), [
+                b.setv("traceT", b.div(b.add(
+                    b.mul(b.sub(b.vvar("traceMouseX"), item("graphSegX1")), b.vvar("traceDX")),
+                    b.mul(b.sub(b.vvar("traceMouseY"), item("graphSegY1")), b.vvar("traceDY"))),
+                    b.vvar("traceD2"))),
+                b.if_(b.lt(b.vvar("traceT"), b.vnum(0)), [b.setv("traceT", b.vnum(0))]),
+                b.if_(b.gt(b.vvar("traceT"), b.vnum(1)), [b.setv("traceT", b.vnum(1))]),
             ]),
-            b.setv("err", b.vnum(0)),
-            b.setv("errMsg", b.vtext("")),
-        ], [
-            b.setv("traceValid", b.vnum(0)),
+            b.setv("tracePX", b.add(item("graphSegX1"), b.mul(b.vvar("traceT"), b.vvar("traceDX")))),
+            b.setv("tracePY", b.add(item("graphSegY1"), b.mul(b.vvar("traceT"), b.vvar("traceDY")))),
+            b.setv("traceDistance", b.add(
+                b.mul(b.sub(b.vvar("tracePX"), b.vvar("traceMouseX")), b.sub(b.vvar("tracePX"), b.vvar("traceMouseX"))),
+                b.mul(b.sub(b.vvar("tracePY"), b.vvar("traceMouseY")), b.sub(b.vvar("tracePY"), b.vvar("traceMouseY"))))),
+            b.if_(b.lt(b.vvar("traceDistance"), b.vvar("traceBest")), [
+                b.setv("traceBest", b.vvar("traceDistance")), b.setv("traceX", b.vvar("tracePX")),
+                b.setv("traceY", b.vvar("tracePY")), b.setv("traceValid", b.vnum(1)),
+            ]),
+            b.changev("traceIndex", b.vnum(1)),
         ]),
-        b.wait(b.vnum(0.05)),
+        b.ifelse(b.eqn("traceValid", 1), [
+            b.setv("traceWX", b.add(b.vvar("centerX"), b.div(b.vvar("traceX"), b.vvar("scale")))),
+            b.setv("traceWY", b.add(b.vvar("centerY"), b.div(b.vvar("traceY"), b.vvar("scale")))),
+            b.call(p["fmt"], [b.vvar("traceWX")]), b.setv("txs", b.vvar("fmtOut")),
+            b.call(p["fmt"], [b.vvar("traceWY")]), b.setv("tys", b.vvar("fmtOut")),
+            b.setv("traceText", join2(b.vtext("~ x = "), join2(b.vvar("txs"),
+                join2(b.vtext(", y = "), b.vvar("tys"))))),
+        ], [b.setv("traceText", b.vtext("Move near a curve (16 px)."))]),
+    ])
+    trace = [
+        b.ifelse(b.and_(b.eqv("screen", "graph"), b.and_(b.eqn("traceOn", 1), b.eqn("busy", 0))), [
+            b.setv("busy", b.vnum(1)), b.call(trace_proc, []), b.setv("busy", b.vnum(0)),
+        ], [b.setv("traceValid", b.vnum(0))]),
+        b.wait(b.vnum(0.1)),
     ]
     flag_hat(b, [b.forever(trace)], 0, 800)
+
+    # Keyboard pan and zoom: lock the shared evaluator/pen while rebuilding.
+    for key, dx, dy in (("left arrow", -4, 0), ("right arrow", 4, 0),
+                        ("up arrow", 0, 4), ("down arrow", 0, -4)):
+        h = b._add("event_whenkeypressed", fields={"KEY_OPTION": [key, None]}, top=True)
+        action = [b.if_(b.and_(b.eqv("screen", "graph"), b.eqn("busy", 0)), [
+            b.setv("busy", b.vnum(1)),
+            b.changev("centerX", b.div(b.vnum(dx * 20), b.vvar("scale"))),
+            b.changev("centerY", b.div(b.vnum(dy * 20), b.vvar("scale"))),
+            b.call(p["plotGraph"], []), b.setv("busy", b.vnum(0)),
+        ])]
+        b.stack(h, action); b.blocks[h]["next"] = action[0]
+    for key, idx in (("z", 4), ("x", 3), ("r", 5), ("t", 6)):
+        h = b._add("event_whenkeypressed", fields={"KEY_OPTION": [key, None]}, top=True)
+        action = [b.if_(b.and_(b.eqv("screen", "graph"), b.eqn("busy", 0)), [
+            b.setv("busy", b.vnum(1)), b.call(p["handleGraphKey"], [b.vnum(idx)]),
+            b.setv("busy", b.vnum(0)),
+        ])]
+        b.stack(h, action); b.blocks[h]["next"] = action[0]
 
     # ---------------------------------------------------------------- costumes
     keypad_n = assets.keypad_svg(NORMAL)
@@ -224,14 +283,14 @@ def build(path):
     c_body = [
         cb.op("looks_hide"),
         cb.forever([
-            cb.ifelse(cb.and_(cb.eqv("screen", "graph"), cb.eqn("traceOn", 1)), [
-                cb.op("motion_gotoxy", {"X": cb.vvar("traceX"), "Y": cb.vnum(7.5)}),
+            cb.ifelse(cb.and_(cb.eqv("screen", "graph"), cb.and_(cb.eqn("traceOn", 1), cb.eqn("traceValid", 1))), [
+                cb.op("motion_gotoxy", {"X": cb.vvar("traceX"), "Y": cb.vnum(8)}),
                 cb.op("looks_show"),
             ], [cb.op("looks_hide")]),
         ]),
     ]
     flag_hat(cb, c_body, 0, 0)
-    cross = cb.sprite_json("Crosshair", [costume("line", cross_svg, 1, 142.5)],
+    cross = cb.sprite_json("Crosshair", [costume("line", cross_svg, 1, 140)],
                            cb.blocks, layer=3, visible=False)
 
     # --------------------------------------------------------------- TraceDot
@@ -258,7 +317,8 @@ def build(path):
     t_body = [
         tb.op("looks_say", {"MESSAGE": tb.vtext("")}),
         tb.forever([
-            tb.ifelse(tb.and_(tb.eqv("screen", "graph"), tb.eqn("traceOn", 1)),
+            tb.ifelse(tb.and_(tb.eqv("screen", "graph"),
+                                 tb.and_(tb.eqn("traceOn", 1), tb.eqn("graphDragActive", 0))),
                       [tb.op("looks_say", {"MESSAGE": tb.vblock(tb.var("traceText"))})],
                       [tb.op("looks_say", {"MESSAGE": tb.vtext("")})]),
             tb.wait(tb.vnum(0.1)),
@@ -266,7 +326,7 @@ def build(path):
     ]
     flag_hat(tb, t_body, 0, 0)
     trace_lbl = tb.sprite_json("TraceLabel", [costume("mark", mark_svg, 3, 3)],
-                               tb.blocks, layer=5, visible=True, x=-215, y=152)
+                               tb.blocks, layer=5, visible=True, x=-215, y=-118)
 
     project = {
         "targets": [stage, calc, glow, cross, dot, trace_lbl],

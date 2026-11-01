@@ -992,6 +992,73 @@ int test_svg_bad_decode() {
     return g_fail;
 }
 
+
+// scratch-render の penStamp は _drawThese(..., {ignoreVisibility: true}) で
+// 描き、ghost エフェクトは通常描画と同じく適用する。xyo が可視性で
+// 打ち消したり、ghost 100 を「効果なし」と取り違えたりしないことを見る。
+int test_stamp_ghost_and_hidden() {
+    Runtime rt;
+    CHECK(loadProject(rt, R"JSON([{"assetId":"a","name":"a",
+        "dataFormat":"svg","md5ext":"a.svg","bitmapResolution":1,
+        "rotationCenterX":50,"rotationCenterY":25}])JSON"));
+    Target* sp = spriteOf(rt);
+    CHECK(sp != nullptr);
+    if (!sp) return g_fail;
+    const char* kRed =
+        R"SVG(<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><rect width="100" height="50" fill="#ff0000"/></svg>)SVG";
+    setCostumeData(sp, 0, kRed, std::strlen(kRed));
+
+    SdlRenderer ren;
+    CHECK(ren.init(rt, 1));
+    rt.renderer = &ren;
+    const int penSkin = ren.createPenSkin();
+    const int id = sp->drawableID;
+    const auto* s = svgSkin(ren, sp, 0);
+    CHECK(s != nullptr);
+    if (!s) return g_fail;
+    int ix = -1, iy = -1;
+    for (int y = 0; y < s->h && ix < 0; ++y)
+        for (int x = 0; x < s->w; ++x) {
+            const uint8_t* p = &s->px[(static_cast<size_t>(y) * s->w + x) * 4];
+            if (p[3] >= 200 && p[0] > 200) { ix = x; iy = y; break; }
+        }
+    CHECK(ix >= 0);
+    if (ix < 0) return g_fail;
+    const double px = 240.0 + (ix + 0.5) / s->scale - s->rcx;
+    const double py = 180.0 + (iy + 0.5) / s->scale - s->rcy;
+    const int wx = static_cast<int>(px), wy = static_cast<int>(py);
+
+    // 1) ghost 100: スタンプは残らない
+    sp->effects["ghost"] = 100.0;
+    ren.penClear(penSkin);
+    ren.penStamp(penSkin, id);
+    const uint8_t* q = pxAt(TA::penPx(ren), TA::penW(ren), wx, wy);
+    CHECK_EQ(static_cast<int>(q[3]), 0);
+
+    // 2) ghost 50: 半分の alpha で乗る
+    sp->effects["ghost"] = 50.0;
+    ren.penClear(penSkin);
+    ren.penStamp(penSkin, id);
+    q = pxAt(TA::penPx(ren), TA::penW(ren), wx, wy);
+    CHECK(q[3] > 100 && q[3] < 160);
+
+    // 3) 隠していてもスタンプは描かれる（scratch-render は ignoreVisibility）
+    sp->effects.erase("ghost");
+    sp->visible = false;
+    ren.penClear(penSkin);
+    ren.penStamp(penSkin, id);
+    q = pxAt(TA::penPx(ren), TA::penW(ren), wx, wy);
+    CHECK(q[3] > 200);
+    CHECK(q[0] > 200 && q[1] < 80 && q[2] < 80);
+
+    // 4) 隠している間もスプライト本体は描かれない（可視性そのものは生きている）
+    CHECK_EQ(ren.pick(px, py), -1);
+    sp->visible = true;
+    CHECK_EQ(ren.pick(px, py), id);
+    std::printf("stamp-ghost: %d checks, %d failures\n", g_checks, g_fail);
+    return g_fail;
+}
+
 int test_svg_text_usage() {
     Runtime rt;
     CHECK(loadProject(rt, R"JSON([{"assetId":"u","name":"u",
@@ -1563,6 +1630,7 @@ int main() {
     test_svg_anchor_and_viewbox();
     test_svg_bad_decode();
     test_svg_text_usage();
+    test_stamp_ghost_and_hidden();
     test_fence_empty_point();
     test_fence_aabb();
     test_pen_border_fenced();

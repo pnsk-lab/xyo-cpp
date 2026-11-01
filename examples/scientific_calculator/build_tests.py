@@ -146,6 +146,11 @@ CASES = [
     ("gamma(0)", "ERR", "DEG"),
     ("gamma(-1)", "ERR", "DEG"),
     ("1e-13", "1E-13", "DEG"),
+    ("re(3)", "3", "DEG"),
+    ("im(3)", "0", "DEG"),
+    ("norm(-3)", "3", "DEG"),
+    ("inv(2)", "0.5", "DEG"),
+    ("conj(3)", "3", "DEG"),
     ("sum(1+i,2+3i)", "3+4i", "DEG"),
     ("avg(1+i,3+3i)", "2+2i", "DEG"),
     ("sum(1+2j,3+4k)", "4+2j+4k", "DEG"),
@@ -199,6 +204,27 @@ def build(path, cases=CASES):
             b.op("looks_say", {"MESSAGE": b.vblock(b.var("msg"))}),
             b.changev("testIndex", b.vnum(1)),
         ]),
+    ]
+    def check(cond):
+        return b.ifelse(cond,
+                        [b.op("looks_say", {"MESSAGE": b.vtext("pass")})],
+                        [b.list_add("testLog", b.vvar("result")),
+                         b.list_add("testLog", b.vvar("errMsg")),
+                         b.op("looks_say", {"MESSAGE": b.vtext("fail")})])
+    body += [
+        b.setv("xval", b.vnum(3)), b.setv("yval", b.vnum(4)),
+        b.call(p["evaluate"], [b.vtext("x^2+y^2")]),
+        check(b.lt(b.mathop("abs", b.sub(b.vvar("result"), b.vnum(25))), b.vnum(1e-9))),
+        b.setv("xval", b.vnum(-2)), b.setv("yval", b.vnum(5)),
+        b.call(p["runRpn"], []),
+        check(b.lt(b.mathop("abs", b.sub(b.vvar("result"), b.vnum(29))), b.vnum(1e-9))),
+        b.setv("xval", b.vnum(0)),
+        b.call(p["evaluate"], [b.vtext("1/x")]),
+        check(b.and_(b.eqn("parseOk", 1), b.eqn("err", 1))),
+        b.setv("xval", b.vnum(2)), b.call(p["runRpn"], []),
+        check(b.and_(b.eqn("err", 0), b.eq(b.vvar("result"), b.vnum(0.5)))),
+        b.call(p["evaluate"], [b.vtext("x+*y")]),
+        check(b.eqn("parseOk", 0)),
         b.op("looks_say", {"MESSAGE": b.vtext("end")}),
     ]
     run.body(body)

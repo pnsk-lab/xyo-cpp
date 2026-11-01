@@ -1,4 +1,4 @@
-// List bounds lowering: ordered FP guards, truncation, and same-class aliases.
+// List bounds lowering: defined conversion, truncation, and same-class aliases.
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -36,6 +36,12 @@ std::vector<Case> cases() {
     num(-std::numeric_limits<double>::max(), -1);
     num(1e30, -1); num(-1e30, -1);
     num(2147483648.0, -1); num(4294967296.0, -1);
+    // CVTTSD2SI's indefinite result (INT64_MIN) and the representable values
+    // around its limits must never wrap into an in-bounds list subscript.
+    num(-0x1p63, -1); num(0x1p63, -1);
+    num(std::nextafter(-0x1p63, 0.0), -1);
+    num(std::nextafter(0x1p63, 0.0), -1);
+    num(-0x1p64, -1); num(0x1p64, -1);
     const struct { const char* input; int expected; } strings[] = {
         {"last", 3}, {"random", 0}, {"any", 0}, {"1", 1}, {"2.9", 2},
         {"3.9", 3}, {"03", 3}, {" 3 ", 3}, {"0x3", 3}, {"4", -1},
@@ -148,7 +154,7 @@ void run(JitMode mode, int arithmeticIndex = 0) {
     setJitMode(mode);
     Runtime rt;
     // Runtime owns/roots targets and indices before any subsequent allocation.
-    check(loadSb3(rt, project(43, arithmeticIndex), nullptr).ok, "load bounds fixture");
+    check(loadSb3(rt, project(49, arithmeticIndex), nullptr).ok, "load bounds fixture");
     if (rt.targets.size() != 2) { check(false, "loaded test target"); return; }
     Target* t = rt.targets[1];
     SList* indices = t->lookupVariableById("indices")->list;
@@ -159,7 +165,7 @@ void run(JitMode mode, int arithmeticIndex = 0) {
         inputs = cases();
         for (auto c : inputs) indices->push(c.index);
     }
-    check(inputs.size() == 43, "fixture iteration count matches cases");
+    check(inputs.size() == 49, "fixture iteration count matches cases");
     rt.greenFlag();
 #ifdef XYO_JIT
     if (mode == JitMode::Eager)

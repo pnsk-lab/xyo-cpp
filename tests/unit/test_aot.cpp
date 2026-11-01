@@ -17,6 +17,7 @@
 #include "core/sstr.hpp"
 #include "engine/runtime.hpp"
 #include "load/sb3.hpp"
+#include "load/zip.hpp"
 #include "model/target.hpp"
 
 #ifdef XYO_JIT
@@ -93,12 +94,7 @@ std::string dumpState(Runtime& rt) {
     return s;
 }
 
-void runCase(const char* rel, int frames) {
-    std::vector<uint8_t> data;
-    if (!readAll(fixturePath(rel), data)) {
-        check(false, "fixture read");
-        return;
-    }
+void runData(const char* rel, const std::vector<uint8_t>& data, int frames) {
     Runtime a;
     if (!loadSb3File(a, data.data(), data.size()).ok) {
         check(false, "fixture load");
@@ -146,9 +142,35 @@ void runCase(const char* rel, int frames) {
                 br.slots);
 }
 
+void runCase(const char* rel, int frames) {
+    std::vector<uint8_t> data;
+    if (!readAll(fixturePath(rel), data)) {
+        check(false, "fixture read");
+        return;
+    }
+    runData(rel, data, frames);
+}
+
+void runPromotedList() {
+    // A promoted list must produce valid IR even before the O2 pipeline.
+    // An unused len64 PHI once referred to a zext in the wrong predecessor.
+    const std::string json = R"({"targets":[{"isStage":true,"name":"Stage",
+      "variables":{"sum":["sum",0]},"lists":{"L":["L",[7,11,13]]},
+      "blocks":{
+        "hat":{"opcode":"event_whenflagclicked","next":"loop","topLevel":true},
+        "loop":{"opcode":"control_repeat","inputs":{"TIMES":[1,[4,"100"]],"SUBSTACK":[2,"change"]}},
+        "change":{"opcode":"data_changevariableby","inputs":{"VALUE":[2,"item"]},"fields":{"VARIABLE":["sum","sum"]}},
+        "item":{"opcode":"data_itemoflist","inputs":{"INDEX":[1,[4,"2.9"]]},"fields":{"LIST":["L","L"]}}
+      },"costumes":[],"sounds":[]}],"monitors":[],"extensions":[],"meta":{}})";
+    ZipWriter zip;
+    zip.addFile("project.json", std::vector<uint8_t>(json.begin(), json.end()));
+    runData("promoted-list", zip.finish(), 200);
+}
+
 } // namespace
 
 int test_aot_main() {
+    runPromotedList();
     runCase("basic.sb3", 200);
     runCase("par/par_indep.sb3", 60);
     std::printf("aot: %d checks, %d failures\n", g_aotChecks, g_aotFails);

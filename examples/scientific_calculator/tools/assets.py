@@ -98,7 +98,7 @@ def graphui_svg():
     f = Font(BOLD)
     keys = [
         ("BACK", "#2a3346", "#c8d4ea", "#3b4862"),
-        ("f(x)", "#1c3540", "#7fe3ff", "#2b4d5c"),
+        ("EQN", "#1c3540", "#7fe3ff", "#2b4d5c"),
         ("−", "#35291c", "#ffb454", "#4a3a28"),
         ("+", "#35291c", "#ffb454", "#4a3a28"),
         ("RESET", "#3a2626", "#ffb0a0", "#543535"),
@@ -175,8 +175,8 @@ def key_glow_svg():
 
 
 def crosshair_svg():
-    return ('<svg xmlns="http://www.w3.org/2000/svg" width="2" height="285" '
-            'viewBox="0 0 2 285"><rect width="2" height="285" fill="#7fe3ff" '
+    return ('<svg xmlns="http://www.w3.org/2000/svg" width="2" height="280" '
+            'viewBox="0 0 2 280"><rect width="2" height="280" fill="#7fe3ff" '
             'fill-opacity="0.55"/></svg>')
 
 

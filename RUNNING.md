@@ -34,6 +34,11 @@ Linux 版は 2 種類あります。どちらも **LLVM は静的リンク**な�
   `wait` / `wait until` / `broadcast and wait` などの待機は danger でも他
   スレッドへ譲るので停止します）。`run`/`play`/`test`/`edit` と AOT 実行
   ファイル（`./app run --danger`）で使えます。
+- `--list-limit N`（環境変数 `XYO_LIST_LIMIT=N`）は **リスト長の上限**です。
+  既定は 0 = 無制限（TurboWarp と同じ）。Scratch の 200000 を再現するなら
+  `--list-limit 200000`。上限に達すると `add` は追加を落とし、`insert` は
+  末尾を落として長さを保ちます（Scratch/Mistwarp 準拠）。JIT のインライン
+  追加経路・AOT 実行ファイルでも同じ設定が効きます。
 
 - `ldd`/`readelf -d` で NEEDED が 0（glibc も静的）。どの x86-64 Linux でも動きます。
 - `play` / `gui`（ウィンドウ表示）は **含みません** — SDL2 を使うためです。

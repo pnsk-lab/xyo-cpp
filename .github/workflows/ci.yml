@@ -122,7 +122,6 @@ jobs:
         run: ctest --test-dir build-norsvg -R xyo-render-tests --output-on-failure
 
   # Windows の JIT は MSYS2 の mingw-w64 LLVM（静的アーカイブ同梱）で検証する。
-  # zig クロスでは LLVM for Windows が無く interp のみになるため。
   windows-jit:
     name: Windows / JIT + SDL2（MSYS2 mingw）
     runs-on: windows-latest
@@ -187,44 +186,3 @@ jobs:
         run: |
           bash tools/ci/smoke.sh run build-win-static/xyo.exe
           bash tools/ci/smoke.sh play build-win-static/xyo.exe
-
-  # LLVM for Windows が無い環境向けの zig クロス（interp のみ・headless）。
-  windows-cross:
-    name: Windows / zig クロス（interp・headless）
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: zig 0.15.1
-        run: |
-          curl -sL -o zig.tar.xz \
-            https://ziglang.org/download/0.15.1/zig-x86_64-linux-0.15.1.tar.xz
-          tar xf zig.tar.xz
-          echo "$PWD/zig-x86_64-linux-0.15.1" >>"$GITHUB_PATH"
-          ./zig-x86_64-linux-0.15.1/zig version
-
-      - name: Windows 用 zlib
-        run: |
-          mkdir -p .windeps
-          curl -sL -o .windeps/zlib.tar.gz \
-            https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz
-          tar xzf .windeps/zlib.tar.gz -C .windeps
-          cmake -B .windeps/zlib-build -S .windeps/zlib-1.3.1 \
-            -DCMAKE_TOOLCHAIN_FILE="$PWD/cmake/zig-windows-x86_64.cmake" \
-            -DCMAKE_BUILD_TYPE=Release
-          cmake --build .windeps/zlib-build --target zlibstatic -j"$(nproc)"
-          mkdir -p .windeps/zlib/lib .windeps/zlib/include
-          cp .windeps/zlib-build/libzlibstatic.a .windeps/zlib/lib/
-          cp .windeps/zlib-1.3.1/zlib.h .windeps/zlib-build/zconf.h \
-            .windeps/zlib/include/
-
-      - name: Build xyo.exe（XYO_JIT=OFF）
-        run: |
-          cmake -B build-win \
-            -DCMAKE_TOOLCHAIN_FILE="$PWD/cmake/zig-windows-x86_64.cmake" \
-            -DXYO_JIT=OFF -DXYO_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release \
-            -DZLIB_LIBRARY="$PWD/.windeps/zlib/lib/libzlibstatic.a" \
-            -DZLIB_INCLUDE_DIR="$PWD/.windeps/zlib/include"
-          cmake --build build-win -j"$(nproc)"
-          file build-win/xyo.exe

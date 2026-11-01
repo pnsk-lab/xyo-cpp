@@ -3,9 +3,10 @@ import math
 
 from sb3 import Model  # noqa: F401
 from qmath import QMathMixin
+from graphing import GraphingMixin
 
 
-class Evaluator(QMathMixin):
+class Evaluator(QMathMixin, GraphingMixin):
     def __init__(self, b):
         self.b = b
         self.m = b.m
@@ -101,6 +102,7 @@ class Evaluator(QMathMixin):
         p["applyOp"] = b.defproc("applyOp", ["op"], True)
         p["applyFunc"] = b.defproc("applyFunc", ["fn", "ac"], True)
         p["evaluate"] = b.defproc("evaluate", ["source"], True)
+        p["runRpn"] = b.defproc("runRpn", [], True)
         p["preview"] = b.defproc("preview", [], True)
         p["eval"] = b.defproc("eval", [], True)
         p["insertText"] = b.defproc("insertText", ["t"], True)
@@ -119,9 +121,11 @@ class Evaluator(QMathMixin):
         p["handleGraphKey"] = b.defproc("handleGraphKey", ["idx"], True)
         p["plotGraph"] = b.defproc("plotGraph", [], True)
         p["drawLine"] = b.defproc("drawLine", ["text", "yy", "sz", "al"], True)
+        p["drawAt"] = b.defproc("drawAt", ["text", "xx", "yy", "sz"], True)
         p["drawDisplay"] = b.defproc("drawDisplay", [], True)
         p["handleKeyIndex"] = b.defproc("handleKeyIndex", ["idx"], True)
         self._qdef()
+        self._graph_def()
 
     def _bodies(self):
         self.gen_normalize()
@@ -156,7 +160,7 @@ class Evaluator(QMathMixin):
         self.gen_toggles()
         self.gen_memory()
         self.gen_switch()
-        self.gen_plot()
+        self._graph_gen()
         self.gen_draw_line()
         self.gen_draw_display()
         self.gen_handle_key()
@@ -262,6 +266,8 @@ class Evaluator(QMathMixin):
         b = self.b
         p = self.p["pushFunc"]
         p.body([
+            b.if_(b.eq(b.vblock(b.list_itemnum("functionNames", b.vblock(b.arg("fn")))), self.N(0)),
+                  self.err("Unknown fn")),
             b.list_add("ops", self.T("f")),
             b.list_add("funcNames", self.b.vblock(self.b.arg("fn"))),
         ])
@@ -302,10 +308,15 @@ class Evaluator(QMathMixin):
                                                  self.T(comps[2]),
                                                  self.T("1" if name == "k" else "0")])
             ], cur)]
-        # ans / mem / x use the current values
-        for name, var in (("x", "xval"), ("mem", "mem"), ("ans", "ans")):
+        # Coordinates remain symbolic so a graph is parsed only once.
+        for name in ("x", "y"):
             cur = [b.ifelse(nm_is(name), [
-                self.call(self.p["pushNumber"], [b.join(self.V(var), self.T("")), self.T("0"), self.T("0"), self.T("0")])
+                self.call(self.p["pushOut"], [self.T(name), self.T("v"), self.N(0)])
+            ], cur)]
+        for name in ("mem", "ans"):
+            cur = [b.ifelse(nm_is(name), [
+                self.call(self.p["pushNumber"], [self.V(name), self.V(name + "Im"),
+                                                self.V(name + "J"), self.V(name + "K")])
             ], cur)]
         p.body(cur)
 
@@ -448,7 +459,17 @@ class Evaluator(QMathMixin):
                                                       ]),
                                          ])])]),
         ]
-        p.body(body)
+        # Polynomial graph kernels dominate sampling. Multiplication is faster
+        # and avoids exp(log(5)*2) losing the exact zero of x^2+y^2-25.
+        p.body([
+            *body[:5],
+            b.ifelse(self.eqn("pb", 2), [
+                self.setv("pOut2", b.mul(self.V("pa"), self.V("pa"))),
+            ], [b.ifelse(self.eqn("pb", 3), [
+                self.setv("pOut2", b.mul(b.mul(self.V("pa"), self.V("pa")), self.V("pa"))),
+            ], body[5:])]),
+            b.if_(b.gt(b.mathop("abs", self.V("pOut2")), self.N(1e308)), self.err("Overflow")),
+        ])
 
     # ------------------------------------------------------------------ gcd2
     def gen_gcd2(self):
@@ -1111,7 +1132,9 @@ class Evaluator(QMathMixin):
         root_q = b.and_(fn("root"),
                         b.and_(b.lt(A(), self.N(0)),
                                b.eq(b.mul(b.mathop("floor", b.div(Bv(), self.N(2))), self.N(2)), Bv())))
-        needs_q = b.or_(b.or_(self.eqn("qAny", 1), domain_q), b.or_(pow_q, root_q))
+        needs_q = b.or_(
+            b.gt(b.vblock(b.list_itemnum("componentFunctions", self.V("fname"))), self.N(0)),
+            b.or_(b.or_(self.eqn("qAny", 1), domain_q), b.or_(pow_q, root_q)))
         push = iff(b.and_(self.eqn("err", 0), self.eqn("haveResult", 1)), [
             iff(b.or_(b.or_(b.not_(b.eq(self.V("fr"), self.V("fr"))),
                             b.not_(b.eq(self.V("frIm"), self.V("frIm")))),
@@ -1385,9 +1408,13 @@ class Evaluator(QMathMixin):
                 b.if_(self.eqn("err", 0), [
                     self.setv("tok", b.vblock(b.list_item("out", self.V("i")))),
                     self.setv("kind", b.vblock(b.list_item("outKind", self.V("i")))),
-                    b.ifelse(self.eqv("kind", "n"),
+                    b.ifelse(b.or_(self.eqv("kind", "n"), self.eqv("kind", "v")),
                              [
-                                 self.setv("numVal", b.add(self.V("tok"), self.N(0))),
+                                 b.ifelse(self.eqv("kind", "v"), [
+                                     b.ifelse(self.eqv("tok", "x"),
+                                              [self.setv("numVal", self.V("xval"))],
+                                              [self.setv("numVal", self.V("yval"))]),
+                                 ], [self.setv("numVal", b.add(self.V("tok"), self.N(0)))]),
                                  self.setv("numIm", b.vblock(b.list_item("outIm", self.V("i")))),
                                  self.setv("numJ", b.vblock(b.list_item("outJ", self.V("i")))),
                                  self.setv("numK", b.vblock(b.list_item("outK", self.V("i")))),
@@ -1430,8 +1457,15 @@ class Evaluator(QMathMixin):
                          ]),
             ]),
         ]
+        self.p["runRpn"].body([
+            self.setv("err", self.N(0)), self.setv("errMsg", self.T("")),
+            *[self.setv(name, self.N(0)) for name in ("result", "resultIm", "resultJ", "resultK")],
+            *rpn_body,
+        ])
         # main body
         body = [
+            self.setv("parseOk", self.N(0)),
+            self.setv("graphCompiled", self.N(0)),
             self.call(self.p["normalize"], [self.b.vblock(self.b.arg("source"))]),
             self.setv("src", self.V("normOut")),
             self.setv("err", self.N(0)),
@@ -1468,7 +1502,10 @@ class Evaluator(QMathMixin):
                                                       self.err("Unmatched ("),
                                                       [self.call(self.p["popOp"], [])])]),
                          ]),
-                         b.if_(self.eqn("err", 0), rpn_body),
+                         b.if_(self.eqn("err", 0), [
+                              self.setv("parseOk", self.N(1)),
+                              self.call(self.p["runRpn"], []),
+                          ]),
                      ]),
         ]
         p.body(body)
@@ -1624,8 +1661,7 @@ class Evaluator(QMathMixin):
     def gen_switch(self):
         b = self.b
         self.p["graphFromExpr"].body([
-            b.if_(b.or_(b.contains(self.V("expr"), self.T("x")),
-                        b.contains(self.V("expr"), self.T("X"))),
+            b.if_(b.not_(self.eqv("expr", "")),
                   [self.setv("graphExpr", self.V("expr"))]),
             self.call(self.p["switchToGraph"], []),
         ])
@@ -1661,6 +1697,11 @@ class Evaluator(QMathMixin):
         p.body([
             self.setv("screen", self.T("calc")),
             self.setv("angleMode", self.V("savedAngleMode")),
+            self.setv("xval", self.N(0)), self.setv("yval", self.N(0)),
+            b.ifelse(self.eqn("justEval", 1), [
+                *[self.setv("result" + comp, self.V("ans" + comp))
+                  for comp in ("", "Im", "J", "K")],
+            ], [self.call(self.p["preview"], [])]),
             self.setv("traceOn", self.N(0)),
             self.setv("traceValid", self.N(0)),
             self.setv("err", self.N(0)),
@@ -1676,7 +1717,7 @@ class Evaluator(QMathMixin):
             self.call(self.p["drawDisplay"], []),
         ])
         self.p["graphAsk"].body([
-            b.op("sensing_askandwait", {"QUESTION": self.T("f(x) =")}),
+            b.op("sensing_askandwait", {"QUESTION": self.T("Graph: sin(x), y=x^2, x^2+y^2=25, or F(x,y)=0")}),
             self.call(self.p["normalize"], [b.vblock(b.op("sensing_answer"))]),
             b.if_(b.not_(self.eqv("normOut", "")), [self.setv("graphExpr", self.V("normOut"))]),
             self.call(self.p["plotGraph"], []),
@@ -1694,115 +1735,20 @@ class Evaluator(QMathMixin):
                 [iff(b.eq(idx(), self.N(2)), [self.call(self.p["graphAsk"], [])],
                      [iff(b.eq(idx(), self.N(3)), [
                          self.setv("scale", b.div(self.V("scale"), self.N(1.25))),
-                         b.if_(b.lt(self.V("scale"), self.N(5)), [self.setv("scale", self.N(5))]),
+                         b.if_(b.lt(self.V("scale"), self.N(1)), [self.setv("scale", self.N(1))]),
                          self.call(self.p["plotGraph"], []),
                      ], [iff(b.eq(idx(), self.N(4)), [
                          self.setv("scale", b.mul(self.V("scale"), self.N(1.25))),
-                         b.if_(b.gt(self.V("scale"), self.N(80)), [self.setv("scale", self.N(80))]),
+                         b.if_(b.gt(self.V("scale"), self.N(640)), [self.setv("scale", self.N(640))]),
                          self.call(self.p["plotGraph"], []),
                      ], [iff(b.eq(idx(), self.N(5)), [
                          self.setv("scale", self.N(20)),
+                          self.setv("centerX", self.N(0)), self.setv("centerY", self.N(0)),
                          self.call(self.p["plotGraph"], []),
                      ], [iff(b.eq(idx(), self.N(6)), [
                          self.setv("traceOn", b.sub(self.N(1), self.V("traceOn"))),
                          b.if_(self.eqn("traceOn", 0), [self.setv("traceValid", self.N(0))]),
                      ], [])])])])])]),
-        ]
-        p.body(body)
-
-    # -------------------------------------------------------------- plotting
-    def gen_plot(self):
-        b = self.b
-        p = self.p["plotGraph"]
-        def pen(color, size):
-            return [
-                b.op("pen_setPenColorToColor", {"COLOR": [1, [9, color]]}),
-                b.op("pen_setPenSizeTo", {"SIZE": self.N(size)}),
-            ]
-        vgrid = [
-            self.setv("pgs", self.V("scale")),
-            self.setv("k", b.mathop("ceiling", b.div(self.N(-235), self.V("pgs")))),
-            b.repeat(b.add(b.sub(b.mathop("floor", b.div(self.N(235), self.V("pgs"))), self.V("k")), self.N(1)), [
-                self.setv("pgx", b.mul(self.V("k"), self.V("pgs"))),
-                self.iff(self.eqn("k", 0), pen("#6f86ad", 2),
-                         [self.iff(b.eq(b.mod(b.mathop("abs", self.V("k")), self.N(5)), self.N(0)),
-                                   pen("#243553", 1), pen("#182338", 1))]),
-                b.op("motion_gotoxy", {"X": self.V("pgx"), "Y": self.N(-135)}),
-                b.op("pen_penDown"),
-                b.op("motion_gotoxy", {"X": self.V("pgx"), "Y": self.N(150)}),
-                b.op("pen_penUp"),
-                self.changev("k", self.N(1)),
-            ]),
-        ]
-        hgrid = [
-            self.setv("k", b.mathop("ceiling", b.div(self.N(-135), self.V("pgs")))),
-            b.repeat(b.add(b.sub(b.mathop("floor", b.div(self.N(150), self.V("pgs"))), self.V("k")), self.N(1)), [
-                self.setv("pgy", b.mul(self.V("k"), self.V("pgs"))),
-                self.iff(self.eqn("k", 0), pen("#6f86ad", 2),
-                         [self.iff(b.eq(b.mod(b.mathop("abs", self.V("k")), self.N(5)), self.N(0)),
-                                   pen("#243553", 1), pen("#182338", 1))]),
-                b.op("motion_gotoxy", {"X": self.N(-235), "Y": self.V("pgy")}),
-                b.op("pen_penDown"),
-                b.op("motion_gotoxy", {"X": self.N(235), "Y": self.V("pgy")}),
-                b.op("pen_penUp"),
-                self.changev("k", self.N(1)),
-            ]),
-        ]
-        curve = [
-            *pen("#3fe0c0", 3),
-            self.setv("px", self.N(-235)),
-            self.setv("penWasDown", self.N(0)),
-            b.repeat(self.N(236), [
-                self.setv("xval", b.div(self.V("px"), self.V("pgs"))),
-                self.call(self.p["evaluate"], [self.B("graphExpr")]),
-                self.iff(self.eqn("err", 1),
-                         [b.op("pen_penUp"), self.setv("penWasDown", self.N(0))],
-                         [
-                             self.setv("py", b.mul(self.V("result"), self.V("pgs"))),
-                             self.iff(b.or_(b.or_(b.or_(b.lt(self.V("py"), self.N(-135)),
-                                                       b.gt(self.V("py"), self.N(150))),
-                                                 b.not_(self.eqn("resultIm", 0))),
-                                           b.or_(b.not_(self.eqn("resultJ", 0)),
-                                                 b.not_(self.eqn("resultK", 0)))),
-                                      [b.op("pen_penUp"), self.setv("penWasDown", self.N(0))],
-                                      [
-                                          self.iff(self.eqn("penWasDown", 0), [
-                                              b.op("motion_gotoxy", {"X": self.V("px"), "Y": self.V("py")}),
-                                              b.op("pen_penDown"),
-                                              self.setv("penWasDown", self.N(1)),
-                                          ], []),
-                                          b.op("motion_gotoxy", {"X": self.V("px"), "Y": self.V("py")}),
-                                      ]),
-                         ]),
-                self.changev("px", self.N(2)),
-            ]),
-            b.op("pen_penUp"),
-            self.setv("xval", self.N(0)),
-            self.setv("err", self.N(0)),
-            self.setv("errMsg", self.T("")),
-        ]
-        header = [
-            self.call(self.p["fmt"], [self.B("scale")]),
-            self.setv("exprText", b.join(self.T("f(x)="), self.V("graphExpr"))),
-            self.setv("exprText", b.join(
-                self.V("exprText"),
-                b.join(self.T("   "), b.join(self.V("angleMode"),
-                                             b.join(self.T("  ZOOM "), self.V("fmtOut")))))),
-            self.setv("esize", self.N(80)),
-            b.if_(b.gt(b.vblock(b.length(self.V("exprText"))), self.N(40)),
-                  [self.setv("esize", self.N(65))]),
-            self.call(self.p["drawLine"], [self.B("exprText"), self.N(162),
-                                           self.V("esize"), self.N(0)]),
-        ]
-        body = [
-            b.if_(self.eqv("graphExpr", ""), [self.setv("graphExpr", self.T("sin(x)"))]),
-            b.op("pen_clear"),
-            b.op("looks_hide"),
-            *vgrid, *hgrid, *curve, *header,
-            b.op("looks_switchcostumeto", {"COSTUME": b.vmenu(b.menu_costume("graphui"))}),
-            b.op("motion_gotoxy", {"X": self.N(0), "Y": self.N(0)}),
-            b.op("looks_setsizeto", {"SIZE": self.N(100)}),
-            b.op("looks_show"),
         ]
         p.body(body)
 
@@ -1812,6 +1758,8 @@ class Evaluator(QMathMixin):
         p = self.p["drawLine"]
         adv = b.div(b.mul(self.N(9.6), self.V("dlSize")), self.N(100))
         body = [
+            b.op("pen_penUp"),
+            b.op("looks_seteffectto", {"VALUE": self.N(0)}, {"EFFECT": ["ghost", None]}),
             self.setv("dlText", b.vblock(b.arg("text"))),
             self.setv("dlY", b.vblock(b.arg("yy"))),
             self.setv("dlSize", b.vblock(b.arg("sz"))),
@@ -1829,6 +1777,7 @@ class Evaluator(QMathMixin):
                 self.iff(self.eqn("dlAlign", 0),
                          [self.setv("dlX", self.N(-224))],
                          [self.setv("dlX", b.sub(self.N(224), b.mul(self.V("dlLen"), self.V("dlAdv"))))]),
+                b.if_(self.eqn("dlAlign", 2), [self.setv("dlX", self.V("dlOriginX"))]),
                 self.setv("dlI", self.V("dlStart")),
                 b.repeat(self.V("dlLen"), [
                     self.setv("dlCh", b.vblock(b.letter(self.V("dlI"), self.V("dlText")))),
@@ -1837,10 +1786,10 @@ class Evaluator(QMathMixin):
                     b.if_(self.eqv("dlCh", "-"), [self.setv("dlCh", self.T("−"))]),
                     b.if_(b.not_(self.eqv("dlCh", " ")), [
                         self.setv("dlIdx", b.vblock(b.list_itemnum("glyphChars", self.V("dlCh")))),
-                        b.if_(self.eqn("dlIdx", 0), [self.setv("dlIdx", self.N(31))]),
+                        b.if_(self.eqn("dlIdx", 0), [self.setv("dlCh", self.T("?"))]),
                         b.op("looks_switchcostumeto", {
-                            "COSTUME": b.vblock(b.list_item("glyphNames", self.V("dlIdx")),
-                                                b.menu_costume("g65"))
+                            "COSTUME": b.vblock(b.join(self.T("glyph:"), self.V("dlCh")),
+                                                b.menu_costume("glyph:?"))
                         }),
                         b.op("motion_gotoxy", {
                             "X": b.add(self.V("dlX"), b.div(b.mul(self.N(6), self.V("dlSize")), self.N(100))),
@@ -1855,6 +1804,11 @@ class Evaluator(QMathMixin):
             ]),
         ]
         p.body(body)
+        self.p["drawAt"].body([
+            self.setv("dlOriginX", b.vblock(b.arg("xx"))),
+            self.call(self.p["drawLine"], [b.vblock(b.arg("text")),
+                b.vblock(b.arg("yy")), b.vblock(b.arg("sz")), self.N(2)]),
+        ])
 
     # ----------------------------------------------------------- drawDisplay
     def gen_draw_display(self):

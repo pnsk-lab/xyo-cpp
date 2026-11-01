@@ -370,10 +370,13 @@ extern int test_slot_hoist_main();
 extern int test_list_codegen_bounds_main();
 extern int test_nan_codegen_main();
 extern int test_literal_context_main();
+extern int test_numeric_promotion_main();
+extern int test_list_read_memo_main();
 extern int test_danger_main();
 extern int test_list_string_intern_main();
 extern int test_gl_chunk_plan_main();
 extern int test_scratch_compat_main();
+extern int test_list_limit_main();
 int main() {
     test_toNumber();
     test_toBoolean();
@@ -409,16 +412,19 @@ int main() {
     int listCodegenBoundsFail = test_list_codegen_bounds_main();
     int nanCodegenFail = test_nan_codegen_main();
     int literalContextFail = test_literal_context_main();
+    int numericPromotionFail = test_numeric_promotion_main();
+    int listReadMemoFail = test_list_read_memo_main();
     int dangerFail = test_danger_main();
     int listStringInternFail = test_list_string_intern_main();
     int glChunkPlanFail = test_gl_chunk_plan_main();
     int scratchCompatFail = test_scratch_compat_main();
+    int listLimitFail = test_list_limit_main();
     return (g_fail + e2eFail + penFail + aotFail + wasmEmitFail +
             wasmCompileFail + minifyFail + depsFail + analysisFail + parforFail + penHoistFail + rewriteFail +
             parallelStringsFail + schedulerFail +
             equalityLiteralFail + colorFastFail + motionNumericFail + slotHoistFail +
-            listCodegenBoundsFail + nanCodegenFail + literalContextFail + dangerFail + listStringInternFail +
-            glChunkPlanFail + scratchCompatFail)
+            listCodegenBoundsFail + nanCodegenFail + literalContextFail + numericPromotionFail + dangerFail + listStringInternFail +
+            glChunkPlanFail + scratchCompatFail + listLimitFail + listReadMemoFail)
                ? 1
                : 0;
 }

@@ -26,9 +26,19 @@ __pycache__/
 
 # --- ローカルの作業ディレクトリ・実験出力 ---
 /.scratch/
+/.bench/
+/.calc/
+/bench-output/
+/*.ir
 /*.err
 # ルート直下に落ちる実験時のスクリーンショット
 /*.png
 
 # ローカルのみ（大きいデモプロジェクトはリポジトリに含めない）
 /*.sb3
+
+# --- アルゴリズムベンチの生成物・計測結果 ---
+tests/bench/algos/out/
+tests/bench/algos/.logs/
+tests/bench/algos/results*.json
+tests/bench/algos/v8out/

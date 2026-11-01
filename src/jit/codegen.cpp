@@ -7,6 +7,9 @@
 #include "parfor.hpp"
 
 #include <llvm/IR/IRBuilder.h>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <llvm/IR/IntrinsicsX86.h>
+#endif
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Metadata.h>
 #include <llvm/IR/Verifier.h>
@@ -509,6 +512,7 @@ struct Codegen {
     bool mainThread = false;
     FunctionCallee decl(const char* name, Type* ret,
                         ArrayRef<Type*> args) {
+
         // Compat/reporters may mutate shared execution caches or invoke
         // registered primitives that static opcode memory keys cannot model.
         if (std::string_view(name).starts_with("xyo_rt_")) mainThread = true;
@@ -621,6 +625,46 @@ struct Codegen {
         return it->second;
     }
 
+    /// 分岐重み (branch_weights) を付ける。LLVM のブロック配置が
+    /// hot 側を fall-through にし、cold 側を関数末尾へ追い出す。
+    void setWeights(BranchInst* br, uint32_t hot, uint32_t cold) {
+        LLVMContext& c = br->getContext();
+        Metadata* md[3] = {
+            MDString::get(c, "branch_weights"),
+            ConstantAsMetadata::get(ConstantInt::get(i32t, hot)),
+            ConstantAsMetadata::get(ConstantInt::get(i32t, cold))};
+        br->setMetadata(LLVMContext::MD_prof, MDNode::get(c, md));
+    }
+    BranchInst* hotBr(llvm::Value* cond, BasicBlock* hotBB, BasicBlock* coldBB,
+                      uint32_t hotW = 1000, uint32_t coldW = 1) {
+        BranchInst* br = b.CreateCondBr(cond, hotBB, coldBB);
+        setWeights(br, hotW, coldW);
+        return br;
+    }
+    /// ループのバックエッジに llvm.loop.unroll.count を付ける。
+    /// （LLVM の既定ヒューリスティックでは、分岐の多いループは
+    ///   アンロールされないため明示する。）
+    void markUnroll(BranchInst* br, uint32_t count) {
+        LLVMContext& c = br->getContext();
+        Metadata* propOps[2] = {
+            MDString::get(c, "llvm.loop.unroll.count"),
+            ConstantAsMetadata::get(ConstantInt::get(i32t, count))};
+        MDNode* prop = MDNode::get(c, propOps);
+        Metadata* idOps[2] = {MDString::get(c, "llvm.loop"), prop};
+        MDNode* loopID = MDNode::getDistinct(c, idOps);
+        loopID->replaceOperandWith(0, loopID);
+        br->setMetadata(LLVMContext::MD_loop, loopID);
+    }
+
+    /// llvm.fptosi.sat.i64.f64 — NaN/±Inf/範囲外で未定義動作にならず
+    /// INT64_MIN/MAX に飽和する。リスト索引の整数境界検査に使う。
+    llvm::Value* satToI64(llvm::Value* d) {
+        Function* f = Intrinsic::getOrInsertDeclaration(
+            b.GetInsertBlock()->getModule(), Intrinsic::fptosi_sat,
+            {i64t, f64t});
+        return b.CreateCall(f, {d});
+    }
+
     llvm::Value* boolToValue(llvm::Value* i32) {
         // i32 truth → kTrue/kFalse ビット
         llvm::Value* t = b.CreateICmpNE(i32, ci32(0));
@@ -632,6 +676,8 @@ struct Codegen {
     //  5 args   6 numArgs 7 warpStartMs 8 isWarp+stopped(i32x2)
     //  9 reportOut 10 compatBranch+isLoop 11 compatEc
     // 12 varSlotData 13 yieldCheckN
+    /// 1.0 の IEEE-754 ビット表現（整数境界検査の下限）。
+    static constexpr uint64_t kBitsOne = 0x3FF0000000000000ULL;
     static constexpr uint32_t kYieldCheckNOff =
         uint32_t(offsetof(JitCtx, yieldCheckN));
 
@@ -639,27 +685,51 @@ struct Codegen {
     /// warp は 500ms stuck 窓の時計読みを 64 回に 1 回へ間引く
     /// （判定遅延 << 500ms）。xyo_loop_yield 内で isWarp/isStuck を
     /// 再確認するので意味論は不変。
+    void beginLoopYieldScope() {
+        yieldStack.push_back({curYieldCnt, curYieldWarp, curYieldMask});
+        curYieldCnt = entryAlloca(i64t, 1, "ycnt");
+        b.CreateStore(
+            b.CreateLoad(i64t,
+                         b.CreateConstGEP1_32(i8t, ctxArg, kYieldCheckNOff)),
+            curYieldCnt);
+        curYieldWarp = loadIsWarp();
+        curYieldMask = b.CreateSelect(
+            b.CreateICmpNE(curYieldWarp, ci32(0)), ci64(63), ci64(0));
+    }
+    /// storeBack: ループが通常脱出するなら ctx へ書き戻す（global 位相を保つ）。
+    void endLoopYieldScope(bool storeBack) {
+        if (storeBack && curYieldCnt)
+            b.CreateStore(b.CreateLoad(i64t, curYieldCnt),
+                          b.CreateConstGEP1_32(i8t, ctxArg, kYieldCheckNOff));
+        YieldScope s = yieldStack.back();
+        yieldStack.pop_back();
+        curYieldCnt = s.cnt;
+        curYieldWarp = s.warp;
+        curYieldMask = s.mask;
+    }
     void emitLoopYield() {
-        llvm::Value* iw = loadIsWarp();
-        BasicBlock* wBB = BasicBlock::Create(lc, "", fn);
-        BasicBlock* nwBB = BasicBlock::Create(lc, "", fn);
+        // warp: 64 回に 1 回だけ yield。非 warp: mask=0 なので毎回 yield。
+        // ループ不変な isWarp の分岐を毎反復から外し、判定を 1 分岐にする。
+        llvm::Value* mask = curYieldMask;
+        if (!mask) {
+            llvm::Value* iw = curYieldWarp ? curYieldWarp : loadIsWarp();
+            mask = b.CreateSelect(b.CreateICmpNE(iw, ci32(0)), ci64(63),
+                                  ci64(0));
+        }
         BasicBlock* chkBB = BasicBlock::Create(lc, "", fn);
         BasicBlock* done = BasicBlock::Create(lc, "", fn);
-        b.CreateCondBr(b.CreateICmpNE(iw, ci32(0)), wBB, nwBB);
-        b.SetInsertPoint(nwBB);
-        call1("xyo_loop_yield", voidt, ctxArg);
-        b.CreateBr(done);
-        b.SetInsertPoint(wBB);
-        llvm::Value* np =
-            b.CreateConstGEP1_32(i8t, ctxArg, kYieldCheckNOff);
-        llvm::Value* n =
-            b.CreateAdd(b.CreateLoad(i64t, np), ci64(1));
+        llvm::Value* np = curYieldCnt
+            ? static_cast<llvm::Value*>(curYieldCnt)
+            : b.CreateConstGEP1_32(i8t, ctxArg, kYieldCheckNOff);
+        llvm::Value* n = b.CreateAdd(b.CreateLoad(i64t, np), ci64(1));
         b.CreateStore(n, np);
         llvm::Value* due =
-            b.CreateICmpEQ(b.CreateAnd(n, ci64(63)), ci64(0));
-        b.CreateCondBr(due, chkBB, done);
+            b.CreateICmpEQ(b.CreateAnd(n, mask), ci64(0));
+        hotBr(due, chkBB, done, 1, 63);
         b.SetInsertPoint(chkBB);
+        spillPromoted();
         call1("xyo_loop_yield", voidt, ctxArg);
+        reloadPromoted();
         b.CreateBr(done);
         b.SetInsertPoint(done);
     }
@@ -687,12 +757,68 @@ struct Codegen {
     }
     /// emitCanon 等で num タグが保証される SSA 値（再チェック省略用）
     std::unordered_set<llvm::Value*> knownNum;
+
+    // --- ループ内スカラー変数のレジスタ昇格 -----------------------------
+    // Scratch 変数は Variable::value（メモリ）に置かれるため、ループの
+    // たびに store→load の転送遅延（~5 cycle）がループキャリー依存に
+    // なる。ループ本体の変数アクセスがすべて JIT の inline 経路で完結し、
+    // 途中に yield 以外の「観測点」が無いループでは、値を alloca（mem2reg
+    // で SSA レジスタ）に載せ、yield の前後だけ実メモリへ spill/reload する。
+    struct PromotedVar {
+        const BlockField* field;
+        llvm::AllocaInst* slot;   // i64 bits（常に有効・正準表現）
+        llvm::AllocaInst* dslot;  // f64（numeric のときだけ non-null）
+        bool numeric = false;
+    };
+    /// ループ内で item/replace/length だけを受けるリストは、SList の
+    /// len/items を preheader と yield 再開時にロードして SSA 化する
+    /// （本体内の resize は走査で除外、他スクリプトの変更は再開時に反映）。
+    struct PromotedList {
+        const BlockField* field;
+        AllocaInst* len;    // i32 shadow, refreshed after yield
+        AllocaInst* items;  // ptr shadow, refreshed after yield
+    };
+    std::vector<PromotedVar> promoted;
+    std::vector<PromotedList> promotedLists;
+    /// 昇格した数値変数の「boxed bits → f64」対応。emitToNumF64 が
+    /// タグ検査・NaN 正規化・GP↔XMM 移動なしで値を返せるようにする。
+    std::unordered_map<llvm::Value*, llvm::Value*> knownNumD;
+    struct ReadNumberMemo {
+        AllocaInst* key;
+        AllocaInst* number;
+    };
+    std::vector<ReadNumberMemo> readNumberMemos;
+    std::unordered_map<llvm::Value*, llvm::Value*> finiteMemoPaths;
+    std::unordered_set<llvm::Value*> memoizableListReads;
+    BasicBlock* readMemoPreheader = nullptr;
+    bool readMemoAllowed = false;
+
+    // --- ループ yield 判定の巻き上げ ------------------------------------
+    // isWarp はループ境界で不変（手続き呼出しは push/pop で復元する）ので
+    // ループ入口で一度だけロードする。yieldCheckN は alloca（mem2reg で
+    // レジスタ）に載せ、ループ脱出時だけ ctx へ書き戻す — ctx の
+    // store→load 依存を毎反復から外す。
+    struct YieldScope {
+        llvm::AllocaInst* cnt;
+        llvm::Value* warp;
+        llvm::Value* mask;
+    };
+    std::vector<YieldScope> yieldStack;
+    llvm::AllocaInst* curYieldCnt = nullptr;
+    llvm::Value* curYieldWarp = nullptr;
+    /// warp なら 63、非 warp なら 0。`(counter & mask) == 0` が
+    /// 「yield する」判定になり、非 warp は毎反復 true になる。
+    llvm::Value* curYieldMask = nullptr;
+    bool promotingLoop = false;   // このループが write-back を持つ（最外）
     // Only constValue registers immutable string literals, keyed by their exact
     // emitted boxed Value, never by interpreting arbitrary ConstantInt pointers.
     // Keep across native functions: LLVM constants are safe module-wide, while
     // instruction keys (including AOT slot-derived bits) are unique SSA values.
     // Payloads are doubles only: no GC references or AOT host pointers.
     std::map<llvm::Value*, double> literalNums;
+    /// 比較用: cast::compare の規則（空白のみの文字列は NaN = 文字列比較）。
+    /// 相手が数値と分かっている比較でのみ使う（下の foldLiteral）。
+    std::map<llvm::Value*, double> literalCmpNums;
 
     /// double → NaN 正規化 bits（Value::numCanonical と同型）
     llvm::Value* emitCanon(llvm::Value* d) {
@@ -739,6 +865,10 @@ struct Codegen {
     /// キャッシュは inline、初回パースのみ xyo_to_num helper。
     /// undefined/color/空文字は toNumber → 0。
     llvm::Value* emitToNumF64(llvm::Value* bits) {
+        // 昇格した数値変数: 影の f64 をそのまま返す（タグ検査・NaN 正規化・
+        // GP↔XMM 移動なし）。影の不変条件が d を非 NaN に保っている。
+        if (auto it = knownNumD.find(bits); it != knownNumD.end())
+            return it->second;
         if (auto d = constNumV(bits))
             return cf64(std::isnan(*d) ? 0.0 : *d);
         if (!genericLiteralNum) {
@@ -746,21 +876,61 @@ struct Codegen {
             if (it != literalNums.end()) return cf64(it->second);
         }
         if (knownNum.count(bits)) return emitNotNaN(emitAsF64(bits));
-        llvm::Value* ok;
-        llvm::Value* d = emitNumBoolF64(bits, &ok);
-        llvm::Value* nd = emitNotNaN(d);
-        BasicBlock* fastBB = b.GetInsertBlock();
+        // Plain-double fast path. `bits < kFalse` is a *signed* compare:
+        // every IEEE double (negative ones included, plus +-inf and negative
+        // NaN payloads) and kNan sort below the 0x7FF8 payload tags, while
+        // false/true/""/undefined, heap strings and colors do not. Hot
+        // numeric loops (change i by 1, comparisons, list indices) thus skip
+        // the true/false/kNan mapping cascade entirely.
+        // 整数比較の fast path（符号付き bits < kFalse）。実測では
+        // `d == d`（ord）版より速い — FP 比較は分岐解決が 2〜3 サイクル
+        // 遅く、ループのキャリー依存に乗るため。
+        BasicBlock* plainBB = BasicBlock::Create(lc, "", fn);
         BasicBlock* slowBB = BasicBlock::Create(lc, "", fn);
-        BasicBlock* strBB = BasicBlock::Create(lc, "", fn);
+        BasicBlock* outBB = BasicBlock::Create(lc, "", fn);
+        // `bits < kFalse` は kTrue/kFalse と同じ 0x7FF8 系列の定数で、
+        // LLVM が movabs + leaq で共有できる。kNan を除く版（NaN 正規化を
+        // 省ける）は read が 10% 遅くなった（実測）のでこちらを採る。
+        hotBr(b.CreateICmpSLT(bits, ci64(val::kFalse)), plainBB, slowBB);
+        b.SetInsertPoint(plainBB);
+        llvm::Value* plain = emitNotNaN(emitAsF64(bits));
+        b.CreateBr(outBB);
+        b.SetInsertPoint(slowBB);
+        std::optional<ReadNumberMemo> memo;
+        BasicBlock* memoHit = nullptr;
+        llvm::Value* memoNumber = nullptr;
+        const char* memoMode = std::getenv("XYO_LIST_READ_MEMO");
+        if ((!memoMode || memoMode[0] != '0') && memoizableListReads.count(bits)) {
+            memo = ReadNumberMemo{entryAlloca(i64t, 1, "read.key"),
+                                  entryAlloca(f64t, 1, "read.number")};
+            readNumberMemos.push_back(*memo);
+            IRBuilder<> init(readMemoPreheader->getTerminator());
+            init.CreateStore(ci64(val::kUndefined), memo->key);
+            init.CreateStore(cf64(0.0), memo->number);
+            memoHit = BasicBlock::Create(lc, "read.memo.hit", fn);
+            BasicBlock* miss = BasicBlock::Create(lc, "read.memo.miss", fn);
+            hotBr(b.CreateICmpEQ(bits, b.CreateLoad(i64t, memo->key)), memoHit, miss);
+            b.SetInsertPoint(memoHit);
+            memoNumber = b.CreateLoad(f64t, memo->number);
+            b.CreateBr(outBB);
+            b.SetInsertPoint(miss);
+        }
+        BasicBlock* fastBB = BasicBlock::Create(lc, "number.other", fn);
+        BasicBlock* strBB = BasicBlock::Create(lc, "number.string", fn);
         BasicBlock* hitBB = BasicBlock::Create(lc, "", fn);
         BasicBlock* missBB = BasicBlock::Create(lc, "", fn);
         BasicBlock* zeroBB = BasicBlock::Create(lc, "", fn);
         BasicBlock* merge = BasicBlock::Create(lc, "", fn);
-        b.CreateCondBr(ok, merge, slowBB);
-        b.SetInsertPoint(slowBB);
+        // Plain numbers were handled above. Dispatch strings before doing the
+        // number/boolean tag mapping, especially on non-repeating list values.
         llvm::Value* isStr = b.CreateICmpEQ(
             b.CreateLShr(bits, ci64(48)), ci64(val::kTagStr >> 48));
-        b.CreateCondBr(isStr, strBB, zeroBB);
+        hotBr(isStr, strBB, fastBB);
+        b.SetInsertPoint(fastBB);
+        llvm::Value* ok;
+        llvm::Value* d = emitNumBoolF64(bits, &ok);
+        llvm::Value* nd = emitNotNaN(d);
+        b.CreateCondBr(ok, merge, zeroBB);
         b.SetInsertPoint(strBB);
         llvm::Value* sp = b.CreateIntToPtr(
             b.CreateAnd(bits, ci64(val::kPtrMask)), ptrt);
@@ -784,7 +954,39 @@ struct Codegen {
         p->addIncoming(cd, hitBB);
         p->addIncoming(hv, missBB);
         p->addIncoming(cf64(0.0), zeroBB);
-        return p;
+        if (memo) {
+            // Keep one monomorphic entry until yield, rather than thrashing
+            // on heterogeneous strings. Only the first miss publishes a key.
+            BasicBlock* publish = BasicBlock::Create(lc, "read.memo.publish", fn);
+            BasicBlock* done = BasicBlock::Create(lc, "read.memo.ready", fn);
+            hotBr(b.CreateICmpEQ(b.CreateLoad(i64t, memo->key), ci64(val::kUndefined)),
+                  publish, done, 1, 63);
+            b.SetInsertPoint(publish);
+            // A hit proves a finite delta. A non-finite first value disables
+            // the entry with key=+0,D=0 (also a valid finite coercion pair).
+            llvm::Value* finite = b.CreateFCmpOLT(
+                b.CreateUnaryIntrinsic(Intrinsic::fabs, p),
+                cf64(std::numeric_limits<double>::infinity()));
+            b.CreateStore(b.CreateSelect(finite, bits, ci64(0)), memo->key);
+            b.CreateStore(b.CreateSelect(finite, p, cf64(0.0)), memo->number);
+            b.CreateBr(done);
+            b.SetInsertPoint(done);
+        }
+        BasicBlock* convertedBB = b.GetInsertBlock();
+        b.CreateBr(outBB);
+        b.SetInsertPoint(outBB);
+        PHINode* outp = b.CreatePHI(f64t, memo ? 3 : 2);
+        outp->addIncoming(plain, plainBB);
+        outp->addIncoming(p, convertedBB);
+        if (memo) {
+            outp->addIncoming(memoNumber, memoHit);
+            PHINode* finitePath = b.CreatePHI(b.getInt1Ty(), 3);
+            finitePath->addIncoming(b.getFalse(), plainBB);
+            finitePath->addIncoming(b.getFalse(), convertedBB);
+            finitePath->addIncoming(b.getTrue(), memoHit);
+            finiteMemoPaths[outp] = finitePath;
+        }
+        return outp;
     }
     // Match SStr's atomic_ref cache protocol, including speculative payload
     // loads in list-index lowering. Acquire state publishes the relaxed payload.
@@ -811,7 +1013,8 @@ struct Codegen {
     /// ctx->varSlotData[idx] から Variable* を直接 load して返す。
     /// 初出の (id,isList) にはエントリ関数先頭へ xyo_varslot_init を
     /// 挿入（全使用点を支配。proc 呼出しでは init は再実行されない）。
-    llvm::Value* varSlot(const BlockField* f, bool isList) {
+    llvm::Value* varSlot(const BlockField* f, bool isList,
+                         uint64_t* idxOut = nullptr) {
         std::string key = f->id;
         key += '\x03';
         if (f->value.isString() && f->value.asStrPtr()) {
@@ -821,6 +1024,7 @@ struct Codegen {
         }
         key += isList ? '\x01' : '\x02';
         auto [it, ins] = varSlotIdx.emplace(key, numVarSlots);
+        if (idxOut) *idxOut = it->second;
         if (ins) {
             ++numVarSlots;
             IRBuilder<> ib(&entryFn->getEntryBlock(),
@@ -847,35 +1051,385 @@ struct Codegen {
         uint32_t(offsetof(Variable, value));
     static constexpr uint32_t kVarListOff =
         uint32_t(offsetof(Variable, list));
+    /// 実メモリ（Variable::value）を指す。昇格中でも spill 側はこちらを使う。
+    llvm::Value* realVarValuePtr(const BlockField* f) {
+        llvm::Value* v = varSlot(f, false);
+        return b.CreateConstGEP1_32(i8t, v, kVarValueOff);
+    }
     llvm::Value* varValuePtr(const BlockField* f) {
         // par-for の反復カウンタは反復ローカル（i64 の Value bits）へ差し替える
         if (!varOverride.empty()) {
             auto ov = varOverride.find(f->id);
             if (ov != varOverride.end()) return ov->second;
         }
-        llvm::Value* v = varSlot(f, false);
-        return b.CreateConstGEP1_32(i8t, v, kVarValueOff);
-    }
-    llvm::Value* varListPtr(const BlockField* f) {
-        llvm::Value* v = varSlot(f, true);
-        llvm::Value* lp = b.CreateConstGEP1_32(i8t, v, kVarListOff);
-        return b.CreateLoad(ptrt, lp);
+        for (const PromotedVar& p : promoted)
+            if (p.field->id == f->id) return p.slot;
+        return realVarValuePtr(f);
     }
 
+    /// ループ本体の走査: 変数アクセスがすべて inline で、yield 以外の
+    /// 観測点（手続き呼出し・broadcast・wait・stop・compat・sensing_of・
+    /// for_each・append 系）を含まないときだけ昇格する。
+    static bool promotableOpcode(const std::string& op) {
+        static const std::unordered_set<std::string> kOk = {
+            "data_variable", "data_setvariableto", "data_changevariableby",
+            "data_itemoflist", "data_replaceitemoflist",
+            "data_lengthoflist", "data_listcontainsitem",
+            "operator_add", "operator_subtract", "operator_multiply",
+            "operator_divide", "operator_mod", "operator_round",
+            "operator_mathop", "operator_lt", "operator_gt",
+            "operator_equals", "operator_and", "operator_or",
+            "operator_not", "operator_join", "operator_letter_of",
+            "operator_length", "operator_contains",
+            "control_if", "control_if_else", "control_repeat",
+            "control_repeat_until", "control_while", "control_forever",
+            "argument_reporter_string_number", "argument_reporter_boolean",
+            "argument_reporter",
+        };
+        return kOk.count(op) != 0;
+    }
+    bool scanPromotable(const std::string& firstId,
+                        std::vector<const BlockField*>& vars,
+                        std::vector<const BlockField*>& lists) {
+        std::vector<std::string> stack{firstId};
+        std::unordered_set<std::string> seen;
+        std::unordered_set<std::string> varIds;
+        std::unordered_set<std::string> listIds;
+        while (!stack.empty()) {
+            std::string id = std::move(stack.back());
+            stack.pop_back();
+            if (id.empty() || !seen.insert(id).second) continue;
+            Block* b2 = blocks->getBlock(id);
+            if (!b2) return false;
+            if (b2->shadow) continue;   // 定数
+            // No list mutation anywhere in the loop, including aliases by
+            // another id/name. A cached string remains rooted by its list.
+            if (b2->opcode == "data_replaceitemoflist" ||
+                b2->opcode == "control_repeat" || b2->opcode == "control_forever" ||
+                b2->opcode == "control_while" || b2->opcode == "control_repeat_until" ||
+                b2->opcode == "control_for_each") readMemoAllowed = false;
+            if (!promotableOpcode(b2->opcode)) {
+                if (std::getenv("XYO_JIT_VERBOSE"))
+                    std::fprintf(stderr, "xyo-jit: promo skip (%s at %s)\n",
+                                 b2->opcode.c_str(), id.c_str());
+                return false;
+            }
+            if (b2->opcode == "data_variable" ||
+                b2->opcode == "data_setvariableto" ||
+                b2->opcode == "data_changevariableby") {
+                const BlockField* f = findField(b2, "VARIABLE");
+                if (!f) return false;
+                if (varIds.insert(f->id).second) vars.push_back(f);
+            }
+            if (b2->opcode == "data_itemoflist" ||
+                b2->opcode == "data_replaceitemoflist" ||
+                b2->opcode == "data_lengthoflist") {
+                const BlockField* f = findField(b2, "LIST");
+                if (!f) return false;
+                if (listIds.insert(f->id).second) lists.push_back(f);
+            }
+            if (!b2->next.empty()) stack.push_back(b2->next);
+            for (const auto& [n, in] : b2->inputs.items) {
+                (void)n;
+                if (!in.block.empty()) stack.push_back(in.block);
+                if (!in.shadow.empty()) stack.push_back(in.shadow);
+            }
+        }
+        return true;
+    }
+    /// ループ本体の直前（preheader）で呼ぶ。このループが昇格を所有したら true。
+    bool beginLoopPromotion(Block* loopBlk, bool gpuHandled) {
+        if (!promoted.empty() || promotingLoop || gpuHandled) return false;
+        readMemoAllowed = true;
+        const BlockInput* in = loopBlk->inputs.find("SUBSTACK");
+        if (!in || in->block.empty()) return false;
+        std::vector<const BlockField*> vars;
+        std::vector<const BlockField*> lists;
+        // The body plus every other input of the loop block: repeat_until /
+        // while re-evaluate CONDITION inside the loop, so its accesses must be
+        // part of the promotion set (a procedure call there would write the
+        // variable behind the shadow's back -> scanPromotable bails).
+        bool ok = true;
+        for (const auto& [n, li] : loopBlk->inputs.items) {
+            (void)n;
+            if (!li.block.empty() && !scanPromotable(li.block, vars, lists)) {
+                ok = false;
+                break;
+            }
+            if (!li.shadow.empty() && !scanPromotable(li.shadow, vars, lists)) {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) return false;
+        if (vars.empty() && lists.empty()) return false;
+        // Each input of the loop block is scanned separately, so the same
+        // variable can be collected more than once — dedupe by id. A duplicate
+        // slot would also break the yield spill (the stale twin would be
+        // written back last).
+        std::unordered_set<std::string> seenVar;
+        std::vector<const BlockField*> uniq;
+        for (const BlockField* f : vars)
+            if (!f->id.empty() && seenVar.insert(f->id).second)
+                uniq.push_back(f);
+        // 数値特化の可否: ループ直前（直線区間）で全昇格変数が数値と
+        // 証明できていれば、影を f64 のまま持てる。証明できなければ
+        // 従来の i64（boxed）影にする。
+        // 影は (bits, d=toNum(bits)) の対で常に整合するので、どのループでも
+        // 数値特化してよい（非数値の読み書きは従来どおり helper 経由）。
+        const bool numeric = !uniq.empty();
+        for (const BlockField* f : uniq) {
+            AllocaInst* slot = entryAlloca(i64t, 1, "pv");
+            llvm::Value* init = b.CreateLoad(i64t, realVarValuePtr(f));
+            b.CreateStore(init, slot);
+            AllocaInst* ds = nullptr;
+            if (numeric) {
+                ds = entryAlloca(f64t, 1, "pvd");
+                // 不変条件: d == toNum(bits)。初期値は文字列でもよい
+                // （"0" のような数値リテラルは constValue が畳む）。
+                b.CreateStore(emitToNumF64(init), ds);
+            }
+            promoted.push_back({f, slot, ds, numeric});
+        }
+        // リストヘッダ (len/items) を preheader へ。リストは slot init で
+        // lookupOrCreateList 済みなので通常は非 null だが、null 経路でも
+        // 本体は slow path へ落ちるので 0/null を phi で渡す。
+        std::unordered_set<std::string> seenList;
+        for (const BlockField* f : lists) {
+            if (!seenList.insert(f->id).second) continue;
+            llvm::Value* l = varListPtr(f);
+            BasicBlock* loadBB = BasicBlock::Create(lc, "", fn);
+            BasicBlock* zeroBB = BasicBlock::Create(lc, "", fn);
+            BasicBlock* mergeBB = BasicBlock::Create(lc, "", fn);
+            hotBr(b.CreateICmpNE(b.CreatePtrToInt(l, i64t), ci64(0)),
+                  loadBB, zeroBB);
+            b.SetInsertPoint(loadBB);
+            llvm::Value* len =
+                b.CreateLoad(i32t, b.CreateConstGEP1_32(i8t, l, kListLenOff));
+            llvm::Value* items =
+                b.CreateLoad(ptrt, b.CreateConstGEP1_32(i8t, l, kListItemsOff));
+            b.CreateBr(mergeBB);
+            b.SetInsertPoint(zeroBB);
+            b.CreateBr(mergeBB);
+            b.SetInsertPoint(mergeBB);
+            PHINode* lenPhi = b.CreatePHI(i32t, 2);
+            lenPhi->addIncoming(ci32(0), zeroBB);
+            lenPhi->addIncoming(len, loadBB);
+            PHINode* itemsPhi = b.CreatePHI(ptrt, 2);
+            itemsPhi->addIncoming(
+                ConstantPointerNull::get(
+                    static_cast<llvm::PointerType*>(ptrt)), zeroBB);
+            itemsPhi->addIncoming(items, loadBB);
+            AllocaInst* lenSlot = entryAlloca(i32t, 1, "list.len");
+            AllocaInst* itemsSlot = entryAlloca(ptrt, 1, "list.items");
+            b.CreateStore(lenPhi, lenSlot);
+            b.CreateStore(itemsPhi, itemsSlot);
+            promotedLists.push_back({f, lenSlot, itemsSlot});
+        }
+        promotingLoop = !promoted.empty() || !promotedLists.empty();
+        readMemoPreheader = promotingLoop ? b.GetInsertBlock() : nullptr;
+        return promotingLoop;
+    }
+    const PromotedList* findPromotedList(const std::string& id) const {
+        for (const PromotedList& pl : promotedLists)
+            if (pl.field->id == id) return &pl;
+        return nullptr;
+    }
+    /// ループ脱出点（merge）で呼ぶ。実メモリへ書き戻す。
+    void endLoopPromotion(bool owner) {
+        if (!owner || !promotingLoop) return;
+        for (const PromotedVar& p : promoted)
+            b.CreateStore(b.CreateLoad(i64t, p.slot),
+                          realVarValuePtr(p.field));
+        promoted.clear();
+        promotedLists.clear();
+        readNumberMemos.clear();
+        finiteMemoPaths.clear();
+        memoizableListReads.clear();
+        readMemoPreheader = nullptr;
+        readMemoAllowed = false;
+        promotingLoop = false;
+    }
+    void clearLoopPromotion(bool owner) {
+        if (!owner) return;
+        promoted.clear();
+        promotedLists.clear();
+        readNumberMemos.clear();
+        finiteMemoPaths.clear();
+        memoizableListReads.clear();
+        readMemoPreheader = nullptr;
+        readMemoAllowed = false;
+        promotingLoop = false;
+    }
+    /// yield の直前/直後: 実メモリと同期する（他スレッドが読み書きできる）。
+    void spillPromoted() {
+        // bits 影は常に正準表現（NaN は kNan）なので、そのまま書き戻せる。
+        for (const PromotedVar& p : promoted)
+            b.CreateStore(b.CreateLoad(i64t, p.slot),
+                          realVarValuePtr(p.field));
+    }
+    void reloadPromoted() {
+        for (const PromotedVar& p : promoted) {
+            auto* ld = b.CreateLoad(i64t, realVarValuePtr(p.field));
+            ld->setVolatile(true);   // 呼出し前の store を畳ませない
+            b.CreateStore(ld, p.slot);
+            if (p.numeric) b.CreateStore(emitToNumF64(ld), p.dslot);
+        }
+        // A yielded script may resize or clear a list. Keep only the SList*
+        // invariant; len/items must be refreshed before any resumed access.
+        for (const PromotedList& list : promotedLists) {
+            llvm::Value* l = varListPtr(list.field);
+            BasicBlock* have = BasicBlock::Create(lc, "list.reload", fn);
+            BasicBlock* empty = BasicBlock::Create(lc, "list.reload.empty", fn);
+            BasicBlock* done = BasicBlock::Create(lc, "list.reload.done", fn);
+            hotBr(b.CreateICmpNE(b.CreatePtrToInt(l, i64t), ci64(0)), have, empty);
+            b.SetInsertPoint(have);
+            b.CreateStore(b.CreateLoad(i32t,
+                b.CreateConstGEP1_32(i8t, l, kListLenOff)), list.len);
+            b.CreateStore(b.CreateLoad(ptrt,
+                b.CreateConstGEP1_32(i8t, l, kListItemsOff)), list.items);
+            b.CreateBr(done);
+            b.SetInsertPoint(empty);
+            b.CreateStore(ci32(0), list.len);
+            b.CreateStore(ConstantPointerNull::get(llvm::cast<PointerType>(ptrt)), list.items);
+            b.CreateBr(done);
+            b.SetInsertPoint(done);
+        }
+        // A different script may remove a cached string while we yield.
+        // Never compare its old pointer after resuming (GC may reuse it).
+        for (const ReadNumberMemo& memo : readNumberMemos) {
+            b.CreateStore(ci64(val::kUndefined), memo.key);
+            b.CreateStore(cf64(0.0), memo.number);
+        }
+    }
+    llvm::Value* varListPtr(const BlockField* f) {
+        uint64_t idx = 0;
+        llvm::Value* v = varSlot(f, true, &idx);
+        llvm::Value* lp = b.CreateConstGEP1_32(i8t, v, kVarListOff);
+        auto* load = b.CreateLoad(ptrt, lp);
+        // Variable::list is filled once by xyo_varslot_init (lookupOrCreateList)
+        // and never replaced (delete all keeps the SList), so the pointer is
+        // loop-invariant. hoistVarSlotPointers lifts it to the function entry
+        // together with the Variable* load; without that every list access
+        // pays a 3-deep dependent load chain (slot -> Variable -> SList).
+        load->setMetadata("xyo.varlist", MDNode::get(lc,
+            {ConstantAsMetadata::get(ci64(idx))}));
+        return load;
+    }
+
+    PromotedVar* findPromoted(const BlockField* f) {
+        if (!f) return nullptr;
+        for (PromotedVar& p : promoted)
+            if (p.field->id == f->id) return &p;
+        return nullptr;
+    }
+    /// (bits, d) の整合ペアを書き込む。NaN は bits=kNan / d=0 に落とす
+    /// （Scratch の正準表現 + toNum(NaN)=0 を、読み出し側の検査なしで保つ）。
+    void storeNumericPair(PromotedVar& p, llvm::Value* bits,
+                          llvm::Value* d) {
+        b.CreateStore(bits, p.slot);
+        b.CreateStore(d, p.dslot);
+        knownNumD[bits] = d;
+    }
     llvm::Value* emitVarGet(const BlockField* f) {
         // jitVar（lookupOrCreate）は常に非 null — helper の v? ガードと等価
-        return b.CreateLoad(i64t, varValuePtr(f));
+        llvm::Value* vp = varValuePtr(f);
+        llvm::Value* bits = b.CreateLoad(i64t, vp);
+        if (PromotedVar* p = findPromoted(f))
+            if (p->numeric) knownNumD[bits] = b.CreateLoad(f64t, p->dslot);
+        return bits;
     }
     void emitVarSet(const BlockField* f, llvm::Value* val) {
+        if (PromotedVar* p = findPromoted(f)) {
+            if (p->numeric) {
+                // 影の不変条件: d == toNum(bits)。bits は代入された値そのもの
+                // （"0" のような文字列リテラルでもよい）。
+                storeNumericPair(*p, val, emitToNumF64(val));
+                return;
+            }
+        }
         b.CreateStore(val, varValuePtr(f));
     }
     void emitVarChange(const BlockField* f, llvm::Value* delta) {
         llvm::Value* vp = varValuePtr(f);
         llvm::Value* cur = b.CreateLoad(i64t, vp);
-        // xyo_var_change と同型: numCanonical(toNum(cur)+toNum(delta))
-        llvm::Value* s = emitCanon(
-            b.CreateFAdd(emitToNumF64(cur), emitToNumF64(delta)));
-        b.CreateStore(s, vp);
+        // xyo_var_change と同型: numCanonical(toNum(cur)+toNum(delta)).
+        // emitToNumF64 never yields NaN, so a finite constant delta cannot
+        // produce NaN here (inf + finite = +-inf) and canon collapses.
+        llvm::Value* fb = emitToNumF64(delta);
+        PromotedVar* pv = findPromoted(f);
+        if (pv && pv->numeric) {
+            // 影は f64。有限定数デルタなら結果は NaN になり得ない
+            // （影の不変条件: d は NaN でない）ので正規化を省く。
+            llvm::Value* r =
+                b.CreateFAdd(b.CreateLoad(f64t, pv->dslot), fb);
+            BasicBlock* finiteJoin = nullptr;
+            if (auto it = finiteMemoPaths.find(fb); it != finiteMemoPaths.end()) {
+                BasicBlock* finiteBB = BasicBlock::Create(lc, "memo.add.finite", fn);
+                BasicBlock* checkedBB = BasicBlock::Create(lc, "memo.add.checked", fn);
+                finiteJoin = BasicBlock::Create(lc, "memo.add.done", fn);
+                hotBr(it->second, finiteBB, checkedBB);
+                b.SetInsertPoint(finiteBB);
+                storeNumericPair(*pv, b.CreateBitCast(r, i64t), r);
+                b.CreateBr(finiteJoin);
+                b.SetInsertPoint(checkedBB);
+            }
+            bool finite = false;
+            if (auto* cf = llvm::dyn_cast<llvm::ConstantFP>(fb)) {
+                const llvm::APFloat& ap = cf->getValueAPF();
+                finite = !ap.isNaN() && !ap.isInfinity();
+            }
+            if (finite) {
+                // 影の d は決して NaN にならない（toNum の結果）ので、
+                // 有限デルタでは結果も NaN にならない。
+                llvm::Value* rb = b.CreateBitCast(r, i64t);
+                b.CreateStore(r, pv->dslot);
+                b.CreateStore(rb, pv->slot);
+                knownNumD[rb] = r;
+            } else if (finiteJoin || memoizableListReads.count(delta)) {
+                // Keep NaN repair off the ordinary list-accumulation carry,
+                // including when coercion memoization is explicitly disabled.
+                // Other dynamic changes retain their branchless lowering.
+                BasicBlock* repair = BasicBlock::Create(lc, "change.nan", fn);
+                BasicBlock* normal = BasicBlock::Create(lc, "change.number", fn);
+                BasicBlock* merge = BasicBlock::Create(lc, "change.done", fn);
+                hotBr(b.CreateFCmpUNO(r, r), repair, normal, 1, 1000000);
+                b.SetInsertPoint(normal);
+                storeNumericPair(*pv, b.CreateBitCast(r, i64t), r);
+                b.CreateBr(merge);
+                b.SetInsertPoint(repair);
+                b.CreateCall(Intrinsic::getOrInsertDeclaration(&mod, Intrinsic::sideeffect));
+                b.CreateStore(cf64(0.0), pv->dslot);
+                b.CreateStore(ci64(val::kNan), pv->slot);
+                b.CreateBr(merge);
+                b.SetInsertPoint(merge);
+            } else {
+                // NaN 判定は 1 回で済ませる（emitCanon + emitNotNaN は
+                // それぞれ fcmp uno を出す）。
+                llvm::Value* isn = b.CreateFCmpUNO(r, r);
+                llvm::Value* dv = b.CreateSelect(isn, cf64(0.0), r);
+                llvm::Value* bv = b.CreateSelect(
+                    isn, ci64(val::kNan), b.CreateBitCast(r, i64t));
+                b.CreateStore(dv, pv->dslot);
+                b.CreateStore(bv, pv->slot);
+                knownNumD[bv] = dv;
+            }
+            if (finiteJoin) {
+                b.CreateBr(finiteJoin);
+                b.SetInsertPoint(finiteJoin);
+            }
+            return;
+        }
+        llvm::Value* s = b.CreateFAdd(emitToNumF64(cur), fb);
+        bool finiteDelta = false;
+        if (auto* cf = llvm::dyn_cast<llvm::ConstantFP>(fb)) {
+            const llvm::APFloat& ap = cf->getValueAPF();
+            finiteDelta = !ap.isNaN() && !ap.isInfinity();
+        }
+        if (finiteDelta)
+            b.CreateStore(b.CreateBitCast(s, i64t), vp);
+        else
+            b.CreateStore(emitCanon(s), vp);
     }
 
     // --- 算術・比較の fast path -------------------------------------------
@@ -911,11 +1465,49 @@ struct Codegen {
     /// cast::compare 意味での数値変換。*okOut=true なら f64 が有効
     /// （num(kNan除く)|true|false|numState==1 の数値キャッシュ済み str）。
     /// それ以外は NaN→文字列比較の領域なので helper に任せる。
-    llvm::Value* emitCmpNumF64(llvm::Value* bits, llvm::Value** okOut) {
+    /// その SSA が数値だと分かっているか（数値影・既知数値・数値定数）。
+    bool isNumericOperand(llvm::Value* v) {
+        return knownNumD.count(v) || knownNum.count(v) || constNumV(v);
+    }
+
+    /// foldLiteral: 相手側が数値と分かっているときに限り、数値として
+    /// 解釈できる文字列リテラルをコンパイル時に畳む。相手が数値なら
+    /// cast::compare は必ず数値比較になるので、リテラル側の numState
+    /// 経路（空白のみ = state 3 で文字列比較）を飛ばしてよい。
+    llvm::Value* emitCmpNumF64(llvm::Value* bits, llvm::Value** okOut,
+                               bool foldLiteral = false) {
+        // 昇格した数値変数: 影の f64 をそのまま比較に使う（タグ検査・
+        // NaN 判定・GP↔XMM 移動なし）。比較は NaN を素通ししてよい
+        // （cast::compare の数値比較は NaN で false）。
+        if (auto it = knownNumD.find(bits); it != knownNumD.end()) {
+            *okOut = b.getInt1(true);
+            return it->second;
+        }
+        if (foldLiteral) {
+            if (auto it = literalCmpNums.find(bits);
+                it != literalCmpNums.end() && !std::isnan(it->second)) {
+                *okOut = b.getInt1(true);
+                return cf64(it->second);
+            }
+        }
         if (knownNum.count(bits)) {
             *okOut = b.CreateICmpNE(bits, ci64(val::kNan));
             return emitAsF64(bits);
         }
+        // 数値として解釈できる文字列リテラル（"1000" など）は比較を
+        // コンパイル時に畳む。literalNums は cast::toNumber の結果で、
+        // 空白のみ・非数値は NaN なので fold しない（Scratch は
+        // その場合だけ文字列比較へ落ちる）。
+        // Plain IEEE double (see emitToNumF64): skip the tag mapping cascade.
+        // Comparisons need the raw double (NaN stays NaN), not toNum().
+        BasicBlock* dblBB = BasicBlock::Create(lc, "", fn);
+        BasicBlock* tagBB = BasicBlock::Create(lc, "", fn);
+        BasicBlock* outBB = BasicBlock::Create(lc, "", fn);
+        hotBr(b.CreateICmpSLT(bits, ci64(val::kNan)), dblBB, tagBB);
+        b.SetInsertPoint(dblBB);
+        llvm::Value* dbl = emitAsF64(bits);
+        b.CreateBr(outBB);
+        b.SetInsertPoint(tagBB);
         llvm::Value* isn = emitIsNum(bits);
         llvm::Value* isNan = b.CreateICmpEQ(bits, ci64(val::kNan));
         llvm::Value* okNum = b.CreateAnd(isn, b.CreateNot(isNan));
@@ -933,7 +1525,7 @@ struct Codegen {
         BasicBlock* strBadBB = BasicBlock::Create(lc, "", fn);
         BasicBlock* otherBB = BasicBlock::Create(lc, "", fn);
         BasicBlock* merge = BasicBlock::Create(lc, "", fn);
-        b.CreateCondBr(ok0, merge, slowBB);
+        hotBr(ok0, merge, slowBB);
         b.SetInsertPoint(slowBB);
         llvm::Value* isStr = b.CreateICmpEQ(
             b.CreateLShr(bits, ci64(48)), ci64(val::kTagStr >> 48));
@@ -964,8 +1556,16 @@ struct Codegen {
         d->addIncoming(nc, strHitBB);
         d->addIncoming(d0, strBadBB);
         d->addIncoming(d0, otherBB);
-        *okOut = ok;
-        return d;
+        b.CreateBr(outBB);
+        b.SetInsertPoint(outBB);
+        PHINode* okOutP = b.CreatePHI(b.getInt1Ty(), 2);
+        okOutP->addIncoming(b.getInt1(true), dblBB);
+        okOutP->addIncoming(ok, merge);
+        PHINode* dOut = b.CreatePHI(f64t, 2);
+        dOut->addIncoming(dbl, dblBB);
+        dOut->addIncoming(d, merge);
+        *okOut = okOutP;
+        return dOut;
     }
 
     /// operator_mathop の f64 実装（xyo_mathop と同型）。
@@ -1229,8 +1829,10 @@ struct Codegen {
         b.CreateBr(merge);
         b.SetInsertPoint(notSameBB);
         llvm::Value *okA, *okB;
-        llvm::Value* fa = emitCmpNumF64(a, &okA);
-        llvm::Value* fb = emitCmpNumF64(bv, &okB);
+        const bool aNum = isNumericOperand(a);
+        const bool bNum = isNumericOperand(bv);
+        llvm::Value* fa = emitCmpNumF64(a, &okA, bNum);
+        llvm::Value* fb = emitCmpNumF64(bv, &okB, aNum);
         b.CreateCondBr(b.CreateAnd(okA, okB), cmpBB, strBB);
         b.SetInsertPoint(cmpBB);
         llvm::Value* c = b.CreateZExt(b.CreateFCmpOEQ(fa, fb), i32t);
@@ -1532,9 +2134,12 @@ struct Codegen {
                          const char* helper, CmpInst::Predicate pred) {
         llvm::Value* a = emitInputOf(blk, in1);
         llvm::Value* bv = emitInputOf(blk, in2);
+        // 相手が数値と分かっていれば、リテラル側を数値へ畳める。
+        const bool aNum = isNumericOperand(a);
+        const bool bNum = isNumericOperand(bv);
         llvm::Value *okA, *okB;
-        llvm::Value* fa = emitCmpNumF64(a, &okA);
-        llvm::Value* fb = emitCmpNumF64(bv, &okB);
+        llvm::Value* fa = emitCmpNumF64(a, &okA, bNum);
+        llvm::Value* fb = emitCmpNumF64(bv, &okB, aNum);
         llvm::Value* both = b.CreateAnd(okA, okB);
         BasicBlock* fastBB = BasicBlock::Create(lc, "", fn);
         BasicBlock* slowBB = BasicBlock::Create(lc, "", fn);
@@ -1565,14 +2170,27 @@ struct Codegen {
             if (vb == val::kTrue) return b.getInt1(true);
             if (vb == val::kFalse) return b.getInt1(false);
         }
+        // Comparisons / boolean operators already carry an i1 condition.
+        // Recover it before boxing adds tag tests and a false-side helper call.
+        if (auto* sel = dyn_cast<SelectInst>(bits)) {
+            auto* t = dyn_cast<ConstantInt>(sel->getTrueValue());
+            auto* f = dyn_cast<ConstantInt>(sel->getFalseValue());
+            if (t && f) {
+                if (t->getZExtValue() == val::kTrue && f->getZExtValue() == val::kFalse)
+                    return sel->getCondition();
+                if (t->getZExtValue() == val::kFalse && f->getZExtValue() == val::kTrue)
+                    return b.CreateNot(sel->getCondition());
+            }
+        }
         llvm::Value* isn = emitIsNum(bits);
         llvm::Value* isTrue = b.CreateICmpEQ(bits, ci64(val::kTrue));
+        llvm::Value* isFalse = b.CreateICmpEQ(bits, ci64(val::kFalse));
         BasicBlock* numBB = BasicBlock::Create(lc, "", fn);
         BasicBlock* slowBB = BasicBlock::Create(lc, "", fn);
         BasicBlock* merge = BasicBlock::Create(lc, "", fn);
-        // isNum → fcmp one; それ以外は kTrue||helper（kFalse は
-        // helper でも false だが short-circuit で節約）
-        llvm::Value* goNum = b.CreateOr(isn, isTrue);
+        // Both boxed booleans stay inline. kFalse is a NaN bit pattern,
+        // so ordered nonzero is false; only strings/other tags need a helper.
+        llvm::Value* goNum = b.CreateOr(isn, b.CreateOr(isTrue, isFalse));
         b.CreateCondBr(goNum, numBB, slowBB);
         b.SetInsertPoint(numBB);
         llvm::Value* tn = b.CreateOr(
@@ -1607,8 +2225,14 @@ struct Codegen {
     /// num → asF64、numState∈{1,3,4} の heap str → numCache を使う。
     /// それ以外（未parse str/NaN str/'last'/'random'/bool/color/""）は
     /// slowBB へ。戻り値は dBB の f64 phi（呼出側で addIncoming）。
-    std::pair<BasicBlock*, PHINode*> emitListIdxAsF64(
+    std::pair<BasicBlock*, llvm::Value*> emitListIdxAsF64(
             llvm::Value* idx, BasicBlock* slowBB) {
+        // 昇格した数値変数 / 数値リテラルはタグ検査も分岐も不要。
+        if (auto it = knownNumD.find(idx); it != knownNumD.end())
+            return {b.GetInsertBlock(), it->second};
+        if (auto c = constNumV(idx))
+            return {b.GetInsertBlock(),
+                    cf64(std::isnan(*c) ? 0.0 : *c)};
         BasicBlock* haveBB = b.GetInsertBlock();
         BasicBlock* numDBB = BasicBlock::Create(lc, "", fn);
         BasicBlock* strBB = BasicBlock::Create(lc, "", fn);
@@ -1642,8 +2266,31 @@ struct Codegen {
         return {dBB, d};
     }
 
+    // Unlike LLVM fptosi, CVTTSD2SI is defined for every input: NaN and
+    // overflow produce INT64_MIN. After wrapping subtraction, those become
+    // INT64_MAX and fail the unsigned u32-length check, just like negatives.
+    // This avoids both poison and the multi-instruction fptosi.sat lowering.
+    std::pair<llvm::Value*, llvm::Value*> emitListBounds(
+            llvm::Value* d, llvm::Value* len) {
+#if defined(__x86_64__) || defined(_M_X64)
+        auto* vt = llvm::FixedVectorType::get(f64t, 2);
+        llvm::Value* vec = b.CreateInsertElement(
+            llvm::UndefValue::get(vt), d, uint64_t(0));
+        auto* cvt = llvm::Intrinsic::getOrInsertDeclaration(
+            &mod, llvm::Intrinsic::x86_sse2_cvttsd2si64);
+        llvm::Value* i0 = b.CreateSub(b.CreateCall(cvt, {vec}), ci64(1));
+        return {b.CreateICmpULT(i0, b.CreateZExt(len, i64t)), i0};
+#else
+        llvm::Value* upper = b.CreateFAdd(b.CreateUIToFP(len, f64t), cf64(1.0));
+        llvm::Value* inb = b.CreateAnd(b.CreateFCmpOGE(d, cf64(1.0)),
+                                      b.CreateFCmpOLT(d, upper));
+        return {inb, nullptr}; // Conversion is emitted only after this guard.
+#endif
+    }
+
     llvm::Value* emitListItem(Block* blk, const BlockField* f) {
         llvm::Value* idx = emitInputOf(blk, "INDEX");
+        const PromotedList* pl = findPromotedList(f->id);
         llvm::Value* l = varListPtr(f);   // null 可（list 非保有）
         llvm::Value* nonNull = b.CreateICmpNE(
             b.CreatePtrToInt(l, i64t), ci64(0));
@@ -1652,22 +2299,20 @@ struct Codegen {
         BasicBlock* emptyBB = BasicBlock::Create(lc, "", fn);
         BasicBlock* slowBB = BasicBlock::Create(lc, "", fn);
         BasicBlock* merge = BasicBlock::Create(lc, "", fn);
-        b.CreateCondBr(nonNull, haveBB, slowBB);
+        // Null promoted lists have len=0/items=null. The bounds check rejects
+        // every numeric index before loading items, so no second null test.
+        if (pl && !std::getenv("XYO_LIST_READ_NULL_CHECK")) b.CreateBr(haveBB);
+        else b.CreateCondBr(nonNull, haveBB, slowBB);
         b.SetInsertPoint(haveBB);
         auto [dBB, d] = emitListIdxAsF64(idx, slowBB);
         b.SetInsertPoint(dBB);
-        llvm::Value* len = b.CreateLoad(
+        llvm::Value* len = pl ? b.CreateLoad(i32t, pl->len) : b.CreateLoad(
             i32t, b.CreateConstGEP1_32(i8t, l, kListLenOff));
-        // Ordered bounds BEFORE fptosi: NaN/Inf/huge values must not create
-        // poison used by the branch. For positive d, trunc(d)-1 < len iff
-        // 1 <= d < len+1. A u32 len and len+1 are exactly representable in f64.
-        llvm::Value* upper = b.CreateFAdd(b.CreateUIToFP(len, f64t), cf64(1.0));
-        llvm::Value* inb = b.CreateAnd(b.CreateFCmpOGE(d, cf64(1.0)),
-                                       b.CreateFCmpOLT(d, upper));
-        b.CreateCondBr(inb, fastBB, emptyBB);
+        auto [inb, i0] = emitListBounds(d, len);
+        hotBr(inb, fastBB, emptyBB);
         b.SetInsertPoint(fastBB);
-        llvm::Value* i0 = b.CreateSub(b.CreateFPToSI(d, i64t), ci64(1));
-        llvm::Value* items = b.CreateLoad(
+        if (!i0) i0 = b.CreateSub(b.CreateFPToSI(d, i64t), ci64(1));
+        llvm::Value* items = pl ? b.CreateLoad(ptrt, pl->items) : b.CreateLoad(
             ptrt, b.CreateConstGEP1_32(i8t, l, kListItemsOff));
         llvm::Value* v = b.CreateLoad(i64t, b.CreateGEP(i64t, items, i0));
         b.CreateBr(merge);
@@ -1682,6 +2327,8 @@ struct Codegen {
         phi->addIncoming(v, fastBB);
         phi->addIncoming(ci64(Value::emptyStr().bits), emptyBB);
         phi->addIncoming(s, slowBB);
+        if (promotingLoop && readMemoAllowed && readMemoPreheader)
+            memoizableListReads.insert(phi);
         return phi;
     }
 
@@ -1699,17 +2346,15 @@ struct Codegen {
         b.SetInsertPoint(haveBB);
         auto [dBB, d] = emitListIdxAsF64(idx, slowBB);
         b.SetInsertPoint(dBB);
-        llvm::Value* len = b.CreateLoad(
+        const PromotedList* pl = findPromotedList(f->id);
+        llvm::Value* len = pl ? b.CreateLoad(i32t, pl->len) : b.CreateLoad(
             i32t, b.CreateConstGEP1_32(i8t, l, kListLenOff));
-        // Same ordered guard as list reads; invalid numeric indices are no-op,
-        // with INDEX and ITEM already evaluated in their original order above.
-        llvm::Value* upper = b.CreateFAdd(b.CreateUIToFP(len, f64t), cf64(1.0));
-        llvm::Value* inb = b.CreateAnd(b.CreateFCmpOGE(d, cf64(1.0)),
-                                       b.CreateFCmpOLT(d, upper));
-        b.CreateCondBr(inb, fastBB, merge);
+        // INDEX and ITEM have already been evaluated in their original order.
+        auto [inb, i0] = emitListBounds(d, len);
+        hotBr(inb, fastBB, merge);
         b.SetInsertPoint(fastBB);
-        llvm::Value* i0 = b.CreateSub(b.CreateFPToSI(d, i64t), ci64(1));
-        llvm::Value* items = b.CreateLoad(
+        if (!i0) i0 = b.CreateSub(b.CreateFPToSI(d, i64t), ci64(1));
+        llvm::Value* items = pl ? b.CreateLoad(ptrt, pl->items) : b.CreateLoad(
             ptrt, b.CreateConstGEP1_32(i8t, l, kListItemsOff));
         b.CreateStore(item, b.CreateGEP(i64t, items, i0));
         b.CreateStore(b.getInt8(1),
@@ -1720,6 +2365,13 @@ struct Codegen {
               {ctxArg, varSlot(f, true), idx, item});
         b.CreateBr(merge);
         b.SetInsertPoint(merge);
+    }
+
+    llvm::GlobalVariable* listLimitGlobal() {
+        if (auto* g = mod.getGlobalVariable("xyo_list_limit")) return g;
+        return new GlobalVariable(mod, i32t, false,
+                                  GlobalValue::ExternalLinkage, nullptr,
+                                  "xyo_list_limit");
     }
 
     /// data_addtolist — l!=null && len<cap なら store/len++/dirty のみ。
@@ -1754,7 +2406,13 @@ struct Codegen {
             i32t, b.CreateConstGEP1_32(i8t, l, kListLenOff));
         llvm::Value* cap = b.CreateLoad(
             i32t, b.CreateConstGEP1_32(i8t, l, kListCapOff));
-        b.CreateCondBr(b.CreateICmpULT(len, cap), fastBB, slowBB);
+        // リスト長上限（0 = 無制限）。上限に達していたら helper 経由にして
+        // 追加を落とす（SList::push が上限を見る）。
+        llvm::Value* lim = b.CreateLoad(i32t, listLimitGlobal());
+        llvm::Value* room = b.CreateOr(b.CreateICmpEQ(lim, ci32(0)),
+                                       b.CreateICmpULT(len, lim));
+        b.CreateCondBr(
+            b.CreateAnd(b.CreateICmpULT(len, cap), room), fastBB, slowBB);
         b.SetInsertPoint(fastBB);
         llvm::Value* items = b.CreateLoad(
             ptrt, b.CreateConstGEP1_32(i8t, l, kListItemsOff));
@@ -1935,7 +2593,13 @@ struct Codegen {
             // static fields, not reporter evaluation. Preserve its boxed string
             // for string/list/compare uses; only numeric conversion may fold.
             // Shared cast semantics include empty strings, NaN -> 0 and -0/Inf.
-            if (!genericLiteralNum) literalNums[bits] = cast::toNumber(v);
+            if (!genericLiteralNum) {
+                literalNums[bits] = cast::toNumber(v);
+                literalCmpNums[bits] =
+                    cast::isWhiteSpace(v)
+                        ? std::numeric_limits<double>::quiet_NaN()
+                        : cast::toNumber(v);
+            }
             return bits;
         }
         return ci64(v.bits);
@@ -2067,10 +2731,20 @@ struct Codegen {
             std::string fname;
             if (f && f->value.isString() && f->value.asStrPtr())
                 fname = SStr::toUtf8(f->value.asStrPtr()->view());
-            int32_t fn = 0;
+            // Scratch は menu 値を toLowerCase して照合し、未知の値は 0 を返す
+            // （scratch3_operators.mathop の default）。大文字始まりの値
+            // （"Sqrt" 等）で abs にフォールバックしていたのを修正。
+            for (char& c : fname)
+                if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
+            int32_t fn = -1;
             auto it = ops.find(fname);
             if (it != ops.end()) fn = it->second;
             llvm::Value* x = emitToNumF64(emitInputOf(blk, "NUM"));
+            if (fn < 0) {
+                llvm::Value* zero = cf64(0.0);
+                return genericMathBox ? call1("xyo_num", i64t, zero)
+                                      : emitCanon(zero);
+            }
             llvm::Value* r = emitMathop(fn, x);
             // xyo_num is exactly Value::numCanonical. Keep its NaN/Inf/±0
             // semantics inline, and expose the numeric result to consumers so
@@ -2318,6 +2992,14 @@ struct Codegen {
             BasicBlock* merge = BasicBlock::Create(lc, "", fn);
             b.CreateCondBr(isT, thenBB, elseBB);
             b.SetInsertPoint(thenBB);
+            if (op == "control_if" && promotingLoop) {
+                const char* e = std::getenv("XYO_BRANCH_IF");
+                if (!e || e[0] != '0') {
+                    // Do not turn a conditional numeric update into an FP
+                    // blend on the loop-carried value's dependency chain.
+                    b.CreateCall(Intrinsic::getOrInsertDeclaration(&mod, Intrinsic::sideeffect));
+                }
+            }
             {
                 const BlockInput* in = blk->inputs.find("SUBSTACK");
                 if (in) emitChainBlocks(chainOf(in->block));
@@ -2336,9 +3018,15 @@ struct Codegen {
         if (op == "control_repeat") {
             // for (i = toNum(TIMES); i >= 0.5; i--) { body; loopYield }
             llvm::Value* n = emitToNumF64(emitInputOf(blk, "TIMES"));
+            // ループ内スカラー変数をレジスタへ昇格する（可能なら）。
+            // 昇格中は GPU 委譲しない（GPU 側はメモリを直接更新するため、
+            // 戻り値の shadow と二重になる）。
+            beginLoopYieldScope();
+            const bool promotedLoop = beginLoopPromotion(blk, false);
             // 本体が GPU 並列実行可能なら xyo_gpu_repeat へ委譲し、
             // 失敗時のみ従来の CPU ループへ進む分岐を emit する。
-            const gpu::Program* gp = tryGpuLoop(blk);
+            const gpu::Program* gp =
+                promotedLoop ? nullptr : tryGpuLoop(blk);
             AllocaInst* iv = entryAlloca(f64t, 1, "rep_i");
             b.CreateStore(n, iv);
             // 本体先頭の不変 pen setter をループ外へ（本体が 0 回なら実行しない）
@@ -2380,12 +3068,16 @@ struct Codegen {
                 b.CreateBr(head);
             }
             b.SetInsertPoint(merge);
+            endLoopYieldScope(true);
+            endLoopPromotion(promotedLoop);
             return;
         }
 
         if (op == "control_forever") {
             // forever の本体は必ず 1 回は走るのでガード不要
             emitHoistedSetters(hoistableSetters(blk), nullptr);
+            beginLoopYieldScope();
+            const bool promotedLoop = beginLoopPromotion(blk, false);
             BasicBlock* bodyBB = BasicBlock::Create(lc, "", fn);
             BasicBlock* merge = BasicBlock::Create(lc, "", fn);
             b.CreateBr(bodyBB);
@@ -2399,6 +3091,9 @@ struct Codegen {
                 b.CreateBr(bodyBB);
             }
             b.SetInsertPoint(merge);
+            // forever は通常脱出しない（stop 系は昇格対象外）— 状態だけ戻す
+            endLoopYieldScope(false);
+            clearLoopPromotion(promotedLoop);
             return;
         }
 
@@ -2410,7 +3105,10 @@ struct Codegen {
             // 境界は limitParent/limitInput が指す不変オペランドを
             // ループ前に一度だけ評価する。元の条件は CPU パスで
             // 変更なく再評価される。
-            const gpu::ParallelLoop* pl = tryGpuLoopEx(blk);
+            beginLoopYieldScope();
+            const bool promotedLoop = beginLoopPromotion(blk, false);
+            const gpu::ParallelLoop* pl =
+                promotedLoop ? nullptr : tryGpuLoopEx(blk);
             if (pl && pl->limitParent && !pl->limitInput.empty()) {
                 // 境界は生の数値のみ受理 — emitToNumF64 は NaN を 0 に
                 // 畳むため emitCmpNumF64 で非数値は NaN として helper の
@@ -2449,15 +3147,20 @@ struct Codegen {
                 b.CreateBr(head);
             }
             b.SetInsertPoint(merge);
+            endLoopYieldScope(true);
+            endLoopPromotion(promotedLoop);
             return;
         }
 
         if (op == "control_for_each") {
-            // for (i=1; i<=toNum(VALUE); i++) { var=i; body; loopYield }
+            // Scratch の for_each は index=0 から index < toNum(VALUE) の間
+            // 回る（scratch3_control.forEach）。値が整数でない場合に
+            // ceil 回になるので i=1..<=n では合わない（2.5 → 3 回）。
             llvm::Value* n = emitToNumF64(emitInputOf(blk, "VALUE"));
+            beginLoopYieldScope();
             const gpu::Program* gp = tryGpuLoop(blk);
             AllocaInst* iv = entryAlloca(f64t, 1, "fe_i");
-            b.CreateStore(cf64(1.0), iv);
+            b.CreateStore(cf64(0.0), iv);
             BasicBlock* head = BasicBlock::Create(lc, "", fn);
             BasicBlock* bodyBB = BasicBlock::Create(lc, "", fn);
             BasicBlock* merge = BasicBlock::Create(lc, "", fn);
@@ -2472,13 +3175,14 @@ struct Codegen {
             }
             b.SetInsertPoint(head);
             llvm::Value* i = b.CreateLoad(f64t, iv);
-            llvm::Value* go = b.CreateFCmpOLE(i, n);
+            llvm::Value* go = b.CreateFCmpOLT(i, n);
             b.CreateCondBr(go, bodyBB, merge);
             b.SetInsertPoint(bodyBB);
             {
                 const BlockField* f = findField(blk, "VARIABLE");
                 if (f) {
-                    llvm::Value* vv = call1("xyo_num", i64t, i);
+                    llvm::Value* vv = call1("xyo_num", i64t,
+                                            b.CreateFAdd(i, cf64(1.0)));
                     emitVarSet(f, vv);
                 }
                 const BlockInput* in = blk->inputs.find("SUBSTACK");
@@ -2491,6 +3195,7 @@ struct Codegen {
                 b.CreateBr(head);
             }
             b.SetInsertPoint(merge);
+            endLoopYieldScope(true);
             return;
         }
 
@@ -2554,12 +3259,16 @@ struct Codegen {
 
         if (op == "data_setvariableto") {
             const BlockField* f = findField(blk, "VARIABLE");
-            if (f) emitVarSet(f, emitInputOf(blk, "VALUE"));
+            if (f) {
+                emitVarSet(f, emitInputOf(blk, "VALUE"));
+            }
             return;
         }
         if (op == "data_changevariableby") {
             const BlockField* f = findField(blk, "VARIABLE");
-            if (f) emitVarChange(f, emitInputOf(blk, "VALUE"));
+            if (f) {
+                emitVarChange(f, emitInputOf(blk, "VALUE"));
+            }
             return;
         }
 
@@ -2862,10 +3571,27 @@ struct Codegen {
         for (Function* f : owned) {
             if (!f || f->empty()) continue;
             std::vector<std::pair<LoadInst*, uint64_t>> loads;
+            std::vector<std::pair<LoadInst*, uint64_t>> listLoads;
             for (BasicBlock& bb : *f) {
                 for (Instruction& instruction : bb) {
                     auto* load = dyn_cast<LoadInst>(&instruction);
                     if (!load) continue;
+                    if (MDNode* lm = load->getMetadata("xyo.varlist")) {
+                        auto* wrapped = lm->getNumOperands() == 1
+                            ? dyn_cast<ConstantAsMetadata>(
+                                  lm->getOperand(0).get()) : nullptr;
+                        auto* index = wrapped
+                            ? dyn_cast<ConstantInt>(wrapped->getValue())
+                            : nullptr;
+                        load->setMetadata("xyo.varlist", nullptr);
+                        if (!index || index->getZExtValue() >= numVarSlots ||
+                            load->getType() != ptrt) {
+                            fail = true;
+                            return;
+                        }
+                        listLoads.emplace_back(load, index->getZExtValue());
+                        continue;
+                    }
                     MDNode* marker = load->getMetadata("xyo.varslot");
                     if (!marker) continue;
                     auto* wrapped = marker->getNumOperands() == 1
@@ -2884,7 +3610,7 @@ struct Codegen {
                     loads.emplace_back(load, index->getZExtValue());
                 }
             }
-            if (loads.empty() || slotReload) continue;
+            if ((loads.empty() && listLoads.empty()) || slotReload) continue;
             BasicBlock& entry = f->getEntryBlock();
             auto insert = entry.getFirstInsertionPt();
             bool hasInit = false;
@@ -2915,9 +3641,31 @@ struct Codegen {
                 }
                 load->replaceAllUsesWith(it->second);
             }
+            // Variable::list loads: the Variable* itself comes from the same
+            // slot array, so lift the field load to the entry block as well.
+            std::map<uint64_t, llvm::Value*> listHandles;
+            for (auto [load, index] : listLoads) {
+                auto [it, added] = listHandles.emplace(index, nullptr);
+                if (added) {
+                    llvm::Value* var = handles.count(index)
+                        ? handles[index] : nullptr;
+                    if (!var) {
+                        llvm::Value* slot = ib.CreateGEP(ptrt, array,
+                                                         ci64(index));
+                        var = ib.CreateLoad(ptrt, slot, "varslot");
+                        handles[index] = var;
+                    }
+                    llvm::Value* lp = ib.CreateConstGEP1_32(i8t, var,
+                                                           kVarListOff);
+                    it->second = ib.CreateLoad(ptrt, lp, "varlist");
+                }
+                load->replaceAllUsesWith(it->second);
+            }
             // Gather first, RAUW second, erase last: shared old GEP/load chains
             // may still feed other marked loads until all replacements exist.
             for (auto [load, index] : loads)
+                RecursivelyDeleteTriviallyDeadInstructions(load);
+            for (auto [load, index] : listLoads)
                 RecursivelyDeleteTriviallyDeadInstructions(load);
         }
     }
