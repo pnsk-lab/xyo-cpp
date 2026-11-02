@@ -289,7 +289,7 @@ Value opLength(const ArgValues& a, BlockUtility&) {
 Value opContains(const ArgValues& a, BlockUtility&) {
     SStr* h = SStr::create(u16ToLower(toStr(a.get("STRING1"))));
     SStr* n = SStr::create(u16ToLower(toStr(a.get("STRING2"))));
-    return V(sstrContains(h->view(), n->view()));
+    return V(sstrContains(h, n));
 }
 Value opMod(const ArgValues& a, BlockUtility&) {
     return V(rt::mod(num(a, "NUM1"), num(a, "NUM2")));

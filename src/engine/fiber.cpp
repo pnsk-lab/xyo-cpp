@@ -28,6 +28,19 @@ namespace xyo {
 namespace detail {
 thread_local FiberRegs gSchedulerRegs{};
 thread_local Fiber* gCurrentFiber = nullptr;
+#ifndef XYO_ASAN
+struct FiberChain {
+    Fiber* const* fibers;
+    size_t count;
+    size_t next;
+};
+thread_local FiberChain* gFiberChain = nullptr;
+Fiber* chainNext() {
+    FiberChain* chain = gFiberChain;
+    return chain && chain->next < chain->count
+               ? chain->fibers[chain->next++] : nullptr;
+}
+#endif
 } // namespace detail
 
 Fiber* currentFiber() { return detail::gCurrentFiber; }
@@ -106,12 +119,40 @@ void Fiber::resume() {
     detail::gCurrentFiber = prev;
 }
 
+void Fiber::resumeChain(Fiber* const* fibers, size_t count) {
+    if (!count) return;
+#ifdef XYO_ASAN
+    for (size_t i = 0; i < count; ++i) fibers[i]->resume();
+#else
+    if (detail::gFiberChain) {
+        for (size_t i = 0; i < count; ++i) fibers[i]->resume();
+        return;
+    }
+    detail::FiberChain chain{fibers, count, 1};
+    detail::gFiberChain = &chain;
+    fibers[0]->resume();
+    detail::gFiberChain = nullptr;
+#endif
+}
+
 void Fiber::yield() {
+#ifndef XYO_ASAN
+    if (Fiber* next = detail::chainNext()) {
+        detail::gCurrentFiber = next;
+        xyo_fiber_switch(&regs_, &next->regs_);
+        return;
+    }
+#endif
 #ifdef XYO_ASAN
     __sanitizer_finish_switch_fiber(asanCallerFake_,
                                     &asanSelfBottom_, &asanSelfSize_);
 #endif
     xyo_fiber_switch(&regs_, &detail::gSchedulerRegs);
+}
+
+// Same translation unit as Fiber::yield permits inlining its chain dispatch.
+extern "C" void xyo_yield_fast(Fiber* f) {
+    f->yield();
 }
 
 void* Fiber::suspendedSp() const {
@@ -194,6 +235,13 @@ extern "C" void xyo_fiber_trampoline() {
 extern "C" [[noreturn]] void xyo_fiber_main(xyo::Fiber* f) {
     f->run();
     f->finished_ = true;
+#ifndef XYO_ASAN
+    if (xyo::Fiber* next = xyo::detail::chainNext()) {
+        xyo::detail::gCurrentFiber = next;
+        xyo_fiber_switch(&f->regs_, next->regs());
+        __builtin_unreachable();
+    }
+#endif
     xyo::detail::gCurrentFiber = nullptr;
 #ifdef XYO_ASAN
     __sanitizer_finish_switch_fiber(f->asanCallerFake_,

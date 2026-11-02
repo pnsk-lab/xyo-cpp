@@ -102,13 +102,56 @@ bool toBoolean(Value v) {
     return false;
 }
 
+// Small integers repeat constantly in Scratch (`i ++ ""`, `join(i, ...)`).
+// V8 keeps a number-string cache; return the same immutable SStr instead of
+// formatting and allocating one per conversion. The entries are GC roots.
+namespace {
+constexpr int kSmallIntMin = -128;
+constexpr int kSmallIntMax = 1023;
+SStr* g_smallInts[kSmallIntMax - kSmallIntMin + 1] = {};
+SStr* const* smallIntTable() {
+    static SStr* const* table = [] {
+        Gc::get().addRootProvider(g_smallInts, [](Gc& g) {
+            for (SStr* s : g_smallInts) g.markPtr(s);
+        });
+        for (int i = kSmallIntMin; i <= kSmallIntMax; ++i)
+            g_smallInts[i - kSmallIntMin] = sstrFromAscii(std::to_string(i));
+        return g_smallInts;
+    }();
+    return table;
+}
+} // namespace
+
+SStr* smallIntString(double d) {
+    // Check the range before conversion so NaN and huge values never reach an
+    // out-of-range floating-to-integer conversion.
+    if (!(d >= double(kSmallIntMin) && d <= double(kSmallIntMax))) return nullptr;
+    const int i = static_cast<int>(d);
+    if (double(i) != d) return nullptr;
+    return smallIntTable()[i - kSmallIntMin];
+}
+
+// Canonical String(number) is ASCII and round-trips to the original number,
+// except that String(-0) is "0" and reparses as positive zero. Seed the same
+// cache states as numberOrNaNImpl without parsing the freshly formatted text.
+static SStr* numberToString(double d) {
+    if (SStr* cached = smallIntString(d)) return cached;
+    SStr* s = sstrFromAscii(jsnum::toString(d));
+    const uint32_t state = std::isnan(d) ? 2 : (std::isinf(d) ? 4 : 1);
+    const double parsed = std::isnan(d)
+        ? std::numeric_limits<double>::quiet_NaN()
+        : (d == 0 ? 0.0 : d);
+    s->publishNumCache(parsed, state);
+    return s;
+}
+
 SStr* toString(Value v) {
     if (v.isString()) {
         SStr* s = v.asStrPtr();
         if (s) return s;
         return SStr::create(std::u16string_view{});
     }
-    if (v.isNumber()) return SStr::create(jsnum::toString16(v.asNumberUnchecked()));
+    if (v.isNumber()) return numberToString(v.asNumberUnchecked());
     if (v.isBool()) return sstrFromAscii(v.asBool() ? "true" : "false");
     if (v.isColor()) {
         char buf[24];
@@ -123,11 +166,7 @@ SStr* toString(Value v) {
 
 Value toStringValue(Value v) {
     if (v.isString()) return v;
-    if (v.isNumber()) {
-        std::u16string s = jsnum::toString16(v.asNumberUnchecked());
-        if (s.empty()) return Value::emptyStr();
-        return Value::string(SStr::create(std::u16string_view(s)));
-    }
+    if (v.isNumber()) return Value::string(numberToString(v.asNumberUnchecked()));
     if (v.isBool()) return Value::string(sstrFromAscii(v.asBool() ? "true" : "false"));
     if (v.isColor()) {
         char buf[24];
@@ -152,7 +191,7 @@ double compare(Value v1, Value v2) {
         // 小文字化文字列比較
         SStr* s1 = toString(v1);
         SStr* s2 = toString(v2);
-        return compareStringsCaseInsensitive(s1->view(), s2->view());
+        return compareStringsCaseInsensitive(s1, s2);
     }
     if ((n1 == std::numeric_limits<double>::infinity() &&
          n2 == std::numeric_limits<double>::infinity()) ||

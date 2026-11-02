@@ -77,13 +77,13 @@ bool compareEqualSlow(Value v1, Value v2) {
     if (std::isnan(n1) || (n1 == 0 && cast::isNotActuallyZero(v1))) {
         SStr* s1 = cast::toString(v1);
         SStr* s2 = cast::toString(v2);
-        return compareStringsCaseInsensitive(s1->view(), s2->view()) == 0;
+        return compareStringsCaseInsensitive(s1, s2) == 0;
     }
     double n2 = cast::toNumberOrNaN(v2);
     if (std::isnan(n2) || (n2 == 0 && cast::isNotActuallyZero(v2))) {
         SStr* s1 = cast::toString(v1);
         SStr* s2 = cast::toString(v2);
-        return compareStringsCaseInsensitive(s1->view(), s2->view()) == 0;
+        return compareStringsCaseInsensitive(s1, s2) == 0;
     }
     return n1 == n2;
 }
@@ -117,7 +117,7 @@ bool compareGreaterThanSlow(Value v1, Value v2) {
     if (std::isnan(n1) || std::isnan(n2)) {
         SStr* s1 = cast::toString(v1);
         SStr* s2 = cast::toString(v2);
-        return compareStringsCaseInsensitive(s1->view(), s2->view()) > 0;
+        return compareStringsCaseInsensitive(s1, s2) > 0;
     }
     return n1 > n2;
 }
@@ -141,7 +141,7 @@ bool compareLessThanSlow(Value v1, Value v2) {
     if (std::isnan(n1) || std::isnan(n2)) {
         SStr* s1 = cast::toString(v1);
         SStr* s2 = cast::toString(v2);
-        return compareStringsCaseInsensitive(s1->view(), s2->view()) < 0;
+        return compareStringsCaseInsensitive(s1, s2) < 0;
     }
     return n1 < n2;
 }
@@ -189,18 +189,94 @@ double randomIntWithout(double low, double high, double excluded) {
 
 // --- 文字列 ---
 
+Value joinStrings(Value a, Value b) {
+    // Contract: caller has established that both Values are strings. Keep the
+    // original bits for empty operands; in Scratch, "" ++ x can return x even
+    // when x is another string representation of an empty value.
+    SStr* s1 = a.asStrPtr();
+    SStr* s2 = b.asStrPtr();
+    if (!s1 || !s1->len) return b;
+    if (!s2 || !s2->len) return a;
+    if (size_t(s1->len) + s2->len >= 16)
+        return Value::string(sstrCons(s1, s2));
+    return Value::string(sstrConcat(s1->view(), s2->view()));
+}
+
 Value join(Value a, Value b) {
-    // 最多ケース (str, num): 数値表記を直接書き込み中間 SStr を省く。
+    // The common string/string case needs no generic cast calls. Keep short
+    // joins on a direct path as well as the long cons-string case.
+    if (a.isString() && b.isString()) return joinStrings(a, b);
+    // Empty operands need no materialization (in particular no temporary empty
+    // SStr for the common number ++ "" conversion).
+    if (a.isString() && (!a.asStrPtr() || a.asStrPtr()->len == 0))
+        return cast::toStringValue(b);
+    if (b.isString() && (!b.asStrPtr() || b.asStrPtr()->len == 0))
+        return cast::toStringValue(a);
+    // (str, num): 数値表記がASCIIであることを利用して一時変換を省く。
     // jsnum::toString の出力は ASCII のみ（NaN/Infinity/指数含む）。
     if (a.isString() && b.isNumber()) {
-        std::string ns = jsnum::toString(b.asNumberUnchecked());
         SStr* s1 = a.asStrPtr();     // kEmptyStr → nullptr
+        const double d = b.asNumberUnchecked();
+        // Small integers are interned; reuse that leaf instead of allocating.
+        if (SStr* leaf = cast::smallIntString(d)) {
+            if (!s1 || !s1->len) return Value::string(leaf);
+            if (size_t(s1->len) + leaf->len >= 16)
+                return Value::string(sstrCons(s1, leaf));
+            return Value::string(sstrConcat(s1->view(), leaf->view()));
+        }
+        std::string ns = jsnum::toString(d);
+        // Do not flatten/copy a growing prefix for each numeric append.
+        // Keep the single-allocation ASCII path for short results.
+        if (s1 && s1->len && size_t(s1->len) + ns.size() >= 16) {
+            SStr* leaf = sstrFromAscii(ns);
+            return Value::string(sstrCons(s1, leaf));
+        }
         return Value::string(sstrConcatAscii(
             s1 ? s1->view() : std::u16string_view(), ns));
+    }
+    // (num, str): convert the number once, then concatenate directly instead
+    // of allocating the numeric string and copying it into a second object.
+    if (a.isNumber() && b.isString()) {
+        SStr* s2 = b.asStrPtr();
+        SStr* s1 = cast::smallIntString(a.asNumberUnchecked());
+        if (!s1) {
+            std::string ns = jsnum::toString(a.asNumberUnchecked());
+            const size_t len = ns.size() + s2->len;
+            if (len < 16) {
+                // Non-interned numeric prefixes used to allocate a numeric
+                // SStr and then another flat result. Build the short result
+                // once, just like the existing (string, number) path.
+                char16_t units[16];
+                for (size_t i = 0; i < ns.size(); ++i)
+                    units[i] = static_cast<char16_t>(ns[i]);
+                std::memcpy(units + ns.size(), s2->data(), size_t(s2->len) * 2);
+                return Value::string(SStr::create(units, static_cast<uint32_t>(len)));
+            }
+            s1 = sstrFromAscii(ns);
+        }
+        if (s2->len == 1 && !s2->isCons()) {
+            const char16_t c = s2->data()[0];
+            if (c < 128) s2 = letterCached(c);
+        }
+        if (size_t(s1->len) + s2->len >= 16)
+            return Value::string(sstrCons(s1, s2));
+        return Value::string(sstrConcat(s1->view(), s2->view()));
+    }
+    // (num, num): two conversions plus one concatenation, not three objects.
+    if (a.isNumber() && b.isNumber()) {
+        SStr* s1 = cast::toString(a);
+        SStr* s2 = cast::toString(b);
+        if (size_t(s1->len) + s2->len >= 16)
+            return Value::string(sstrCons(s1, s2));
+        return Value::string(sstrConcat(s1->view(), s2->view()));
     }
     SStr* s1 = cast::toString(a);
     SStr* s2 = cast::toString(b);
     if (s1->len == 0 && s2->len == 0) return Value::emptyStr();
+    // "" ++ x / x ++ "" はコピーせず、そのまま返す（不変なので共有してよい）。
+    // `x/4 ++ ""` のような数値→文字列の定番形で SStr の確保とコピーが 1 回減る。
+    if (s1->len == 0) return Value::string(s2);
+    if (s2->len == 0) return Value::string(s1);
     return Value::string(sstrConcat(s1->view(), s2->view()));
 }
 
@@ -241,7 +317,7 @@ Value letterOf(Value letter, Value str) {
     if (std::isnan(index)) index = 0;      // JS: charAt(NaN) → charAt(0)
     SStr* s = cast::toString(str);
     if (index < 0 || index >= s->len) return Value::emptyStr();
-    char16_t c = s->data()[static_cast<uint32_t>(index)];  // trunc
+    char16_t c = s->unitAt(static_cast<uint32_t>(index));  // trunc
     if (SStr* cached = letterCached(c)) return Value::string(cached);
     return Value::string(SStr::create(&c, 1));
 }
@@ -254,7 +330,7 @@ double strLength(Value s) {
 bool strContains(Value hay, Value needle) {
     SStr* h = cast::toString(hay);
     SStr* n = cast::toString(needle);
-    return sstrContains(h->view(), n->view());
+    return sstrContains(h, n);
 }
 
 SStr* toLowerSStr(Value v) {
@@ -311,32 +387,61 @@ static bool sameValueZero(Value a, Value b) {
 
 bool listContains(SList* list, Value item) {
     noteCall();
-    // indexOf(SameValueZero) fast path → Cast.compare===0 走査（JS 版と同じ順序）
+    // Unlike indexOf, contains returns only a boolean: the first strict
+    // match and the first Scratch-coercing match have identical results.
+    // Combining both comparisons into one pass halves the work for misses.
+    bool numericNeedleValid = item.isNumber();
+    double numericNeedle =
+        numericNeedleValid ? item.asNumberUnchecked() : 0.0;
+    if (numericNeedleValid) {
+        numericNeedleValid = !std::isnan(numericNeedle);
+    } else if (item.isString()) {
+        // The string is converted just once, not per list element. Scratch's
+        // whitespace/"not actually zero" strings must use string comparison.
+        numericNeedle = cast::toNumberOrNaN(item);
+        numericNeedleValid = !std::isnan(numericNeedle) &&
+            !(numericNeedle == 0.0 && cast::isNotActuallyZero(item));
+    }
     for (uint32_t i = 0; i < list->len; ++i) {
-        if (sameValueZero(list->items[i], item)) {
+        Value entry = list->items[i];
+        bool hit;
+        if (numericNeedleValid && entry.isNumber()) {
+            hit = entry.asNumberUnchecked() == numericNeedle;
+        } else {
+            hit = sameValueZero(entry, item) || compareEqual(entry, item);
+        }
+        if (hit) {
             noteScanned(i + 1);
             noteHit(i + 1);
             return true;
         }
     }
-    for (uint32_t i = 0; i < list->len; ++i) {
-        if (compareEqual(list->items[i], item)) {
-            noteScanned(list->len + i + 1);
-            noteHit(i + 1);
-            return true;
-        }
-    }
-    noteScanned(2 * list->len);
+    noteScanned(list->len);
     return false;
 }
 
 double listIndexOf(SList* list, Value item) {
     noteCall();
-    for (uint32_t i = 0; i < list->len; ++i) {
-        if (compareEqual(list->items[i], item)) {
-            noteScanned(i + 1);
-            noteHit(i + 1);
-            return i + 1;
+    if (item.isNumber() && !std::isnan(item.asNumberUnchecked())) {
+        const double needle = item.asNumberUnchecked();
+        for (uint32_t i = 0; i < list->len; ++i) {
+            Value entry = list->items[i];
+            const bool found = entry.isNumber()
+                ? entry.asNumberUnchecked() == needle
+                : compareEqual(entry, item);
+            if (found) {
+                noteScanned(i + 1);
+                noteHit(i + 1);
+                return i + 1;
+            }
+        }
+    } else {
+        for (uint32_t i = 0; i < list->len; ++i) {
+            if (compareEqual(list->items[i], item)) {
+                noteScanned(i + 1);
+                noteHit(i + 1);
+                return i + 1;
+            }
         }
     }
     noteScanned(list->len);

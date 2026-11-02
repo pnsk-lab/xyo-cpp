@@ -48,6 +48,7 @@ Runtime::~Runtime() {
 Thread* Runtime::pushThread(const std::string& id, Target* target,
                             bool stackClick, bool updateMonitor,
                             const Block* topHint) {
+#if !defined(XYO_DISABLE_RT_PROF)
     struct PProf {
         bool enabled = std::getenv("XYO_PROF") != nullptr;
         double allocNs = 0, mapNs = 0, compileNs = 0; uint64_t n = 0;
@@ -63,6 +64,7 @@ Thread* Runtime::pushThread(const std::string& id, Target* target,
     auto now = []{ return std::chrono::steady_clock::now(); };
     std::chrono::steady_clock::time_point t0;
     if (pp.enabled) { t0 = now(); }
+#endif
     auto thread = std::make_unique<Thread>(id);
     Thread* t = thread.get();
     t->target = target;
@@ -75,9 +77,13 @@ Thread* Runtime::pushThread(const std::string& id, Target* target,
     if (!t->stackClick && !t->updateMonitor) {
         threadMap[t->getId()] = t;
     }
+#if !defined(XYO_DISABLE_RT_PROF)
     if (pp.enabled) { pp.allocNs += std::chrono::duration<double,std::nano>(now()-t0).count(); t0 = now(); }
+#endif
     if (!updateMonitor) t->tryCompile(topHint);
+#if !defined(XYO_DISABLE_RT_PROF)
     if (pp.enabled) { pp.compileNs += std::chrono::duration<double,std::nano>(now()-t0).count(); ++pp.n; }
+#endif
     return t;
 }
 
@@ -94,7 +100,18 @@ Thread* Runtime::restartThread(Thread* thread, const Block* topHint) {
     n->updateMonitor = thread->updateMonitor;
     n->blockContainer = thread->blockContainer;
     n->pushStack(thread->topBlock);
-    if (thread->triedToCompile) n->tryCompile(topHint);
+    if (thread->isCompiled) {
+        // A restarted script has exactly the same entry block and compiled
+        // code. The CompiledScript is owned by JitEngine, not by the Thread.
+        // Avoid repeating the JIT cache lookup and compilation decision for
+        // every broadcast while preserving HotSpot promotion for cold scripts.
+        n->triedToCompile = true;
+        n->topBlockPtr = thread->topBlockPtr;
+        n->compiled = thread->compiled;
+        n->isCompiled = true;
+    } else if (thread->triedToCompile) {
+        n->tryCompile(topHint);
+    }
     if (!n->stackClick && !n->updateMonitor) {
         threadMap[n->getId()] = n;
     }
@@ -190,7 +207,14 @@ std::vector<Thread*> Runtime::startHats(
             }
             const std::string& topBlockId = script.blockId;
             if (hatMeta.restartExistingThreads) {
-                auto it = threadMap.find(Thread::getIdFromTargetAndBlock(target, topBlockId));
+                // Broadcast can restart the same hat thousands of times per
+                // frame. Reuse key storage instead of allocating the composite
+                // target/block identity for every lookup.
+                static thread_local std::string lookupKey;
+                lookupKey.assign(target->id);
+                lookupKey.push_back('&');
+                lookupKey.append(topBlockId);
+                auto it = threadMap.find(lookupKey);
                 if (it != threadMap.end()) {
                     newThreads.push_back(restartThread(it->second, script.block));
                     return;
@@ -276,6 +300,29 @@ void Runtime::greenFlag() {
 
 // ------------------------------------------------------------------ step --
 
+void Runtime::reclaimThreads() {
+    // 待機中の broadcast and wait が握っている生ポインタを集める。
+    std::unordered_set<const Thread*> refs;
+    for (Thread* t : threads) {
+        for (auto& f : t->stackFrames) {
+            if (!f->executionContext) continue;
+            for (Thread* s : f->executionContext->startedThreads)
+                refs.insert(s);
+        }
+        if (t->jitCtx && t->jitCtx->joinRefs) {
+            for (Thread* s : *t->jitCtx->joinRefs) refs.insert(s);
+        }
+    }
+    for (auto& up : ownedThreads) {
+        Thread* t = up.get();
+        if (!t || t->status != STATUS_DONE || t->fiber || t->jitCtx) continue;
+        if (refs.count(t)) continue;
+        up.reset();
+    }
+    // 次の回収は 25% 増えたとき（空きスロットは 8 バイトだけ残る）。
+    reclaimAt = ownedThreads.size() + ownedThreads.size() / 4 + 1024;
+}
+
 void Runtime::step() {
     ++stepSerial;
     // 停止指示のあったスレッドを除去
@@ -286,6 +333,10 @@ void Runtime::step() {
     // killed スレッドは ownedThreads に残す: broadcastandwait 等の
     // startedThreads が生ポインタを保持するため（解放すると ABA になる）
     updateThreadMap();
+    if (ownedThreads.size() >= reclaimAt) {
+        lastStepDoneThreads.clear();   // 保持は 1 ステップだけ（読み手なし）
+        reclaimThreads();
+    }
 
     // エッジ起動ハットを毎フレーム評価
     for (auto& [hatType, meta] : hats) {

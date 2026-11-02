@@ -43,3 +43,6 @@ tests/bench/algos/.logs/
 tests/bench/algos/results*.json
 tests/bench/algos/v8out/
 /.ghcache/
+
+# 独立した実験用 Git チェックアウト（本リポジトリには含めない）
+/scratch-bench/

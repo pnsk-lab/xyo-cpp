@@ -301,6 +301,91 @@ State truthRun(Value input, JitMode mode) {
           "truth conversion leaves dynamic variable Value unchanged");
     return result;
 }
+
+// for_each writes its loop variable implicitly; promotion must observe that
+// write, preserve changes inside the body, and leave it alone for zero trips.
+State foreachRun(const char* limit, int bodyKind, JitMode mode) {
+    Graph g;
+    g.add("hat", "event_whenflagclicked", "loop", "{}", "{}", true);
+    const std::string limitInput = "[1,[4,\"" + std::string(limit) + "\"]]";
+    g.add("loop", "control_for_each", "",
+          "{\"VALUE\":" + limitInput + ",\"SUBSTACK\":" + ref("first") + "}",
+          field("VARIABLE", "i"));
+    std::string body = "first";
+    if (bodyKind == 1) {
+        g.add("first", "data_changevariableby", "sum",
+              "{\"VALUE\":" + number(10) + "}", field("VARIABLE", "i"));
+        body = "sum";
+    } else if (bodyKind == 2) {
+        g.add("first", "data_setvariableto", "sum",
+              "{\"VALUE\":[1,[10,\"text\"]]}", field("VARIABLE", "i"));
+        body = "sum";
+    }
+    if (bodyKind == 3) {
+        g.add("first", "data_changevariableby", "",
+              "{\"VALUE\":" + number(7) + "}", field("VARIABLE", "sum"));
+    } else {
+        g.add(body, "data_changevariableby", "",
+              "{\"VALUE\":" + g.var("i") + "}", field("VARIABLE", "sum"));
+    }
+    std::string proj =
+        "{\"targets\":[{\"isStage\":true,\"name\":\"Stage\","
+        "\"variables\":{\"i\":[\"i\",\"raw\"],\"sum\":[\"sum\",0]},"
+        "\"lists\":{},\"blocks\":{" + g.blocks + "},\"costumes\":[],\"sounds\":[]}],"
+        "\"monitors\":[],\"extensions\":[],\"meta\":{}}";
+    setJitMode(mode);
+    Runtime rt;
+    const bool loaded = loadSb3(rt, proj, nullptr).ok;
+    check(loaded, "for_each fixture loads");
+    if (!loaded) return {};
+    Target* t = rt.targets[0];
+    rt.greenFlag();
+#ifdef XYO_JIT
+    if (mode == JitMode::Eager)
+        for (Thread* th : rt.threads)
+            check(th->isCompiled, "for_each fixture is JIT-compiled");
+#endif
+    rt.runUntilDone(20);
+    check(rt.threads.empty(), "for_each fixture terminates");
+    return {encode(t->lookupVariableById("i")->value),
+            encode(t->lookupVariableById("sum")->value)};
+}
+void foreachCases() {
+    struct Test {
+        const char* limit;
+        int body;
+        const char* finalText;  // nullptr means numeric
+        double finalNumber;
+        double sum;
+    };
+    const Test cases[] = {
+        {"0",   0, "raw",  0,  0},  // zero trips: preserve initial text
+        {"3.5", 0, nullptr, 4, 10}, // fractional bound: four iterations
+        {"3",   1, nullptr, 13, 36},// body also changes the loop variable
+        {"3",   2, "text", 0,  0},  // body writes a non-numeric string
+        {"3",   3, nullptr, 3, 21}, // implicit loop write without body reading i
+        {"-2",  0, "raw",  0,  0},
+    };
+    for (const auto& c : cases) {
+        const State interp = foreachRun(c.limit, c.body, JitMode::Off);
+        const State eager = foreachRun(c.limit, c.body, JitMode::Eager);
+        check(interp.size() == 2 && interp == eager,
+              "for_each: interpreter/eager output agree");
+        if (interp.size() != 2) continue;
+        if (interp[1] != encode(Value::num(c.sum)))
+            std::printf("for_each sum mismatch limit=%s kind=%d got=%s expected=%s\n",
+                        c.limit, c.body, interp[1].c_str(),
+                        encode(Value::num(c.sum)).c_str());
+        check(interp[1] == encode(Value::num(c.sum)), "for_each: expected sum");
+        if (c.finalText)
+            check(interp[0] == encode(Value::string(SStr::fromUtf8(c.finalText))),
+                  "for_each: expected final string variable");
+        else
+            check(interp[0] == encode(Value::num(c.finalNumber)),
+                  "for_each: expected final numeric variable");
+    }
+}
+
 void truthCases() {
     const double inf = std::numeric_limits<double>::infinity();
     const std::vector<Value> inputs = {
@@ -374,6 +459,7 @@ int test_numeric_promotion_main() {
     const State got = run(interleave, JitMode::Eager, true);
     check(!expected.empty() && got == expected, "interleaved script states match interp/eager with exact Value tags");
     truthCases();
+    foreachCases();
     setJitMode(saved);
     std::printf("numeric promotion: %d checks, %d failures\n", checks, failures);
     return failures;

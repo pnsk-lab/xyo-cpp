@@ -43,6 +43,7 @@
 #include "load/sb3_minify.hpp"
 #include "load/sb3_rewrite.hpp"
 #include "load/sb3_save.hpp"
+#include "core/gc.hpp"
 #include "model/blocks.hpp"
 #include "model/target.hpp"
 #include "jit/jit.hpp"
@@ -71,6 +72,13 @@ static int usage() {
         "usage:\n"
         "  xyo run <project.sb3> [--frames N] [--aot obj]"
         " [--jit hotspot|eager|off] [--danger]\n"
+        "          [--fps N] [--print-list NAME]\n"
+        "      --fps: 1 ステップを 1/N 秒に合わせる（scratch-vm の 30fps 相当。"
+        "既定 0 = 最速）\n"
+        "      --print-list: ステージのリスト NAME の未出力要素を 1 行ずつ"
+        " stdout へ出す\n"
+        "          （ログ出力つきプロジェクトをヘッドレスで観察する用。"
+        "他は stderr へ退避）\n"
         "  xyo play <project.sb3> [--scale N] [--turbo] [--fps N]"
         " [--gpu-realtime ray|path] [--danger]\n"
         "  xyo aot <project.sb3> (-o <out> | --obj <file>)  "
@@ -238,28 +246,92 @@ static void dumpVarsIfRequested(Runtime& rt) {
     }
 }
 
-static void printLoadInfo(Runtime& rt, const Sb3LoadResult& r) {
-    std::printf("loaded: %zu targets", rt.targets.size());
+static void printLoadInfo(Runtime& rt, const Sb3LoadResult& r, FILE* out) {
+    std::fprintf(out, "loaded: %zu targets", rt.targets.size());
     if (!r.extensionIds.empty()) {
-        std::printf("  extensions:");
-        for (auto& e : r.extensionIds) std::printf(" %s", e.c_str());
+        std::fprintf(out, "  extensions:");
+        for (auto& e : r.extensionIds) std::fprintf(out, " %s", e.c_str());
     }
-    std::printf("\n");
+    std::fprintf(out, "\n");
     for (Target* t : rt.targets) {
-        std::printf("  %s%s: %zu blocks, %zu scripts\n",
-                    SStr::toUtf8(t->getName()).c_str(),
-                    t->isStage ? " (stage)" : "",
-                    t->blocks->size(), t->blocks->getScripts().size());
+        std::fprintf(out, "  %s%s: %zu blocks, %zu scripts\n",
+                     SStr::toUtf8(t->getName()).c_str(),
+                     t->isStage ? " (stage)" : "",
+                     t->blocks->size(), t->blocks->getScripts().size());
     }
 }
 
 static const char* g_saveAfterRun = nullptr;
 
+/// ステージ（無ければ先に見つかったターゲット）のリスト変数を名前で探す。
+/// `--print-list NAME` が tail する対象。
+static SList* findListByName(Runtime& rt, const char* name) {
+    SList* found = nullptr;
+    for (Target* t : rt.targets) {
+        for (auto& [id, v] : t->variables) {
+            if (v.type != Variable::kListType || !v.list) continue;
+            if (SStr::toUtf8(v.name) != name) continue;
+            if (t->isStage) return v.list;   // ステージ優先
+            found = found ? found : v.list;
+        }
+    }
+    return found;
+}
+
+/// `--print-list NAME`: リストの未出力要素を 1 行ずつ stdout へ出す。
+/// 追記専用のリスト（ログ用途）を想定する — 途中で clear されると
+/// インデックスがずれるので、縮んだ分は読み飛ばすだけにする。
+static void flushList(SList* l, size_t& printed) {
+    if (!l) return;
+    if (l->len < printed) printed = l->len;
+    for (; printed < l->len; ++printed) {
+        SStr* s = cast::toString(l->items[printed]);
+        const std::string u = s ? SStr::toUtf8(s->view()) : std::string();
+        std::fwrite(u.data(), 1, u.size(), stdout);
+        std::fputc('\n', stdout);
+    }
+    std::fflush(stdout);
+}
+
+/// `--print-list NAME` のリスト名（nullptr なら通常のヘッドレス実行）。
+static const char* g_printList = nullptr;
+
 /// ロード済み Runtime をヘッドレス実行する（cmdRun と AOT 実行で共有）。
-static int runLoaded(Runtime& rt, const Sb3LoadResult* r, int maxFrames) {
-    if (r) printLoadInfo(rt, *r);
+/// `fps > 0` で 1 ステップを実時間に合わせる（scratch-vm の 30fps 相当 —
+/// 非 warp ループは 1 フレーム 1 反復なので、スケジューラ系の計測に要る）。
+/// `g_printList` 指定時は stdout をそのリストの内容だけにする（他は stderr）。
+static int runLoaded(Runtime& rt, const Sb3LoadResult* r, int maxFrames,
+                     int fps = 0) {
+    const bool quietOut = g_printList != nullptr;
+    if (r) printLoadInfo(rt, *r, quietOut ? stderr : stdout);
+    SList* list = g_printList ? findListByName(rt, g_printList) : nullptr;
+    if (g_printList && !list)
+        std::fprintf(stderr, "no list named \"%s\"\n", g_printList);
+    size_t printed = 0;
     rt.greenFlag();
-    bool finished = rt.runUntilDone(maxFrames > 0 ? maxFrames : 1000000);
+    const int limit = maxFrames > 0 ? maxFrames : 1000000;
+    const auto frameDur =
+        std::chrono::microseconds(fps > 0 ? 1000000 / fps : 0);
+    bool finished = false;
+    for (int step = 0; step < limit; ++step) {
+        bool anyActive = false;
+        for (Thread* t : rt.threads) {
+            if (!t->stack.empty() && t->status != STATUS_DONE) {
+                anyActive = true;
+                break;
+            }
+        }
+        if (!anyActive) { finished = true; break; }
+        const auto t0 = std::chrono::steady_clock::now();
+        rt.step();
+        if (g_printList) flushList(list, printed);
+        if (fps > 0) {
+            const auto dt = std::chrono::steady_clock::now() - t0;
+            if (dt < frameDur)
+                std::this_thread::sleep_for(frameDur - dt);
+        }
+    }
+    if (g_printList) flushList(list, printed);
     if (g_saveAfterRun) {
         if (saveSb3File(rt, g_saveAfterRun))
             std::printf("saved: %s\n", g_saveAfterRun);
@@ -267,11 +339,30 @@ static int runLoaded(Runtime& rt, const Sb3LoadResult* r, int maxFrames) {
             std::fprintf(stderr, "save failed: %s\n", g_saveAfterRun);
     }
     dumpVarsIfRequested(rt);
-    std::printf("%s\n", finished ? "done" : "frame limit reached");
+    if (std::getenv("XYO_DEBUG_COUNTS")) {
+        size_t frames = 0, pooled = 0;
+        size_t alive = 0;
+        for (const auto& t : rt.ownedThreads) {
+            if (!t) continue;   // 回収済みスロット
+            ++alive;
+            frames += t->stackFrames.size();
+            pooled += t->framePool.size();
+        }
+        std::fprintf(stderr,
+                     "[counts] threads=%zu alive=%zu frames=%zu "
+                     "pooledFrames=%zu "
+                     "targets=%zu objects=%zu gcBytes=%.1fMB\n",
+                     rt.ownedThreads.size(), alive, frames, pooled,
+                     rt.targets.size(),
+                     Gc::get().objectCount(),
+                     Gc::get().bytesAllocated() / 1048576.0);
+    }
+    std::fprintf(quietOut ? stderr : stdout, "%s\n",
+                 finished ? "done" : "frame limit reached");
     return finished ? 0 : 2;
 }
 
-static int cmdRun(const char* path, int maxFrames) {
+static int cmdRun(const char* path, int maxFrames, int fps) {
     bool ok;
     std::vector<uint8_t> data = readFile(path, ok);
     if (!ok) { std::fprintf(stderr, "cannot read %s\n", path); return 1; }
@@ -286,7 +377,7 @@ static int cmdRun(const char* path, int maxFrames) {
 #ifdef XYO_JIT
     applyAotObject(rt, g_aotObj, data.data(), data.size());
 #endif
-    return runLoaded(rt, &r, maxFrames);
+    return runLoaded(rt, &r, maxFrames, fps);
 }
 
 static int cmdDump(const char* path) {
@@ -761,6 +852,15 @@ static int playLoaded(Runtime& rt, const std::string& title, int scale,
     };
     std::vector<InjectEvent> inject = parseInject(std::getenv("XYO_INJECT"));
     size_t injectIdx = 0;
+    // `--print-list NAME`: ウィンドウ実行でもリストの新規要素を 1 フレーム
+    // ごとに stdout へ（パリティテストのような「GUI が要るが結果は行で出る」
+    // プロジェクトをヘッドレスに測るため）。XYO_EXIT_ON_DONE=1 で全スレッド
+    // 終了時に終了する。
+    SList* printListObj = g_printList ? findListByName(rt, g_printList) : nullptr;
+    if (g_printList && !printListObj)
+        std::fprintf(stderr, "no list named \"%s\"\n", g_printList);
+    size_t printListAt = 0;
+    const bool exitOnDone = std::getenv("XYO_EXIT_ON_DONE") != nullptr;
 
     // フレーム駆動: 既定 ~30fps（JS: STEP_TIME≈33ms 周期）。
     // --fps N で step 間隔を変更（TurboWarp のカスタム fps 相当 —
@@ -775,7 +875,9 @@ static int playLoaded(Runtime& rt, const std::string& title, int scale,
         if (!ren.pollEvents()) break;
         rt.step();
         audio.update();   // 再生完了 wait の解決（メインスレッド必須）
+        if (g_printList) flushList(printListObj, printListAt);
         if ((exitOnStop && projectStopped) ||
+            (exitOnDone && rt.threads.empty()) ||
             (exitFrames > 0 && frame + 1 >= exitFrames)) {
             if (shot) ren.savePPM(shot);
             break;
@@ -1044,12 +1146,16 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--save") == 0 && i + 1 < argc) {
             g_saveAfterRun = argv[++i];
         }
+        else if (std::strcmp(argv[i], "--print-list") == 0 && i + 1 < argc) {
+            g_printList = argv[++i];
+        }
 #ifdef XYO_JIT
         else if (std::strcmp(argv[i], "--aot") == 0 && i + 1 < argc)
             g_aotObj = argv[++i];
 #endif
     }
-    if (std::strcmp(cmd, "run") == 0) return cmdRun(argv[2], maxFrames);
+    if (std::strcmp(cmd, "run") == 0)
+        return cmdRun(argv[2], maxFrames, fps > 0 ? fps : 0);
     if (std::strcmp(cmd, "play") == 0)
         return cmdPlay(argv[2], scale > 0 ? scale : 2, turbo, fps,
                        gpuMode);

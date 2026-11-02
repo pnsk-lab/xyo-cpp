@@ -35,9 +35,133 @@ Scratch/TurboWarp 完全互換の LLVM JIT 対応高速ランタイム（C++20�
 - **Scratch 互換の修正（差分ハーネス）**: `tests/differential/` に scratch-vm との repro 19 件（`repro/*.sb3`、生成器 `gen_repros.py`、比較 `run_repros.py`）を追加。修正内容: (1) NaN インデックスの `delete`/`insert` が `uint32_t(-1)` の `memmove` で SIGSEGV していたのを `toListIndexD` の NaN→`LIST_INVALID` で no-op 化（`SList::insert0/erase0` にも防御）、(2) 2^53 超の `String(x)` を最短往復表現に、(3) JIT `mod` を `r=n%m; if (r/m<0) r+=m` に（`Infinity`/巨大 m/非正規化数、-0 保持）、(4) JIT `sin/cos` を `(pi*x)/180` に（1e308 で Scratch と同じ NaN）、(5) `jsnum::jsRound`（Math.round 準拠）を追加し `operator_round`/`control_repeat`/`looks_size`/`setCostume`/tan/limitPrecision/乱数方向/JIT を統一、(6) 非 BMP 小文字表を追加し `toLowerCase` をコードポイント単位に、(7) JIT 逆三角関数を `(v*180)/pi` に、(8) fdlibm `e_log.c` を `jsnum::jsLog` として移植し `ln`/`log` を V8 と一致（20 万件でビット一致）。WASM コンパイラの `mod`/`round` も同じ式へ。追加: (9) `asin`/`acos`/`atan`/`exp` を V8 14.6 の fdlibm（`src/core/v8math.cpp`）へ移植し JIT も `xyo_asin` 等の共通ヘルパに、(10) `u16ToLower` に Unicode Final_Sigma を実装（`Cased`/`Case_Ignorable` テーブルは Node の `\p{...}` から `tools/gen_case_props.mjs` で生成）、(11) Unicode 17 の新規小文字 28 コードポイントを追加し全 1,112,064 コードポイントで Node と一致、(12) `data_listcontents` を scratch-vm の `typeof string` 判定に合わせた（`[1,2,3]` は `"1 2 3"`。TW コンパイラは `"123"` だが、差分ハーネスの参照も `vm.setCompilerOptions({enabled:false})` で scratch-vm インタプリタに統一）、(13) `motion_pointtowards` の `atan2` を V8 fdlibm へ移植（80 位置中 3 箇所で 1 ULP 違っていた）、(14) `motion_movesteps` の `sin`/`cos` を V8 fdlibm（`rem_pio2` 込み）へ移植（128 ケース中 10 箇所で 1 ULP 違っていた）、(15) `sensing_timer` を整数 ms に量子化（ヘッドレスでは毎フレーム最低 1ms 進める）、(16) JIT の変数キャッシュ/スロットキーを `(id,name,list)` に拡張（id→name の解決順を再現）。検証: `python3 tests/differential/run_repros.py` が 19/19 一致、`test_scratch_compat` 90 checks、`test_nan_codegen` 113,368 checks、execute 116/116・assert 338、ctest 6/6。詳細は `docs/scratch-divergences.md`。
 - **リスト長上限（`--list-limit N` / `XYO_LIST_LIMIT=N`、既定 0 = 無制限）**: プロセス全体の `xyo::xyo_list_limit`（`src/core/slist.cpp`）を `SList::push`/`insert0` が見る。上限に達すると `push` は追加を落とし、`insert0` は挿入後に末尾を落として長さを保つ（`insert "last"` は実質 no-op）。JIT の `data_addtolist` インライン経路は `xyo_list_limit` をデータシンボルとして直接ロードし、上限なら helper（`SList::push`）へ落とす — AOT でも同じシンボルが `kRtSymbols` 経由で解決するので生成済みオブジェクトに設定が効く。par-for は予約 `base+trip` が上限を超えるとき逐次へフォールバック。既定 0 は TurboWarp と同じ無制限で、`--list-limit 200000` を渡すと Scratch/Mistwarp の挙動（200000 で長さが止まる）になる。テスト: `tests/unit/test_list_limit.cpp`（push/insert/helper の 12 checks）。
 - **Scratch の有名アルゴリズム・ベンチマーク（`tests/bench/algos/`、結果は `docs/algo-bench.md`）**: Scratch ブロックだけで quicksort / mergesort / bubblesort / sieve / fib / sha256 を実装した sb3 を生成し、同じファイルを xyo と `refs/scratch-vm`（TurboWarp 2.1.46、コンパイラ有効）で実行して比較する。計測はプロジェクト内の `days since 2000`（ms、ウォームアップ後 3 回。データ生成・ロード・コンパイルは計測外）で、`bench.py` が全モードの checksum を Python 参照実装と照合する（全 30 構成で一致）。実測（i7-12700 / Node 26 / LLVM 23、JIT 最適化後）: TurboWarp compiled が quicksort 32ms・mergesort 39ms・bubblesort 53ms・sieve 14ms に対し xyo JIT 44/83/119/21ms（TW が 1.4〜2.2 倍速い）だが、fib 52 vs 33、sha256 83 vs 58、**`change i by 1` のループは 51 vs 39ms で xyo が 1.3 倍速い**。対照実験: `change i by 1`（50M）TW 51ms / xyo 39ms、`item i of L` 88/203、`replace item i of L` 109/155 とリストアクセスは V8 が 1.4〜2.3 倍速いが、**`add k to L`（20M）は TW 163ms / xyo 20ms で xyo が 8.2 倍速い**。sieve はフラグリスト構築を他と同じく計測外にしている（含めると append 8.2 倍で xyo が勝ってしまう）。`--danger` との差は 0〜5% で warp 予算はこのサイズでは効かない。
-- **ループ内変数のレジスタ昇格とタグ変換 fast path（`codegen.cpp`、上のベンチで見つけた弱点の修正）**: (1) `emitToNumF64`/`emitCmpNumF64` に「素の double」fast path（符号付き `bits < kNan`）。比較だけは **kNan を fast path から外す** — Scratch は NaN 同士の比較を文字列比較へ落とす（`test_literal_context` が検出した）。(2) `data_changevariableby` の `numCanonical` を有限定数デルタで省略（`emitToNumF64` は NaN を返さないため）。(3) `Variable::list` のロードと、ループ内で resize しないリストの `len`/`items` を preheader へ hoist（`xyo.varlist` メタデータ + `hoistVarSlotPointers` 拡張）。(4) **ループ内スカラー変数のレジスタ昇格** — ループ本体とループ入力（`repeat_until` の CONDITION を含む）の変数アクセスがすべて inline で完結する（opcode allowlist: data/operator/control_if/repeat 系のみ。手続き呼出し・broadcast・wait・stop・compat・sensing_of・append を含めば不適用）ループでは値を alloca（mem2reg で SSA）に載せ、**yield の前後だけ実メモリへ spill / volatile reload**、ループ脱出で書き戻す。変数 id で必ず重複排除する — 重複スロットがあると spill が stale 値を最後に書き、変数がループ入口の値へ巻き戻って無限ループ/SEGV になる（実際に踏んだ）。昇格中は GPU 委譲しない（GPU はメモリを直接更新するため shadow と二重になる）。(5) yield 判定の `isWarp` をループ入口で hoist し、`yieldCheckN` もレジスタ化して脱出時だけ ctx へ書き戻す。(6) **数値影（numeric shadow）** — 昇格する変数を `(bits, d = toNum(bits))` の対で持ち、**d を f64 のまま XMM に置く**。数値読み出しは d をそのまま返すのでタグ検査・NaN 正規化・GP↔XMM 移動が消える。bits は常に正準な Value（文字列のまま代入された値もそのまま）なので Value 読み出し・yield の spill・脱出時の書き戻しは厳密。`change` は有限定数デルタなら NaN が生じないので `d+delta` を bits にも写すだけ。索引が数値影／数値リテラルなら `emitListIdxAsF64` のタグ検査も省く。(7) タグ検査・yield・リスト境界の分岐に `branch_weights` を付けて高速側を fall-through させる。比較も数値影を素通しする（`emitCmpNumF64` が knownNumD を引く）。yield 判定はループ入口で `mask = isWarp ? 63 : 0` を作り `(++counter & mask) == 0` の 1 分岐に畳む（非 warp は mask=0 で毎反復 true = 従来同値）。数値リテラルとの比較は、**相手オペランドが数値と分かっているときだけ**コンパイル時に畳む（`isNumericOperand` + `literalCmpNums`、空白のみは `cast::isWhiteSpace` で除外）。**不採用（実測付き）**: リスト境界の `fptosi.sat` 整数化（x86 で 6 命令に展開され f64 比較 2 回より高くつき、read が 8% 悪化）、ループのアンロール（yield 検査が償却されずコードが増えるだけ）、数値リテラル比較の**無条件**畳み込み（`literal context` の 219,850 checks のうち 5,843 件が落ちた — 空白のみ文字列は numState 3 で文字列比較になるため。相手が数値のときだけ畳む版なら全テスト通過）、`toNum` fast path の `d == d`（ord）判定（read 180→192ms、FP 比較は分岐解決が遅い）、fast path の `bits < kNan`（NaN 正規化を省けるが read 180→200ms — `bits < kFalse` は kTrue/kFalse と同じ 0x7FF8 系列で movabs+leaq を共有できる）。実測（同一ベンチ、xyo JIT。マシン負荷で絶対値は ±10% 動く）: quicksort 60→46ms、mergesort 114→85、bubblesort 183→123、sieve 37→21、fib 43→36、sha256 64→61、**micro loop 161→35（TurboWarp 53ms を 1.5 倍逆転）**、read 285→180、write 247→135、append 26→25。検証: ctest 6/6（literal context 219,850 checks、e2e 99、parfor/pen/minify/deps）、差分 repro 19/19（HotSpot/interp）、ベンチ全 checksum 一致、AOT も同一 checksum。残差はリストアクセス。**リスト読みの専用高速経路は 4 案試して全て不採用**（実測）: (a) 昇格リストの null 検査除去+ヘッダ固定は read 183→238ms（レジスタ圧で影が spill）、(b) 索引 bits での整数境界検査は不正（数値影の bits は `set i to 1` のように文字列のことがあり quicksort が SEGV）、(c) `fptosi(d)-1` の整数境界検査は範囲外が LLVM IR の poison で UB（同じく SEGV）、(d) yield を `preserve_all` 規約にしても効果なし。**診断**: yield 検査を外すと read 180→159 / write 137→113 / `change i by 1` 35→22ms なので yield は 1〜2 サイクル。残る差の主因は、ループ運搬値（影の `d`）が IR では SSA phi なのに**レジスタ割当がスタックへ落とし**、16 バイト store + スカラ load の store-forwarding 遅延がループキャリーに乗ること。
+- **ループ内変数のレジスタ昇格とタグ変換 fast path（`codegen.cpp`、上のベンチで見つけた弱点の修正）**: (1) `emitToNumF64`/`emitCmpNumF64` に「素の double」fast path（符号付き `bits < kNan`）。比較だけは **kNan を fast path から外す** — Scratch は NaN 同士の比較を文字列比較へ落とす（`test_literal_context` が検出した）。(2) `data_changevariableby` の `numCanonical` を有限定数デルタで省略（`emitToNumF64` は NaN を返さないため）。(3) `Variable::list` のロードと、ループ内で resize しないリストの `len`/`items` を preheader へ hoist（`xyo.varlist` メタデータ + `hoistVarSlotPointers` 拡張）。(4) **ループ内スカラー変数のレジスタ昇格** — ループ本体とループ入力（`repeat_until` の CONDITION を含む）の変数アクセスがすべて inline で完結する（opcode allowlist: data/operator/control_if/repeat 系のみ。手続き呼出し・broadcast・wait・stop・compat・sensing_of・append を含めば不適用）ループでは値を alloca（mem2reg で SSA）に載せ、**yield の前後だけ実メモリへ spill / volatile reload**、ループ脱出で書き戻す。変数 id で必ず重複排除する — 重複スロットがあると spill が stale 値を最後に書き、変数がループ入口の値へ巻き戻って無限ループ/SEGV になる（実際に踏んだ）。昇格中は GPU 委譲しない（GPU はメモリを直接更新するため shadow と二重になる）。(5) yield 判定の `isWarp` をループ入口で hoist し、`yieldCheckN` もレジスタ化して脱出時だけ ctx へ書き戻す。(6) **数値影（numeric shadow）** — 昇格する変数を `(bits, d = toNum(bits))` の対で持ち、**d を f64 のまま XMM に置く**。数値読み出しは d をそのまま返すのでタグ検査・NaN 正規化・GP↔XMM 移動が消える。bits は常に正準な Value（文字列のまま代入された値もそのまま）なので Value 読み出し・yield の spill・脱出時の書き戻しは厳密。`change` は有限定数デルタなら NaN が生じないので `d+delta` を bits にも写すだけ。索引が数値影／数値リテラルなら `emitListIdxAsF64` のタグ検査も省く。(7) タグ検査・yield・リスト境界の分岐に `branch_weights` を付けて高速側を fall-through させる。比較も数値影を素通しする（`emitCmpNumF64` が knownNumD を引く）— ただし**影を比較に使えるのは値が素の double で非 NaN のときだけ**なので、変数ごとに `knownNumOk`（i1）を書き込み側で更新し、比較はそれを読む（scratch-bench の checksum 不一致から見つけた修正。文字列を持つ昇格変数は `d=NaN` で比較が常に false になっていた）。yield 判定はループ入口で `mask = isWarp ? 63 : 0` を作り `(++counter & mask) == 0` の 1 分岐に畳む（非 warp は mask=0 で毎反復 true = 従来同値）。数値リテラルとの比較は、**相手オペランドが数値と分かっているときだけ**コンパイル時に畳む（`isNumericOperand` + `literalCmpNums`、空白のみは `cast::isWhiteSpace` で除外）。**不採用（実測付き）**: リスト境界の `fptosi.sat` 整数化（x86 で 6 命令に展開され f64 比較 2 回より高くつき、read が 8% 悪化）、ループのアンロール（yield 検査が償却されずコードが増えるだけ）、数値リテラル比較の**無条件**畳み込み（`literal context` の 219,850 checks のうち 5,843 件が落ちた — 空白のみ文字列は numState 3 で文字列比較になるため。相手が数値のときだけ畳む版なら全テスト通過）、`toNum` fast path の `d == d`（ord）判定（read 180→192ms、FP 比較は分岐解決が遅い）、fast path の `bits < kNan`（NaN 正規化を省けるが read 180→200ms — `bits < kFalse` は kTrue/kFalse と同じ 0x7FF8 系列で movabs+leaq を共有できる）。実測（同一ベンチ、xyo JIT。マシン負荷で絶対値は ±10% 動く）: quicksort 60→46ms、mergesort 114→85、bubblesort 183→123、sieve 37→21、fib 43→36、sha256 64→61、**micro loop 161→35（TurboWarp 53ms を 1.5 倍逆転）**、read 285→180、write 247→135、append 26→25。検証: ctest 6/6（literal context 219,850 checks、e2e 99、parfor/pen/minify/deps）、差分 repro 19/19（HotSpot/interp）、ベンチ全 checksum 一致、AOT も同一 checksum。残差はリストアクセス。**リスト読みの専用高速経路は 4 案試して全て不採用**（実測）: (a) 昇格リストの null 検査除去+ヘッダ固定は read 183→238ms（レジスタ圧で影が spill）、(b) 索引 bits での整数境界検査は不正（数値影の bits は `set i to 1` のように文字列のことがあり quicksort が SEGV）、(c) `fptosi(d)-1` の整数境界検査は範囲外が LLVM IR の poison で UB（同じく SEGV）、(d) yield を `preserve_all` 規約にしても効果なし。**診断**: yield 検査を外すと read 180→159 / write 137→113 / `change i by 1` 35→22ms なので yield は 1〜2 サイクル。残る差の主因は、ループ運搬値（影の `d`）が IR では SSA phi なのに**レジスタ割当がスタックへ落とし**、16 バイト store + スカラ load の store-forwarding 遅延がループキャリーに乗ること。
 - **TurboWarp の生成コードを V8 バイトコード/最適化コードまで降ろした比較（`docs/v8-vs-xyo-codegen.md`、取得は `tests/bench/algos/dump_v8.js`）**: `JSGenerator.testingApparatus` フックで TurboWarp の生成 JS を取り出し、`node --print-bytecode --print-bytecode-filter=funN` と `--print-opt-code --print-opt-code-filter=funN --code-comments` で Ignition バイトコードと TurboFan マシンコードを得る。xyo 側は `xyo aot ... --obj` + `llvm-objdump` で同じ粒度にする。分かったこと: (1) TurboWarp は**変数を JS ローカルへ昇格しない** — `b0.value` のプロパティアクセスのままで、V8 の IC と TurboFan が固定オフセットのロード/ストアへ畳む。速さの源は「変数の昇格」ではなく**型特化（Smi）**。バイトコードは 8 命令/反復で `GetNamedProperty`/`AddSmi`/`SetNamedProperty` を使う。(2) TurboFan は `b0.value` を Smi のまま `addl` し（`sarq 32` / `addl` / `shlq 32`）、溢れは `jo` → 脱最適化。型チェックはループ外へ hoist され、4 倍アンロール、割り込みチェックは 1 グループ 1 回。**脱最適化は out-of-line スタブへの分岐**なので本体は一直線。(3) xyo はループ内変数をレジスタへ昇格済みだが**値は i64 のまま**なので、読み出しごとにタグ検査 + NaN 正規化、演算ごとに `vmovq` の **GP↔XMM 往復**が入る（`vmovq → vaddsd → vmovq` で 6〜8 サイクルのキャリー依存）。さらに yield 検査（isWarp + カウンタ）を毎反復、高速パスが無条件ジャンプ 2 個で合流するレイアウト。micro_loop は 16 命令/5 条件分岐/2 無条件ジャンプ (xyo) vs 13〜14 命令/2 分岐 (V8) で、実測 2.98 vs 1.06 ns/反復。(4) リスト読み出しは V8 が `cmpl` 1 回の整数境界検査 + `movq [rbx+r15*8+0xf]` の 7 命令、xyo はタグ検査 + f64 境界検査 2 回 + `vcvttsd2si` の 13 命令。ただし切り捨て前提なら `(uint64)(trunc(d)-1) < len` で整数比較に等価変換できる（`fptosi.sat` 使用）。(5) xyo が勝つ fib/sha256 は、TW が `thread.procedures["Wfib %s"]` の文字列キー参照 + JS 呼び出し + append ごとの `_monitorUpToDate = false` を 払うため。改善案（優先度順）: 数値特化ループ（phi を f64 のまま XMM に）/ isWarp のループ外 hoist / 遅いパスに `cold` + branch weights で fall-through 化 / リスト境界を整数化 / アンロール。
-- 次の候補: さらなるパフォーマンス最適化（var_get のインライン化・SList 直接操作等）。
+- **scratch-bench との統合（`scratch-bench/`、結果と考察は `docs/scratch-bench.md`）**: [gradylink/scratch-bench](https://github.com/gradylink/scratch-bench) のコピーを `scratch-bench/` に置き、`xyo-cpp` ランタイムを追加した（`bun run bench --runtime xyo-cpp`）。ベンチは sb3 で、各カーネルをプロジェクト内の `days since 2000` で 100ms × 6 ラウンド計測し、結果をステージのリスト `output` へ追記する — ランタイム側はそれを stdout へ出せばよい。そのため xyo に CLI を 2 つ足した: `xyo run <sb3> --print-list NAME`（リストの新規要素を 1 step ごとに 1 行ずつ stdout へ。ロード情報・終了行は stderr へ退避するので stdout はプロジェクト出力だけになる）と `xyo run <sb3> --fps N`（1 ステップを実時間 1/N 秒に合わせる。`play` の `--fps` と同じ。既定 0 = 最速）。**`--fps 30` が要る** — scratch-vm は 30fps で step し、1 フレーム内で作業予算までパスを回すので、最速の `xyo run` だと `sched_*`（100ms あたりのループ通過回数）が比較にならない。アダプタは xyo をソースからビルドし（cmake + ninja、Release、JIT on、`.cache/runtimes/xyo-build/<hash>/xyo`）、`XYO_JIT_MODE` を切り替えて hotspot / interpreter / eager / AOT を variant として測る。実測（i7-12700、各 2 run の中央値、score はサイトの重み付き幾何平均）: **xyo JIT 26,213 / TurboWarp compiler 40,265 / Scratch 653**（xyo は TW の 0.36 倍・Scratch の 22.6 倍）。カテゴリ別は loops 819k(0.70×TW)・vars 127k(0.75)・math 55k(0.61)・lists 30k(0.71)・algorithms 132k(0.85)・apps 5.6k(0.67)・**strings 8.3k(0.33)**・**scheduler 737(0.68)**。個別では xyo が勝つものも多い（`algo_fib` 2.3×、`list_insdel` 1.9×、`algo_ack` 1.6×、`loops_repeat` 1.5×、`vars_setchange` 1.4×、**`sched_fanwait` 1.2×（broadcast and wait）**、`sched_fanout` 1.2×、`sched_looptick` 1.2×、`math_trig` 1.2×）。最初の測定（比較バグ修正直後）は overall 14,835 / strings 715 / scheduler 93 / 43.7 秒 / ピーク RSS 1,736MB だったので、**strings 3.5×・scheduler 7.6×・overall +54%・−27% 時間**。**分かったこと（すべて修正済み、下の 3 つの項を参照）**: (1) JIT の比較バグを checksum が検出（`math_strcompare` 8000 vs 12000、`app_brainfuck` 31000 vs 931125）。(2) `broadcast and wait` がJIT で 1 フレーム待ち（`sched_pingpong` 0.03 vs TW 560）。(3) GC がファイバ上で未使用 8MiB を毎回走査 + 完了スレッドを 1 個も解放せず 100 万個/RSS 3GB。(4) 数値→文字列が 17 回の snprintf 往復。(5) 文字列は **rope（cons string）** で解決（`str_join` 209 → 12,514 ops/ms）。続いて GC の確保コスト（`PtrSet` + 空文字列 join の短絡）が効いて strings カテゴリは 8.3k（TW の 0.33 倍）まで来た。(6) パリティスイートも回る（`xyo play --print-list` + SDL offscreen + `--list-limit 200000` で **2061/2123 = 97.1%**）。
+- **rope（cons string）で `++` を O(1) に（`sstr.hpp` / `string_util.cpp` / `gc.cpp` / `rt/runtime_helpers.cpp`）**:
+  Scratch の文字列は不変なので `s = s ++ "ab"` を素直に実装すると 1 反復 O(n)・全体 O(n²)
+  （`str_join` は 1 ラウンド 800MB の memcpy、TurboWarp 比 1/800）。V8 と同じ **連結ノード**を持つ:
+  `SStr` に `flags`（`kConsFlag`）/`left`/`right`/`body` を足し、`join` は両辺が文字列で
+  合計 16 文字以上のときコピーせずノードを返す（`sstrCons`）。本文は最初の `view()`/`data()` で
+  1 回だけ materialize（`SStr::consBody`）し、`body` に CAS で publish する（並列ワーカーが
+  同時に flatten しても内容は同じ・負けた側は free）。flat の本体は従来どおり構造体直後
+  （`kSStrDataOff = sizeof(SStr)`）なので、JIT の inline `letter of`/`=` fast path は
+  `flags & kConsFlag` を見て helper へ落とす（`emitIsConsStr`）。
+  **GC**: `markObject` は cons の子を辿る（深い鎖 = 数万ノードで再帰しないよう、マークは
+  `pending_` に積んで `drainPending()` が反復で消化する方式に変更 — 入れ子リストの
+  スタック溢れ対策も兼ねる）。sweep は `destroyPayload` で body を free。
+  **昇格との干渉**: ループ内変数の数値影は「代入値が数値を生むと静的に言える変数」だけに
+  付ける（`nonNumericVars` + `valueIsNumeric`）。文字列を受ける変数に影を持たせると
+  代入のたびに `toNum` = `view()` = flatten が走り、rope の意味が消える（実測で 2.9 倍悪化）。
+  影は最適化なので誤って付けなければ意味論は変わらない（保守側に倒す）。
+  実測: `str_join` 209 → **5,401 ops/ms**、20 万回連結（200 万文字）が 60ms で flatten・
+  letter of・contains すべて一致、ピーク RSS 1.6GB。残る差は確保コスト（1 ノード約 200ns、
+  `Gc::alloc` の mutex/malloc/hash set。V8 の bump 確保は 6ns）— 次に効くのはアロケータ。
+  テスト: `tests/unit/test_sstr_cons.cpp`（長さ・本文・数値変換・比較・検索・リスト経由・
+  4 万ノードの flatten/GC・flatten 後の GC 生存、29 checks）。
+- **GC の確保を速くする（`gc.hpp` の `PtrSet` / `gc.cpp` / `rt/runtime_helpers.cpp`）**: rope で連結は
+  O(1) になったが、20,000 回の連結が 4ms = **1 ノード約 200ns** かかっていた（V8 の bump 確保は 6ns）。
+  中身は `Gc::alloc` の `std::unordered_set` 2 つ（`objSet_`/`pageSet_`）で、どちらも **要素ごとに
+  ノードを malloc** するため「オブジェクト 1 個 = malloc 3 回 + ハッシュ 3 回」だった。両方を
+  **フラットなオープンアドレッシング集合 `PtrSet`**（挿入/参照のみ・削除なし、sweep の後に
+  生存分で作り直す）に置き換え、`pageSet_` は同じページが続く間は挿入を省く（`lastPage_`）→ 20,000 回の連結が
+  4ms → **2〜3ms**（1 ノード約 200ns → 100〜150ns）。あわせて `join(x, "")` / `join("", x)` はコピーせずオペランドを返す
+  （`x/4 ++ ""` という定番形で SStr の確保とコピーが 1 回減る）ようにし、`sstrContains` は
+  **ASCII なら小文字化用の u16string を 2 本作らずその場で畳んで走査**するようにした
+  （ループ内の `contains(長文, 短語)` で毎回 2 本コピーしていた）。
+  実測: `str_join` 5,401 → **12,514 ops/ms**、`str_cast` 2,535 → **5,368**、
+  `str_contains` 419 → **1,089（TW の 0.81 倍）**、strings カテゴリ 4.4k → **8.3k**、
+  overall 23,459 → **26,213**（TW 比 0.62 → 0.65）、20 万回連結（200 万文字）60ms → 38ms。
+  **残る差は確保ではなくボクシング**（`math_arith` 0.25×・`vars_many` 0.54× は V8 の Smi 特化と
+  4 倍アンロールに対する i64 ボックス演算 — `docs/v8-vs-xyo-codegen.md` の既知の弱点）。
+- **小文字列のスラブ確保（`gc.hpp` / `gc.cpp`）**: それでも文字列 1 個ごとに `malloc` して
+  `objSet_` へ挿入していた（rope 後は 1 連結 = 1 オブジェクト）。**128 バイト以下の
+  `GcType::Str` だけ**を 64KiB 整列スラブ（80/96/128 バイトの 3 クラス）から切り出す。
+  セルの生存はスラブごとの**割り当てビットマップ**が持ち、空き探索はワード単位
+  （`firstFreeWord`）、プール内セルは `objSet_` へ入れない。`GcHeader`/`SStr` の
+  レイアウトは不変なので JIT/AOT のフィールドオフセットも不変。**所属判定はヘッダを
+  読む前に**「登録済みスラブ → データ領域内 → セル境界一致 → ビットセット」で確定し
+  （旧 `markPtr`/`scanRange` は objSet 判定の前に `h->mark` を読んでいた）、
+  `markPtr`/`markObject`/保守的走査は共通の `markHeader` を通す。sweep は死んだセルを
+  ビットマップへ返し、**走査完了後**に空きスラブをクラスごと 1 枚残して解放する
+  （`PtrSet` は削除を持たないので空きリストを切ってからベース集合を再構築）。黒色
+  割り当て・ワーカーの defer 契約は従来どおり。ASan では未使用セルと生存セルの末尾を
+  poison し、確保時に要求サイズだけ unpoison する（共有スラブに隠れる UAF を検出）。
+  `XYO_GC_POOL=0` で従来の malloc 経路。実測（同一ベンチ・直前版比）: 文字列連結
+  68→**38ms**、数値 append 181→**97ms**、短文連結（毎回変化）151→**95ms**、cast
+  41→**32ms**、ピーク RSS 0.8〜2.2MB 減。テスト `tests/unit/test_gc_pool.cpp`
+  （10,079 checks。サイズ境界・実ストライド・偽ポインタの所属判定・ルート付き
+  flat/cons/大文字列/リスト・再入割り当て・延期ワーカー割り当て・空きスラブ解放と
+  再利用。ASan+UBSan / TSan、プール無効でも全ユニット通過）。**その後、プールは
+  スレッド専有スラブに変更**した: 確保はロックを取らず、自分のスラブのビットマップ
+  だけを触る（空きスラブの受け渡しと生成だけロック）。プール内セルは `allObjects_`
+  に入れず、sweep はスラブのビットマップを直接走査する。収集ごとに `poolGen_` を
+  進め、スレッドは世代が一致するときだけキャッシュしたスラブを使う（世代不一致なら
+  参照せず捨てる）。`Gc` の生成時にも世代を一意にする — テストのように同じ番地へ
+  別インスタンスができると古いスラブを掴み、TSan がヒープ use-after-free として
+  検出した。確保量は TLS に 4KiB ためて原子的に加算する（毎回の `lock xadd` は
+  mutex より高い）。単一スクリプトのベンチでは 5% 前後の改善にとどまり、`join` は
+  TW 比 3.9 倍。`XYO_GC_THRESHOLD`（MiB）で収集閾値を上書きでき、8〜64MiB で
+  時間が変わらないことから GC 頻度は残差の主因ではないと確認した。**残る主因は
+  opcode ごとのヘルパ呼び出し**なので、`operator_length` を JIT でインライン化した
+  （`codegen.cpp` の `emitLength`: 空文字列→0、文字列タグ→`kSStrLenOff` の u32 を
+  double 化、それ以外だけ `xyo_strlen`）。1 呼び出しあたり約 5ns が消え、letter
+  21→**14ms**・短文連結 54→**47ms**・cast 30→**26ms**（TW 比 3.5 倍 / 3.4 倍 /
+  1.3 倍）。Scratch は値の種類と制御が限られるため、この種のインライン化はまだ余地がある。
+- **小整数のインターンとASCII判定キャッシュ（`cast.cpp` / `sstr.hpp` / `string_util.cpp` /
+  `runtime_helpers.cpp`）**: 確保を減らした後に残ったのは変換・判定のやり直しだった。
+  (1) `cast::toString` は `-128..1023` の整数を起動時に1回だけ文字列化して共有する
+  （V8 の number-string cache 相当）。`String(-0)` が `"0"` なので `-0.0` は `"0"` の
+  実体を返し、範囲外・非整数は従来どおり新規生成。実体は GC ルート。
+  (2) `join` に `(数値,文字列)` と `(数値,数値)` の融合経路を追加。短い結果は1回の
+  flat 確保、長い結果は cons のまま。**短い結果を cons にしない**のが要点（cons は
+  後で flatten するとき余分な確保が要る）。(3) `SStr::flags` に ASCII 判定を遅延保存
+  （`kAsciiKnown`/`kAsciiValue`、cons は子の合成）。比較と `contains` は毎回
+  両文字列を全走査していたので、1000 文字の `contains` は同じ文字列を2回読んでいた。
+  実測（同一ベンチ・直前版比）: 数値 append 157→**36ms**、短文連結（毎回変化）
+  133→**57ms**、`contains` 1471→**725ms**（TurboWarp 1222ms を逆転）、join 60→**37ms**、
+  cast 34→**28ms**。テストは `test_sstr_cons.cpp` に ASCII 判定（flat/cons/非ASCII・
+  GC 後）を追加（65,617 checks）。差分 19/19・ctest 6/6。
+- **スレッド側の AccessSet キャッシュ（`thread.hpp` / `sequencer.cpp` / `jit.hpp`）**: 並列スケジューラは
+  パスごと・スレッドごとに `JitEngine::accessFor` を呼び、`unordered_map` を 2 段引いていた。
+  結果は (top block, target) 単位で不変なので Thread に `accessCache` と世代（`accessGen`、
+  `JitEngine::invalidate()` で進む）を持たせて 1 回のロードにした。`sched_waituntil` 86 → 123 ops/ms。
+- **compat 経由の broadcast and wait の startedThreads を回収側へ公開（`jit/rt.cpp`）**:
+  `xyo_rt_compat` は合成 ExecContext をファイバローカルに持つため、そこに `startedThreads` が
+  入ると `Runtime::reclaimThreads`（完了スレッドの解放）から見えず、生ポインタが宙に浮く
+  可能性があった。呼出し中だけ `JitCtx::joinRefs` に公開する（1 回だけ観測された SIGSEGV の
+  調査中に見つけた穴）。
+- **JIT ファイバ yield のステータス正規化（`sequencer.cpp`）**: パス内 yield（`u.yield()` 相当）は
+  `STATUS_RUNNING` に戻す — JS の `stepThread` も `stepThreadBound` も、yield から戻るときに同じことを
+  する。YIELD のまま抜けると `stepThreads` の `numActiveThreads` に数えられず、スレッドが 1〜2 本の
+  プロジェクトではフレームが即座に終わって「yield = 1 tick 待ち」になっていた
+  （`broadcast and wait` がこれで 1 フレーム 1 往復、`sched_pingpong` は scratch-vm の 1/12000）。
+  実測: `sched_pingpong` 0.03 → 382 ops/ms、`sched_fanwait` 3 → 984（TW の 1.2 倍）、
+  scheduler カテゴリ 93 → 708。`STATUS_YIELD_TICK`（フレーム単位）と `STATUS_PROMISE_WAIT` は触らない。
+- **GC: ファイバ上のスタック走査範囲と collect 下限（`gc.cpp`）**: 保守的ルート走査は現 rsp を pthread
+  スタック範囲へクランプするが、**ファイバ上の rsp はその範囲の外**なので、クランプするとメインスタックの
+  未使用域（8MiB）まで毎回走査していた — JIT の collect が 2.9ms/回（インタプリタは 0.16ms）、
+  `str_join` は 1 ラウンドに約 400 回。スケジューラの退避 rsp（`detail::gSchedulerRegs.rsp`）から
+  走査するようにし（現ファイバは `Runtime::markRoots` が見る）、collect の下限を 2MiB → 8MiB へ。
+  `str_join` の 20,000 連結が **1,256ms → 46ms**、`str_cast` 33 → 6ms、ピーク RSS も低下。
+  診断は `XYO_GC_DEBUG=1`（collect 回数・live・累計時間を stderr へ。off のときは時計を読まない）。
+- **完了スレッドの回収（`thread.cpp` / `runtime.cpp` / `jit.hpp`）**: `ownedThreads` は
+  broadcast-and-wait の `startedThreads` が生ポインタで持つため何も解放しておらず、スケジューラが
+  速くなると 32 秒で **1,006,615 Thread（RSS 3.0GB）** になった。完了時に `Thread::releaseFinished()`
+  でフレーム・実行コンテキスト・JIT キャッシュを返し、`Runtime::reclaimThreads()` が
+  「待機中の broadcast-and-wait が握っていない」完了スレッドを解放する（インタプリタは
+  `ExecContext::startedThreads`、JIT は `JitCtx::joinRefs` を辿る）。回収は 25% 増えるたびの
+  間引きなので償却 O(1)。RSS 1.6GB・`XYO_DEBUG_COUNTS=1` で残数を確認できる。
+- **数値 → 文字列を `std::to_chars`（Ryu）で（`jsnum.cpp`）**: 従来は p=1..17 の `"%.*e"` + `strtod`
+  往復で最短桁を探しており、非整数 1 回に最大 17 回かかっていた（`x/4 ++ ""` が 1.25µs、V8 は 50ns）。
+  `std::to_chars(scientific)` の桁は既存探索と一致することを確認（40 万サンプル + 境界値。さらに
+  Node の `String(x)` と **120,020 件で完全一致**）ので、ES の整形はその桁から行う。`str_cast` 725 →
+  2,450 ops/ms、`num2str` 20,000 回が 27ms → 10ms。
+- **`xyo play --print-list NAME` と `XYO_EXIT_ON_DONE=1`**: ウィンドウ実行でもリストを 1 フレームごとに
+  stdout へ出し、全スレッド終了で抜ける（`run` の同名オプションと対）。パリティスイート
+  （`parity/project`、描画依存のテストを含む）を回すための経路で、アダプタは SDL の `offscreen`
+  ビデオドライバ + `--list-limit 200000` を渡す — 結果は **2061/2123（97.1%）**。
+- 次の候補: さらなるパフォーマンス最適化（var_get のインライン化・SList 直接操作等）。文字列の rope 化と `broadcast and wait` のフレーム内再開（scratch-bench の strings/scheduler カテゴリがそのまま伸びる）。
 
 ## JIT ブロックヘルパ層（src/jit/rt_blocks.cpp）
 

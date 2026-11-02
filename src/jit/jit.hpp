@@ -146,6 +146,11 @@ struct JitCtx {
     /// warp ループの isStuck 判定を間引くカウンタ
     /// （生成コードが (++n & 63)==0 のときだけ xyo_loop_yield を呼ぶ）。
     uint64_t yieldCheckN;
+
+    /// broadcast and wait が待機中に保持している startedThreads（待機中のみ
+    /// 非 null）。完了スレッドの回収（Runtime::reclaimThreads）が生ポインタ
+    /// 参照を辿るために公開する — 生成コードは触らない。
+    std::vector<Thread*>* joinRefs;
 };
 
 static_assert(std::is_trivially_copyable_v<JitCtx>);
@@ -230,6 +235,8 @@ public:
     /// 実行中スレッドが無いこと（CompiledScript/BlockCached 参照を
     /// 破棄するため）を呼び出し側が保証する。
     void invalidate();
+    /// accessFor の結果キャッシュの世代（invalidate で進む）。
+    uint32_t accessGeneration() const { return accessGen_; }
 
     bool ok() const;
 
@@ -272,6 +279,7 @@ private:
     std::unordered_map<const void*,
                        std::unordered_map<const Target*, AccessSet>>
         accessCache_;
+    uint32_t accessGen_ = 1;
     uint64_t scriptCounter_ = 0;
 };
 

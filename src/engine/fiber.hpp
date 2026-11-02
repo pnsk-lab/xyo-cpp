@@ -68,6 +68,12 @@ public:
     /// 戻ってきた時点でファイバは yield/kill 済み。
     void resume();
 
+    /// A batch of already-initialized fibers, each executed once. A yield
+    /// advances directly to the next fiber without visiting the scheduler.
+    /// Completion also advances; the caller must retire finished fibers.
+    /// Caller-thread only; not used under ASan.
+    static void resumeChain(Fiber* const* fibers, size_t count);
+
     /// ファイバ内からスケジューラへ yield。
     void yield();
 

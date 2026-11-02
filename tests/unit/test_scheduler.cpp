@@ -239,6 +239,45 @@ void testSharedOrder() {
           "single conflict component is not dispatched");
 }
 
+void testSharedYieldChain() {
+    // Different repeat counts force several fibers to complete in the same
+    // chain pass while the other fibers continue yielding. The stage variable
+    // is shared, so the dependence check must keep the original order.
+    Runtime rt;
+    std::string json = "{\"targets\":[" + target("Stage", "{}", true);
+    int expected = 0;
+    for (int i = 0; i < 8; ++i) {
+        const int repetitions = 8 + i;
+        expected += repetitions;
+        const std::string blocks =
+            "{\"hat\":" + hat("repeat") + ",\"repeat\":" +
+            block("control_repeat", nullptr,
+                  "{\"TIMES\":[1,[4,\"" + std::to_string(repetitions) +
+                  "\"]],\"SUBSTACK\":[2,\"inc\"]}") +
+            ",\"inc\":" +
+            block("data_changevariableby", nullptr,
+                  "{\"VALUE\":[1,[4,\"1\"]]}",
+                  "{\"VARIABLE\":[\"s\",\"s\"]}") + "}";
+        json += "," + target("Y" + std::to_string(i), blocks, false, i + 1);
+    }
+    json += "],\"monitors\":[],\"extensions\":[],\"meta\":{}}";
+    const auto loaded = loadSb3(rt, json, nullptr);
+    check(loaded.ok, "load mixed-lifetime shared-writer fibers");
+    if (!loaded.ok) return;
+    rt.greenFlag();
+    const bool eligible = rt.sequencer->parallelEnabled() &&
+        !rt.threads.empty() && rt.threads[0]->isCompiled;
+    rt.runUntilDone(200);
+    check(rt.threads.empty(), "shared-writer fibers all terminate");
+    Variable* shared = rt.getTargetForStage()->lookupVariableById("s");
+    check(shared && cast::toNumber(shared->value) == expected,
+          "mixed-lifetime chain preserves every variable increment");
+    if (eligible && std::getenv("XYO_FIBER_CHAIN") == nullptr) {
+        check(rt.sequencer->parallelStats().chainedPasses > 0,
+              "shared-writer direct fiber chain exercised");
+    }
+}
+
 void testPool() {
     WorkerPool pool;
     struct Context {
@@ -281,6 +320,7 @@ int test_scheduler_main() {
     testCompute(true, false);
     testCompute(false, true);
     testSharedOrder();
+    testSharedYieldChain();
     testCompatBarrier();
     std::printf("scheduler: %d checks, %d failures\n", checks, failures);
     return failures;

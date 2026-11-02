@@ -4,6 +4,7 @@
 #   tools/ci/smoke.sh run  build/xyo             # run → AOT 書き出し → 実行
 #   tools/ci/smoke.sh run  build/xyo --jit-log   # 上記 + JIT のコンパイル数
 #   tools/ci/smoke.sh play build/xyo             # headless play + PPM 出力
+#   tools/ci/smoke.sh gui  build/xyo             # SDL dummy で GUI 起動・終了
 #
 # 第3引数以降でプロジェクトを指定できる（既定 examples/play_demo.sb3）。
 # 作業ファイルはリポジトリ直下の相対パスに作る（MSYS2 のパス変換を避ける）。
@@ -82,6 +83,12 @@ play)
     XYO_EXIT_FRAMES=10 XYO_SHOT="$work/shot.ppm" "$bin" play "$project"
     test -s "$work/shot.ppm"
     ls -l "$work/shot.ppm"
+    ;;
+gui)
+    echo "--- gui（SDL dummy ドライバ） ---"
+    export SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy
+    # ウィンドウ生成とランチャー描画を検証し、1 フレームで終了する。
+    XYO_GUI_ACTIONS=quit "$bin" gui examples
     ;;
 *)
     usage

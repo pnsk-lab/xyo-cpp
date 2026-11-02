@@ -27,6 +27,23 @@ std::string Thread::getId() const {
     return idCache_;
 }
 
+void Thread::releaseFinished() {
+    stack.clear();
+    stackFrames.clear();
+    trashFrames.clear();
+    framePool.clear();
+    blockGlowInFrame.clear();
+    justReported = Value::undefined();
+    compatibilityStackFrame.vals.clear();
+    compatibilityStackFrame.startedThreads.clear();
+    compatibilityStackFrame.startedThreads.shrink_to_fit();
+    compatibilityStackFrame.returnValue = Value::undefined();
+    compatibilityStackFrame.hasStartedThreads = false;
+    hasCompatStackFrame = false;
+    jitVarCache.clear();
+    jitVarSlots.clear();
+}
+
 void Thread::pushStack(const std::string& blockId) {
     stack.push_back(blockId);
     if (stack.size() > stackFrames.size()) {
@@ -163,6 +180,7 @@ void Thread::tryCompile(const Block* topHint) {
     if (verbose)
         std::fprintf(stderr, "xyo-jit: compile top=%s target=%s\n",
                      topBlock.c_str(), target->id.c_str());
+#if !defined(XYO_DISABLE_RT_PROF)
     struct CProf {
         bool enabled = std::getenv("XYO_PROF") != nullptr;
         double ns = 0; uint64_t n = 0;
@@ -175,13 +193,16 @@ void Thread::tryCompile(const Block* topHint) {
     static CProf cp;
     std::chrono::steady_clock::time_point t0;
     if (cp.enabled) t0 = std::chrono::steady_clock::now();
+#endif
     const CompiledScript* cs =
         rt->jit->compile(*this, *rt, *rt->sequencer, top);
+#if !defined(XYO_DISABLE_RT_PROF)
     if (cp.enabled) {
         cp.ns += std::chrono::duration<double, std::nano>(
             std::chrono::steady_clock::now() - t0).count();
         ++cp.n;
     }
+#endif
     if (cs) {
         compiled = cs;
         isCompiled = true;

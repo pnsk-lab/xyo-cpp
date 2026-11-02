@@ -29,6 +29,9 @@ double randomIntWithout(double low, double high, double excluded); // inclusiveR
 
 // --- 文字列演算（scratch3_operators + jsgen の OP_*）---
 Value join(Value a, Value b);
+/// Typed string/string case for JIT dispatch after both Value tags are checked.
+Value joinStrings(Value a, Value b);
+SStr* letterCached(uint32_t cp); // shared immutable ASCII leaf cache
 Value letterOf(Value letter, Value str);
 double strLength(Value s);                        // toString(s).length
 bool  strContains(Value hay, Value needle);

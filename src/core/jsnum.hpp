@@ -2,6 +2,7 @@
 // V8/SpiderMonkey と同じ結果を出す必要がある（Scratch の toString/toNumber の基盤）。
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <string_view>
 

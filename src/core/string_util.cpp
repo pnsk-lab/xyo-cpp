@@ -1,6 +1,9 @@
 // xyo-cpp: UTF-16 文字列操作 + SStr 生成。
 #include "sstr.hpp"
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -8,6 +11,120 @@ namespace xyo {
 
 struct CasePropRange { uint32_t lo, hi; };
 #include "case_props.inc"
+
+// 診断（XYO_STR_DEBUG=1）: cons 生成数と flatten 回数を終了時に stderr へ。
+namespace {
+struct StrDebug {
+    bool on = std::getenv("XYO_STR_DEBUG") != nullptr;
+    std::atomic<uint64_t> cons{0}, flat{0};
+    ~StrDebug() {
+        if (on)
+            std::fprintf(stderr, "[str] cons=%llu flatten=%llu\n",
+                         (unsigned long long)cons.load(std::memory_order_relaxed),
+                         (unsigned long long)flat.load(std::memory_order_relaxed));
+    }
+};
+StrDebug& strDebug() { static StrDebug d; return d; }
+} // namespace
+
+// --- 連結ノード（cons string） -------------------------------------
+//
+// Scratch の文字列は不変なので `s = s ++ "ab"` を素直に実装すると
+// 反復ごとに全体をコピーする O(n²) になる（TurboWarp/V8 は cons string で
+// O(1) 連結 → 遅延 flatten）。ここでも同じ表現を持ち、**本文が初めて
+// 必要になったときだけ** materialize する。
+//
+// レイアウト: flat は構造体直後に char16_t data[len+1]。cons は
+// left/right を持ち、body に flatten 結果（malloc）を遅延 publish する。
+// GC は cons の子を辿り（gc.cpp）、sweep で body を free する。
+
+const char16_t* SStr::consBody() const {
+    auto* self = const_cast<SStr*>(this);
+    if (char16_t* done = std::atomic_ref<char16_t*>(self->body)
+                             .load(std::memory_order_acquire))
+        return done;
+    if (strDebug().on) ++strDebug().flat;
+    const size_t n = self->len;
+    auto* buf = static_cast<char16_t*>(
+        std::malloc((n + 1) * sizeof(char16_t)));
+    if (!buf) return reinterpret_cast<const char16_t*>(u"");   // OOM
+
+    // 反復 DFS で左から順に書き込む（深い連鎖で再帰スタックを溢れさせない）。
+    std::vector<const SStr*> stack;
+    stack.reserve(64);
+    stack.push_back(self);
+    size_t at = 0;
+    while (!stack.empty()) {
+        const SStr* s = stack.back();
+        stack.pop_back();
+        if (s->isCons()) {
+            // 既に materialize 済みならそれを丸ごとコピー（部分木を辿らない）
+            if (char16_t* pb = std::atomic_ref<char16_t*>(
+                    const_cast<SStr*>(s)->body)
+                                   .load(std::memory_order_acquire)) {
+                std::memcpy(buf + at, pb, size_t(s->len) * sizeof(char16_t));
+                at += s->len;
+                continue;
+            }
+            stack.push_back(s->right);   // 後入れ先出し → 左を先に処理
+            stack.push_back(s->left);
+            continue;
+        }
+        std::memcpy(buf + at, s->inlineBody(),
+                    size_t(s->len) * sizeof(char16_t));
+        at += s->len;
+    }
+    buf[n] = 0;
+    if (at != n) {
+        // 不変条件（len == 子の len 合計）が壊れている — 破棄して空を返す。
+        std::free(buf);
+        return reinterpret_cast<const char16_t*>(u"");
+    }
+    // 他スレッドと競合したら負けた側を捨てる（内容は同じ）。
+    char16_t* expected = nullptr;
+    if (!std::atomic_ref<char16_t*>(self->body).compare_exchange_strong(
+            expected, buf, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        std::free(buf);
+        return expected;
+    }
+    return buf;
+}
+
+char16_t SStr::unitAt(uint32_t index) const {
+    const uint32_t originalIndex = index;
+    const SStr* node = this;
+    for (unsigned depth = 0; depth < 32; ++depth) {
+        if (!node->isCons()) return node->inlineBody()[index];
+        if (auto* flat = std::atomic_ref<char16_t*>(
+                const_cast<SStr*>(node)->body).load(std::memory_order_acquire))
+            return flat[index];
+        if (index < node->left->len) {
+            node = node->left;
+        } else {
+            index -= node->left->len;
+            node = node->right;
+        }
+    }
+    // Cache the original rope, not just a descendant: repeated reads of the
+    // same deep rope must not pay the bounded walk on every call.
+    return data()[originalIndex];
+}
+
+SStr* sstrCons(SStr* a, SStr* b) {
+    if (strDebug().on) ++strDebug().cons;
+#if defined(XYO_STRING_CONS_POOL)
+    auto* s = static_cast<SStr*>(Gc::get().allocCons(sizeof(SStr)));
+#else
+    auto* s = static_cast<SStr*>(Gc::get().alloc(GcType::Str, sizeof(SStr)));
+#endif
+    s->len = a->len + b->len;
+    s->hash = 0;
+    s->initCaches();
+    s->flags = SStr::kConsFlag;
+    s->left = a;
+    s->right = b;
+    return s;
+}
 
 // 生成テーブル（BMP 小写化・大写化）
 #include "lower_table.inc"
@@ -41,6 +158,7 @@ SStr* sstrFromAscii(std::string_view sv) {
     s->len = static_cast<uint32_t>(sv.size());
     s->hash = 0;
     s->initCaches();
+    s->flags = SStr::kAsciiKnown | SStr::kAsciiValue;   // ASCII by construction
     for (size_t i = 0; i < sv.size(); ++i) s->data()[i] = static_cast<char16_t>(sv[i]);
     s->data()[sv.size()] = 0;
     return s;
@@ -180,10 +298,34 @@ std::u16string u16ToLowerAscii(std::u16string_view sv) {
     return out;
 }
 
+bool SStr::isAscii() const {
+    auto* self = const_cast<SStr*>(this);
+    auto flagsRef = std::atomic_ref<uint32_t>(self->flags);
+    const uint32_t f = flagsRef.load(std::memory_order_acquire);
+    if (f & kAsciiKnown) return (f & kAsciiValue) != 0;
+    bool ascii;
+    if (f & kConsFlag) {
+        ascii = left->isAscii() && right->isAscii();
+    } else {
+        ascii = true;
+        const char16_t* d = inlineBody();
+        for (uint32_t i = 0; i < len; ++i) {
+            if (d[i] >= 0x80) { ascii = false; break; }
+        }
+    }
+    flagsRef.store(f | kAsciiKnown | (ascii ? kAsciiValue : 0),
+                   std::memory_order_release);
+    return ascii;
+}
+
 static bool isAsciiOnly(std::u16string_view s) {
     for (char16_t c : s) if (c >= 0x80) return false;
     return true;
 }
+
+static int compareLoweredViews(std::u16string_view a, std::u16string_view b);
+static int compareAsciiCaseInsensitive(std::u16string_view a,
+                                       std::u16string_view b);
 
 int compareStrings(std::u16string_view a, std::u16string_view b) {
     size_t n = a.size() < b.size() ? a.size() : b.size();
@@ -196,19 +338,18 @@ int compareStrings(std::u16string_view a, std::u16string_view b) {
 
 int compareStringsCaseInsensitive(std::u16string_view a, std::u16string_view b) {
     // ASCII 高速パス
-    if (isAsciiOnly(a) && isAsciiOnly(b)) {
-        size_t n = a.size() < b.size() ? a.size() : b.size();
-        for (size_t i = 0; i < n; ++i) {
-            char16_t ca = a[i], cb = b[i];
-            if (ca >= u'A' && ca <= u'Z') ca += 32;
-            if (cb >= u'A' && cb <= u'Z') cb += 32;
-            if (ca != cb) return ca < cb ? -1 : 1;
-        }
-        if (a.size() == b.size()) return 0;
-        return a.size() < b.size() ? -1 : 1;
-    }
-    std::u16string la = u16ToLower(a), lb = u16ToLower(b);
-    return compareStrings(la, lb);
+    if (isAsciiOnly(a) && isAsciiOnly(b)) return compareAsciiCaseInsensitive(a, b);
+    // Avoid allocating two temporary strings for the common non-ASCII
+    // comparison. Lowercase expansion (U+0130) is handled as a virtual unit.
+    return compareLoweredViews(a, b);
+}
+
+int compareStringsCaseInsensitive(const SStr* a, const SStr* b) {
+    // The ASCII property is cached on the string, so repeated comparisons of
+    // the same operands do not rescan them before every compare.
+    if (a->isAscii() && b->isAscii())
+        return compareAsciiCaseInsensitive(a->view(), b->view());
+    return compareStringsCaseInsensitive(a->view(), b->view());
 }
 
 bool sstrLetterAt(std::u16string_view s, int64_t idx1, char16_t& out) {
@@ -217,11 +358,159 @@ bool sstrLetterAt(std::u16string_view s, int64_t idx1, char16_t& out) {
     return true;
 }
 
+static constexpr char16_t foldAscii(char16_t c) {
+    return (c >= u'A' && c <= u'Z') ? char16_t(c + 32) : c;
+}
+
+// Boyer-Moore-Horspool over case-folded ASCII. Scratch contains checks often
+// search a short word near the end of a long string; skipping by the needle
+// length avoids comparing every candidate position in that workload.
+static bool containsAscii(std::u16string_view hay, std::u16string_view needle) {
+    const size_t n = needle.size();
+    if (n == 0) return true;
+    if (n == 1) {
+        const char16_t wanted = foldAscii(needle[0]);
+        const char16_t* p = hay.data();
+        const char16_t* end = p + hay.size();
+        while (p < end) if (foldAscii(*p++) == wanted) return true;
+        return false;
+    }
+    // Short needles are cheaper with the straightforward scan; constructing
+    // a skip table costs more than it saves for the common two/three chars.
+    if (n < 4) {
+        const char16_t first = foldAscii(needle[0]);
+        const size_t last = hay.size() - n;
+        for (size_t i = 0; i <= last; ++i) {
+            if (foldAscii(hay[i]) != first) continue;
+            size_t j = 1;
+            for (; j < n; ++j)
+                if (foldAscii(hay[i + j]) != foldAscii(needle[j])) break;
+            if (j == n) return true;
+        }
+        return false;
+    }
+    size_t skip[128];
+    for (size_t i = 0; i < std::size(skip); ++i) skip[i] = n;
+    for (size_t i = 0; i + 1 < n; ++i)
+        skip[foldAscii(needle[i])] = n - 1 - i;
+
+    size_t pos = 0;
+    while (pos <= hay.size() - n) {
+        size_t j = n;
+        while (j && foldAscii(hay[pos + j - 1]) == foldAscii(needle[j - 1])) --j;
+        if (j == 0) return true;
+        pos += skip[foldAscii(hay[pos + n - 1])];
+    }
+    return false;
+}
+
+static int compareLoweredViews(std::u16string_view a, std::u16string_view b) {
+    // Unicode case mappings can expand (e.g. U+0130 → i + combining dot) or
+    // map astral code points to astral code points. Decode one code point at a
+    // time and compare the folded UTF-16 units as streams, without allocating.
+    size_t ia = 0, ib = 0;
+    uint32_t remA = 0, remB = 0;
+    char16_t pendingA = 0, pendingB = 0;
+    auto next = [](std::u16string_view s, size_t& i, uint32_t& rem,
+                   char16_t& pending, char16_t& out) {
+        if (pending) { out = pending; pending = 0; return true; }
+        if (rem) {
+            const uint32_t cp = rem; rem = 0;
+            out = static_cast<char16_t>(0xDC00 + (cp & 0x3FF));
+            return true;
+        }
+        if (i >= s.size()) return false;
+        uint32_t cp = s[i++];
+        if (cp >= 0xD800 && cp <= 0xDBFF && i < s.size() &&
+            s[i] >= 0xDC00 && s[i] <= 0xDFFF) {
+            cp = 0x10000 + ((cp - 0xD800) << 10) + (s[i++] - 0xDC00);
+        }
+        char16_t extra = 0;
+        uint32_t lo = lowerCp(cp, &extra);
+        // String comparison's lowercasing is context-sensitive for capital
+        // sigma. The operands here are compared as complete strings, so check
+        // the preceding/following cased context for the current code point.
+        if (cp == 0x03A3) {
+            bool before = false, after = false;
+            for (size_t j = i - 1; j-- > 0;) {
+                uint32_t prior = s[j];
+                if (prior >= 0xDC00 && prior <= 0xDFFF && j > 0 &&
+                    s[j - 1] >= 0xD800 && s[j - 1] <= 0xDBFF) {
+                    prior = 0x10000 + ((s[j - 1] - 0xD800) << 10) +
+                            (s[j] - 0xDC00);
+                    --j;
+                }
+                if (isCaseIgnorable(prior)) continue;
+                before = isCased(prior); break;
+            }
+            for (size_t j = i; j < s.size(); ++j) {
+                uint32_t following = s[j];
+                if (following >= 0xD800 && following <= 0xDBFF && j + 1 < s.size() &&
+                    s[j + 1] >= 0xDC00 && s[j + 1] <= 0xDFFF) {
+                    following = 0x10000 + ((s[j] - 0xD800) << 10) +
+                                (s[++j] - 0xDC00);
+                }
+                if (isCaseIgnorable(following)) continue;
+                after = isCased(following); break;
+            }
+            if (before && !after) lo = 0x03C2;
+        }
+        if (lo > 0xFFFF) {
+            const uint32_t v = lo - 0x10000;
+            out = static_cast<char16_t>(0xD800 + (v >> 10));
+            rem = lo;
+        } else {
+            out = static_cast<char16_t>(lo);
+        }
+        pending = extra;
+        return true;
+    };
+    for (;;) {
+        char16_t ca = 0, cb = 0;
+        const bool ha = next(a, ia, remA, pendingA, ca);
+        const bool hb = next(b, ib, remB, pendingB, cb);
+        if (!ha || !hb) return ha == hb ? 0 : (ha ? 1 : -1);
+        if (ca != cb) return ca < cb ? -1 : 1;
+    }
+}
+
+static int compareAsciiCaseInsensitive(std::u16string_view a,
+                                       std::u16string_view b) {
+    size_t n = a.size() < b.size() ? a.size() : b.size();
+    for (size_t i = 0; i < n; ++i) {
+        char16_t ca = foldAscii(a[i]), cb = foldAscii(b[i]);
+        if (ca != cb) return ca < cb ? -1 : 1;
+    }
+    if (a.size() == b.size()) return 0;
+    return a.size() < b.size() ? -1 : 1;
+}
+
 bool sstrContains(std::u16string_view hay, std::u16string_view needle) {
+    if (needle.empty()) return true;
+    if (needle.size() > hay.size()) return false;
+    // ASCII だけなら小文字化用の u16string を 2 本作らず、その場で
+    // 畳みながら走査する（`contains(長い文字列, 短い語)` はループ内で
+    // 呼ばれやすく、毎回 2 本のコピーは無駄 — TurboWarp の 3 倍差の主因）。
+    bool ascii = true;
+    for (char16_t c : hay) if (c >= 0x80) { ascii = false; break; }
+    if (ascii)
+        for (char16_t c : needle) if (c >= 0x80) { ascii = false; break; }
+    if (ascii) return containsAscii(hay, needle);
+    // Unicode case folding can expand characters and applies Final_Sigma
+    // contextually. Keep the established exact path for those uncommon inputs.
     std::u16string h = u16ToLower(hay);
     std::u16string n = u16ToLower(needle);
-    if (n.empty()) return true;
     return h.find(n) != std::u16string::npos;
+}
+
+bool sstrContains(const SStr* hay, const SStr* needle) {
+    if (needle->len == 0) return true;
+    if (needle->len > hay->len) return false;
+    // The ASCII property is cached, so a repeated contains() on the same
+    // haystack does not rescan it before the search itself.
+    if (hay->isAscii() && needle->isAscii())
+        return containsAscii(hay->view(), needle->view());
+    return sstrContains(hay->view(), needle->view());
 }
 
 SStr* sstrLower(std::u16string_view sv) {

@@ -60,6 +60,7 @@ bool waitShouldYield(JitCtx* c) {
     return !c->isWarp || c->runtime->dangerMode || isStuck(c);
 }
 
+#if !defined(XYO_DISABLE_RT_PROF)
 /// var 系ヘルパ別カウンタ（XYO_PROF 時に内容を表示）
 std::atomic<uint64_t> g_varCtrs[4] = {};
 struct VarCtrDump {
@@ -75,7 +76,11 @@ struct VarCtrDump {
         });
     }
 } g_varCtrDump;
+#else
+// Profiling counters and their process-startup environment checks are absent.
+#endif
 
+#if !defined(XYO_DISABLE_RT_PROF)
 /// compat opcode 別呼出数（XYO_PROF 時）
 std::unordered_map<std::string, uint64_t>& compatOps() {
     static auto* m = new std::unordered_map<std::string, uint64_t>;
@@ -93,6 +98,7 @@ std::unordered_map<std::string, uint64_t>& compatOps() {
     (void)once;
     return *m;
 }
+#endif  // !XYO_DISABLE_RT_PROF
 
 } // namespace
 
@@ -101,7 +107,15 @@ extern "C" {
 // --- 基本 -------------------------------------------------------------
 
 void xyo_yield(JitCtx* c) {
-    XYO_RT_PROF(kYield);
+#if !defined(XYO_DISABLE_RT_PROF)
+    // This is the per-iteration hot path of non-warp Scratch scripts.
+    // Avoid constructing two profiling guards when profiling is disabled.
+    if (RTProf::get().enabled) {
+        XYO_RT_PROF(kYield);
+        c->fiber->yield();
+        return;
+    }
+#endif
     c->fiber->yield();
 }
 
@@ -116,6 +130,28 @@ int32_t xyo_wait_should_yield(JitCtx* c) {
 void xyo_wait_yield(JitCtx* c) {
     XYO_RT_PROF(kLoopY);
     if (waitShouldYield(c)) xyo_yield(c);
+}
+
+void xyo_loop_yield(JitCtx* c);
+
+// An empty warp repeat has no observable body work. Preserve the exact
+// (++yieldCheckN & 63) sampling phase while jumping directly to each check.
+// Only called for nonnegative integral iteration counts <= 2^40.
+void xyo_empty_repeat_warp(JitCtx* c, double repetitions) {
+    uint64_t left = static_cast<uint64_t>(repetitions);
+    uint64_t counter = c->yieldCheckN;
+    while (left) {
+        const uint64_t untilCheck = 64 - (counter & 63);
+        if (left < untilCheck) {
+            counter += left;
+            break;
+        }
+        counter += untilCheck;
+        left -= untilCheck;
+        c->yieldCheckN = counter;
+        xyo_loop_yield(c);
+    }
+    c->yieldCheckN = counter;
 }
 
 /// loop 末尾の yield 点 — non-warp なら常に、warp なら stuck 時のみ
@@ -285,7 +321,9 @@ double xyo_round(double x) {
 Variable* xyo_jitVar(JitCtx* c, const char* id, const char16_t* name,
                      int list) {
     XYO_RT_PROF(kVar);
+#if !defined(XYO_DISABLE_RT_PROF)
     if (RTProf::get().enabled) ++g_varCtrs[0];
+#endif
     auto& cache = c->thread->jitVarCache;
     JitVarCacheKey key{id, name, list};
     auto it = cache.find(key);
@@ -306,7 +344,9 @@ void xyo_varslot_init(JitCtx* c, uint64_t idx, const char* id,
 
 uint64_t xyo_var_get(JitCtx* c, const char* id, const char16_t* name) {
     XYO_RT_PROF(kVar);
+#if !defined(XYO_DISABLE_RT_PROF)
     if (RTProf::get().enabled) ++g_varCtrs[1];
+#endif
     Variable* v = xyo_jitVar(c, id, name, false);
     return v ? toB(v->value) : toB(Value::undefined());
 }
@@ -314,7 +354,9 @@ uint64_t xyo_var_get(JitCtx* c, const char* id, const char16_t* name) {
 void xyo_var_set(JitCtx* c, const char* id, const char16_t* name,
                  uint64_t value) {
     XYO_RT_PROF(kVar);
+#if !defined(XYO_DISABLE_RT_PROF)
     if (RTProf::get().enabled) ++g_varCtrs[2];
+#endif
     Variable* v = xyo_jitVar(c, id, name, false);
     if (v) v->value = toV(value);
 }
@@ -322,7 +364,9 @@ void xyo_var_set(JitCtx* c, const char* id, const char16_t* name,
 void xyo_var_change(JitCtx* c, const char* id, const char16_t* name,
                     uint64_t value) {
     XYO_RT_PROF(kVar);
+#if !defined(XYO_DISABLE_RT_PROF)
     if (RTProf::get().enabled) ++g_varCtrs[3];
+#endif
     Variable* v = xyo_jitVar(c, id, name, false);
     if (v) {
         const double d = cast::toNumber(v->value) + cast::toNumber(toV(value));
@@ -401,6 +445,7 @@ void xyo_broadcast_wait_v(JitCtx* c, uint64_t v) {
     std::vector<Thread*> started =
         rt->startHats("event_whenbroadcastreceived", &m, nullptr);
     if (started.empty()) return;
+    c->joinRefs = &started;   // 回収側から見えるように（完了スレッドを守る）
     for (;;) {
         bool waiting = false, allWaiting = true;
         for (Thread* t : started) {
@@ -419,6 +464,7 @@ void xyo_broadcast_wait_v(JitCtx* c, uint64_t v) {
             allWaiting ? STATUS_YIELD_TICK : STATUS_YIELD;
         xyo_yield(c);
     }
+    c->joinRefs = nullptr;
     c->thread->status = STATUS_RUNNING;
 }
 
@@ -449,13 +495,19 @@ void xyo_rt_setarg(const BlockCached* op, const char* name, uint64_t v) {
 
 uint64_t xyo_rt_compat(JitCtx* c, const BlockCached* op) {
     XYO_RT_PROF(kCompat);
+#if !defined(XYO_DISABLE_RT_PROF)
     static bool profOps = std::getenv("XYO_PROF") != nullptr;
     if (profOps) compatOps()[op->opcode]++;
+#endif
     Thread* t = c->thread;
     BlockUtility& util = jitUtil(c);
     ExecContext ec;
     // プリミティブが stackFrame() を要求したとき合成 EC を返す
     util.jitCompatEc = &ec;
+    // compat 経由の broadcast and wait は startedThreads をこのファイバ
+    // ローカルの EC に持つ。完了スレッドの回収（Runtime::reclaimThreads）が
+    // 生ポインタ参照を辿れるよう、呼出し中だけ公開する。
+    c->joinRefs = &ec.startedThreads;
 
     Value rv = op->blockFunction
         ? op->blockFunction(op->argValues, util)
@@ -463,6 +515,7 @@ uint64_t xyo_rt_compat(JitCtx* c, const BlockCached* op) {
     for (;;) {
         if (t->status == STATUS_PROMISE_WAIT || t->status == STATUS_DONE) {
             util.jitCompatEc = nullptr;
+            c->joinRefs = nullptr;
             xyo_yield(c);
             return toB(Value::emptyStr());
         }
@@ -478,6 +531,7 @@ uint64_t xyo_rt_compat(JitCtx* c, const BlockCached* op) {
             : Value::undefined();
     }
     util.jitCompatEc = nullptr;
+    c->joinRefs = nullptr;
     return toB(rv);
 }
 

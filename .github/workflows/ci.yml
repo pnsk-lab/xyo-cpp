@@ -38,7 +38,7 @@ jobs:
         run: |
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DLLVM_CONFIG="/usr/lib/llvm-${LLVM_LATEST}/bin/llvm-config" \
-            -DXYO_REQUIRE_SDL2=ON
+            -DXYO_SDL2=ON -DXYO_REQUIRE_SDL2=ON -DXYO_FULL_BUILD=ON
 
       - name: Build
         run: cmake --build build -j"$(nproc)"
@@ -50,6 +50,15 @@ jobs:
         run: |
           bash tools/ci/smoke.sh run build/xyo
           bash tools/ci/smoke.sh play build/xyo
+          bash tools/ci/smoke.sh gui build/xyo
+
+      - name: フルビルド成果物（Linux）
+        uses: actions/upload-artifact@v5
+        with:
+          name: xyo-linux-full
+          path: build/xyo
+          if-no-files-found: error
+          retention-days: 7
 
       - name: 失敗時のテストログ
         if: failure()
@@ -156,7 +165,7 @@ jobs:
         run: |
           cmake -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DXYO_JIT=ON -DXYO_LLVM_MODE=config \
-            -DXYO_SDL2=ON -DXYO_REQUIRE_SDL2=ON \
+            -DXYO_SDL2=ON -DXYO_REQUIRE_SDL2=ON -DXYO_FULL_BUILD=ON \
             -DXYO_BUILD_TESTS=OFF
           cmake --build build-win -j"$(nproc)"
           ls -l build-win/xyo.exe
@@ -165,13 +174,14 @@ jobs:
         run: |
           bash tools/ci/smoke.sh run build-win/xyo.exe --jit-log
           bash tools/ci/smoke.sh play build-win/xyo.exe
+          bash tools/ci/smoke.sh gui build-win/xyo.exe
 
       - name: Build（JIT + SDL2、完全静的）
         run: |
           cmake -B build-win-static -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DXYO_JIT=ON -DXYO_LLVM_MODE=llvm-config \
             -DXYO_STATIC=ON -DXYO_STATIC_LLVM=ON \
-            -DXYO_SDL2=ON -DXYO_REQUIRE_SDL2=ON \
+            -DXYO_SDL2=ON -DXYO_REQUIRE_SDL2=ON -DXYO_FULL_BUILD=ON \
             -DXYO_BUILD_TESTS=OFF
           cmake --build build-win-static -j"$(nproc)"
           ls -l build-win-static/xyo.exe
@@ -186,3 +196,12 @@ jobs:
         run: |
           bash tools/ci/smoke.sh run build-win-static/xyo.exe
           bash tools/ci/smoke.sh play build-win-static/xyo.exe
+          bash tools/ci/smoke.sh gui build-win-static/xyo.exe
+
+      - name: フルビルド成果物（Windows / SDL2 静的リンク）
+        uses: actions/upload-artifact@v5
+        with:
+          name: xyo-windows-full
+          path: build-win-static/xyo.exe
+          if-no-files-found: error
+          retention-days: 7

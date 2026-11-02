@@ -1451,8 +1451,9 @@ int test_frame_capture() {
     CHECK(ren.init(rt, 1));
     rt.renderer = &ren;
 
-    const char* p1 = "/tmp/xyo_frame_capture_a.ppm";
-    const char* p2 = "/tmp/xyo_frame_capture_b.ppm";
+    // CTest の作業ディレクトリへ保存する（/tmp は sandbox で書込不可の場合がある）。
+    const char* p1 = "xyo_frame_capture_a.ppm";
+    const char* p2 = "xyo_frame_capture_b.ppm";
     int calls = 0;
     ren.setFrameCapture([&] {
         ++calls;
@@ -1483,6 +1484,8 @@ int test_frame_capture() {
     CHECK(ppmCount(p1, isWhite) > 0);
     CHECK_EQ(ppmCount(p1, isRed), 0);
     CHECK(ppmCount(p2, isRed) > 0);
+    std::remove(p1);
+    std::remove(p2);
 
     std::printf("frame-capture: %d checks, %d failures\n", g_checks, g_fail);
     return g_fail;

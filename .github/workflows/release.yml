@@ -30,7 +30,7 @@ jobs:
             -DXYO_BUILD_TESTS=OFF \
             -DXYO_LLVM_MODE=llvm-config \
             -DLLVM_CONFIG="/usr/lib/llvm-${LLVM_STATIC}/bin/llvm-config" \
-            -DXYO_REQUIRE_SDL2=ON \
+            -DXYO_SDL2=ON -DXYO_REQUIRE_SDL2=ON -DXYO_FULL_BUILD=ON \
             -DXYO_STATIC_LLVM=ON
           cmake --build build -j"$(nproc)"
           echo "--- libLLVM に依存していないこと ---"
@@ -40,6 +40,7 @@ jobs:
         run: |
           bash tools/ci/smoke.sh run build/xyo
           bash tools/ci/smoke.sh play build/xyo
+          bash tools/ci/smoke.sh gui build/xyo
 
       - name: パッケージ
         run: |
@@ -129,7 +130,7 @@ jobs:
           cmake -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DXYO_JIT=ON -DXYO_LLVM_MODE=llvm-config \
             -DXYO_STATIC=ON -DXYO_STATIC_LLVM=ON \
-            -DXYO_SDL2=ON -DXYO_REQUIRE_SDL2=ON \
+            -DXYO_SDL2=ON -DXYO_REQUIRE_SDL2=ON -DXYO_FULL_BUILD=ON \
             -DXYO_BUILD_TESTS=OFF
           cmake --build build-win -j"$(nproc)"
           strip -s build-win/xyo.exe
@@ -145,6 +146,7 @@ jobs:
         run: |
           bash tools/ci/smoke.sh run build-win/xyo.exe --jit-log
           bash tools/ci/smoke.sh play build-win/xyo.exe
+          bash tools/ci/smoke.sh gui build-win/xyo.exe
 
       - name: パッケージ
         run: |

@@ -536,7 +536,7 @@ struct Codegen {
     /// fiber=nullptr での同期実行を壊すため新規 yield 追加時は必ず更新）。
     static bool helperMayYield(const char* n) {
         static const std::unordered_set<std::string_view> k = {
-            "xyo_loop_yield", "xyo_wait_yield", "xyo_rt_wait", "xyo_stop_all",
+            "xyo_yield", "xyo_yield_fast", "xyo_loop_yield", "xyo_wait_yield", "xyo_rt_wait", "xyo_stop_all",
             "xyo_stop_script", "xyo_broadcast_wait_v", "xyo_rt_compat",
             "xyo_rt_reporter", "xyo_mot_glidexy", "xyo_mot_glideto",
             "xyo_looks_saysecs", "xyo_looks_thinksecs",
@@ -682,20 +682,18 @@ struct Codegen {
     static constexpr uint32_t kYieldCheckNOff =
         uint32_t(offsetof(JitCtx, yieldCheckN));
 
-    /// ループ末尾の yield 点。non-warp は常に xyo_loop_yield。
+    /// ループ末尾の yield 点。non-warp は直接 xyo_yield(_fast)。
     /// warp は 500ms stuck 窓の時計読みを 64 回に 1 回へ間引く
     /// （判定遅延 << 500ms）。xyo_loop_yield 内で isWarp/isStuck を
     /// 再確認するので意味論は不変。
     void beginLoopYieldScope() {
-        yieldStack.push_back({curYieldCnt, curYieldWarp, curYieldMask});
+        yieldStack.push_back({curYieldCnt, curYieldWarp});
         curYieldCnt = entryAlloca(i64t, 1, "ycnt");
         b.CreateStore(
             b.CreateLoad(i64t,
                          b.CreateConstGEP1_32(i8t, ctxArg, kYieldCheckNOff)),
             curYieldCnt);
         curYieldWarp = loadIsWarp();
-        curYieldMask = b.CreateSelect(
-            b.CreateICmpNE(curYieldWarp, ci32(0)), ci64(63), ci64(0));
     }
     /// storeBack: ループが通常脱出するなら ctx へ書き戻す（global 位相を保つ）。
     void endLoopYieldScope(bool storeBack) {
@@ -706,17 +704,9 @@ struct Codegen {
         yieldStack.pop_back();
         curYieldCnt = s.cnt;
         curYieldWarp = s.warp;
-        curYieldMask = s.mask;
     }
     void emitLoopYield() {
-        // warp: 64 回に 1 回だけ yield。非 warp: mask=0 なので毎回 yield。
-        // ループ不変な isWarp の分岐を毎反復から外し、判定を 1 分岐にする。
-        llvm::Value* mask = curYieldMask;
-        if (!mask) {
-            llvm::Value* iw = curYieldWarp ? curYieldWarp : loadIsWarp();
-            mask = b.CreateSelect(b.CreateICmpNE(iw, ci32(0)), ci64(63),
-                                  ci64(0));
-        }
+        // non-warp は毎反復 yield。warp は 64 回に 1 回 stuck を検査。
         BasicBlock* chkBB = BasicBlock::Create(lc, "", fn);
         BasicBlock* done = BasicBlock::Create(lc, "", fn);
         llvm::Value* np = curYieldCnt
@@ -724,8 +714,24 @@ struct Codegen {
             : b.CreateConstGEP1_32(i8t, ctxArg, kYieldCheckNOff);
         llvm::Value* n = b.CreateAdd(b.CreateLoad(i64t, np), ci64(1));
         b.CreateStore(n, np);
+        // Non-warp loops must yield on every iteration. Bypass the generic
+        // helper and its warp/time checks, leaving the 64-iteration sampling
+        // only on the warp path. The counter still advances on both paths.
+        llvm::Value* warp = curYieldWarp ? curYieldWarp : loadIsWarp();
+        BasicBlock* warpBB = BasicBlock::Create(lc, "", fn);
+        BasicBlock* normalBB = BasicBlock::Create(lc, "", fn);
+        b.CreateCondBr(b.CreateICmpEQ(warp, ci32(0)), normalBB, warpBB);
+        b.SetInsertPoint(normalBB);
+        spillPromoted();
+        if (std::getenv("XYO_PROF"))
+            call1("xyo_yield", voidt, ctxArg);
+        else
+            call1("xyo_yield_fast", voidt, ctxPtr(4));
+        reloadPromoted();
+        b.CreateBr(done);
+        b.SetInsertPoint(warpBB);
         llvm::Value* due =
-            b.CreateICmpEQ(b.CreateAnd(n, mask), ci64(0));
+            b.CreateICmpEQ(b.CreateAnd(n, ci64(63)), ci64(0));
         hotBr(due, chkBB, done, 1, 63);
         b.SetInsertPoint(chkBB);
         spillPromoted();
@@ -769,6 +775,7 @@ struct Codegen {
         const BlockField* field;
         llvm::AllocaInst* slot;   // i64 bits（常に有効・正準表現）
         llvm::AllocaInst* dslot;  // f64（numeric のときだけ non-null）
+        llvm::AllocaInst* okslot; // i1: d を比較に使ってよいか
         bool numeric = false;
     };
     /// ループ内で item/replace/length だけを受けるリストは、SList の
@@ -784,6 +791,11 @@ struct Codegen {
     /// 昇格した数値変数の「boxed bits → f64」対応。emitToNumF64 が
     /// タグ検査・NaN 正規化・GP↔XMM 移動なしで値を返せるようにする。
     std::unordered_map<llvm::Value*, llvm::Value*> knownNumD;
+    /// knownNumD の値が「比較の数値 fast path に載せてよい」か（i1）。
+    /// 影は toNum の結果なので、非数値文字列は NaN、数値文字列は数値、
+    /// 空白のみの文字列は 0 になる — 数値比較になるのは「素の double で
+    /// 非 NaN」のときだけ（空白のみの文字列は cast::compare が文字列比較）。
+    std::unordered_map<llvm::Value*, llvm::Value*> knownNumOk;
     struct ReadNumberMemo {
         AllocaInst* key;
         AllocaInst* number;
@@ -802,14 +814,10 @@ struct Codegen {
     struct YieldScope {
         llvm::AllocaInst* cnt;
         llvm::Value* warp;
-        llvm::Value* mask;
     };
     std::vector<YieldScope> yieldStack;
     llvm::AllocaInst* curYieldCnt = nullptr;
     llvm::Value* curYieldWarp = nullptr;
-    /// warp なら 63、非 warp なら 0。`(counter & mask) == 0` が
-    /// 「yield する」判定になり、非 warp は毎反復 true になる。
-    llvm::Value* curYieldMask = nullptr;
     bool promotingLoop = false;   // このループが write-back を持つ（最外）
     // Only constValue registers immutable string literals, keyed by their exact
     // emitted boxed Value, never by interpreting arbitrary ConstantInt pointers.
@@ -1006,6 +1014,16 @@ struct Codegen {
         uint32_t(offsetof(SStr, len));
     static constexpr uint32_t kSStrDataOff =
         uint32_t(sizeof(SStr));
+    static constexpr uint32_t kSStrFlagsOff =
+        uint32_t(offsetof(SStr, flags));
+    /// 連結ノード（cons string）は本文が構造体直後に無い — inline の
+    /// 文字列 fast path は必ず helper へ落とす。
+    llvm::Value* emitIsConsStr(llvm::Value* sp) {
+        llvm::Value* f = b.CreateLoad(
+            i32t, b.CreateConstGEP1_32(i8t, sp, kSStrFlagsOff));
+        return b.CreateICmpNE(
+            b.CreateAnd(f, ci32(SStr::kConsFlag)), ci32(0));
+    }
     static constexpr uint32_t kSStrRgbStateOff =
         uint32_t(offsetof(SStr, rgbState));
     static constexpr uint32_t kSStrRgbCacheOff =
@@ -1089,6 +1107,34 @@ struct Codegen {
         };
         return kOk.count(op) != 0;
     }
+    /// ループ内で「数値を生まない」書き込みを受ける変数の id。
+    /// こういう変数に f64 の数値影を持たせると、代入のたびに toNum が要る
+    /// （文字列なら view() = flatten — cons string を毎回 materialize して
+    /// しまい、連結ループが O(n²) に戻る）。影は最適化なので、疑わしければ
+    /// 付けない（意味論は tagged 経路で常に正しい）。
+    std::unordered_set<std::string> nonNumericVars;
+
+    /// 代入値が数値を生むと静的に言えるか（保守的）。
+    bool valueIsNumeric(Block* blk, const char* input) {
+        const BlockInput* in = blk->inputs.find(input);
+        if (!in) return false;
+        const std::string& id = in->block.empty() ? in->shadow : in->block;
+        if (id.empty()) return false;   // 圧縮プリミティブ
+        Block* v = blocks->getBlock(id);
+        if (!v) return false;
+        static const std::unordered_set<std::string> kNum = {
+            "math_number", "operator_add", "operator_subtract",
+            "operator_multiply", "operator_divide", "operator_mod",
+            "operator_round", "operator_mathop", "data_variable",
+            "data_itemoflist", "data_lengthoflist",
+            "sensing_timer", "sensing_dayssince2000", "sensing_answer",
+            "sensing_loudness", "motion_xposition", "motion_yposition",
+            "motion_direction", "looks_size", "control_get_counter",
+            "sensing_mousex", "sensing_mousey",
+        };
+        return kNum.count(v->opcode) != 0;
+    }
+
     bool scanPromotable(const std::string& firstId,
                         std::vector<const BlockField*>& vars,
                         std::vector<const BlockField*>& lists) {
@@ -1121,6 +1167,9 @@ struct Codegen {
                 const BlockField* f = findField(b2, "VARIABLE");
                 if (!f) return false;
                 if (varIds.insert(f->id).second) vars.push_back(f);
+                if (b2->opcode != "data_variable" &&
+                    !valueIsNumeric(b2, "VALUE"))
+                    nonNumericVars.insert(f->id);
             }
             if (b2->opcode == "data_itemoflist" ||
                 b2->opcode == "data_replaceitemoflist" ||
@@ -1146,6 +1195,7 @@ struct Codegen {
         if (!in || in->block.empty()) return false;
         std::vector<const BlockField*> vars;
         std::vector<const BlockField*> lists;
+        nonNumericVars.clear();
         // The body plus every other input of the loop block: repeat_until /
         // while re-evaluate CONDITION inside the loop, so its accesses must be
         // part of the promotion set (a procedure call there would write the
@@ -1163,6 +1213,13 @@ struct Codegen {
             }
         }
         if (!ok) return false;
+        // for_each implicitly writes VARIABLE before running its body.
+        // Include that slot even when the body never refers to it, so the
+        // regular yield spill/reload and loop-exit writeback stay coherent.
+        if (loopBlk->opcode == "control_for_each") {
+            if (const BlockField* f = findField(loopBlk, "VARIABLE"))
+                vars.push_back(f);
+        }
         if (vars.empty() && lists.empty()) return false;
         // Each input of the loop block is scanned separately, so the same
         // variable can be collected more than once — dedupe by id. A duplicate
@@ -1173,24 +1230,27 @@ struct Codegen {
         for (const BlockField* f : vars)
             if (!f->id.empty() && seenVar.insert(f->id).second)
                 uniq.push_back(f);
-        // 数値特化の可否: ループ直前（直線区間）で全昇格変数が数値と
-        // 証明できていれば、影を f64 のまま持てる。証明できなければ
-        // 従来の i64（boxed）影にする。
-        // 影は (bits, d=toNum(bits)) の対で常に整合するので、どのループでも
-        // 数値特化してよい（非数値の読み書きは従来どおり helper 経由）。
-        const bool numeric = !uniq.empty();
+        // 数値影の可否は**変数ごと**に決める: ループ内の書き込みがすべて
+        // 数値を生むと分かる変数だけ f64 の影を持つ。文字列を受ける変数に
+        // 影を持たせると、代入のたびに toNum（= view = flatten）が走る。
         for (const BlockField* f : uniq) {
             AllocaInst* slot = entryAlloca(i64t, 1, "pv");
             llvm::Value* init = b.CreateLoad(i64t, realVarValuePtr(f));
             b.CreateStore(init, slot);
             AllocaInst* ds = nullptr;
+            AllocaInst* oks = nullptr;
+            const bool numeric = !nonNumericVars.count(f->id);
             if (numeric) {
                 ds = entryAlloca(f64t, 1, "pvd");
                 // 不変条件: d == toNum(bits)。初期値は文字列でもよい
                 // （"0" のような数値リテラルは constValue が畳む）。
-                b.CreateStore(emitToNumF64(init), ds);
+                llvm::Value* d0 = emitToNumF64(init);
+                b.CreateStore(d0, ds);
+                // 比較に d を使ってよいのは初期値が素の double のとき。
+                oks = entryAlloca(b.getInt1Ty(), 1, "pvok");
+                b.CreateStore(numericCmpOk(init, d0), oks);
             }
-            promoted.push_back({f, slot, ds, numeric});
+            promoted.push_back({f, slot, ds, oks, numeric});
         }
         // リストヘッダ (len/items) を preheader へ。リストは slot init で
         // lookupOrCreateList 済みなので通常は非 null だが、null 経路でも
@@ -1274,7 +1334,11 @@ struct Codegen {
             auto* ld = b.CreateLoad(i64t, realVarValuePtr(p.field));
             ld->setVolatile(true);   // 呼出し前の store を畳ませない
             b.CreateStore(ld, p.slot);
-            if (p.numeric) b.CreateStore(emitToNumF64(ld), p.dslot);
+            if (p.numeric) {
+                llvm::Value* d = emitToNumF64(ld);
+                b.CreateStore(d, p.dslot);
+                b.CreateStore(numericCmpOk(ld, d), p.okslot);
+            }
         }
         // A yielded script may resize or clear a list. Keep only the SList*
         // invariant; len/items must be refreshed before any resumed access.
@@ -1324,20 +1388,36 @@ struct Codegen {
             if (p.field->id == f->id) return &p;
         return nullptr;
     }
+    /// 比較の数値 fast path に載せてよいか（素の double かつ非 NaN）。
+    /// 影の d だけでは足りない — toNum(" ")==0 だが cast::compare は
+    /// 空白のみの文字列を文字列比較する（"1000" のような数値文字列は
+    /// 数値比較でよいので d がそのまま使える）。
+    llvm::Value* numericCmpOk(llvm::Value* bits, llvm::Value* d) {
+        return b.CreateAnd(b.CreateICmpSLT(bits, ci64(val::kNan)),
+                           b.CreateFCmpORD(d, d));
+    }
     /// (bits, d) の整合ペアを書き込む。NaN は bits=kNan / d=0 に落とす
     /// （Scratch の正準表現 + toNum(NaN)=0 を、読み出し側の検査なしで保つ）。
+    /// ok は「比較に d を使えるか」— 省略時は (bits, d) から判定する。
     void storeNumericPair(PromotedVar& p, llvm::Value* bits,
-                          llvm::Value* d) {
+                          llvm::Value* d, llvm::Value* ok = nullptr) {
         b.CreateStore(bits, p.slot);
         b.CreateStore(d, p.dslot);
+        llvm::Value* o = ok ? ok : numericCmpOk(bits, d);
+        b.CreateStore(o, p.okslot);
         knownNumD[bits] = d;
+        knownNumOk[bits] = o;
     }
     llvm::Value* emitVarGet(const BlockField* f) {
         // jitVar（lookupOrCreate）は常に非 null — helper の v? ガードと等価
         llvm::Value* vp = varValuePtr(f);
         llvm::Value* bits = b.CreateLoad(i64t, vp);
-        if (PromotedVar* p = findPromoted(f))
-            if (p->numeric) knownNumD[bits] = b.CreateLoad(f64t, p->dslot);
+        if (PromotedVar* p = findPromoted(f)) {
+            if (p->numeric) {
+                knownNumD[bits] = b.CreateLoad(f64t, p->dslot);
+                knownNumOk[bits] = b.CreateLoad(b.getInt1Ty(), p->okslot);
+            }
+        }
         return bits;
     }
     void emitVarSet(const BlockField* f, llvm::Value* val) {
@@ -1382,11 +1462,9 @@ struct Codegen {
             }
             if (finite) {
                 // 影の d は決して NaN にならない（toNum の結果）ので、
-                // 有限デルタでは結果も NaN にならない。
+                // 有限デルタでは結果も NaN にならない = 数値比較可。
                 llvm::Value* rb = b.CreateBitCast(r, i64t);
-                b.CreateStore(r, pv->dslot);
-                b.CreateStore(rb, pv->slot);
-                knownNumD[rb] = r;
+                storeNumericPair(*pv, rb, r, b.getInt1(true));
             } else if (finiteJoin || memoizableListReads.count(delta)) {
                 // Keep NaN repair off the ordinary list-accumulation carry,
                 // including when coercion memoization is explicitly disabled.
@@ -1394,14 +1472,17 @@ struct Codegen {
                 BasicBlock* repair = BasicBlock::Create(lc, "change.nan", fn);
                 BasicBlock* normal = BasicBlock::Create(lc, "change.number", fn);
                 BasicBlock* merge = BasicBlock::Create(lc, "change.done", fn);
-                hotBr(b.CreateFCmpUNO(r, r), repair, normal, 1, 1000000);
+                llvm::Value* isNan = b.CreateFCmpUNO(r, r);
+                hotBr(isNan, repair, normal, 1, 1000000);
                 b.SetInsertPoint(normal);
-                storeNumericPair(*pv, b.CreateBitCast(r, i64t), r);
+                storeNumericPair(*pv, b.CreateBitCast(r, i64t), r,
+                                 b.getInt1(true));
                 b.CreateBr(merge);
                 b.SetInsertPoint(repair);
                 b.CreateCall(llvmc::intrinsicDeclaration(&mod, Intrinsic::sideeffect));
                 b.CreateStore(cf64(0.0), pv->dslot);
                 b.CreateStore(ci64(val::kNan), pv->slot);
+                b.CreateStore(b.getInt1(false), pv->okslot);
                 b.CreateBr(merge);
                 b.SetInsertPoint(merge);
             } else {
@@ -1413,7 +1494,10 @@ struct Codegen {
                     isn, ci64(val::kNan), b.CreateBitCast(r, i64t));
                 b.CreateStore(dv, pv->dslot);
                 b.CreateStore(bv, pv->slot);
+                llvm::Value* ok = b.CreateNot(isn);
+                b.CreateStore(ok, pv->okslot);
                 knownNumD[bv] = dv;
+                knownNumOk[bv] = ok;
             }
             if (finiteJoin) {
                 b.CreateBr(finiteJoin);
@@ -1451,12 +1535,105 @@ struct Codegen {
         case AOp::Mul: r = b.CreateFMul(fa, fb); break;
         case AOp::Div: r = b.CreateFDiv(fa, fb); break;
         case AOp::Mod: {
-            // scratch-vm: r = n % m; if (r / m < 0) r += m;
-            // ((n % m) + m) % m は m=Infinity で NaN、巨大 m で桁落ちする。
-            llvm::Value* r0 = b.CreateFRem(fa, fb);
-            llvm::Value* signDiff =
-                b.CreateFCmpOLT(b.CreateFDiv(r0, fb), cf64(0.0));
-            r = b.CreateSelect(signDiff, b.CreateFAdd(r0, fb), r0);
+            // Scratch: rem = fmod(n,m); rem/m < 0 ? rem+m : rem.
+            // For an integral positive constant divisor, use integer srem
+            // only if the dividend is exactly a representable integer. In
+            // this range srem has the same mathematical remainder as fmod.
+            // Preserve negative zero when a negative multiple divides evenly.
+            auto slowMod = [&]() -> llvm::Value* {
+                llvm::Value* r0 = b.CreateFRem(fa, fb);
+                llvm::Value* signDiff =
+                    b.CreateFCmpOLT(b.CreateFDiv(r0, fb), cf64(0.0));
+                return b.CreateSelect(signDiff, b.CreateFAdd(r0, fb), r0);
+            };
+            auto* div = dyn_cast<ConstantFP>(fb);
+            double m = div ? div->getValueAPF().convertToDouble() : 0.0;
+            if (m >= 1 && m <= 2147483647.0 && std::trunc(m) == m) {
+                BasicBlock* checkInt = BasicBlock::Create(lc, "mod.range", fn);
+                BasicBlock* fast = BasicBlock::Create(lc, "mod.int", fn);
+                BasicBlock* slow = BasicBlock::Create(lc, "mod.float", fn);
+                BasicBlock* merge = BasicBlock::Create(lc, "mod.done", fn);
+                llvm::Value* inRange = b.CreateAnd(
+                    b.CreateAnd(
+                        b.CreateFCmpOGT(fa, cf64(-4503599627370496.0)),
+                        b.CreateFCmpOLT(fa, cf64(4503599627370496.0))),
+                    b.CreateFCmpONE(fa, cf64(0.0)));
+                b.CreateCondBr(inRange, checkInt, slow);
+                b.SetInsertPoint(checkInt);
+                llvm::Value* n = b.CreateFPToSI(fa, i64t);
+                llvm::Value* exact = b.CreateFCmpOEQ(
+                    b.CreateSIToFP(n, f64t), fa);
+                b.CreateCondBr(exact, fast, slow);
+                b.SetInsertPoint(fast);
+                llvm::Value* rem = b.CreateSRem(n, ci64(uint64_t(m)));
+                llvm::Value* adjusted = b.CreateSelect(
+                    b.CreateICmpSLT(rem, ci64(0)),
+                    b.CreateAdd(rem, ci64(uint64_t(m))), rem);
+                llvm::Value* integerResult = b.CreateSIToFP(adjusted, f64t);
+                llvm::Value* negativeZero = b.CreateAnd(
+                    b.CreateICmpEQ(rem, ci64(0)),
+                    b.CreateICmpSLT(n, ci64(0)));
+                llvm::Value* fastResult = b.CreateSelect(
+                    negativeZero, cf64(-0.0), integerResult);
+                b.CreateBr(merge);
+                b.SetInsertPoint(slow);
+                llvm::Value* slowResult = slowMod();
+                b.CreateBr(merge);
+                b.SetInsertPoint(merge);
+                PHINode* result = b.CreatePHI(f64t, 2);
+                result->addIncoming(fastResult, fast);
+                result->addIncoming(slowResult, slow);
+                r = result;
+            } else {
+                // Variable divisor: exact integer operands also admit a
+                // native signed remainder. Both conversions are performed
+                // only after a finite-range check (fptosi would otherwise
+                // produce poison for NaN/Infinity/out-of-range values).
+                BasicBlock* checkInt = BasicBlock::Create(lc, "mod.var.range", fn);
+                BasicBlock* fast = BasicBlock::Create(lc, "mod.var.int", fn);
+                BasicBlock* slow = BasicBlock::Create(lc, "mod.var.float", fn);
+                BasicBlock* merge = BasicBlock::Create(lc, "mod.var.done", fn);
+                auto inSignedRange = [&](llvm::Value* x) {
+                    return b.CreateAnd(
+                        b.CreateFCmpOGT(x, cf64(-4503599627370496.0)),
+                        b.CreateFCmpOLT(x, cf64(4503599627370496.0)));
+                };
+                llvm::Value* range = b.CreateAnd(
+                    b.CreateAnd(inSignedRange(fa), inSignedRange(fb)),
+                    b.CreateAnd(b.CreateFCmpONE(fa, cf64(0.0)),
+                                b.CreateFCmpONE(fb, cf64(0.0))));
+                b.CreateCondBr(range, checkInt, slow);
+                b.SetInsertPoint(checkInt);
+                llvm::Value* ni = b.CreateFPToSI(fa, i64t);
+                llvm::Value* di = b.CreateFPToSI(fb, i64t);
+                llvm::Value* ints = b.CreateAnd(
+                    b.CreateFCmpOEQ(b.CreateSIToFP(ni, f64t), fa),
+                    b.CreateFCmpOEQ(b.CreateSIToFP(di, f64t), fb));
+                b.CreateCondBr(ints, fast, slow);
+                b.SetInsertPoint(fast);
+                llvm::Value* rem = b.CreateSRem(ni, di);
+                llvm::Value* neg = b.CreateXor(
+                    b.CreateICmpSLT(rem, ci64(0)),
+                    b.CreateICmpSLT(di, ci64(0)));
+                llvm::Value* adjust = b.CreateAnd(
+                    neg, b.CreateICmpNE(rem, ci64(0)));
+                llvm::Value* wrapped = b.CreateSelect(
+                    adjust, b.CreateAdd(rem, di), rem);
+                llvm::Value* result = b.CreateSIToFP(wrapped, f64t);
+                llvm::Value* negZero = b.CreateAnd(
+                    b.CreateICmpEQ(rem, ci64(0)),
+                    b.CreateICmpSLT(ni, ci64(0)));
+                result = b.CreateSelect(negZero, cf64(-0.0), result);
+                b.CreateBr(merge);
+                b.SetInsertPoint(slow);
+                llvm::Value* fallback = slowMod();
+                b.CreateBr(merge);
+                b.SetInsertPoint(merge);
+                PHINode* phi = b.CreatePHI(f64t, 2);
+                phi->addIncoming(result, fast);
+                phi->addIncoming(fallback, slow);
+                r = phi;
+            }
             break;
         }
         }
@@ -1477,11 +1654,18 @@ struct Codegen {
     /// 経路（空白のみ = state 3 で文字列比較）を飛ばしてよい。
     llvm::Value* emitCmpNumF64(llvm::Value* bits, llvm::Value** okOut,
                                bool foldLiteral = false) {
-        // 昇格した数値変数: 影の f64 をそのまま比較に使う（タグ検査・
-        // NaN 判定・GP↔XMM 移動なし）。比較は NaN を素通ししてよい
-        // （cast::compare の数値比較は NaN で false）。
+        // 昇格した変数の影: (bits, d=toNum(bits)) の d をそのまま使う。
+        // ただし **d が非 NaN でも数値比較になるとは限らない** — 昇格は
+        // 「ループ内のアクセスが inline で完結する」だけで型は証明して
+        // いないので bits は任意の文字列でありうる（toNum(" ")==0 だが
+        // cast::compare は文字列比較）。可否は変数ごとに持ち
+        // （numericCmpOk）、書き込み側で更新しておく — 比較のたびに
+        // タグ検査を出すと分岐が増えてループが伸びる。
         if (auto it = knownNumD.find(bits); it != knownNumD.end()) {
-            *okOut = b.getInt1(true);
+            auto ok = knownNumOk.find(bits);
+            *okOut = ok != knownNumOk.end()
+                         ? ok->second
+                         : numericCmpOk(bits, it->second);
             return it->second;
         }
         if (foldLiteral) {
@@ -1642,6 +1826,7 @@ struct Codegen {
         BasicBlock* cacheBB = BasicBlock::Create(lc, "", fn);
         BasicBlock* slowBB = BasicBlock::Create(lc, "", fn);
         BasicBlock* merge = BasicBlock::Create(lc, "", fn);
+        BasicBlock* numLetterBB = BasicBlock::Create(lc, "", fn);
         b.CreateCondBr(emitIsNum(l), numBB, slowBB);
         b.SetInsertPoint(numBB);
         b.CreateCondBr(b.CreateICmpEQ(
@@ -1651,6 +1836,9 @@ struct Codegen {
         b.SetInsertPoint(strBB);
         llvm::Value* sp = b.CreateIntToPtr(
             b.CreateAnd(s, ci64(val::kPtrMask)), ptrt);
+        // 連結ノードは本文が別確保 — helper（view() が flatten する）へ。
+        b.CreateCondBr(emitIsConsStr(sp), slowBB, numLetterBB);
+        b.SetInsertPoint(numLetterBB);
         // i0 = trunc(toNumber(letter))-1 — |x|>1e18 は整数域外になる
         // ので先にクランプして fptosi の poison を避ける
         llvm::Value* lf = emitToNumF64(l);
@@ -1689,6 +1877,45 @@ struct Codegen {
         b.SetInsertPoint(merge);
         PHINode* p = b.CreatePHI(i64t, 2);
         p->addIncoming(fastBits, cacheBB);
+        p->addIncoming(hv, slowBB);
+        return p;
+    }
+
+    /// operator_length の fast path: 文字列タグなら len を直接読む。
+    /// 空文字列シングルトンは 0。それ以外は xyo_strlen へ（数値や真偽値の
+    /// 文字列化は確保を伴うので helper に任せる）。
+    llvm::Value* emitLength(Block* blk) {
+        llvm::Value* s = emitInputOf(blk, "STRING");
+        BasicBlock* strBB = BasicBlock::Create(lc, "", fn);
+        BasicBlock* slowBB = BasicBlock::Create(lc, "", fn);
+        BasicBlock* merge = BasicBlock::Create(lc, "", fn);
+        llvm::Value* empty = b.CreateICmpEQ(s, ci64(val::kEmptyStr));
+        llvm::Value* tagged = b.CreateICmpEQ(b.CreateLShr(s, ci64(48)),
+                                             ci64(val::kTagStr >> 48));
+        b.CreateCondBr(b.CreateOr(empty, tagged), strBB, slowBB);
+        b.SetInsertPoint(strBB);
+        llvm::Value* sp = b.CreateIntToPtr(
+            b.CreateAnd(s, ci64(val::kPtrMask)), ptrt);
+        // A select does not guard its operands: branch around the load for
+        // the empty singleton, which has no SStr payload.
+        BasicBlock* emptyBB = b.GetInsertBlock();
+        BasicBlock* loadBB = BasicBlock::Create(lc, "", fn);
+        b.CreateCondBr(empty, merge, loadBB);
+        b.SetInsertPoint(loadBB);
+        llvm::Value* len = b.CreateZExt(b.CreateLoad(i32t,
+            b.CreateConstGEP1_32(i8t, sp, kSStrLenOff)), i64t);
+        // Numbers are the raw double bits (the NaN-box tag is the leftmost
+        // 0x7FF8 group, which a u32 length can never produce).
+        llvm::Value* fast =
+            b.CreateBitCast(b.CreateUIToFP(len, f64t), i64t);
+        b.CreateBr(merge);
+        b.SetInsertPoint(slowBB);
+        llvm::Value* hv = b.CreateCall(decl("xyo_strlen", i64t, {i64t}), {s});
+        b.CreateBr(merge);
+        b.SetInsertPoint(merge);
+        PHINode* p = b.CreatePHI(i64t, 3);
+        p->addIncoming(ci64(Value::num(0).bits), emptyBB);
+        p->addIncoming(fast, loadBB);
         p->addIncoming(hv, slowBB);
         return p;
     }
@@ -1739,6 +1966,7 @@ struct Codegen {
         BasicBlock* lenBB = newBB("eq.lit.len");
         BasicBlock* wordBB = newBB("eq.lit.word");
         BasicBlock* compareBB = newBB("eq.lit.compare");
+        BasicBlock* lenZeroBB = newBB("eq.lit.lenzero");
         BasicBlock* ret0BB = newBB("eq.lit.no");
         BasicBlock* ret1BB = newBB("eq.lit.yes");
         BasicBlock* helperBB = newBB("eq.lit.slow");
@@ -1750,6 +1978,8 @@ struct Codegen {
         llvm::Value* sp = b.CreateIntToPtr(
             b.CreateAnd(dynamic, ci64(val::kPtrMask)), ptrt);
         llvm::Value* len = b.CreateLoad(i32t, fld(sp, kSStrLenOff));
+        b.CreateCondBr(emitIsConsStr(sp), helperBB, lenZeroBB);
+        b.SetInsertPoint(lenZeroBB);
         b.CreateCondBr(b.CreateICmpEQ(len, ci32(0)), ret0BB, firstBB);
         b.SetInsertPoint(firstBB);
         llvm::Value* first = b.CreateLoad(i16t, fld(sp, kSStrDataOff));
@@ -1854,6 +2084,12 @@ struct Codegen {
             b.CreateAnd(bv, ci64(val::kPtrMask)), ptrt);
         BasicBlock* memBB  = newBB("eq.mc");
         BasicBlock* diffBB = newBB("eq.df");
+        // 連結ノードは本文が構造体直後に無いので helper（view が flatten）。
+        BasicBlock* flatBB = newBB("eq.flat");
+        b.CreateCondBr(
+            b.CreateOr(emitIsConsStr(sp1), emitIsConsStr(sp2)),
+            helperBB, flatBB);
+        b.SetInsertPoint(flatBB);
         llvm::Value* l1 = b.CreateLoad(
             i32t, b.CreateConstGEP1_32(i8t, sp1, kSStrLenOff));
         llvm::Value* l2 = b.CreateLoad(
@@ -2796,8 +3032,65 @@ struct Codegen {
                                   ci64(val::kTrue), ci64(val::kFalse));
         }
 
+        // Fold only actual text shadows selected by the normal input lookup.
+        // Never substitute a covered shadow for a live reporter, or stringify
+        // numeric shadows at compile time.
+        if (op == "operator_join") {
+            auto textShadow = [&](const char* name) -> const BlockField* {
+                const BlockInput* in = blk->inputs.find(name);
+                if (!in) return nullptr;
+                Block* child = getBlock(in->block.empty() ? in->shadow : in->block);
+                if (!child || !child->shadow || child->opcode != "text") return nullptr;
+                const BlockField* f = findField(child, "TEXT");
+                return f && f->value.isString() ? f : nullptr;
+            };
+            const BlockField* left = textShadow("STRING1");
+            const BlockField* right = textShadow("STRING2");
+            if (left && right) {
+                std::u16string joined;
+                if (SStr* s = left->value.asStrPtr()) joined.append(s->view());
+                if (SStr* s = right->value.asStrPtr()) joined.append(s->view());
+                // Reuse the JIT pin / relocatable AOT StrLit boundary.
+                return constValue(Value::string(SStr::create(joined)));
+            }
+        }
+
+#if defined(XYO_STRING_JOIN_SPECIALIZED)
+        // Dynamically guard the string/string domain once in JIT code. The
+        // typed helper shares the runtime implementation but skips its generic
+        // value-tag dispatch; all other tags retain the original helper path.
+        if (op == "operator_join") {
+            llvm::Value* lhs = emitInputOf(blk, "STRING1");
+            llvm::Value* rhs = emitInputOf(blk, "STRING2");
+            auto isStringBits = [&](llvm::Value* bits) {
+                llvm::Value* empty = b.CreateICmpEQ(bits, ci64(val::kEmptyStr));
+                llvm::Value* heap = b.CreateICmpEQ(
+                    b.CreateLShr(bits, ci64(48)), ci64(val::kTagStr >> 48));
+                return b.CreateOr(empty, heap);
+            };
+            llvm::Value* bothStrings = b.CreateAnd(
+                isStringBits(lhs), isStringBits(rhs));
+            BasicBlock* stringBB = BasicBlock::Create(lc, "join.str", fn);
+            BasicBlock* genericBB = BasicBlock::Create(lc, "join.generic", fn);
+            BasicBlock* mergeBB = BasicBlock::Create(lc, "join.merge", fn);
+            b.CreateCondBr(bothStrings, stringBB, genericBB);
+            b.SetInsertPoint(stringBB);
+            llvm::Value* strings = call2("xyo_join_strings", i64t, lhs, rhs);
+            b.CreateBr(mergeBB);
+            b.SetInsertPoint(genericBB);
+            llvm::Value* generic = call2("xyo_join", i64t, lhs, rhs);
+            b.CreateBr(mergeBB);
+            b.SetInsertPoint(mergeBB);
+            llvm::PHINode* result = b.CreatePHI(i64t, 2);
+            result->addIncoming(strings, stringBB);
+            result->addIncoming(generic, genericBB);
+            return result;
+        }
+#endif
+
         // --- 直接ヘルパ（レポータ）---
         if (op == "operator_letter_of") return emitLetterOf(blk);
+        if (op == "operator_length") return emitLength(blk);
         {
             auto it = directInputs().find(op);
             if (it != directInputs().end()) {
@@ -3019,6 +3312,29 @@ struct Codegen {
         if (op == "control_repeat") {
             // for (i = toNum(TIMES); i >= 0.5; i--) { body; loopYield }
             llvm::Value* n = emitToNumF64(emitInputOf(blk, "TIMES"));
+            // An empty warp repeat is just a sequence of loop-yield checks.
+            // Advance the 64-iteration sampling counter in bulk, retaining
+            // the 500 ms warp budget checks and the non-warp fallback.
+            BasicBlock* emptyDone = nullptr;
+            const BlockInput* repeatBody = blk->inputs.find("SUBSTACK");
+            if (!repeatBody || repeatBody->block.empty()) {
+                BasicBlock* emptyFast = BasicBlock::Create(lc, "rep.empty.fast", fn);
+                BasicBlock* emptySlow = BasicBlock::Create(lc, "rep.empty.slow", fn);
+                emptyDone = BasicBlock::Create(lc, "rep.empty.done", fn);
+                llvm::Value* valid = b.CreateAnd(
+                    b.CreateAnd(
+                        b.CreateICmpNE(loadIsWarp(), ci32(0)),
+                        b.CreateFCmpOGE(n, cf64(0.0))),
+                    b.CreateAnd(
+                        b.CreateFCmpOLE(n, cf64(1099511627776.0)),
+                        b.CreateFCmpOEQ(
+                            n, b.CreateUnaryIntrinsic(Intrinsic::floor, n))));
+                b.CreateCondBr(valid, emptyFast, emptySlow);
+                b.SetInsertPoint(emptyFast);
+                call2("xyo_empty_repeat_warp", voidt, ctxArg, n);
+                b.CreateBr(emptyDone);
+                b.SetInsertPoint(emptySlow);
+            }
             // ループ内スカラー変数をレジスタへ昇格する（可能なら）。
             // 昇格中は GPU 委譲しない（GPU 側はメモリを直接更新するため、
             // 戻り値の shadow と二重になる）。
@@ -3071,6 +3387,10 @@ struct Codegen {
             b.SetInsertPoint(merge);
             endLoopYieldScope(true);
             endLoopPromotion(promotedLoop);
+            if (emptyDone) {
+                b.CreateBr(emptyDone);
+                b.SetInsertPoint(emptyDone);
+            }
             return;
         }
 
@@ -3159,7 +3479,9 @@ struct Codegen {
             // ceil 回になるので i=1..<=n では合わない（2.5 → 3 回）。
             llvm::Value* n = emitToNumF64(emitInputOf(blk, "VALUE"));
             beginLoopYieldScope();
-            const gpu::Program* gp = tryGpuLoop(blk);
+            const bool promotedLoop = beginLoopPromotion(blk, false);
+            const gpu::Program* gp =
+                promotedLoop ? nullptr : tryGpuLoop(blk);
             AllocaInst* iv = entryAlloca(f64t, 1, "fe_i");
             b.CreateStore(cf64(0.0), iv);
             BasicBlock* head = BasicBlock::Create(lc, "", fn);
@@ -3182,9 +3504,12 @@ struct Codegen {
             {
                 const BlockField* f = findField(blk, "VARIABLE");
                 if (f) {
-                    llvm::Value* vv = call1("xyo_num", i64t,
-                                            b.CreateFAdd(i, cf64(1.0)));
-                    emitVarSet(f, vv);
+                    llvm::Value* next = b.CreateFAdd(i, cf64(1.0));
+                    llvm::Value* vv = emitCanon(next);
+                    if (PromotedVar* p = findPromoted(f); p && p->numeric)
+                        storeNumericPair(*p, vv, next, b.getInt1(true));
+                    else
+                        emitVarSet(f, vv);
                 }
                 const BlockInput* in = blk->inputs.find("SUBSTACK");
                 if (in) emitChainBlocks(chainOf(in->block));
@@ -3197,6 +3522,7 @@ struct Codegen {
             }
             b.SetInsertPoint(merge);
             endLoopYieldScope(true);
+            endLoopPromotion(promotedLoop);
             return;
         }
 

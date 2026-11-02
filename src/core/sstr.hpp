@@ -25,7 +25,23 @@ struct SStr {
     /// 2='#' 始まりでない（toNumber decimal 経路へ）。
     uint32_t rgbCache;
     uint32_t rgbState;
-    // char16_t data[len+1] がここに続く
+    /// 0 = flat（本体は構造体直後の char16_t data[len+1]）、
+    /// 1 = cons（left/right の遅延連結。本体は初回アクセスで materialize）。
+    uint32_t flags;
+    struct SStr* left;    // cons のみ
+    struct SStr* right;   // cons のみ
+    /// cons の flatten 結果（未 materialize は null）。複数スレッドが同時に
+    /// flatten しうるので publish は atomic（勝った側のバッファを使う）。
+    char16_t* body;
+    // char16_t data[len+1] がここに続く（flat のみ）
+    static constexpr uint32_t kConsFlag = 1;
+    /// kAsciiKnown が立っていれば kAsciiValue が ASCII 性を表す（遅延計算）。
+    static constexpr uint32_t kAsciiKnown = 2;
+    static constexpr uint32_t kAsciiValue = 4;
+    /// 全コードユニットが 0x80 未満か。比較・検索の大小文字折り畳みや
+    /// u16ToLower のコピーを省く判定に使う。一度だけ計算して flags に
+    /// キャッシュする（cons は子の結果を合成する）。
+    bool isAscii() const;
 
     // Keep the plain-field ABI used by JIT/AOT offsets, but access published
     // caches atomically: independent scripts can share the same immutable SStr.
@@ -58,13 +74,31 @@ struct SStr {
         numState = 0;
         rgbCache = 0;
         rgbState = 0;
+        flags = 0;
+        left = nullptr;
+        right = nullptr;
+        body = nullptr;
     }
     static_assert(std::atomic_ref<double>::required_alignment <= alignof(double));
     static_assert(std::atomic_ref<uint32_t>::required_alignment <= alignof(uint32_t));
 
-    char16_t* data() { return reinterpret_cast<char16_t*>(this + 1); }
-    const char16_t* data() const { return reinterpret_cast<const char16_t*>(this + 1); }
+    bool isCons() const { return flags & kConsFlag; }
+    /// flat の本体（構造体直後）。cons では left/right がここに入る。
+    char16_t* inlineBody() { return reinterpret_cast<char16_t*>(this + 1); }
+    const char16_t* inlineBody() const {
+        return reinterpret_cast<const char16_t*>(this + 1);
+    }
+    char16_t* data() {
+        return isCons() ? const_cast<char16_t*>(consBody()) : inlineBody();
+    }
+    const char16_t* data() const { return isCons() ? consBody() : inlineBody(); }
     std::u16string_view view() const { return {data(), len}; }
+    /// cons を 1 回だけ materialize して本体を返す（string_util.cpp）。
+    const char16_t* consBody() const;
+    /// Read one UTF-16 unit without flattening shallow cons paths. The caller
+    /// must check index < len. Deep paths fall back to materialization so random
+    /// access over a skewed rope cannot repeatedly walk its entire depth.
+    char16_t unitAt(uint32_t index) const;
 
     static SStr* create(std::u16string_view sv) {
         auto* s = static_cast<SStr*>(
@@ -72,7 +106,7 @@ struct SStr {
         s->len = static_cast<uint32_t>(sv.size());
         s->hash = 0;
         s->initCaches();
-        std::memcpy(s->data(), sv.data(), sv.size() * 2);
+        if (!sv.empty()) std::memcpy(s->data(), sv.data(), sv.size() * 2);
         s->data()[sv.size()] = 0;
         return s;
     }
@@ -92,6 +126,9 @@ struct SStr {
 SStr* sstrCreate(std::u16string_view sv);
 SStr* sstrFromAscii(std::string_view sv);
 SStr* sstrConcat(std::u16string_view a, std::u16string_view b);
+/// 連結ノード（V8 の cons string 相当）: コピーせず left/right を保持し、
+/// 本文は view()/data() が初めて必要になったときに 1 回だけ作る。
+SStr* sstrCons(SStr* a, SStr* b);
 /// 後段が ASCII（数値表記など）の結合 — 中間 SStr を作らない
 SStr* sstrConcatAscii(std::u16string_view a, std::string_view b);
 SStr* sstrLower(std::u16string_view sv);
@@ -107,6 +144,8 @@ std::u16string u16ToUpper(std::u16string_view sv);
 
 /// JS 的小文字化文字列比較: a<b → -1, a==b → 0, a>b → 1
 int compareStringsCaseInsensitive(std::u16string_view a, std::u16string_view b);
+/// SStr 版: 事前計算済みの ASCII 判定を使い、毎回の全走査を省く。
+int compareStringsCaseInsensitive(const SStr* a, const SStr* b);
 
 /// JS 的 UTF-16 code unit 比較（toLowerCase なし）
 int compareStrings(std::u16string_view a, std::u16string_view b);
@@ -116,5 +155,7 @@ bool sstrLetterAt(std::u16string_view s, int64_t idx1, char16_t& out);
 
 /// contains: 大文字小文字を区別しない部分一致（OP_CONTAINS 用）
 bool sstrContains(std::u16string_view hay, std::u16string_view needle);
+/// SStr 版: ASCII 判定をキャッシュから引き、毎回の全走査を省く。
+bool sstrContains(const SStr* hay, const SStr* needle);
 
 } // namespace xyo

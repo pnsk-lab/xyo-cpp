@@ -13,6 +13,7 @@ namespace xyo {
 struct Runtime;
 struct DepGraph;
 struct AccessSet;
+class Fiber;
 
 class Sequencer {
 public:
@@ -66,6 +67,7 @@ public:
 
     struct ParallelStats {
         uint64_t batches = 0, dispatches = 0, threads = 0, groups = 0;
+        uint64_t chainedPasses = 0;
     };
     const ParallelStats& parallelStats() const { return parStats_; }
 
@@ -74,6 +76,7 @@ private:
     std::unique_ptr<WorkerPool> parPool_;
     std::vector<Thread*> parBatch_;
     std::vector<const AccessSet*> parSets_;
+    std::vector<Fiber*> parFibers_;
     ParallelStats parStats_;
     int depGraphSeq_ = 0;
 };

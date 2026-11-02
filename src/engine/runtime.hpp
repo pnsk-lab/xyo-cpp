@@ -160,6 +160,12 @@ public:
     std::vector<Target*> executableTargets;  // 実行対象（stage 最後）
     std::vector<std::unique_ptr<Sprite>> ownedSprites;   // sb3 ロード時の所有
     std::deque<std::unique_ptr<Thread>> ownedThreads;
+    /// 回収（ownedThreads から解放）を次に試すサイズ。回収は O(n) なので
+    /// 25% 増えるたびに間引く — 償却 O(1)/スレッド。
+    size_t reclaimAt = 4096;
+    /// 完了スレッドを解放する。broadcast-and-wait が startedThreads を
+    /// 生ポインタで保持している間は残す（ABA 回避）。
+    void reclaimThreads();
     std::vector<Thread*> threads;
     std::unordered_map<std::string, Thread*> threadMap;
 

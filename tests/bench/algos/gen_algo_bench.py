@@ -173,7 +173,7 @@ def S_call(proccode, args=()):
 BOOL_OPS = {
     "operator_lt", "operator_gt", "operator_equals",
     "operator_and", "operator_or", "operator_not",
-    "data_listcontainsitem",
+    "data_listcontainsitem", "operator_contains",
 }
 # Boolean input names per opcode (the child is a boolean reporter).
 BOOL_INPUTS = {
@@ -331,14 +331,14 @@ class Gen:
         self.blocks[hat]["next"] = first
         return hat
 
-    def define(self, proccode, argnames, body, x=0, y=0):
+    def define(self, proccode, argnames, body, x=0, y=0, warp=True):
         argids = ["arg%d" % i for i in range(len(argnames))]
         mut = {"tagName": "mutation", "children": [],
                "proccode": proccode,
                "argumentids": json.dumps(argids),
                "argumentnames": json.dumps(argnames),
                "argumentdefaults": json.dumps(["0"] * len(argnames)),
-               "warp": "true"}
+               "warp": "true" if warp else "false"}
         self.procs[proccode] = mut
         d = self.new("procedures_definition", top=True, x=x, y=y)
         proto = self.new("procedures_prototype", shadow=True, parent=d,

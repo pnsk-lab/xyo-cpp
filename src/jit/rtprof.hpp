@@ -3,6 +3,7 @@
 // 終了時にスロット別の消費時間・呼出回数を stderr へ集計出力する。
 #pragma once
 
+#if !defined(XYO_DISABLE_RT_PROF)
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -13,13 +14,14 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-
 #if defined(__x86_64__) || defined(__i386__)
 #include <x86intrin.h>
+#endif
 #endif
 
 namespace xyo {
 
+#if !defined(XYO_DISABLE_RT_PROF)
 /// 高分解能タイマ。x86 では rdtsc、それ以外（WASM 等）では
 /// steady_clock のナノ秒を「サイクル」として扱う（tscHz=1e9 に校正）。
 inline uint64_t rtProfNow() {
@@ -30,7 +32,23 @@ inline uint64_t rtProfNow() {
         std::chrono::steady_clock::now().time_since_epoch().count());
 #endif
 }
+#endif  // !XYO_DISABLE_RT_PROF
 
+#if defined(XYO_DISABLE_RT_PROF)
+struct RTProf {
+    enum Slot {
+        kReporter = 0, kCompat, kYield, kList, kVar, kCast,
+        kArith, kStr, kBlocks, kArg, kProc, kGc, kBcast, kLoopY,
+        kPen, kOther, kMax
+    };
+    static constexpr bool enabled = false;
+    static RTProf& get() { static RTProf p; return p; }
+};
+struct RTProfScope {
+    explicit RTProfScope(int) {}
+};
+inline void rtProfBump(const char*) {}
+#else
 struct RTProf {
     enum Slot {
         kReporter = 0, kCompat, kYield, kList, kVar, kCast,
@@ -97,7 +115,9 @@ struct RTProfScope {
         }
     }
 };
+#endif  // XYO_DISABLE_RT_PROF
 
+#if !defined(XYO_DISABLE_RT_PROF)
 namespace detail {
 /// map dos contadores por nome de função — heap-leak intencional para
 /// o lambda do atexit acessar sem captura (static não é capturável).
@@ -133,12 +153,17 @@ inline void rtProfBump(const char* name) {
     std::lock_guard lock(detail::rtProfNameMutex());
     ++detail::rtProfNameMap()[name];
 }
+#endif  // !XYO_DISABLE_RT_PROF
 
 } // namespace xyo
 
+#if defined(XYO_DISABLE_RT_PROF)
+#define XYO_RT_PROF(slot) do { (void)0; } while (0)
+#else
 #define XYO_RT_PROF(slot)                                              \
     ::xyo::RTProfScope _rtprof_(::xyo::RTProf::slot);                  \
     do {                                                             \
         if (::xyo::RTProf::get().enabled)                            \
             ::xyo::rtProfBump(__func__);                             \
     } while (0)
+#endif  // XYO_DISABLE_RT_PROF

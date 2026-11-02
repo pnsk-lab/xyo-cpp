@@ -131,6 +131,23 @@ std::string project() {
     g.append("idx", g.item("order", number(2)));
     for (const auto& pair : {std::pair<std::string, std::string>{"Infinity", "infinity"}, {" Infinity ", "infinity"}, {"\t", "0"}})
         g.append("cmp", g.reporter("operator_equals", "{\"OPERAND1\":" + lit(pair.first) + ",\"OPERAND2\":" + lit(pair.second) + "}"));
+    auto join = [&](const std::string& a, const std::string& b) {
+        return g.reporter("operator_join", "{\"STRING1\":" + a + ",\"STRING2\":" + b + "}");
+    };
+    lists += ",\"joins\":[\"joins\",[]]";
+    g.append("joins", join(lit(""), lit("")));
+    g.append("joins", join(lit("01"), lit(" 2 ")));
+    g.append("joins", join(lit("日本😀"), lit(std::string("\0tail", 5))));
+    // Preserve UTF-16 code units, including isolated and split surrogates.
+    g.append("joins", join("[1,[10,\"\\ud800\"]]", "[1,[10,\"x\\udfff\"]]"));
+    g.append("joins", join("[1,[10,\"\\ud83d\"]]", "[1,[10,\"\\ude00\"]]"));
+    g.append("joins", join(number(12), lit("03")));
+    g.append("joins", join(g.readX(), lit("!")));
+    g.append("joins", join(join(lit("a"), lit("b")), lit("c")));
+    // A live reporter with a text fallback must execute, in left-to-right order.
+    const std::string live = g.fresh();
+    g.add(live, "literal_probe", "", "{}", "{\"TAG\":[\"C\",null],\"VALUE\":[\"live\",null]}");
+    g.append("joins", join("[3," + quoted(live) + ",[10,\"hidden\"]]", g.probe("D", "!")));
     g.add("s" + std::to_string(g.statement), "data_setvariableto", "", "{\"VALUE\":" + number(1) + "}", field("VARIABLE", "done"));
     return "{\"targets\":[{\"isStage\":true,\"name\":\"Stage\",\"variables\":{\"x\":[\"x\",0],\"done\":[\"done\",0]},\"lists\":{" + lists +
         "},\"blocks\":{" + g.blocks + "},\"costumes\":[],\"sounds\":[]}],\"monitors\":[],\"extensions\":[],\"meta\":{}}";
@@ -215,7 +232,7 @@ Result run(JitMode mode, bool useAot = false) {
     for (size_t row = 0; row < inputs.size(); ++row) {
         t->lookupVariableById("x")->value = inputs[row];
         t->lookupVariableById("done")->value = Value::num(0);
-        for (const char* name : {"cmp", "idx", "kept"}) list(name)->clear();
+        for (const char* name : {"cmp", "idx", "kept", "joins"}) list(name)->clear();
         for (size_t i = 0; i < literals().size(); ++i) for (bool empty : {false, true}) {
             SList* l = list("l" + std::to_string(i) + (empty ? "e" : "n"));
             l->clear();
@@ -238,7 +255,22 @@ Result run(JitMode mode, bool useAot = false) {
         check(rt.threads.empty() && cast::toNumber(t->lookupVariableById("done")->value) == 1, "script completes");
         std::string wantedOrder;
         for (size_t i = 0; i < literals().size() * 2; ++i) wantedOrder += "AB";
-        check(order == wantedOrder + "IAB", "ITEM side effects execute even for invalid/empty indices; INDEX then ITEM left-to-right");
+        check(order == wantedOrder + "IABCD", "ITEM side effects execute even for invalid/empty indices; INDEX then ITEM left-to-right");
+        {
+            const std::vector<std::u16string> expected = {
+                u"", u"01 2 ", std::u16string(u"日本😀") + std::u16string(u"\0tail", 5),
+                std::u16string({char16_t(0xd800), u'x', char16_t(0xdfff)}),
+                std::u16string({char16_t(0xd83d), char16_t(0xde00)}),
+                u"1203", std::u16string(cast::toString(inputs[row])->view()) + u"!", u"abc", u"live!"
+            };
+            SList* joins = list("joins");
+            check(joins->len == expected.size(), "all join regression outputs present");
+            for (size_t j = 0; j < expected.size() && j < joins->len; ++j) {
+                Value v = joins->items[j];
+                check(v.isString() && (v.asStrPtr() ? std::u16string(v.asStrPtr()->view()) : std::u16string()) == expected[j],
+                      "join preserves exact UTF-16, string spelling, numeric/live inputs and nested reporter semantics");
+            }
+        }
         result.rng.emplace_back();
         for (int j = 0; j < 8; ++j) result.rng.back().push_back(Rng::global().next());
         result.cmp.emplace_back(); result.idx.emplace_back();

@@ -74,14 +74,20 @@ struct Graph {
 };
 std::string sprite(const char* name, int seed) {
     Graph g;
-    g.add("hat", "event_whenflagclicked", "cold", "{}", "{}", ",\"topLevel\":true");
+    g.add("hat", "event_whenflagclicked", "emptyLength", "{}", "{}", ",\"topLevel\":true");
+    // The singleton comes from a runtime slot, not a foldable text literal.
+    g.add("emptyLength", "data_setvariableto", "cold",
+          "{\"VALUE\":[2,\"lengthProbe\"]}", variable("emptyLength"));
+    g.add("lengthProbe", "operator_length", "", "{\"STRING\":[2,\"readEmpty\"]}");
+    g.add("readEmpty", "data_variable", "", "{}", variable("emptyInput"));
     g.add("cold", "control_if", "loop",
           "{\"CONDITION\":[2,\"never\"],\"SUBSTACK\":[2,\"cold0\"]}");
     g.add("never", "operator_equals", "", "{\"OPERAND1\":" + number(0) +
           ",\"OPERAND2\":" + number(1) + "}");
     std::string vars = "\"x\":[\"x\"," + std::to_string(seed) +
         "],\"sum\":[\"sum\",0],\"depth\":[\"depth\",0],\"alias\":[\"alias\",3],"
-        "\"procOnly\":[\"procOnly\",0]";
+        "\"procOnly\":[\"procOnly\",0],\"emptyInput\":[\"emptyInput\",\"\"],"
+        "\"emptyLength\":[\"emptyLength\",-1]";
     // Slots from unreachable branches are still initialized unconditionally;
     // using many forces vector growth before the final initialization finishes.
     for (int i = 0; i < 96; ++i) {
@@ -149,8 +155,13 @@ Value probe(const ArgValues&, BlockUtility& u) {
 void prepare(Runtime& rt, const std::string& json) {
     rt.registerPrimitive("slot_probe", probe);
     check(loadSb3(rt, json, nullptr).ok, "load multi-script slot fixture");
-    for (Target* t : rt.targets)
-        if (!t->isStage) t->lookupVariableById("items")->list = nullptr;
+    for (Target* t : rt.targets) {
+        if (t->isStage) continue;
+        t->lookupVariableById("items")->list = nullptr;
+        // JSON empty strings may be allocated SStrs. Force the distinct
+        // payload-less Value representation that must never be dereferenced.
+        t->lookupVariableById("emptyInput")->value = Value::emptyStr();
+    }
 }
 double value(Target* t, const char* id) {
     Variable* v = t->lookupVariableById(id);
@@ -165,6 +176,7 @@ void verify(Runtime& rt) {
         check(value(t, "x") == seed + (t->isOriginal ? 39 : 46), "target-local handles and post-callback values");
         check(value(t, "sum") == seed + 37, "compat reporter mutation is visible");
         check(value(t, "procOnly") == 3, "nested/procedure-only slot initialized");
+        check(value(t, "emptyLength") == 0, "length of runtime empty singleton is zero");
         check(value(t, "depth") == 0, "recursive invocation handles remain valid");
         check(value(t, "alias") == 6, "distinct IDs may alias by name");
         check(value(t, "cold0") == 0 && value(t, "cold95") == 95, "cold-branch values untouched");
@@ -208,10 +220,14 @@ void testRestart() {
     Thread* fresh = rt.restartThread(old);
     rt.stopThread(old);
     check(fresh != old && fresh->jitVarSlots.empty(), "restart owns a fresh slot vector");
-    rt.runUntilDone(200);
-    check(rt.threads.empty(), "restarted script and clones complete");
+    // Compare while the restarted script is still suspended: Thread::
+    // releaseFinished() returns the slot vector when the script completes, so
+    // the identity has to be observed on a live thread.
+    rt.sequencer->jitStepThread(*fresh);
     check(!fresh->jitVarSlots.empty() && fresh->jitVarSlots.data() != oldArray,
           "restart cannot replace the suspended thread's slot array");
+    rt.runUntilDone(200);
+    check(rt.threads.empty(), "restarted script and clones complete");
     const int seed = target->getName() == u"A" ? 1 : 100;
     check(value(target, "x") == seed + 40, "restart runs from new entry after one prior increment");
 }

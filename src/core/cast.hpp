@@ -19,6 +19,7 @@ double toNumberOrNaN(Value v);   // NaN 保持（+v 相当）
 bool   toBoolean(Value v);
 SStr*  toString(Value v);        // 常に非 null。空文字列は len=0 SStr
 Value  toStringValue(Value v);   // 空文字列は kEmptyStr シングルトン
+SStr*  smallIntString(double d); // cached common integer range, else nullptr
 double compare(Value v1, Value v2);
 bool   isInt(Value v);
 bool   isWhiteSpace(Value v);

@@ -48,10 +48,12 @@ bool jitEmitScript(llvm::Module&, llvm::LLVMContext&, Runtime&, Target*,
 // 生成コードが参照する extern "C" ヘルパ（rt.cpp 定義）
 extern "C" {
 void xyo_yield(JitCtx*);
+void xyo_yield_fast(xyo::Fiber*);
 int32_t xyo_is_stuck(JitCtx*);
 int32_t xyo_wait_should_yield(JitCtx*);
 void xyo_wait_yield(JitCtx*);
 void xyo_loop_yield(JitCtx*);
+void xyo_empty_repeat_warp(JitCtx*, double);
 double xyo_to_num(uint64_t);
 int32_t xyo_truthy(uint64_t);
 uint64_t xyo_num(double);
@@ -95,6 +97,9 @@ void xyo_rt_setarg(const void*, const char*, uint64_t);
 
 // --- rt_blocks.cpp: ブロック直接ヘルパ ---
 uint64_t xyo_join(uint64_t, uint64_t);
+#if defined(XYO_STRING_JOIN_SPECIALIZED)
+uint64_t xyo_join_strings(uint64_t, uint64_t);
+#endif
 uint64_t xyo_letterof(uint64_t, uint64_t);
 uint64_t xyo_strlen(uint64_t);
 uint64_t xyo_strcontains(uint64_t, uint64_t);
@@ -211,10 +216,12 @@ const std::pair<const char*, void*> kRtSymbols[] = {
     // リスト長上限（データシンボル: 生成コードが直接ロードする）
     {"xyo_list_limit", (void*)&xyo::xyo_list_limit},
     {"xyo_yield", (void*)&xyo_yield},
+    {"xyo_yield_fast", (void*)&xyo_yield_fast},
     {"xyo_is_stuck", (void*)&xyo_is_stuck},
     {"xyo_wait_should_yield", (void*)&xyo_wait_should_yield},
     {"xyo_wait_yield", (void*)&xyo_wait_yield},
     {"xyo_loop_yield", (void*)&xyo_loop_yield},
+    {"xyo_empty_repeat_warp", (void*)&xyo_empty_repeat_warp},
     {"xyo_to_num", (void*)&xyo_to_num},
     {"xyo_truthy", (void*)&xyo_truthy},
     {"xyo_num", (void*)&xyo_num},
@@ -274,6 +281,9 @@ const std::pair<const char*, void*> kRtSymbols[] = {
     {"xyo_proc_pop", (void*)&xyo_proc_pop},
     {"xyo_rt_setarg", (void*)&xyo_rt_setarg},
     {"xyo_join", (void*)&xyo_join},
+#if defined(XYO_STRING_JOIN_SPECIALIZED)
+    {"xyo_join_strings", (void*)&xyo_join_strings},
+#endif
     {"xyo_letterof", (void*)&xyo_letterof},
     {"xyo_strlen", (void*)&xyo_strlen},
     {"xyo_strcontains", (void*)&xyo_strcontains},
@@ -995,6 +1005,7 @@ void JitEngine::invalidate() {
     profiles_.clear();
     failed_.clear();
     accessCache_.clear();
+    ++accessGen_;   // Thread 側のキャッシュを無効化する
 }
 
 const AccessSet* JitEngine::accessFor(const Thread& thread,

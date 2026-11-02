@@ -18,6 +18,7 @@ namespace xyo {
 
 namespace {
 
+#if !defined(XYO_DISABLE_RT_PROF)
 // --- 簡易プロファイラ（XYO_PROF=1 で有効、終了時に stderr へ集計）----
 // worker スレッドからも更新されるためカウンタは atomic。
 struct ProfAccum {
@@ -53,6 +54,7 @@ struct ProfScope {
                        std::memory_order_relaxed);
     }
 };
+#endif  // !XYO_DISABLE_RT_PROF
 
 /// fiber エントリ: コンパイル済みスクリプトを実行（yield は fiber switch）
 void jitEntry(void* arg) {
@@ -167,6 +169,7 @@ std::vector<Thread*> Sequencer::stepThreads() {
                     runtime.threads[nextActive++] = t;
                 } else {
                     runtime.threadMap.erase(t->getId());
+                    t->releaseFinished();
                     doneThreads.push_back(t);
                 }
             }
@@ -182,13 +185,17 @@ std::vector<Thread*> Sequencer::stepThreads() {
 
 void Sequencer::stepThread(Thread& thread) {
     if (thread.isCompiled) {
+#if !defined(XYO_DISABLE_RT_PROF)
         std::optional<ProfScope> ps;
         if (prof().enabled) { ps.emplace(&prof().stepJitNs); ++prof().nJit; }
+#endif
         jitStepThread(thread);
         return;
     }
+#if !defined(XYO_DISABLE_RT_PROF)
     std::optional<ProfScope> ps;
     if (prof().enabled) { ps.emplace(&prof().stepInterpNs); ++prof().nInterp; }
+#endif
     stepThreadBound(thread, 0);
 }
 
@@ -347,8 +354,10 @@ void Sequencer::jitStepThread(Thread& thread) {
         if (!cs->mayYield) {
             // yield 点を持たないスクリプト — fiber を介さず同期実行。
             // broadcast 受信等の短命スレッドの切替コストを削る。
+#if !defined(XYO_DISABLE_RT_PROF)
             std::optional<ProfScope> ps;
             if (prof().enabled) { ps.emplace(&prof().syncNs); ++prof().nSync; }
+#endif
             c->fiber = nullptr;
             c->warpStartMs = runtime.currentMSecs;
             cs->entry(c);
@@ -362,8 +371,10 @@ void Sequencer::jitStepThread(Thread& thread) {
         c->fiber = thread.fiber;
     }
     c->target = thread.target;
+#if !defined(XYO_DISABLE_RT_PROF)
     std::optional<ProfScope> ps;
     if (prof().enabled) { ps.emplace(&prof().fiberNs); ++prof().nFiber; }
+#endif
     c->fiber->resume();
     if (c->fiber->finished()) {
         // エントリ関数が戻った = スクリプト完了。Thread オブジェクトは
@@ -375,6 +386,15 @@ void Sequencer::jitStepThread(Thread& thread) {
         thread.fiber = nullptr;
         releaseJitCtx(c);
         thread.jitCtx = nullptr;
+    } else if (thread.status == STATUS_YIELD) {
+        // パス内 yield（`u.yield()` 相当）は STATUS_RUNNING に戻す — JS の
+        // stepThread も stepThreadBound も yield から戻るときに同じことを
+        // する。YIELD のままにすると「このパスで動けるスレッド」に数えられず
+        // (stepThreads の numActiveThreads)、1 スレッドだけのプロジェクトでは
+        // フレームが即座に終わって yield が 1 tick 待ちになる。broadcast and
+        // wait / wait until がこれで 1 フレーム 1 回になっていた
+        // (sched_pingpong が scratch-vm の 1/2000)。
+        thread.status = STATUS_RUNNING;
     }
 }
 
@@ -423,12 +443,19 @@ bool Sequencer::parallelEligible(Thread& t) const {
 const AccessSet* Sequencer::parallelAccessFor(Thread& t) const {
     if (!runtime.jit || !t.isCompiled || !t.target || t.stackClick || t.updateMonitor)
         return nullptr;
+    // パスごとに 2 段の unordered_map を引かないようスレッド側に持つ。
+    if (t.accessResolved && t.accessGen == runtime.jit->accessGeneration())
+        return t.accessCache;
     auto* cs = static_cast<const CompiledScript*>(t.compiled);
     // GPU helpers may invoke the renderer or shared compute backends, even in
     // a script whose Scratch-level effects are purely numeric.
     if (!cs || !cs->entry || cs->mainThread || !cs->gpuProgs.empty()) return nullptr;
     const AccessSet* as = runtime.jit->accessFor(t, runtime);
-    return as && as->workerSafe() ? as : nullptr;
+    const AccessSet* res = as && as->workerSafe() ? as : nullptr;
+    t.accessCache = res;
+    t.accessResolved = true;
+    t.accessGen = runtime.jit->accessGeneration();
+    return res;
 }
 
 namespace {
@@ -471,8 +498,81 @@ Sequencer::ParFlush Sequencer::flushParBatch() {
         return finish();
     }
 
-    std::vector<std::vector<size_t>> groups;
+    // A common writer key makes the entire batch a single conflict component.
+    // This is especially common for cloned scripts updating a stage variable:
+    // building the writer index, union/find and group vectors every pass would
+    // only prove that they must all run serially anyway.
+    // Keep the full graph path when explicitly requested for diagnostics.
     static const char* graphDump = std::getenv("XYO_DEPGRAPH");
+    if (!graphDump || !*graphDump) {
+        for (const MemKey& key : sets.front()->writes) {
+            bool allConflict = true;
+            for (size_t i = 1; i < sets.size(); ++i) {
+                if (!sets[i]->writes.contains(key) &&
+                    !sets[i]->reads.contains(key)) {
+                    allConflict = false;
+                    break;
+                }
+            }
+            if (!allConflict) continue;
+
+            ++parStats_.batches;
+            parStats_.threads += batch.size();
+            ++parStats_.groups;
+#if !defined(XYO_DISABLE_RT_PROF)
+            if (prof().enabled) {
+                prof().parThreads += batch.size();
+                ++prof().parGroups;
+                ++prof().parBatches;
+            }
+#endif
+            // All scripts are serialized anyway. Once their fibers have
+            // started, run a direct fiber-to-fiber round-robin pass. Newborn
+            // scripts and profiler runs retain the ordinary scheduler.
+            static const bool chainEnabled = [] {
+                const char* env = std::getenv("XYO_FIBER_CHAIN");
+                return !env || env[0] != '0';
+            }();
+            bool chained = chainEnabled && batch.size() >= 2;
+#if !defined(XYO_DISABLE_RT_PROF)
+            chained = chained && !prof().enabled;
+#endif
+            auto& fibers = parFibers_;
+            fibers.clear();
+            if (chained) {
+                for (Thread* t : batch) {
+                    if (!t->isCompiled || !t->jitCtx || !t->fiber ||
+                        t->fiber->finished()) {
+                        chained = false;
+                        break;
+                    }
+                    fibers.push_back(t->fiber);
+                }
+            }
+            if (chained) {
+                ++parStats_.chainedPasses;
+                Fiber::resumeChain(fibers.data(), fibers.size());
+                for (Thread* t : batch) {
+                    JitCtx* c = t->jitCtx;
+                    if (t->fiber->finished()) {
+                        t->status = STATUS_DONE;
+                        t->stack.clear();
+                        FiberPool::release(c->fiber);
+                        t->fiber = nullptr;
+                        releaseJitCtx(c);
+                        t->jitCtx = nullptr;
+                    } else if (t->status == STATUS_YIELD) {
+                        t->status = STATUS_RUNNING;
+                    }
+                }
+            } else {
+                for (Thread* t : batch) jitStepThread(*t);
+            }
+            return finish();
+        }
+    }
+
+    std::vector<std::vector<size_t>> groups;
     if (graphDump && *graphDump) {
         // Full edges and their human-readable reasons are diagnostic work.
         DepGraph g = buildDepGraph(sets);
@@ -484,11 +584,13 @@ Sequencer::ParFlush Sequencer::flushParBatch() {
     ++parStats_.batches;
     parStats_.threads += batch.size();
     parStats_.groups += groups.size();
+#if !defined(XYO_DISABLE_RT_PROF)
     if (prof().enabled) {
         prof().parThreads += batch.size();
         prof().parGroups += groups.size();
         ++prof().parBatches;
     }
+#endif
     if (groups.size() <= 1) {
         // 全員が同一衝突成分 — バッチ順に直列
         for (Thread* t : batch) jitStepThread(*t);

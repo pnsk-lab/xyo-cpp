@@ -9,6 +9,9 @@ set_source_files_properties(unit/test_scheduler.cpp unit/test_motion_numeric.cpp
 if(TEST_SOURCES)
   add_executable(xyo-tests ${TEST_SOURCES})
   target_link_libraries(xyo-tests PRIVATE xyo)
+  if(XYO_STRING_CONS_POOL)
+    target_compile_definitions(xyo-tests PRIVATE XYO_STRING_CONS_POOL=1)
+  endif()
   add_test(NAME xyo-tests COMMAND xyo-tests)
   # 通常実行は HotSpot（既定）だが、テストは従来どおり全スクリプトを
   # 即コンパイルする eager で JIT の意味論を検証する。

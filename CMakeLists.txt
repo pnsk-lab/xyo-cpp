@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(xyo-cpp VERSION 0.3.0 LANGUAGES C CXX ASM)
+project(xyo-cpp VERSION 0.4.0 LANGUAGES C CXX ASM)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -13,6 +13,13 @@ endif()
 option(XYO_JIT "Enable LLVM JIT" ON)
 option(XYO_BUILD_SHELL "Build xyo CLI shell" ON)
 option(XYO_BUILD_TESTS "Build tests" ON)
+option(XYO_FULL_BUILD "Require all supported native rendering and JIT features (CI/release)" OFF)
+
+# Factorial experiment toggles for string/cons optimization. These are private
+# compile-time switches so each variant has a fixed runtime and JIT path.
+option(XYO_STRING_CONS_POOL "Separate cons allocations into dedicated GC slabs" OFF)
+option(XYO_STRING_JOIN_SPECIALIZED "Lower dynamic string/string joins through a typed helper" OFF)
+option(XYO_DISABLE_RT_PROF "Compile out optional runtime profiling instrumentation" OFF)
 
 # --- LLVM ---
 option(XYO_STATIC_LLVM "Link LLVM statically (static archives required)" OFF)
@@ -129,6 +136,20 @@ endif()
 add_library(xyo STATIC ${XYO_CORE_SOURCES})
 target_include_directories(xyo PUBLIC src)
 target_compile_options(xyo PRIVATE -fno-exceptions $<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>)
+if(XYO_STRING_CONS_POOL)
+  set_property(SOURCE src/core/gc.cpp src/core/string_util.cpp
+               APPEND PROPERTY COMPILE_DEFINITIONS XYO_STRING_CONS_POOL=1)
+endif()
+if(XYO_STRING_JOIN_SPECIALIZED)
+  set_property(SOURCE src/jit/codegen.cpp src/jit/jit.cpp src/jit/rt_blocks.cpp
+               APPEND PROPERTY COMPILE_DEFINITIONS XYO_STRING_JOIN_SPECIALIZED=1)
+endif()
+if(XYO_DISABLE_RT_PROF)
+  set_property(SOURCE src/core/gc.cpp src/jit/rt.cpp src/jit/rt_blocks.cpp
+                      src/engine/sequencer.cpp src/engine/runtime.cpp
+                      src/engine/thread.cpp
+               APPEND PROPERTY COMPILE_DEFINITIONS XYO_DISABLE_RT_PROF=1)
+endif()
 if(EMSCRIPTEN)
   # Emscripten: zlib は ports（-sUSE_ZLIB=1）から供給される（zlib 1.3.x）。
   # find_package(ZLIB) は使わず、リンクフラグでポートを有効化する。
@@ -466,6 +487,36 @@ if(XYO_JIT)
     target_link_options(xyo PUBLIC -static-libstdc++ -static-libgcc)
     message(STATUS "link: static LLVM + static libstdc++/libgcc")
   endif()
+endif()
+
+# --- フルビルドの機能保証（CI/リリース） ---
+# 各機能は普段は任意依存だが、成果物を full と名乗る場合は
+# 依存の検出失敗を黙ってヘッドレスに落とさない。
+if(XYO_FULL_BUILD)
+  if(EMSCRIPTEN)
+    message(FATAL_ERROR "XYO_FULL_BUILD is for native targets (WASM uses a separate profile)")
+  endif()
+  if(NOT XYO_JIT OR NOT XYO_BUILD_SHELL)
+    message(FATAL_ERROR "XYO_FULL_BUILD requires XYO_JIT=ON and XYO_BUILD_SHELL=ON")
+  endif()
+  if(NOT XYO_SDL2 OR NOT SDL2_FOUND)
+    message(FATAL_ERROR "XYO_FULL_BUILD requires SDL2 (play/gui/editor)")
+  endif()
+  if(NOT EXISTS "${XYO_FONT_REGULAR}" OR NOT EXISTS "${XYO_FONT_BOLD}")
+    message(FATAL_ERROR "XYO_FULL_BUILD requires bundled Liberation Sans fonts")
+  endif()
+  if(UNIX AND NOT APPLE)
+    if(NOT XYO_RSVG OR NOT RSVG_FOUND)
+      message(FATAL_ERROR "XYO_FULL_BUILD requires librsvg on Linux")
+    endif()
+    if(NOT GLPC_FOUND)
+      message(FATAL_ERROR "XYO_FULL_BUILD requires OpenGL (pkg-config gl) on Linux")
+    endif()
+    if(NOT XYO_GLSLC OR NOT XYO_VULKAN_INCLUDE)
+      message(FATAL_ERROR "XYO_FULL_BUILD requires glslc and Vulkan headers on Linux")
+    endif()
+  endif()
+  message(STATUS "xyo full build: native feature requirements satisfied")
 endif()
 
 # --- テスト ---

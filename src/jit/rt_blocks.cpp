@@ -150,6 +150,12 @@ uint64_t xyo_join(uint64_t a, uint64_t b) {
     XYO_RT_PROF(kStr);
     return toB(rt::join(toV(a), toV(b)));
 }
+#if defined(XYO_STRING_JOIN_SPECIALIZED)
+uint64_t xyo_join_strings(uint64_t a, uint64_t b) {
+    XYO_RT_PROF(kStr);
+    return toB(rt::joinStrings(toV(a), toV(b)));
+}
+#endif
 uint64_t xyo_letterof(uint64_t letter, uint64_t s) {
     XYO_RT_PROF(kStr);
     return toB(rt::letterOf(toV(letter), toV(s)));

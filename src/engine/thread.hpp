@@ -116,6 +116,8 @@ struct StackFrame {
 };
 
 /// Thread — 実行中スタックコンテキスト。
+struct AccessSet;
+
 class Thread {
 public:
     explicit Thread(std::string firstBlock);
@@ -165,11 +167,25 @@ public:
     /// data() を指す）。スクリプトエントリで xyo_varslot_init が埋める。
     std::vector<Variable*> jitVarSlots;
     mutable std::string idCache_;   // getId() 遅延キャッシュ
+    /// parallelAccessFor の結果（JitEngine::accessCache_ は (top, target)
+    /// 単位で不変）。パスごとに unordered_map を 2 段引くのを避ける。
+    /// accessGen が JitEngine の世代と違えば無効（invalidate で進む）。
+    const AccessSet* accessCache = nullptr;
+    bool accessResolved = false;
+    uint32_t accessGen = 0;
 
     static std::string getIdFromTargetAndBlock(const Target* target,
                                              const std::string& topBlock);
     /// target.id&topBlock — target セット後は不変なので遅延キャッシュ
     std::string getId() const;
+
+    /// 完了したスレッドの重い状態を返す（frames / 実行コンテキスト /
+    /// JIT キャッシュ）。Thread オブジェクト自体は broadcastandwait の
+    /// startedThreads が生ポインタで保持するため解放できない（ABA）が、
+    /// 中身を読む観測者は無い — status / stack / updateMonitor だけ。
+    /// スケジューラが速くなってスレッド生成が増え、32 秒の実行で 100 万
+    /// スレッド × 数 KB = RSS 3GB になっていた。
+    void releaseFinished();
 
     void pushStack(const std::string& blockId);
     void reuseStackForNextBlock(const std::string& blockId);

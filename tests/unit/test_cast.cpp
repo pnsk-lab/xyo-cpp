@@ -292,6 +292,17 @@ static void test_rt_list() {
     CHECK_EQ(ts(rt::listContents(list)), "10 99 true");
     rt::listDelete(list, s("all"));
     CHECK_EQ(list->len, 0);
+    // Numeric-only fast search and string/number coercion fallback.
+    list->push(n(1));
+    list->push(n(2));
+    list->push(n(-0.0));
+    CHECK(rt::listContains(list, n(2)));
+    CHECK(!rt::listContains(list, n(1001)));
+    CHECK(rt::listContains(list, n(0.0)));
+    CHECK(rt::listContains(list, s("2")));
+    CHECK_EQ(rt::listIndexOf(list, n(2)), 2);
+    CHECK_EQ(rt::listIndexOf(list, n(1001)), 0);
+    rt::listDeleteAll(list);
     // 1 文字要素のみ → join('')
     list->push(s("a"));
     list->push(s("b"));
@@ -377,6 +388,8 @@ extern int test_list_string_intern_main();
 extern int test_gl_chunk_plan_main();
 extern int test_scratch_compat_main();
 extern int test_list_limit_main();
+extern int test_sstr_cons_main();
+extern int test_gc_pool_main();
 int main() {
     test_toNumber();
     test_toBoolean();
@@ -419,12 +432,14 @@ int main() {
     int glChunkPlanFail = test_gl_chunk_plan_main();
     int scratchCompatFail = test_scratch_compat_main();
     int listLimitFail = test_list_limit_main();
+    int sstrConsFail = test_sstr_cons_main();
+    int gcPoolFail = test_gc_pool_main();
     return (g_fail + e2eFail + penFail + aotFail + wasmEmitFail +
             wasmCompileFail + minifyFail + depsFail + analysisFail + parforFail + penHoistFail + rewriteFail +
             parallelStringsFail + schedulerFail +
             equalityLiteralFail + colorFastFail + motionNumericFail + slotHoistFail +
             listCodegenBoundsFail + nanCodegenFail + literalContextFail + numericPromotionFail + dangerFail + listStringInternFail +
-            glChunkPlanFail + scratchCompatFail + listLimitFail + listReadMemoFail)
+            glChunkPlanFail + scratchCompatFail + listLimitFail + listReadMemoFail + sstrConsFail + gcPoolFail)
                ? 1
                : 0;
 }
