@@ -1115,7 +1115,8 @@ int test_svg_text_usage() {
 
     sp->visible = false;
     CHECK_EQ(ren.pick(px, py), -1);
-    CHECK(!ren.isTouchingColor(id, 0xFF0000));
+    // Touching colour still senses the covered pixels of a hidden tester.
+    CHECK(ren.isTouchingColor(id, 0xFF0000));
     sp->visible = true;
     std::printf("svg-usage: %d checks, %d failures\n", g_checks, g_fail);
     return g_fail;

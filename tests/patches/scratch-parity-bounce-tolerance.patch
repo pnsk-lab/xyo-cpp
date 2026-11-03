@@ -1,0 +1,16 @@
+diff --git a/project/mot_Box/main.fractch b/project/mot_Box/main.fractch
+index 46a9049..fca1c30 100644
+--- a/project/mot_Box/main.fractch
++++ b/project/mot_Box/main.fractch
+@@ -182,8 +182,9 @@ when broadcast mot_bounce {
+   append(remoteResults, direction() == 37 && xPosition() == 0 && yPosition() == 0);
+   goto 230, 0;
+   if_on_edge_bounce;
+-  // facing 37 at the right edge: bounces to -37.00000000000003 (float error from cos/sin/atan2)
+-  append(remoteResults, direction() == -37.00000000000003);
++  // The reflected direction is approximately -37 degrees. The final low bits of
++  // cos/sin/atan2 vary across JavaScript engines, so compare with tolerance.
++  append(remoteResults, abs(direction() + 37) < 0.000000001);
+   point 90;
+   goto 230, 0;
+   if_on_edge_bounce;

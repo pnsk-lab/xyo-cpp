@@ -488,7 +488,12 @@ Value evBroadcastAndWait(const ArgValues& a, BlockUtility& u) {
             for (Thread* x : rt->threads) if (x == t) { inList = true; break; }
             if (inList) {
                 waiting = true;
-                if (!rt->isWaitingThread(t)) allWaiting = false;
+                // Membership is already known. isWaitingThread() would
+                // redundantly scan runtime.threads a second time.
+                if (t->status != STATUS_PROMISE_WAIT &&
+                    t->status != STATUS_YIELD_TICK &&
+                    !t->stack.empty() && t->status != STATUS_DONE)
+                    allWaiting = false;
             }
         }
         if (waiting) {

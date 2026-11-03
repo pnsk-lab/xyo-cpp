@@ -144,6 +144,11 @@ std::string project() {
     g.append("joins", join(number(12), lit("03")));
     g.append("joins", join(g.readX(), lit("!")));
     g.append("joins", join(join(lit("a"), lit("b")), lit("c")));
+    // The base may be a dynamic non-string; a chain of constant suffixes
+    // still folds without recognizing any enclosing control-flow pattern.
+    g.append("joins", join(join(g.readX(), lit("!")), lit("?")));
+    g.append("joins", join(join(join(g.readX(), lit("A")), lit("日本")), lit("C")));
+    g.append("joins", join(join(g.readX(), lit("")), lit("tail")));
     // A live reporter with a text fallback must execute, in left-to-right order.
     const std::string live = g.fresh();
     g.add(live, "literal_probe", "", "{}", "{\"TAG\":[\"C\",null],\"VALUE\":[\"live\",null]}");
@@ -261,7 +266,10 @@ Result run(JitMode mode, bool useAot = false) {
                 u"", u"01 2 ", std::u16string(u"日本😀") + std::u16string(u"\0tail", 5),
                 std::u16string({char16_t(0xd800), u'x', char16_t(0xdfff)}),
                 std::u16string({char16_t(0xd83d), char16_t(0xde00)}),
-                u"1203", std::u16string(cast::toString(inputs[row])->view()) + u"!", u"abc", u"live!"
+                u"1203", std::u16string(cast::toString(inputs[row])->view()) + u"!", u"abc",
+                std::u16string(cast::toString(inputs[row])->view()) + u"!?",
+                std::u16string(cast::toString(inputs[row])->view()) + u"A日本C",
+                std::u16string(cast::toString(inputs[row])->view()) + u"tail", u"live!"
             };
             SList* joins = list("joins");
             check(joins->len == expected.size(), "all join regression outputs present");

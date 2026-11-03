@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -348,6 +349,10 @@ public:
         const std::map<std::string, std::u16string>* optMatchFields,
         Target* optTarget);
 
+    // Fast non-waiting broadcast path: avoids constructing a transient
+    // fields map and a returned thread vector for compiled receivers.
+    void startBroadcast(std::u16string_view name);
+
     void stopForTarget(Target* target, Thread* optException);
     void stopAll();
     void greenFlag();
@@ -360,7 +365,7 @@ public:
 
     // ------------------------------------------------------------ ターゲット --
     void addTarget(Target* target);
-    void moveExecutable(Target* target, int delta);
+    void moveExecutable(Target* target, double delta);
     void setExecutablePosition(Target* target, int newIndex);
     void removeExecutable(Target* target);
     void disposeTarget(Target* target);

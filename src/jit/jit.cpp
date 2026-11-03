@@ -91,7 +91,8 @@ void xyo_broadcast_wait_v(JitCtx*, uint64_t);
 double xyo_timer(JitCtx*);
 uint64_t xyo_rt_compat(JitCtx*, const void*);
 uint64_t xyo_rt_reporter(JitCtx*, const char*);
-void xyo_proc_push(JitCtx*, const char*, const void*, int32_t);
+void xyo_proc_push(JitCtx*, const char*, const void*, int32_t,
+                   const char*, int32_t, int32_t);
 void xyo_proc_pop(JitCtx*);
 void xyo_rt_setarg(const void*, const char*, uint64_t);
 
@@ -767,7 +768,7 @@ const CompiledScript* JitEngine::compile(Thread& thread, Runtime& runtime,
                                topId, entryName, *cs, impl_->pinned, fnNames,
                                procNameMap, nullptr);
         if (emitOk) {
-            // O2 相当の最適化 — varSlotData/alloca の昇格・冗長
+            // O3 by default (XYO_JIT_O2=1 to revert) — varSlotData/alloca
             // タグチェック除去・式共有を行わないと生成コードが数倍遅い
             llvm::PassBuilder pb;
             llvm::LoopAnalysisManager lam;
@@ -780,7 +781,8 @@ const CompiledScript* JitEngine::compile(Thread& thread, Runtime& runtime,
             pb.registerLoopAnalyses(lam);
             pb.crossRegisterProxies(lam, fam, cgam, mam);
             llvm::ModulePassManager mpm = pb.buildPerModuleDefaultPipeline(
-                llvm::OptimizationLevel::O2);
+                std::getenv("XYO_JIT_O2") ? llvm::OptimizationLevel::O2
+                                          : llvm::OptimizationLevel::O3);
             mpm.run(*mod, mam);
             if (const char* d = std::getenv("XYO_JIT_DUMP2"))
                 if (d[0] != '\0') mod->print(llvm::errs(), nullptr);

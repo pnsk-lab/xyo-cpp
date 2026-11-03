@@ -213,8 +213,20 @@ State run(const Case& c, JitMode mode, bool yieldWriter = false) {
         }
     }
     if (yieldWriter) {
-        check(out[0] == encode(Value::num(41)), "reload after another script's write feeds numeric shadow");
-        check(out[2] == encode(c.input), "Value read after reload preserves original string spelling");
+        // The competing writer replaces x with c.input after iteration one.
+        // For N iterations the loop then applies N-1 additional increments.
+        // A raw string is observed before iteration two, but later iteration
+        // reads necessarily see the numeric value produced by the loop body.
+        const double written = cast::toNumber(c.input);
+        const std::string expectedFinal = encode(Value::numCanonical(
+            written + double(c.iterations - 1)));
+        const std::string expectedBeforeLast = c.iterations == 2
+            ? encode(c.input)
+            : encode(Value::numCanonical(written + double(c.iterations - 2)));
+        check(out[0] == expectedFinal,
+              "reload after another script's write feeds numeric shadow");
+        check(out[2] == expectedBeforeLast,
+              "Value read after reload preserves writer's representation");
     }
     return out;
 }
@@ -304,7 +316,8 @@ State truthRun(Value input, JitMode mode) {
 
 // for_each writes its loop variable implicitly; promotion must observe that
 // write, preserve changes inside the body, and leave it alone for zero trips.
-State foreachRun(const char* limit, int bodyKind, JitMode mode) {
+State foreachRun(const char* limit, int bodyKind, JitMode mode,
+                 const char* sumInit = "0") {
     Graph g;
     g.add("hat", "event_whenflagclicked", "loop", "{}", "{}", true);
     const std::string limitInput = "[1,[4,\"" + std::string(limit) + "\"]]";
@@ -321,6 +334,11 @@ State foreachRun(const char* limit, int bodyKind, JitMode mode) {
               "{\"VALUE\":[1,[10,\"text\"]]}", field("VARIABLE", "i"));
         body = "sum";
     }
+    else if (bodyKind == 4) {
+        g.add("first", "data_setvariableto", "sum",
+              "{\"VALUE\":[1,[10,\"-Infinity\"]]}", field("VARIABLE", "i"));
+        body = "sum";
+    }
     if (bodyKind == 3) {
         g.add("first", "data_changevariableby", "",
               "{\"VALUE\":" + number(7) + "}", field("VARIABLE", "sum"));
@@ -330,7 +348,7 @@ State foreachRun(const char* limit, int bodyKind, JitMode mode) {
     }
     std::string proj =
         "{\"targets\":[{\"isStage\":true,\"name\":\"Stage\","
-        "\"variables\":{\"i\":[\"i\",\"raw\"],\"sum\":[\"sum\",0]},"
+        "\"variables\":{\"i\":[\"i\",\"raw\"],\"sum\":[\"sum\"," + std::string(sumInit) + "]},"
         "\"lists\":{},\"blocks\":{" + g.blocks + "},\"costumes\":[],\"sounds\":[]}],"
         "\"monitors\":[],\"extensions\":[],\"meta\":{}}";
     setJitMode(mode);
@@ -357,7 +375,9 @@ void foreachCases() {
         const char* finalText;  // nullptr means numeric
         double finalNumber;
         double sum;
+        const char* sumInit = "0";
     };
+    const double inf = std::numeric_limits<double>::infinity();
     const Test cases[] = {
         {"0",   0, "raw",  0,  0},  // zero trips: preserve initial text
         {"3.5", 0, nullptr, 4, 10}, // fractional bound: four iterations
@@ -365,10 +385,14 @@ void foreachCases() {
         {"3",   2, "text", 0,  0},  // body writes a non-numeric string
         {"3",   3, nullptr, 3, 21}, // implicit loop write without body reading i
         {"-2",  0, "raw",  0,  0},
+        {"3",   0, nullptr, 3, inf, "\"Infinity\""},
+        // A body write must invalidate the finite-index proof. The first
+        // iteration performs +Infinity + -Infinity and repairs numeric NaN.
+        {"3",   4, "-Infinity", 0, -inf, "\"Infinity\""},
     };
     for (const auto& c : cases) {
-        const State interp = foreachRun(c.limit, c.body, JitMode::Off);
-        const State eager = foreachRun(c.limit, c.body, JitMode::Eager);
+        const State interp = foreachRun(c.limit, c.body, JitMode::Off, c.sumInit);
+        const State eager = foreachRun(c.limit, c.body, JitMode::Eager, c.sumInit);
         check(interp.size() == 2 && interp == eager,
               "for_each: interpreter/eager output agree");
         if (interp.size() != 2) continue;
@@ -384,6 +408,35 @@ void foreachCases() {
             check(interp[0] == encode(Value::num(c.finalNumber)),
                   "for_each: expected final numeric variable");
     }
+}
+
+// Differential checks for bounded literal repeat unrolling. The body has
+// several independent list writes, a scalar update and live reporters; no
+// string-join pattern is involved. Test across the 512-copy boundary and the
+// strip-mined multi-group case.
+void repeatUnrollCases() {
+    EnvGuard unroll("XYO_REPEAT_UNROLL");
+    for (int n : {2, 65, 128, 511, 512, 513, 1025}) {
+        const Case c{"literal repeat generic body", Value::num(7),
+                     false, true, false, n, true};
+        unroll.put("0");
+        const State baseline = run(c, JitMode::Eager);
+        unroll.put("1");
+        const State optimized = run(c, JitMode::Eager);
+        if (optimized != baseline)
+            std::printf("unroll parity mismatch: count=%d\\n", n);
+        check(!baseline.empty() && optimized == baseline,
+              "literal repeat unroll matches ordinary JIT");
+    }
+    const Case c{"yield between unrolled iterations",
+                 Value::string(SStr::fromUtf8("040")),
+                 false, true, false, 65, false};
+    unroll.put("0");
+    const State before = run(c, JitMode::Eager, true);
+    unroll.put("1");
+    const State after = run(c, JitMode::Eager, true);
+    check(!before.empty() && before == after,
+          "unrolled non-warp loop reloads competing writes on resume");
 }
 
 void truthCases() {
@@ -460,6 +513,7 @@ int test_numeric_promotion_main() {
     check(!expected.empty() && got == expected, "interleaved script states match interp/eager with exact Value tags");
     truthCases();
     foreachCases();
+    repeatUnrollCases();
     setJitMode(saved);
     std::printf("numeric promotion: %d checks, %d failures\n", checks, failures);
     return failures;

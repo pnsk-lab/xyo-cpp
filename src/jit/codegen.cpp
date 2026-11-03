@@ -764,6 +764,11 @@ struct Codegen {
     }
     /// emitCanon 等で num タグが保証される SSA 値（再チェック省略用）
     std::unordered_set<llvm::Value*> knownNum;
+    // A reporter read of a for-each index is finite when the loop body is
+    // a yield-free chain and never writes that index. Such a delta cannot
+    // produce NaN when added to a non-NaN promoted accumulator.
+    std::unordered_set<std::string> finiteInductionVars;
+    std::unordered_set<llvm::Value*> knownFiniteDeltas;
 
     // --- ループ内スカラー変数のレジスタ昇格 -----------------------------
     // Scratch 変数は Variable::value（メモリ）に置かれるため、ループの
@@ -835,6 +840,12 @@ struct Codegen {
         llvm::Value* r = b.CreateSelect(isn, ci64(val::kNan),
                                       b.CreateBitCast(d, i64t));
         knownNum.insert(r);
+        // Keep the numeric producer in SSA: the next arithmetic input can
+        // consume d without bitcasting the canonicalized NaN-box and
+        // retesting for NaN. Scratch toNumber(NaN) is zero, but numeric
+        // comparisons must still reject the canonical NaN.
+        knownNumD[r] = b.CreateSelect(isn, cf64(0.0), d);
+        knownNumOk[r] = b.CreateNot(isn);
         return r;
     }
     /// 定数 i64 が number 値ならその double を返す（定数畳み込み用）
@@ -1291,6 +1302,41 @@ struct Codegen {
         readMemoPreheader = promotingLoop ? b.GetInsertBlock() : nullptr;
         return promotingLoop;
     }
+    // A pure, uninterrupted for-each body that never writes its induction
+    // variable will always observe the loop header's finite i+1. Reject
+    // nested control structures, procedures, and all opaque blocks rather
+    // than assuming that they cannot yield or mutate state.
+    bool finiteIndexBody(const BlockInput* body, const std::string& indexId) {
+        if (!body || body->block.empty()) return false;
+        std::vector<std::string> todo{body->block};
+        std::unordered_set<std::string> visited;
+        while (!todo.empty()) {
+            std::string id = std::move(todo.back());
+            todo.pop_back();
+            if (id.empty() || !visited.insert(id).second) continue;
+            Block* node = getBlock(id);
+            if (!node) return false;
+            const std::string& op = node->opcode;
+            if (!node->shadow &&
+                op != "data_variable" &&
+                op != "data_setvariableto" &&
+                op != "data_changevariableby" &&
+                op.rfind("operator_", 0) != 0)
+                return false;
+            if (op == "data_setvariableto" ||
+                op == "data_changevariableby") {
+                const BlockField* target = findField(node, "VARIABLE");
+                if (!target || target->id == indexId) return false;
+            }
+            if (!node->next.empty()) todo.push_back(node->next);
+            for (const auto& [name, in] : node->inputs.items) {
+                (void)name;
+                if (!in.block.empty()) todo.push_back(in.block);
+                if (!in.shadow.empty()) todo.push_back(in.shadow);
+            }
+        }
+        return true;
+    }
     const PromotedList* findPromotedList(const std::string& id) const {
         for (const PromotedList& pl : promotedLists)
             if (pl.field->id == id) return &pl;
@@ -1412,6 +1458,8 @@ struct Codegen {
         // jitVar（lookupOrCreate）は常に非 null — helper の v? ガードと等価
         llvm::Value* vp = varValuePtr(f);
         llvm::Value* bits = b.CreateLoad(i64t, vp);
+        if (f && finiteInductionVars.count(f->id))
+            knownFiniteDeltas.insert(bits);
         if (PromotedVar* p = findPromoted(f)) {
             if (p->numeric) {
                 knownNumD[bits] = b.CreateLoad(f64t, p->dslot);
@@ -1460,6 +1508,7 @@ struct Codegen {
                 const llvm::APFloat& ap = cf->getValueAPF();
                 finite = !ap.isNaN() && !ap.isInfinity();
             }
+            finite |= knownFiniteDeltas.count(delta) != 0;
             if (finite) {
                 // 影の d は決して NaN にならない（toNum の結果）ので、
                 // 有限デルタでは結果も NaN にならない = 数値比較可。
@@ -1549,6 +1598,30 @@ struct Codegen {
             auto* div = dyn_cast<ConstantFP>(fb);
             double m = div ? div->getValueAPF().convertToDouble() : 0.0;
             if (m >= 1 && m <= 2147483647.0 && std::trunc(m) == m) {
+                // For an exact positive i32 dividend, a u32 remainder by a
+                // compile-time constant is much cheaper than a 64-bit signed
+                // remainder. Keep the general path for negatives, fractions,
+                // negative zero and values outside this exact domain.
+                BasicBlock* smallCheck = BasicBlock::Create(lc, "mod.c32.check", fn);
+                BasicBlock* smallFast = BasicBlock::Create(lc, "mod.c32.fast", fn);
+                BasicBlock* widePath = BasicBlock::Create(lc, "mod.c32.wide", fn);
+                BasicBlock* finalMerge = BasicBlock::Create(lc, "mod.c32.done", fn);
+                llvm::Value* smallRange = b.CreateAnd(
+                    b.CreateFCmpOGT(fa, cf64(0.0)),
+                    b.CreateFCmpOLE(fa, cf64(2147483647.0)));
+                b.CreateCondBr(smallRange, smallCheck, widePath);
+                b.SetInsertPoint(smallCheck);
+                llvm::Value* smallN = b.CreateFPToUI(fa, i32t);
+                llvm::Value* exact32 = b.CreateFCmpOEQ(
+                    b.CreateUIToFP(smallN, f64t), fa);
+                b.CreateCondBr(exact32, smallFast, widePath);
+                b.SetInsertPoint(smallFast);
+                llvm::Value* rem32 = b.CreateURem(
+                    smallN, b.getInt32(uint32_t(m)));
+                llvm::Value* res32 = b.CreateUIToFP(rem32, f64t);
+                b.CreateBr(finalMerge);
+                b.SetInsertPoint(widePath);
+
                 BasicBlock* checkInt = BasicBlock::Create(lc, "mod.range", fn);
                 BasicBlock* fast = BasicBlock::Create(lc, "mod.int", fn);
                 BasicBlock* slow = BasicBlock::Create(lc, "mod.float", fn);
@@ -1583,8 +1656,38 @@ struct Codegen {
                 PHINode* result = b.CreatePHI(f64t, 2);
                 result->addIncoming(fastResult, fast);
                 result->addIncoming(slowResult, slow);
-                r = result;
+                b.CreateBr(finalMerge);
+                b.SetInsertPoint(finalMerge);
+                PHINode* merged = b.CreatePHI(f64t, 2);
+                merged->addIncoming(res32, smallFast);
+                merged->addIncoming(result, merge);
+                r = merged;
             } else {
+                // Positive integral operands fitting i32 can use the shorter
+                // 32-bit remainder instruction. Range-check before fptoui;
+                // all other cases retain the existing general modulo path.
+                BasicBlock* smallExact = BasicBlock::Create(lc, "mod32.exact", fn);
+                BasicBlock* smallFast = BasicBlock::Create(lc, "mod32.fast", fn);
+                BasicBlock* wide = BasicBlock::Create(lc, "mod32.wide", fn);
+                BasicBlock* both = BasicBlock::Create(lc, "mod32.merge", fn);
+                llvm::Value* inSmallRange = b.CreateAnd(
+                    b.CreateAnd(b.CreateFCmpOGT(fa, cf64(0.0)),
+                                b.CreateFCmpOLE(fa, cf64(2147483647.0))),
+                    b.CreateAnd(b.CreateFCmpOGE(fb, cf64(1.0)),
+                                b.CreateFCmpOLE(fb, cf64(2147483647.0))));
+                b.CreateCondBr(inSmallRange, smallExact, wide);
+                b.SetInsertPoint(smallExact);
+                llvm::Value* smallN = b.CreateFPToUI(fa, i32t);
+                llvm::Value* smallD = b.CreateFPToUI(fb, i32t);
+                llvm::Value* smallIntegers = b.CreateAnd(
+                    b.CreateFCmpOEQ(b.CreateUIToFP(smallN, f64t), fa),
+                    b.CreateFCmpOEQ(b.CreateUIToFP(smallD, f64t), fb));
+                b.CreateCondBr(smallIntegers, smallFast, wide);
+                b.SetInsertPoint(smallFast);
+                llvm::Value* smallResult = b.CreateUIToFP(
+                    b.CreateURem(smallN, smallD), f64t);
+                b.CreateBr(both);
+                b.SetInsertPoint(wide);
                 // Variable divisor: exact integer operands also admit a
                 // native signed remainder. Both conversions are performed
                 // only after a finite-range check (fptosi would otherwise
@@ -1632,7 +1735,12 @@ struct Codegen {
                 PHINode* phi = b.CreatePHI(f64t, 2);
                 phi->addIncoming(result, fast);
                 phi->addIncoming(fallback, slow);
-                r = phi;
+                b.CreateBr(both);
+                b.SetInsertPoint(both);
+                PHINode* joined = b.CreatePHI(f64t, 2);
+                joined->addIncoming(smallResult, smallFast);
+                joined->addIncoming(phi, merge);
+                r = joined;
             }
             break;
         }
@@ -2282,11 +2390,12 @@ struct Codegen {
         llvm::Value* nv = change
             ? b.CreateFAdd(b.CreateLoad(f64t, fp), vv) : vv;
         if (kind == 0) {
-            // wrapColor: fmod(v,100); <0 → +100
-            nv = b.CreateFRem(nv, cf64(100.0));
+            // Match Scratch MathUtil.wrapClamp(v, 0, 100): inclusive
+            // endpoints give a period of 101, not 100.
+            nv = b.CreateFRem(nv, cf64(101.0));
             nv = b.CreateSelect(
                 b.CreateFCmpOLT(nv, cf64(0.0)),
-                b.CreateFAdd(nv, cf64(100.0)), nv);
+                b.CreateFAdd(nv, cf64(101.0)), nv);
         } else {
             // std::clamp(v,0,100) — NaN は fcmp false で保持
             nv = b.CreateSelect(
@@ -3046,6 +3155,46 @@ struct Codegen {
             };
             const BlockField* left = textShadow("STRING1");
             const BlockField* right = textShadow("STRING2");
+            // General associative constant folding of nested joins:
+            // join(join(x, "a"), "b") becomes join(x, "ab").
+            // Only the suffixes are literal shadows; x is evaluated exactly
+            // once and may be any reporter/value. No loop pattern is required.
+            // A bounded fold prevents unreasonable compile-time allocations.
+            std::vector<const BlockField*> suffixes;
+            Block* inner = blk;
+            Block* lastJoin = nullptr;
+            size_t totalSuffixUnits = 0;
+            for (unsigned i = 0; i < 8 && inner &&
+                                 inner->opcode == "operator_join"; ++i) {
+                const BlockInput* rhsInput = inner->inputs.find("STRING2");
+                const BlockInput* lhsInput = inner->inputs.find("STRING1");
+                if (!rhsInput || !lhsInput) break;
+                Block* rhsBlock = getBlock(rhsInput->block.empty()
+                                              ? rhsInput->shadow : rhsInput->block);
+                if (!rhsBlock || !rhsBlock->shadow || rhsBlock->opcode != "text")
+                    break;
+                const BlockField* field = findField(rhsBlock, "TEXT");
+                if (!field || !field->value.isString()) break;
+                const SStr* str = field->value.asStrPtr();
+                const size_t size = str ? str->len : 0;
+                if (totalSuffixUnits + size > 512) break;
+                suffixes.push_back(field);
+                totalSuffixUnits += size;
+                lastJoin = inner;
+                if (lhsInput->block.empty()) break;
+                inner = getBlock(lhsInput->block);
+            }
+            if (suffixes.size() >= 2) {
+                std::u16string combined;
+                combined.reserve(totalSuffixUnits);
+                for (auto it = suffixes.rbegin(); it != suffixes.rend(); ++it)
+                    if (SStr* str = (*it)->value.asStrPtr())
+                        combined.append(str->view());
+                llvm::Value* dynamicBase = emitInputOf(lastJoin, "STRING1");
+                return call2("xyo_join", i64t, dynamicBase,
+                             constValue(Value::string(SStr::create(combined))));
+            }
+
             if (left && right) {
                 std::u16string joined;
                 if (SStr* s = left->value.asStrPtr()) joined.append(s->view());
@@ -3256,6 +3405,103 @@ struct Codegen {
         b.CreateCall(decl(op.fn, voidt, ArrayRef<Type*>(ts)), args);
     }
 
+    // General bounded partial unrolling for literal-count Scratch repeats.
+    // The source body is arbitrary straight-line stack code from this safe set,
+    // not a recognized benchmark or string-concatenation idiom. We retain a
+    // yield checkpoint after *every* logical iteration, including inside each
+    // unrolled group. Nested control flow and opaque/compat instructions use
+    // the ordinary counted loop instead.
+    struct RepeatUnrollPlan {
+        uint64_t trips = 0;
+        unsigned factor = 0;
+        std::vector<Block*> body;
+    };
+    unsigned unrollCodeBudget = 2048;
+
+    std::optional<RepeatUnrollPlan> repeatUnrollPlan(Block* loop) {
+        const char* enabled = std::getenv("XYO_REPEAT_UNROLL");
+        if (!enabled || enabled[0] != '1') return std::nullopt;
+        const BlockInput* times = loop->inputs.find("TIMES");
+        const BlockInput* body = loop->inputs.find("SUBSTACK");
+        if (!times || !body || body->block.empty()) return std::nullopt;
+        const std::string& source =
+            times->block.empty() ? times->shadow : times->block;
+        Block* literal = getBlock(source);
+        if (!literal || !literal->shadow || literal->fields.empty() ||
+            literal->opcode.rfind("math_", 0) != 0)
+            return std::nullopt;
+        const double n = cast::toNumber(literal->fields.begin()->second.value);
+        // Large values may stop decrementing by 1 in double precision.
+        if (!std::isfinite(n) || n < 2 || n > 1000000 ||
+            std::trunc(n) != n)
+            return std::nullopt;
+
+        std::vector<Block*> chain = chainOf(body->block);
+        if (chain.empty() || chain.size() > 8) return std::nullopt;
+        static const std::set<std::string> simple = {
+            "data_setvariableto", "data_changevariableby",
+            "data_addtolist", "data_deleteoflist", "data_deletealloflist",
+            "data_insertatlist", "data_replaceitemoflist",
+            "motion_movesteps", "motion_changexby", "motion_changeyby",
+            "motion_setx", "motion_sety", "motion_turnright",
+            "motion_turnleft", "looks_changesizeby", "looks_setsizeto",
+            "looks_say", "looks_think"
+        };
+        for (Block* stmt : chain) {
+            if (!simple.count(stmt->opcode) ||
+                stmt->inputs.has("SUBSTACK") ||
+                stmt->inputs.has("SUBSTACK2"))
+                return std::nullopt;
+        }
+        unsigned limit = std::min<unsigned>(
+            512u / unsigned(chain.size()),
+            unrollCodeBudget / unsigned(chain.size()));
+        if (limit < 2) return std::nullopt;
+        unsigned factor = std::min(limit, unsigned(n));
+        return RepeatUnrollPlan{uint64_t(n), factor, std::move(chain)};
+    }
+
+    void emitUnrolledRepeat(Block* loop, const RepeatUnrollPlan& plan) {
+        unrollCodeBudget -= plan.factor * unsigned(plan.body.size());
+        const uint64_t groups = plan.trips / plan.factor;
+        const uint64_t tail = plan.trips % plan.factor;
+        beginLoopYieldScope();
+        const bool promotedLoop = beginLoopPromotion(loop, false);
+        // Repeated body evaluation uses the ordinary stack lowerer, so all
+        // variable type, reporter-order, and spill/reload rules are shared.
+        auto emitOne = [&]() {
+            emitChainBlocks(plan.body);
+            if (!bbDone(b.GetInsertBlock())) emitLoopYield();
+        };
+        if (groups == 1) {
+            for (unsigned i = 0; i < plan.factor && !fail; ++i)
+                emitOne();
+        } else {
+            AllocaInst* remaining = entryAlloca(i64t, 1, "rep.unroll.groups");
+            b.CreateStore(ci64(groups), remaining);
+            BasicBlock* head = newBB("rep.unroll.head");
+            BasicBlock* body = newBB("rep.unroll.body");
+            BasicBlock* done = newBB("rep.unroll.done");
+            b.CreateBr(head);
+            b.SetInsertPoint(head);
+            llvm::Value* count = b.CreateLoad(i64t, remaining);
+            b.CreateCondBr(b.CreateICmpNE(count, ci64(0)), body, done);
+            b.SetInsertPoint(body);
+            for (unsigned i = 0; i < plan.factor && !fail; ++i)
+                emitOne();
+            if (!bbDone(b.GetInsertBlock())) {
+                b.CreateStore(b.CreateSub(
+                    b.CreateLoad(i64t, remaining), ci64(1)), remaining);
+                b.CreateBr(head);
+            }
+            b.SetInsertPoint(done);
+        }
+        for (uint64_t i = 0; i < tail && !fail; ++i)
+            emitOne();
+        endLoopYieldScope(true);
+        endLoopPromotion(promotedLoop);
+    }
+
     // --- スタック emit ------------------------------------------------------
 
     void emitStopped() {
@@ -3263,16 +3509,20 @@ struct Codegen {
         b.CreateRetVoid();
     }
 
-    void emitChainBlocks(const std::vector<Block*>& chain) {
+    int nestedBranchDepth = 0;
+
+    void emitChainBlocks(const std::vector<Block*>& chain, bool branch = false) {
+        if (branch) ++nestedBranchDepth;
         for (size_t i = 0; i < chain.size(); ++i) {
             Block* blk = chain[i];
-            if (fail) return;
+            if (fail) break;
             // 現在位置が既に終端済み（stop 等）なら残りは到達不能 — 打ち切る
-            if (bbDone(b.GetInsertBlock())) return;
+            if (bbDone(b.GetInsertBlock())) break;
             if (!hoistedSetters.empty() && hoistedSetters.count(blk))
                 continue;   // ループ外へホイスト済み
             emitStackBlock(blk);
         }
+        if (branch) --nestedBranchDepth;
     }
 
     void emitStackBlock(Block* blk) {
@@ -3296,13 +3546,13 @@ struct Codegen {
             }
             {
                 const BlockInput* in = blk->inputs.find("SUBSTACK");
-                if (in) emitChainBlocks(chainOf(in->block));
+                if (in) emitChainBlocks(chainOf(in->block), true);
             }
             if (!bbDone(b.GetInsertBlock())) b.CreateBr(merge);
             b.SetInsertPoint(elseBB);
             if (op == "control_if_else") {
                 const BlockInput* in = blk->inputs.find("SUBSTACK2");
-                if (in) emitChainBlocks(chainOf(in->block));
+                if (in) emitChainBlocks(chainOf(in->block), true);
             }
             if (!bbDone(b.GetInsertBlock())) b.CreateBr(merge);
             b.SetInsertPoint(merge);
@@ -3311,6 +3561,19 @@ struct Codegen {
 
         if (op == "control_repeat") {
             // for (i = toNum(TIMES); i >= 0.5; i--) { body; loopYield }
+            // Fixed-count straight-line bodies are eligible for bounded
+            // strip-mining into groups of at most 512 logical iterations.
+            if (auto plan = repeatUnrollPlan(blk)) {
+                // Evaluate TIMES once, exactly as in the ordinary lowering.
+                (void)emitToNumF64(emitInputOf(blk, "TIMES"));
+                if (verbose)
+                    std::fprintf(stderr,
+                        "xyo-jit: repeat unroll trips=%llu factor=%u blocks=%zu\\n",
+                        static_cast<unsigned long long>(plan->trips),
+                        plan->factor, plan->body.size());
+                emitUnrolledRepeat(blk, *plan);
+                return;
+            }
             llvm::Value* n = emitToNumF64(emitInputOf(blk, "TIMES"));
             // An empty warp repeat is just a sequence of loop-yield checks.
             // Advance the 64-iteration sampling counter in bulk, retaining
@@ -3376,7 +3639,7 @@ struct Codegen {
             b.SetInsertPoint(bodyBB);
             {
                 const BlockInput* in = blk->inputs.find("SUBSTACK");
-                if (in) emitChainBlocks(chainOf(in->block));
+                if (in) emitChainBlocks(chainOf(in->block), true);
             }
             if (!bbDone(b.GetInsertBlock())) {
                 emitLoopYield();
@@ -3405,7 +3668,7 @@ struct Codegen {
             b.SetInsertPoint(bodyBB);
             {
                 const BlockInput* in = blk->inputs.find("SUBSTACK");
-                if (in) emitChainBlocks(chainOf(in->block));
+                if (in) emitChainBlocks(chainOf(in->block), true);
             }
             if (!bbDone(b.GetInsertBlock())) {
                 emitLoopYield();
@@ -3461,7 +3724,7 @@ struct Codegen {
             b.SetInsertPoint(bodyBB);
             {
                 const BlockInput* in = blk->inputs.find("SUBSTACK");
-                if (in) emitChainBlocks(chainOf(in->block));
+                if (in) emitChainBlocks(chainOf(in->block), true);
             }
             if (!bbDone(b.GetInsertBlock())) {
                 emitLoopYield();
@@ -3477,7 +3740,8 @@ struct Codegen {
             // Scratch の for_each は index=0 から index < toNum(VALUE) の間
             // 回る（scratch3_control.forEach）。値が整数でない場合に
             // ceil 回になるので i=1..<=n では合わない（2.5 → 3 回）。
-            llvm::Value* n = emitToNumF64(emitInputOf(blk, "VALUE"));
+            // scratch3_control.forEach re-evaluates VALUE at every iteration.
+            // Hoisting the reporter breaks loops that change a list's length.
             beginLoopYieldScope();
             const bool promotedLoop = beginLoopPromotion(blk, false);
             const gpu::Program* gp =
@@ -3488,9 +3752,10 @@ struct Codegen {
             BasicBlock* bodyBB = BasicBlock::Create(lc, "", fn);
             BasicBlock* merge = BasicBlock::Create(lc, "", fn);
             if (gp) {
+                llvm::Value* gpuBound = emitToNumF64(emitInputOf(blk, "VALUE"));
                 llvm::Value* done =
                     callN("xyo_gpu_repeat", i32t,
-                          {ctxArg, gpuProgPtr(gp, blk->id), n});
+                          {ctxArg, gpuProgPtr(gp, blk->id), gpuBound});
                 b.CreateCondBr(b.CreateICmpNE(done, ci32(0)), merge,
                                head);
             } else {
@@ -3498,7 +3763,8 @@ struct Codegen {
             }
             b.SetInsertPoint(head);
             llvm::Value* i = b.CreateLoad(f64t, iv);
-            llvm::Value* go = b.CreateFCmpOLT(i, n);
+            llvm::Value* bound = emitToNumF64(emitInputOf(blk, "VALUE"));
+            llvm::Value* go = b.CreateFCmpOLT(i, bound);
             b.CreateCondBr(go, bodyBB, merge);
             b.SetInsertPoint(bodyBB);
             {
@@ -3512,7 +3778,13 @@ struct Codegen {
                         emitVarSet(f, vv);
                 }
                 const BlockInput* in = blk->inputs.find("SUBSTACK");
-                if (in) emitChainBlocks(chainOf(in->block));
+                const bool finiteIndex = promotedLoop && f &&
+                    finiteIndexBody(in, f->id);
+                bool inserted = false;
+                if (finiteIndex)
+                    inserted = finiteInductionVars.insert(f->id).second;
+                if (in) emitChainBlocks(chainOf(in->block), true);
+                if (inserted) finiteInductionVars.erase(f->id);
             }
             if (!bbDone(b.GetInsertBlock())) {
                 emitLoopYield();
@@ -3529,7 +3801,7 @@ struct Codegen {
         if (op == "control_all_at_once") {
             // TW irgen: "if 1 = 1" 相当 — サブスタックをそのまま実行
             const BlockInput* in = blk->inputs.find("SUBSTACK");
-            if (in) emitChainBlocks(chainOf(in->block));
+            if (in) emitChainBlocks(chainOf(in->block), true);
             return;
         }
 
@@ -3823,7 +4095,8 @@ struct Codegen {
             {ctxArg, b.CreateGlobalString(blk->id),
              slotPtr(AotSlotKind::BlockCached, bcKey(blk->id),
                      blocks->getCachedExecute(blk->id)),
-             ci32(warp ? 1 : 0)}));
+             ci32(warp ? 1 : 0), b.CreateGlobalString(pc),
+             ci32(nestedBranchDepth), ci32(0)}));
         auto* callI = llvm::cast<CallInst>(b.CreateCall(pf, argv));
         auto* popI = llvm::cast<CallInst>(
             call1("xyo_proc_pop", voidt, ctxArg));
@@ -3839,17 +4112,37 @@ struct Codegen {
     };
     std::vector<ProcCallSite> procCallSites;
 
-    /// leaf 手続きの呼出しフレーム push/pop を消す。
-    /// 条件: 手続きが自身のコードで yield 可能・compat なヘルパを
-    /// 呼ばない（fnDirect が空）。フレームの観測者 — yield 中の
-    /// warpMode・compat op の読む stack・interp stepToProcedure の
-    /// isRecursiveCall — はいずれも yield/compat コード経由でしか
-    /// 到達しない。再帰手続きも対象: JIT の再帰検出は存在せず
-    /// ネイティブ再帰の深さもフレーム有無で変わらない（interp 側
-    /// 手続き呼出しは def ブロックを直接実行し pf を経由しない）。
+    /// Yield/compat も再帰も発生しない手続きの stack push/pop を省略。
+    /// 再帰関数は Scratch の isRecursiveCall が直近の呼出しフレームを
+    /// 観測するため、明示的な待機ブロックがなくてもフレームを維持する。
+    /// 再帰を含む SCC だけフレームを保持して一般的な leaf の性能を維持。
     void elideLeafProcFrames() {
         if (procCallSites.empty()) return;
+        // A procedure is recursive when its call graph can return to itself.
+        // Its call frames must remain visible to Scratch's bounded stack scan
+        // even if its body has no explicit wait/loop yield helper.
+        std::unordered_set<Function*> cyclic;
+        for (auto& [name, start] : procFns) {
+            std::unordered_set<Function*> seen;
+            std::function<bool(Function*)> visits = [&](Function* node) {
+                auto edges = callEdges.find(node);
+                if (edges == callEdges.end()) return false;
+                for (Function* callee : edges->second) {
+                    if (callee == start) return true;
+                    if (seen.insert(callee).second && visits(callee)) return true;
+                }
+                return false;
+            };
+            if (visits(start)) {
+                cyclic.insert(start);
+                fnDirect[start] = true;
+            }
+        }
         for (auto& s : procCallSites) {
+            if (cyclic.count(s.callee)) {
+                s.push->setArgOperand(6, ci32(1));
+                continue;
+            }
             auto dit = fnDirect.find(s.callee);
             if (dit != fnDirect.end() && dit->second) {
                 if (verbose) std::fprintf(stderr,

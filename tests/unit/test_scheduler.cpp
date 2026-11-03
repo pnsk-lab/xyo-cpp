@@ -1,6 +1,7 @@
 // Headless/mock-renderer scheduler integration and dispatch-and-join stress.
 #include <atomic>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -278,6 +279,155 @@ void testSharedYieldChain() {
     }
 }
 
+void testSelfBroadcastDoesNotRecycleActiveFiber() {
+    // A broadcast can target the script currently executing it. The active
+    // fiber must never be retired or reset while its own stack is live.
+    const std::string recv =
+        "{\"recv\":{\"opcode\":\"event_whenbroadcastreceived\","
+        "\"topLevel\":true,\"next\":\"inc\",\"inputs\":{},"
+        "\"fields\":{\"BROADCAST_OPTION\":[\"PING\",null]}},"
+        "\"inc\":" +
+        block("data_changevariableby", "check",
+              "{\"VALUE\":[1,[4,\"1\"]]}",
+              "{\"VARIABLE\":[\"s\",\"s\"]}") +
+        ",\"check\":" +
+        block("control_if", nullptr,
+              "{\"CONDITION\":[2,\"lt\"],\"SUBSTACK\":[2,\"send\"]}") +
+        ",\"lt\":" +
+        block("operator_lt", nullptr,
+              "{\"OPERAND1\":[2,\"read\"],\"OPERAND2\":[1,[4,\"3\"]]}") +
+        ",\"read\":" +
+        block("data_variable", nullptr, "{}",
+              "{\"VARIABLE\":[\"s\",\"s\"]}") +
+        ",\"send\":" +
+        block("event_broadcast", nullptr,
+              "{\"BROADCAST_INPUT\":[1,[11,\"PING\",\"PING\"]]}") +
+        "}";
+    std::string stage = target("Stage", "{}", true);
+    const std::string emptyBroadcasts = "\"broadcasts\":{}";
+    const size_t at = stage.find(emptyBroadcasts);
+    if (at != std::string::npos)
+        stage.replace(at, emptyBroadcasts.size(),
+                      "\"broadcasts\":{\"PING\":\"PING\"}");
+    const std::string json =
+        "{\"targets\":[" + stage + "," +
+        target("Receiver", recv) +
+        "],\"monitors\":[],\"extensions\":[],\"meta\":{}}";
+    Runtime rt;
+    const auto loaded = loadSb3(rt, json, nullptr);
+    check(loaded.ok, "load self-broadcast script");
+    if (!loaded.ok) return;
+    rt.startBroadcast(u"PING");
+    rt.runUntilDone(100);
+    Variable* shared = rt.getTargetForStage()->lookupVariableById("s");
+    check(shared && cast::toNumber(shared->value) == 3,
+          "self-broadcast correctly runs three receiver instances");
+    check(rt.threads.empty(), "self-broadcast terminates without stale fiber");
+}
+
+void testBroadcastReceiverReuse() {
+    // An ordinary compiled broadcast can restart a suspended receiver
+    // without changing its Thread* identity. Broadcast-and-wait, however,
+    // exposes receiver handles and must create a fresh Thread.
+    const std::string recv =
+        "{\"recv\":{\"opcode\":\"event_whenbroadcastreceived\","
+        "\"topLevel\":true,\"next\":\"loop\",\"inputs\":{},"
+        "\"fields\":{\"BROADCAST_OPTION\":[\"PING\",null]}},"
+        "\"loop\":" + block("control_repeat", nullptr,
+             "{\"TIMES\":[1,[4,\"5\"]],\"SUBSTACK\":[2,\"inc\"]}") +
+        ",\"inc\":" + block("data_changevariableby", nullptr,
+             "{\"VALUE\":[1,[4,\"1\"]]}",
+             "{\"VARIABLE\":[\"s\",\"s\"]}") + "}";
+    const std::string json =
+        "{\"targets\":[" + target("Stage", "{}", true) + "," +
+        target("Receiver", recv) +
+        "],\"monitors\":[],\"extensions\":[],\"meta\":{}}";
+    Runtime rt;
+    const auto loaded = loadSb3(rt, json, nullptr);
+    check(loaded.ok, "load restartable broadcast receiver");
+    if (!loaded.ok) return;
+
+    rt.startBroadcast(u"PING");
+    check(rt.threads.size() == 1, "ordinary broadcast starts receiver");
+    if (rt.threads.empty()) return;
+    Thread* first = rt.threads[0];
+    if (!first->isCompiled) return; // JIT-only reuse (interpreter semantics unchanged).
+
+    rt.sequencer->stepThread(*first);
+    Variable* shared = rt.getTargetForStage()->lookupVariableById("s");
+    check(shared && cast::toNumber(shared->value) == 1,
+          "first receiver yields after one increment");
+    check(first->fiber != nullptr, "first receiver has a suspended fiber");
+
+    rt.startBroadcast(u"ping");
+    check(rt.threads.size() == 1 && rt.threads[0] == first,
+          "ordinary broadcast reuses compiled receiver");
+    check(first->fiber == nullptr && first->status == STATUS_RUNNING,
+          "restart discards old fiber and resets run status");
+
+    const std::map<std::string, std::u16string> match{
+        {"BROADCAST_OPTION", u"PING"}};
+    auto waitReceivers =
+        rt.startHats("event_whenbroadcastreceived", &match, nullptr);
+    check(waitReceivers.size() == 1, "join broadcast starts receiver");
+    if (waitReceivers.empty()) return;
+    Thread* joined = waitReceivers[0];
+    check(joined != first, "join receiver has a distinct identity");
+
+    // A join-exposed receiver must be replaced rather than reused. Start
+    // its JIT fiber first, so restarting it tests the retirement path that
+    // previously kept 1 MiB fiber stack mappings alive indefinitely.
+    bool suspendedJoined = false;
+    if (joined->isCompiled) {
+        rt.sequencer->stepThread(*joined);
+        suspendedJoined = joined->fiber != nullptr;
+        check(suspendedJoined, "join-exposed receiver suspended its fiber");
+    }
+    rt.startBroadcast(u"PING");
+    check(rt.threads.size() == 1 && rt.threads[0] != joined,
+          "ordinary broadcast must not reuse join-exposed receiver");
+    if (suspendedJoined) {
+        check(joined->fiber == nullptr && joined->jitCtx == nullptr &&
+                  joined->status == STATUS_DONE,
+              "replaced receiver releases suspended fiber immediately");
+    }
+    Thread* subsequent = rt.threads[0];
+    rt.startBroadcast(u"ping");
+    check(rt.threads.size() == 1 && rt.threads[0] == subsequent,
+          "subsequent ordinary broadcast is reusable again");
+
+    rt.runUntilDone(100);
+    check(rt.threads.empty(), "restarted receiver completes");
+    check(shared && cast::toNumber(shared->value) ==
+          (suspendedJoined ? 7 : 6),
+          "only executed receiver effects are visible after replacement");
+}
+
+void testFractionalLayerMovement() {
+    Runtime rt;
+    const auto loaded = loadSb3(rt, project(false, false), nullptr);
+    check(loaded.ok, "load layer movement fixture");
+    if (!loaded.ok) return;
+    // The executable list is ordered back-to-front, with stage at index 0.
+    Target* upper = rt.executableTargets.back();
+    const size_t original = rt.executableTargets.size() - 1;
+    rt.moveExecutable(upper, -1.5);
+    check(rt.executableTargets[original - 2] == upper,
+          "backward 1.5 truncates the final index, moving two layers");
+    rt.moveExecutable(upper, 0.5);
+    check(rt.executableTargets[original - 2] == upper,
+          "forward 0.5 does not move an integral-index target");
+    rt.moveExecutable(upper, 1.5);
+    check(rt.executableTargets[original - 1] == upper,
+          "forward 1.5 moves one layer");
+    rt.moveExecutable(upper, std::numeric_limits<double>::infinity());
+    check(rt.executableTargets.back() == upper,
+          "positive infinity moves to front safely");
+    rt.moveExecutable(upper, -std::numeric_limits<double>::infinity());
+    check(rt.executableTargets[1] == upper,
+          "negative infinity keeps sprite behind others but after stage");
+}
+
 void testPool() {
     WorkerPool pool;
     struct Context {
@@ -316,11 +466,14 @@ void testPool() {
 
 int test_scheduler_main() {
     testPool();
+    testFractionalLayerMovement();
     testCompute(false, false);
     testCompute(true, false);
     testCompute(false, true);
     testSharedOrder();
     testSharedYieldChain();
+    testBroadcastReceiverReuse();
+    testSelfBroadcastDoesNotRecycleActiveFiber();
     testCompatBarrier();
     std::printf("scheduler: %d checks, %d failures\n", checks, failures);
     return failures;

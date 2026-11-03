@@ -152,6 +152,9 @@ public:
     const Block* topBlockPtr = nullptr;
     bool triedToCompile = false;
     bool isCompiled = false;
+    // True only for a JIT non-waiting broadcast receiver. Such a Thread*
+    // is never handed back to a broadcast-and-wait caller as a join handle.
+    bool reusableBroadcastReceiver = false;
     bool executableHat = false;
     const void* compiled = nullptr;   // const CompiledScript*（JitEngine 所有）
     JitCtx* jitCtx = nullptr;         // 所有（~Thread で解放）

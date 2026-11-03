@@ -210,7 +210,8 @@ private:
     /// スキン色のサンプル。ignoreVisibility は pen stamp 用 —
     /// scratch-render の penStamp は ignoreVisibility:true で描く。
     bool skinPxAt(const Drawable& d, double stagePx, double stagePy,
-                  uint8_t out[4], bool ignoreVisibility = false) const;
+                  uint8_t out[4], bool ignoreVisibility = false,
+                  bool ignoreGhost = false) const;
 
     // --- 描画 ---
     void drawStageArea();

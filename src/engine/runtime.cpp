@@ -119,11 +119,22 @@ Thread* Runtime::restartThread(Thread* thread, const Block* topHint) {
         if (threads[i] == thread) {
             threads[i] = n;
             ownedThreads.push_back(std::move(nt));
+            // The replaced thread will never be scheduled again. Release
+            // suspended fibers and their 1 MiB stack mappings immediately.
+            // If the old thread is currently executing inside its own fiber,
+            // retireThread defers release to jitStepThread's return path.
+            // Scratch allows a receiver to re-broadcast its own message.
+            // Although the replacement occupies its scheduling slot, the
+            // currently executing old thread runs until its next yield.
+            // Retire it at the sequencer boundary instead of mid-block.
+            if (thread != sequencer->activeThread)
+                sequencer->retireThread(*thread);
             return n;
         }
     }
     threads.push_back(n);
     ownedThreads.push_back(std::move(nt));
+    sequencer->retireThread(*thread);
     return n;
 }
 
@@ -243,6 +254,92 @@ std::vector<Thread*> Runtime::startHats(
         }
     }
     return newThreads;
+}
+
+// Only the non-waiting broadcast path uses this API. Broadcast-and-wait
+// must preserve the exact returned Thread* set for its join semantics.
+void Runtime::startBroadcast(std::u16string_view name) {
+    static const std::string opcode = "event_whenbroadcastreceived";
+    const auto hat = hats.find(opcode);
+    if (hat == hats.end()) return;
+    const HatMeta meta = hat->second;
+
+    // Script input fields were uppercased when the runtime script cache was
+    // built. ASCII names are the frequent case and need no temporary string.
+    const bool ascii = std::all_of(name.begin(), name.end(),
+                                   [](char16_t ch) { return ch < 128; });
+    std::u16string upper;
+    if (!ascii) upper = u16ToUpper(name);
+    const auto matching = [&](const RuntimeScriptCache& script) {
+        const auto field = script.fieldsOfInputs.find("BROADCAST_OPTION");
+        if (field == script.fieldsOfInputs.end()) return false;
+        const Value& v = field->second;
+        SStr* s = v.isString() ? v.asStrPtr() : nullptr;
+        if (!s) return false;
+        const auto expected = s->view();
+        if (!ascii) return expected == upper;
+        if (expected.size() != name.size()) return false;
+        for (size_t i = 0; i < name.size(); ++i) {
+            const char16_t ch = name[i];
+            const char16_t up = ch >= u'a' && ch <= u'z' ? ch - 32 : ch;
+            if (up != expected[i]) return false;
+        }
+        return true;
+    };
+
+    const size_t startingThreadCount = threads.size();
+    std::vector<Thread*> interpreted;
+    forEachScriptByOpcode(opcode,
+        [&](const RuntimeScriptCache& script, Target* target) {
+            if (!matching(script)) return;
+            const std::string& top = script.blockId;
+            Thread* next = nullptr;
+            if (meta.restartExistingThreads) {
+                static thread_local std::string key;
+                key.assign(target->id);
+                key.push_back('&');
+                key.append(top);
+                const auto it = threadMap.find(key);
+                if (it != threadMap.end()) {
+                    Thread* previous = it->second;
+                    // A JIT broadcast without wait never exposes its receiver
+                    // to a join. Reuse a compiled receiver's storage instead
+                    // of allocating and retiring another Thread per broadcast.
+                    // A wait-created receiver, the active sender, or any
+                    // currently executing fiber must retain its old identity.
+                    if (previous->reusableBroadcastReceiver &&
+                        previous->isCompiled && !previous->isKilled &&
+                        previous != sequencer->activeThread &&
+                        (!previous->fiber || previous->fiber != currentFiber())) {
+                        sequencer->retireThread(*previous);
+                        previous->releaseFinished();
+                        previous->compatibilityStackFrame = ExecContext{};
+                        previous->status = STATUS_RUNNING;
+                        previous->isKilled = false;
+                        previous->requestScriptGlowInFrame = false;
+                        previous->hasWarpTimer = false;
+                        previous->pushStack(top);
+                        next = previous;
+                    } else {
+                        next = restartThread(previous, script.block);
+                    }
+                }
+            } else {
+                for (size_t j = 0; j < startingThreadCount; ++j) {
+                    if (threads[j]->target == target &&
+                        threads[j]->topBlock == top &&
+                        !threads[j]->stackClick &&
+                        threads[j]->status != STATUS_DONE) return;
+                }
+            }
+            if (!next) next = pushThread(top, target, false, false, script.block);
+            next->reusableBroadcastReceiver = next->isCompiled;
+            if (!next->isCompiled) interpreted.push_back(next);
+        }, nullptr);
+    for (Thread* t : interpreted) {
+        execute(*sequencer, *t);
+        t->goToNextBlock();
+    }
 }
 
 // --------------------------------------------------------------- stop 系 --
@@ -413,12 +510,16 @@ void Runtime::addTarget(Target* target) {
     executableTargets.push_back(target);
 }
 
-void Runtime::moveExecutable(Target* target, int delta) {
+void Runtime::moveExecutable(Target* target, double delta) {
     auto it = std::find(executableTargets.begin(), executableTargets.end(), target);
     if (it == executableTargets.end()) return;
     int oldIndex = int(it - executableTargets.begin());
     executableTargets.erase(it);
-    int newIndex = oldIndex + delta;
+    // Scratch splices at ToInteger(oldIndex + delta), not at oldIndex + ToInteger(delta).
+    // This distinction matters for negative fractional layer changes.
+    const double dest = std::isnan(delta) ? oldIndex
+        : std::clamp(double(oldIndex) + delta, 0.0, double(executableTargets.size()));
+    int newIndex = static_cast<int>(dest);
     if (newIndex > int(executableTargets.size()))
         newIndex = int(executableTargets.size());
     if (newIndex <= 0) {

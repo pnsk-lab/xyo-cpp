@@ -118,8 +118,9 @@ void syncPenColor(PenState& p) {
 
 // JS: MathUtil.wrapClamp(value, 0, 100)
 double wrapColor(double v) {
-    v = std::fmod(v, 100.0);
-    if (v < 0) v += 100.0;
+    // Scratch MathUtil.wrapClamp(0,100) includes both endpoints (period 101).
+    v = std::fmod(v, 101.0);
+    if (v < 0) v += 101.0;
     return v;
 }
 double clampColorParam(double v) { return std::clamp(v, 0.0, 100.0); }

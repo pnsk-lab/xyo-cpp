@@ -169,7 +169,11 @@ void Target::setDraggable(bool d) {
 }
 
 void Target::setRotationStyle(const std::string& style) {
-    if (style == "none" || style == "all around" || style == "left-right") {
+    // Scratch block menus use "don't rotate"; internal xyo data may use
+    // "none" for the same unrotated rendering mode.
+    if (style == "don't rotate" || style == "none") {
+        rotationStyle = "none";
+    } else if (style == "all around" || style == "left-right") {
         rotationStyle = style;
     }
     if (runtime) {
@@ -198,8 +202,10 @@ void Target::setSize(double s) {
     if (runtime && runtime->renderer) {
         double w = 1, h = 1;
         runtime->renderer->getCurrentSkinSize(drawableID, w, h);
-        const double origW = w > 0 ? w : 1;
-        const double origH = h > 0 ? h : 1;
+        // Zero-sized SVG costumes have no upper size bound: dividing by
+        // their true dimensions yields +infinity, as in Scratch's JS clamp.
+        const double origW = w >= 0 ? w : 1;
+        const double origH = h >= 0 ? h : 1;
         const double minScale = runtime->fencing
             ? std::min(1.0, std::max(5.0 / origW, 5.0 / origH)) : 0;
         const double maxScale = runtime->fencing
@@ -305,13 +311,13 @@ void Target::goToBack() {
 void Target::goForwardLayers(double n) {
     if (runtime && runtime->renderer)
         runtime->renderer->setDrawableOrder(drawableID, n, "sprite", true);
-    if (runtime) runtime->moveExecutable(this, int(n));
+    if (runtime) runtime->moveExecutable(this, n);
 }
 
 void Target::goBackwardLayers(double n) {
     if (runtime && runtime->renderer)
         runtime->renderer->setDrawableOrder(drawableID, -n, "sprite", true);
-    if (runtime) runtime->moveExecutable(this, int(-n));
+    if (runtime) runtime->moveExecutable(this, -n);
 }
 
 void Target::goBehindOther(Target* other) {
@@ -354,10 +360,14 @@ bool Target::isTouchingEdge() const {
     if (!runtime || !runtime->renderer) return false;
     Bounds b;
     if (!getBounds(b)) return false;
-    return b.left < -runtime->stageWidth / 2.0 ||
-           b.right > runtime->stageWidth / 2.0 ||
-           b.top > runtime->stageHeight / 2.0 ||
-           b.bottom < -runtime->stageHeight / 2.0;
+    // Scratch's rendered hull is measured at pixel centres, not the outer
+    // corners of the costume rectangle. The far-right/top raster sample is
+    // inclusive, whereas the left/bottom comparisons are strict.
+    const double inset = std::abs(size) / 200.0;
+    return b.left + inset < -runtime->stageWidth / 2.0 ||
+           b.right - inset >= runtime->stageWidth / 2.0 ||
+           b.top - inset >= runtime->stageHeight / 2.0 ||
+           b.bottom + inset < -runtime->stageHeight / 2.0;
 }
 
 bool Target::isTouchingSprite(const std::u16string& spriteName) {
@@ -378,7 +388,7 @@ bool Target::isTouchingColor(uint32_t rgb) const {
 
 bool Target::colorIsTouchingColor(uint32_t targetRgb, uint32_t maskRgb) const {
     if (!runtime || !runtime->renderer) return false;
-    return runtime->renderer->colorTouchingColor(targetRgb, maskRgb, drawableID);
+    return runtime->renderer->colorTouchingColor(maskRgb, targetRgb, drawableID);
 }
 
 bool Target::keepInFence(double nx, double ny, double& fx, double& fy) const {

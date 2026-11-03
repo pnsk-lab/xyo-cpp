@@ -296,7 +296,9 @@ void SdlAudioBank::update() {
 }
 
 double SdlAudioBank::getLoudness() const {
-    return std::min(100.0, static_cast<double>(peak_) * 100.0);
+    // Scratch's loudness reporter reads microphone input, not the volume of
+    // sounds played by the project. No microphone capture is installed here.
+    return -1.0;
 }
 
 } // namespace xyo

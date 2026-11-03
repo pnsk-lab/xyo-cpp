@@ -422,15 +422,15 @@ void xyo_stop_script(JitCtx* c) {
 
 void xyo_broadcast_v(JitCtx* c, uint64_t v) {
     XYO_RT_PROF(kBcast);
-    std::map<std::string, std::u16string> m;
-    m["BROADCAST_OPTION"] = cast::toString(toV(v))->view();
+    // Own the name across startBroadcast: allocating/compiling a receiver
+    // may collect the temporary SStr, invalidating a borrowed string_view.
+    const std::u16string name(cast::toString(toV(v))->view());
     if (std::getenv("XYO_JIT_VERBOSE")) {
-        std::string s; for (char16_t ch : m["BROADCAST_OPTION"])
+        std::string s; for (char16_t ch : name)
             s += ch < 128 ? char(ch) : '?';
         std::fprintf(stderr, "xyo-jit: broadcast '%s'\n", s.c_str());
     }
-    c->sequencer->runtime.startHats("event_whenbroadcastreceived", &m,
-                                    nullptr);
+    c->sequencer->runtime.startBroadcast(name);
 }
 
 void xyo_broadcast_wait_v(JitCtx* c, uint64_t v) {
@@ -454,7 +454,12 @@ void xyo_broadcast_wait_v(JitCtx* c, uint64_t v) {
                 if (x == t) { inList = true; break; }
             if (inList) {
                 waiting = true;
-                if (!rt->isWaitingThread(t)) allWaiting = false;
+                // Membership is already known. isWaitingThread() would
+                // redundantly scan runtime.threads a second time.
+                if (t->status != STATUS_PROMISE_WAIT &&
+                    t->status != STATUS_YIELD_TICK &&
+                    !t->stack.empty() && t->status != STATUS_DONE)
+                    allWaiting = false;
             }
         }
         if (!waiting) break;
@@ -540,9 +545,28 @@ uint64_t xyo_rt_compat(JitCtx* c, const BlockCached* op) {
 /// isRecursiveCall（同一 proccode 検出で再帰 yield）や warpMode
 /// 継承がこれを参照する — ネイティブ呼出しでも同じ形を再現する。
 void xyo_proc_push(JitCtx* c, const char* blockId, const BlockCached* op,
-                   int32_t defWarp) {
+                   int32_t defWarp, const char* procedureCode,
+                   int32_t nestedBranchDepth, int32_t mayRecurse) {
     XYO_RT_PROF(kProc);
     Thread* t = c->thread;
+    // Scratch thread.isRecursiveCall examines only six ancestors, including
+    // structural control blocks. Native JIT does not materialize those branch
+    // frames, so account for their depth at this particular source callsite.
+    bool recursive = false;
+    if (mayRecurse && !defWarp && nestedBranchDepth <= 5) {
+        int remaining = 6 - nestedBranchDepth;
+        for (auto it = t->stackFrames.rbegin(); it != t->stackFrames.rend() &&
+             remaining > 0; ++it, --remaining) {
+            const BlockCached* frameOp = (*it)->op;
+            const Block* block = frameOp && t->target && t->target->blocks
+                ? t->target->blocks->getBlock(frameOp->id) : nullptr;
+            if (block && block->opcode == "procedures_call" && block->mutation &&
+                block->mutation->attr("proccode") == procedureCode) {
+                recursive = true;
+                break;
+            }
+        }
+    }
     t->pushStack(blockId);
     if (StackFrame* sf = t->peekStackFrame()) {
         // JS stepToProcedure: warpMode は親から継承し、定義が warp なら
@@ -551,6 +575,9 @@ void xyo_proc_push(JitCtx* c, const char* blockId, const BlockCached* op,
         sf->warpMode = c->isWarp != 0 || defWarp != 0;
         sf->op = op;
     }
+    // Match Scratch Sequencer.stepToProcedure: yield *after* pushing the
+    // procedure frame, then execute its body when this thread resumes.
+    if (recursive) xyo_loop_yield(c);
 }
 void xyo_proc_pop(JitCtx* c) {
     Thread* t = c->thread;

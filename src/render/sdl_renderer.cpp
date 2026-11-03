@@ -869,7 +869,7 @@ bool SdlRenderer::xformFor(const Drawable& d, const Skin& s,
 
 // stage 論理 px 座標 → skin texel RGBA。範囲外/透明は false。
 bool SdlRenderer::skinPxAt(const Drawable& d, double px, double py,
-                           uint8_t out[4], bool ignoreVisibility) const {
+                           uint8_t out[4], bool ignoreVisibility, bool ignoreGhost) const {
     Target* t = d.target;
     if (!t || (!t->visible && !t->isStage && !ignoreVisibility)) return false;
     const Skin* s = skinForTarget(t);
@@ -877,7 +877,16 @@ bool SdlRenderer::skinPxAt(const Drawable& d, double px, double py,
     DrawXform f;
     if (!xformFor(d, *s, f)) return false;
     Rendered r;
-    const Rendered* rd = renderedFor(t, s, &r);
+    const auto ghost = t->effects.find("ghost");
+    // Scratch collision/mask passes ignore the ghost alpha of the tester.
+    const bool rawMask = ignoreGhost && ghost != t->effects.end() && ghost->second != 0;
+    const Rendered* rd = rawMask ? nullptr : renderedFor(t, s, &r);
+    if (rawMask) {
+        r.px = s->px.data();
+        r.w = s->w;
+        r.h = s->h;
+        rd = &r;
+    }
     if (!rd->px) return false;
 
     // アンカー（回転中心）からのオフセットを逆変換
@@ -902,45 +911,60 @@ bool SdlRenderer::skinPxAt(const Drawable& d, double px, double py,
 // 背面→前面の全レイヤ（backdrop → pen → sprite）を合成サンプル
 bool SdlRenderer::stageColorAt(double px, double py, int skipId,
                                uint8_t out[4]) const {
-    // 未描画バッチ（CPU 遅延 / GPU クアッド）を反映してから penPx_ を読む
+    // Ensure queued pen draws are visible to colour-sensing reporters.
     const_cast<SdlRenderer*>(this)->penFlushCpuBatch();
     const_cast<SdlRenderer*>(this)->penSyncCpu();
-    // 前面から順に最初の不透明ピクセルを採る
     std::vector<const Drawable*> order;
     order.reserve(drawables_.size());
     for (auto& [id, d] : drawables_) order.push_back(&d);
-    std::sort(order.begin(), order.end(), [](const Drawable* a,
-                                             const Drawable* b) {
-        return a->order > b->order;   // 前面 → 背面
+    std::sort(order.begin(), order.end(), [](const Drawable* a, const Drawable* b) {
+        return a->order > b->order;
     });
-    uint8_t px4[4];
+
+    // Front-to-back alpha compositing. The pen layer stores premultiplied
+    // colours, but skins contain straight-alpha RGBA. A partially ghosted
+    // target must blend with the layers behind it before colour matching.
+    double rgb[3] = {0, 0, 0};
+    double remaining = 1.0;
+    auto blend = [&](const uint8_t* rgba, bool premultiplied) {
+        const double alpha = rgba[3] / 255.0;
+        for (int i = 0; i < 3; ++i)
+            rgb[i] += remaining * (premultiplied ? rgba[i] : rgba[i] * alpha);
+        remaining *= 1.0 - alpha;
+    };
+    uint8_t sample[4];
     for (const Drawable* d : order) {
         if (d->id == skipId || d->group != "sprite") continue;
-        if (skinPxAt(*d, px, py, px4)) { std::memcpy(out, px4, 4); return true; }
+        if (skinPxAt(*d, px, py, sample)) {
+            if (remaining == 1.0 && sample[3] == 255) {
+                std::memcpy(out, sample, 4);
+                return true;
+            }
+            blend(sample, false);
+            if (remaining <= 0.0) break;
+        }
     }
-    // ペンレイヤ
-    if (penTex_ && penW_ > 0) {
-        int ix = static_cast<int>(px * penScale_);
-        int iy = static_cast<int>(py * penScale_);
+    if (remaining > 0.0 && penTex_ && penW_ > 0) {
+        const int ix = static_cast<int>(px * penScale_);
+        const int iy = static_cast<int>(py * penScale_);
         if (ix >= 0 && iy >= 0 && ix < penW_ && iy < penH_) {
             const uint8_t* p =
                 &penPx_[(static_cast<size_t>(iy) * penW_ + ix) * 4];
-            if (p[3] > 0) {
-                int a = p[3];
-                for (int i = 0; i < 3; ++i)
-                    out[i] = static_cast<uint8_t>(
-                        std::min(255, (p[i] * 255 + a / 2) / a));
-                out[3] = static_cast<uint8_t>(a);
-                return true;
+            if (p[3]) blend(p, true);
+        }
+    }
+    if (remaining > 0.0) {
+        for (const Drawable* d : order) {
+            if (d->id == skipId || d->group != "backdrop") continue;
+            if (skinPxAt(*d, px, py, sample)) {
+                blend(sample, false);
+                if (remaining <= 0.0) break;
             }
         }
     }
-    // 背景
-    for (const Drawable* d : order) {
-        if (d->id == skipId || d->group != "backdrop") continue;
-        if (skinPxAt(*d, px, py, px4)) { std::memcpy(out, px4, 4); return true; }
-    }
-    out[0] = out[1] = out[2] = 255; out[3] = 255;   // 白背景
+    for (int i = 0; i < 3; ++i)
+        out[i] = penTo255(rgb[i] + 255.0 * remaining);
+    out[3] = 255;
     return true;
 }
 
@@ -1121,7 +1145,28 @@ void SdlRenderer::getCurrentSkinSize(int drawableID, double& w,
     const Drawable* d = drawableFor(drawableID);
     if (!d || !d->target) return;
     const Skin* s = skinForTarget(d->target);
-    if (s) { w = s->logicalW; h = s->logicalH; }
+    if (s) { w = s->logicalW; h = s->logicalH; return; }
+#ifdef XYO_HAVE_RSVG
+    // librsvg cannot make a texture for a zero-sized SVG, but Scratch still
+    // uses its intrinsic (zero) dimensions when clamping sprite size.
+    const Costume* costume = d->target->getCurrentCostume();
+    if (costume && costume->dataFormat == "svg" && !costume->data.empty()) {
+        GError* error = nullptr;
+        RsvgHandle* handle = rsvg_handle_new_from_data(
+            costume->data.data(), costume->data.size(), &error);
+        if (error) g_error_free(error);
+        if (handle) {
+            gboolean hasWidth = FALSE, hasHeight = FALSE, hasViewBox = FALSE;
+            RsvgLength width{}, height{};
+            RsvgRectangle viewBox{};
+            rsvg_handle_get_intrinsic_dimensions(handle, &hasWidth, &width,
+                &hasHeight, &height, &hasViewBox, &viewBox);
+            if (hasWidth && hasHeight && width.length == 0 && height.length == 0)
+                w = h = 0;
+            g_object_unref(handle);
+        }
+    }
+#endif
 }
 
 double SdlRenderer::setDrawableOrder(int drawableID, double order,
@@ -1129,21 +1174,39 @@ double SdlRenderer::setDrawableOrder(int drawableID, double order,
     Drawable* d = drawableFor(drawableID);
     if (!d) return 0;
     if (group && *group) d->group = group;
+    // Scratch layer changes are display-list splices, not numeric additions
+    // to the previous layer order. Keep the affected group densely indexed.
+    std::vector<Drawable*> layers;
+    for (auto& [id, item] : drawables_)
+        if (item.group == d->group) layers.push_back(&item);
+    std::sort(layers.begin(), layers.end(), [](const Drawable* a, const Drawable* b) {
+        return a->order == b->order ? a->id < b->id : a->order < b->order;
+    });
+    auto at = std::find(layers.begin(), layers.end(), d);
+    const int oldIndex = static_cast<int>(at - layers.begin());
+    layers.erase(at);
+    int newIndex = oldIndex;
     if (std::isinf(order)) {
-        // グループ内の最前/最後へ
-        double best = order > 0 ? -1e18 : 1e18;
-        for (auto& [id, o] : drawables_) {
-            if (o.group != d->group || o.id == d->id) continue;
-            best = order > 0 ? std::max(best, o.order)
-                             : std::min(best, o.order);
-        }
-        d->order = std::abs(best) > 1e17 ? 0
-                   : best + (order > 0 ? 1 : -1);
+        newIndex = order > 0 ? static_cast<int>(layers.size()) : 0;
     } else if (isRelative) {
-        d->order += order;
+        if (!std::isnan(order)) {
+            const double dest = std::clamp(double(oldIndex) + order, 0.0,
+                                           double(layers.size()));
+            newIndex = static_cast<int>(dest);
+        }
     } else {
-        d->order = order;
+        // Clones are inserted immediately behind their parent. The caller
+        // supplies the parent's layer value, and insertion is before it.
+        if (!std::isnan(order)) {
+            newIndex = static_cast<int>(std::lower_bound(
+                layers.begin(), layers.end(), order,
+                [](const Drawable* item, double value) { return item->order < value; })
+                - layers.begin());
+        }
     }
+    layers.insert(layers.begin() + newIndex, d);
+    for (size_t i = 0; i < layers.size(); ++i)
+        layers[i]->order = static_cast<double>(i);
     return d->order;
 }
 
@@ -1216,12 +1279,37 @@ bool SdlRenderer::isTouchingDrawables(int drawableID, const int* others,
         int x1 = static_cast<int>(std::ceil(std::min(ax1, bx1)));
         int y0 = static_cast<int>(std::max(ay0, by0));
         int y1 = static_cast<int>(std::ceil(std::min(ay1, by1)));
+        // The Scratch CPU hit test also samples the shared boundary when two
+        // costumes meet exactly. Check the raw AABBs first so a subpixel gap
+        // does not falsely count as contact.
+        const double left = std::max(ax0, bx0), right = std::min(ax1, bx1);
+        const double top = std::max(ay0, by0), bottom = std::min(ay1, by1);
+        if (left > right || top > bottom) continue;
+        if (left == right || top == bottom) {
+            constexpr double eps = 1e-6;
+            // At a shared boundary, sample a point infinitesimally inside
+            // each costume; their respective interiors are on opposite sides.
+            for (int y = static_cast<int>(std::floor(top)); y <= static_cast<int>(std::ceil(bottom)); ++y) {
+                const double py = top == bottom ? top : std::clamp(y + 0.5, top, bottom);
+                for (int x = static_cast<int>(std::floor(left)); x <= static_cast<int>(std::ceil(right)); ++x) {
+                    const double px = left == right ? left : std::clamp(x + 0.5, left, right);
+                    auto inside = [&](const Drawable& item) {
+                        uint8_t color[4];
+                        for (double dx : {-eps, eps}) for (double dy : {-eps, eps})
+                            if (skinPxAt(item, px + dx, py + dy, color, false, true)) return true;
+                        return false;
+                    };
+                    if (inside(*a) && inside(*b)) return true;
+                }
+            }
+            continue;
+        }
         if (x0 >= x1 || y0 >= y1) continue;
         uint8_t pa[4], pb[4];
         for (int y = y0; y < y1; ++y)
             for (int x = x0; x < x1; ++x)
-                if (skinPxAt(*a, x + 0.5, y + 0.5, pa) &&
-                    skinPxAt(*b, x + 0.5, y + 0.5, pb))
+                if (skinPxAt(*a, x + 0.5, y + 0.5, pa, false, true) &&
+                    skinPxAt(*b, x + 0.5, y + 0.5, pb, false, true))
                     return true;
     }
     return false;
@@ -1235,9 +1323,17 @@ static inline bool colorMatches(uint8_t r, uint8_t g, uint8_t b, uint8_t tr,
            (b & 0xF0) == (tb & 0xF0);
 }
 
+// scratch-render uses 6 high bits per channel for the sprite-mask colour,
+// independently of the 5/5/4 tolerance for the background target colour.
+static inline bool maskColorMatches(uint8_t r, uint8_t g, uint8_t b,
+                                    uint8_t tr, uint8_t tg, uint8_t tb) {
+    return (r & 0xFC) == (tr & 0xFC) && (g & 0xFC) == (tg & 0xFC) &&
+           (b & 0xFC) == (tb & 0xFC);
+}
+
 bool SdlRenderer::isTouchingColor(int drawableID, uint32_t rgb) {
     const Drawable* d = drawableFor(drawableID);
-    if (!d || !d->target || !d->target->visible) return false;
+    if (!d || !d->target) return false;
     double b[4];
     getDrawableBounds(drawableID, b);
     int x0 = static_cast<int>(stageX(std::min(b[0], b[1])));
@@ -1248,18 +1344,44 @@ bool SdlRenderer::isTouchingColor(int drawableID, uint32_t rgb) {
     uint8_t tr = (rgb >> 16) & 0xFF, tg = (rgb >> 8) & 0xFF, tb = rgb & 0xFF;
     for (int y = y0; y < y1; ++y)
         for (int x = x0; x < x1; ++x) {
-            if (!skinPxAt(*d, x + 0.5, y + 0.5, self)) continue;
+            if (!skinPxAt(*d, x + 0.5, y + 0.5, self, true, true)) continue;
             if (!stageColorAt(x + 0.5, y + 0.5, drawableID, behind)) continue;
             if (colorMatches(behind[0], behind[1], behind[2], tr, tg, tb))
                 return true;
         }
+    // Scratch's collision scan includes points at shared costume edges.
+    // Probe infinitesimally inside the tester and outside the same boundary.
+    constexpr double eps = 1e-5;
+    const double left = stageX(std::min(b[0], b[1]));
+    const double right = stageX(std::max(b[0], b[1]));
+    const double top = stageY(std::max(b[2], b[3]));
+    const double bottom = stageY(std::min(b[2], b[3]));
+    auto edgeMatches = [&](double x, double y, double outwardX, double outwardY) {
+        if (!skinPxAt(*d, x - outwardX, y - outwardY, self, true, true))
+            return false;
+        if (!stageColorAt(x + outwardX, y + outwardY, drawableID, behind))
+            return false;
+        return colorMatches(behind[0], behind[1], behind[2], tr, tg, tb);
+    };
+    for (int y = std::max(0, static_cast<int>(std::floor(top)));
+         y <= std::min(static_cast<int>(stageH_), static_cast<int>(std::ceil(bottom))); ++y) {
+        const double py = y + 0.5;
+        if (edgeMatches(left, py, -eps, 0) || edgeMatches(right, py, eps, 0))
+            return true;
+    }
+    for (int x = std::max(0, static_cast<int>(std::floor(left)));
+         x <= std::min(static_cast<int>(stageW_), static_cast<int>(std::ceil(right))); ++x) {
+        const double px = x + 0.5;
+        if (edgeMatches(px, top, 0, -eps) || edgeMatches(px, bottom, 0, eps))
+            return true;
+    }
     return false;
 }
 
 bool SdlRenderer::colorTouchingColor(uint32_t color, uint32_t target,
                                      int drawableID) {
     const Drawable* d = drawableFor(drawableID);
-    if (!d || !d->target || !d->target->visible) return false;
+    if (!d || !d->target) return false;
     double b[4];
     getDrawableBounds(drawableID, b);
     int x0 = static_cast<int>(stageX(std::min(b[0], b[1])));
@@ -1273,8 +1395,8 @@ bool SdlRenderer::colorTouchingColor(uint32_t color, uint32_t target,
     uint8_t self[4], behind[4];
     for (int y = y0; y < y1; ++y)
         for (int x = x0; x < x1; ++x) {
-            if (!skinPxAt(*d, x + 0.5, y + 0.5, self)) continue;
-            if (!colorMatches(self[0], self[1], self[2], c1r, c1g, c1b))
+            if (!skinPxAt(*d, x + 0.5, y + 0.5, self, true, true)) continue;
+            if (!maskColorMatches(self[0], self[1], self[2], c1r, c1g, c1b))
                 continue;
             if (!stageColorAt(x + 0.5, y + 0.5, drawableID, behind)) continue;
             if (colorMatches(behind[0], behind[1], behind[2], c2r, c2g, c2b))

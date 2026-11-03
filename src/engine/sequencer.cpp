@@ -144,6 +144,11 @@ std::vector<Thread*> Sequencer::stepThreads() {
                     stoppedThread |= fr.stopped;
                     numActiveThreads += fr.active;
                     stepThread(*activeThread);
+                    // Self-rebroadcast can replace the active thread in the
+                    // list while its current block continues to completion.
+                    // Its next scheduling turn is now unreachable.
+                    if (!runtime.isActiveThread(activeThread))
+                        retireThread(*activeThread);
                     if (activeThread->status == STATUS_RUNNING)
                         ++numActiveThreads;
                     if (activeThread->stack.empty() ||
@@ -376,7 +381,12 @@ void Sequencer::jitStepThread(Thread& thread) {
     if (prof().enabled) { ps.emplace(&prof().fiberNs); ++prof().nFiber; }
 #endif
     c->fiber->resume();
-    if (c->fiber->finished()) {
+    if (c->fiber->finished() || thread.status == STATUS_DONE ||
+        thread.isKilled || !runtime.isActiveThread(&thread)) {
+        // A thread may be restarted or stopped while it is the currently
+        // executing fiber (e.g. a broadcast restarting its own hat). It
+        // becomes unreachable after this resume returns even if it yielded:
+        // return the suspended fiber to the pool instead of leaking its stack.
         // エントリ関数が戻った = スクリプト完了。Thread オブジェクトは
         // ownedThreads で ~Runtime まで生存するため、fiber/jitCtx は
         // ここで即座にプールへ戻す（broadcast 等の大量スレッド生成対策）。
@@ -541,8 +551,13 @@ Sequencer::ParFlush Sequencer::flushParBatch() {
             fibers.clear();
             if (chained) {
                 for (Thread* t : batch) {
+                    // Broadcast receivers can be replaced in the thread list.
+                    // The chain bypasses jitStepThread's per-fiber liveness
+                    // check, so never chain a restartable receiver.
                     if (!t->isCompiled || !t->jitCtx || !t->fiber ||
-                        t->fiber->finished()) {
+                        t->fiber->finished() || t->reusableBroadcastReceiver ||
+                        (t->topBlockPtr &&
+                         t->topBlockPtr->opcode == "event_whenbroadcastreceived")) {
                         chained = false;
                         break;
                     }
