@@ -205,3 +205,110 @@ jobs:
           path: build-win-static/xyo.exe
           if-no-files-found: error
           retention-days: 7
+
+  # scratch-bench は xyo-cpp のリリースをダウンロードしてはならない。
+  # 同じ CI 実行でビルドした xyo を XYO_BIN で直接渡し、PR の実装を測る。
+  scratch-bench:
+    name: ScratchBench / performance + parity
+    needs: linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      XYO_BIN: ${{ github.workspace }}/.bench/bin/xyo
+      XYO_VIDEODRIVER: offscreen
+      SDL_AUDIODRIVER: dummy
+      LIBGL_ALWAYS_SOFTWARE: "1"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: xyo-linux-full
+          path: .bench/bin
+
+      - name: Install runtime dependencies (LLVM + renderer)
+        uses: ./.github/actions/linux-deps
+        with:
+          llvm: ${{ env.LLVM_LATEST }}
+          llvm_apt: "true"
+          extra: libsdl2-2.0-0 librsvg2-2 libgl1 xvfb fonts-liberation
+
+      - name: Check built xyo
+        run: |
+          chmod +x "$XYO_BIN"
+          ldd "$XYO_BIN"
+          if ldd "$XYO_BIN" | grep -q "not found"; then
+            echo "Missing xyo runtime library" >&2
+            exit 1
+          fi
+
+      # ベンチの内容が黙って変わると CI の比較が崩れるので、上流を固定する。
+      # 更新時は source hash と parity の合格率を確認してから ref を変更する。
+      - uses: actions/checkout@v5
+        with:
+          repository: gradylink/scratch-bench
+          ref: cca6ab15108301bee6b7249db60f00e82f141159
+          path: scratch-bench
+          submodules: true
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.4"
+
+      - name: Install scratch-bench
+        working-directory: scratch-bench
+        run: |
+          test -d parity/project
+          bun install --frozen-lockfile
+
+      - name: Performance (xyo-cpp, all variants)
+        working-directory: scratch-bench
+        run: |
+          set -o pipefail
+          bun run bench --runtime xyo-cpp --suite performance \
+            --runs 3 --timeout 180 --out results/ci-performance \
+            2>&1 | tee ../.bench/performance.log
+
+      # scratch-bench の AOT variant はコンパイル失敗時に JIT へフォールバックする。
+      # 成果物を検査し、AOT 未実行を AOT の計測結果として扱わない。
+      - name: Verify performance AOT object
+        run: |
+          find scratch-bench/.cache/runtimes/xyo-aot -maxdepth 1 -type f \
+            -name 'performance.sb3.*.o' -size +0c -print -quit | grep -q .
+      # 外部ランタイム側の問題で終了マーカーが出ない場合もある。
+      # xyo-cpp の CI 結果に影響させず、比較用ログだけ収集する。
+      - name: TurboWarp reference (best effort)
+        continue-on-error: true
+        working-directory: scratch-bench
+        run: |
+          set -o pipefail
+          bun run bench --runtime turbowarp --suite performance \
+            --runs 3 --timeout 180 --out results/ci-turbowarp \
+            2>&1 | tee ../.bench/turbowarp.log
+      - name: Parity (xyo-cpp, all variants)
+        working-directory: scratch-bench
+        run: |
+          set -o pipefail
+          bun run bench --runtime xyo-cpp --suite parity \
+            --parity-runs 1 --timeout 180 --out results/ci-parity \
+            2>&1 | tee ../.bench/parity.log
+
+      - name: Validate results and publish summary
+        if: always()
+        run: bun tools/ci/scratch-bench-summary.ts
+
+      - name: ScratchBench results and logs
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: scratch-bench-results
+          path: |
+            scratch-bench/results/ci-performance/
+            scratch-bench/results/ci-parity/
+            scratch-bench/results/ci-turbowarp/
+            .bench/performance.log
+            .bench/turbowarp.log
+            .bench/parity.log
+          if-no-files-found: warn
+          retention-days: 14
