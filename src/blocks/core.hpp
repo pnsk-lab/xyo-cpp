@@ -33,6 +33,10 @@ std::vector<Thread*> setBackdropArg(Runtime& rt, Target* stage,
 /// motion_movesteps の座標計算 + setXY。
 void moveSteps(double steps, Target* t);
 
+/// motion_ifonedgebounce の共通実装（interpreter / JIT 共用）。
+/// bounds取得、反射方向、ステージ内への押し戻しを一箇所で管理する。
+void bounceOffEdge(Target* target, Runtime* runtime);
+
 /// '_mouse_'/'_random_'/スプライト名 → [x,y]。見つからなければ false。
 bool getTargetXY(Value targetName, Runtime& rt, double& tx, double& ty);
 

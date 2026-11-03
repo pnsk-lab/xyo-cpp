@@ -160,6 +160,14 @@ void xyo_loop_yield(JitCtx* c) {
     if (!c->isWarp || isStuck(c)) xyo_yield(c);
 }
 
+// Poll without switching fibers or changing Scratch variables. The JIT can
+// keep promoted scalars/lists in SSA if this returns false, and spills them
+// only before an actual scheduler handoff. Only call in a warp loop.
+int32_t xyo_warp_yield_due(JitCtx* c) {
+    XYO_RT_PROF(kLoopY);
+    return isStuck(c) ? 1 : 0;
+}
+
 // --- 値 ----------------------------------------------------------------
 
 double xyo_to_num(uint64_t bits) { return cast::toNumber(toV(bits)); }
@@ -215,12 +223,48 @@ double xyo_acos(double x) { return v8math::acos(x); }
 double xyo_atan(double x) { return v8math::atan(x); }
 double xyo_exp(double x) { return v8math::exp(x); }
 
+// Scratch uses numeric order only when *both* operands are numeric
+// strings; otherwise it compares case-folded text. SStr::numState caches
+// exactly the required distinction (1: numeric, 2: NaN, 3: lexical zero,
+// 4: Infinity literal). Do not change this if either cache is uninitialized.
+static bool cachedStringOrder(uint64_t a, uint64_t b, int* order) {
+    // Most comparisons are not string-vs-string. Reject them before even
+    // accessing the once-initialized A/B switch or any string cache.
+    if ((a >> 48) != (val::kTagStr >> 48) ||
+        (b >> 48) != (val::kTagStr >> 48))
+        return false;
+    static const bool enabled = [] {
+        const char* e = std::getenv("XYO_JIT_STRING_ORDER_CACHE");
+        return !e || e[0] != '0';
+    }();
+    if (!enabled) return false;
+    SStr* lhs = toV(a).asStrPtr();
+    SStr* rhs = toV(b).asStrPtr();
+    const uint32_t leftState = lhs->loadNumState();
+    const uint32_t rightState = rhs->loadNumState();
+    if (leftState == 0 || rightState == 0) return false;
+    const bool leftNumeric = leftState == 1 || leftState == 4;
+    const bool rightNumeric = rightState == 1 || rightState == 4;
+    if (leftNumeric && rightNumeric) {
+        const double x = lhs->loadNumCache();
+        const double y = rhs->loadNumCache();
+        *order = (x > y) - (x < y);
+    } else {
+        *order = compareStringsCaseInsensitive(lhs, rhs);
+    }
+    return true;
+}
+
 int32_t xyo_lt(uint64_t a, uint64_t b) {
     XYO_RT_PROF(kArith);
+    int order = 0;
+    if (cachedStringOrder(a, b, &order)) return order < 0 ? 1 : 0;
     return cast::compare(toV(a), toV(b)) < 0 ? 1 : 0;
 }
 int32_t xyo_gt(uint64_t a, uint64_t b) {
     XYO_RT_PROF(kArith);
+    int order = 0;
+    if (cachedStringOrder(a, b, &order)) return order > 0 ? 1 : 0;
     return cast::compare(toV(a), toV(b)) > 0 ? 1 : 0;
 }
 static int valTag(Value v) {
@@ -253,6 +297,18 @@ int32_t xyo_eq(uint64_t a, uint64_t b) {
             uint32_t s1 = va.asStrPtr()->loadNumState();
             uint32_t s2 = vb.asStrPtr()->loadNumState();
             if (s1 && s2 && s1 != s2 && s1 != 4 && s2 != 4) return 0;
+            // Both immutable strings have already been parsed and proved
+            // nonnumeric. The generic cast::compare would inspect/convert
+            // them again before reaching exactly this case-insensitive
+            // lexical comparison. Retain the generic path for numeric
+            // strings, whitespace-only zero and Infinity.
+            static const bool directNonnumericEq = [] {
+                const char* setting = std::getenv("XYO_JIT_NONNUMERIC_STR_EQ");
+                return !setting || setting[0] != '0';
+            }();
+            if (directNonnumericEq && s1 == 2 && s2 == 2)
+                return compareStringsCaseInsensitive(
+                    va.asStrPtr(), vb.asStrPtr()) == 0 ? 1 : 0;
         }
     }
     return cast::compare(toV(a), toV(b)) == 0 ? 1 : 0;

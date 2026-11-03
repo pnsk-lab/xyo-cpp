@@ -382,6 +382,7 @@ extern int test_list_codegen_bounds_main();
 extern int test_nan_codegen_main();
 extern int test_literal_context_main();
 extern int test_numeric_promotion_main();
+extern int test_type_profile_main();
 extern int test_list_read_memo_main();
 extern int test_danger_main();
 extern int test_list_string_intern_main();
@@ -426,6 +427,7 @@ int main() {
     int nanCodegenFail = test_nan_codegen_main();
     int literalContextFail = test_literal_context_main();
     int numericPromotionFail = test_numeric_promotion_main();
+    int typeProfileFail = test_type_profile_main();
     int listReadMemoFail = test_list_read_memo_main();
     int dangerFail = test_danger_main();
     int listStringInternFail = test_list_string_intern_main();
@@ -438,7 +440,7 @@ int main() {
             wasmCompileFail + minifyFail + depsFail + analysisFail + parforFail + penHoistFail + rewriteFail +
             parallelStringsFail + schedulerFail +
             equalityLiteralFail + colorFastFail + motionNumericFail + slotHoistFail +
-            listCodegenBoundsFail + nanCodegenFail + literalContextFail + numericPromotionFail + dangerFail + listStringInternFail +
+            listCodegenBoundsFail + nanCodegenFail + literalContextFail + numericPromotionFail + typeProfileFail + dangerFail + listStringInternFail +
             glChunkPlanFail + scratchCompatFail + listLimitFail + listReadMemoFail + sstrConsFail + gcPoolFail)
                ? 1
                : 0;

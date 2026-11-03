@@ -299,23 +299,74 @@ std::u16string u16ToLowerAscii(std::u16string_view sv) {
 }
 
 bool SStr::isAscii() const {
-    auto* self = const_cast<SStr*>(this);
-    auto flagsRef = std::atomic_ref<uint32_t>(self->flags);
-    const uint32_t f = flagsRef.load(std::memory_order_acquire);
+    auto loadFlags = [](const SStr* s) {
+        return std::atomic_ref<uint32_t>(const_cast<SStr*>(s)->flags)
+            .load(std::memory_order_acquire);
+    };
+    auto publish = [](const SStr* s, bool ascii) {
+        std::atomic_ref<uint32_t>(const_cast<SStr*>(s)->flags)
+            .fetch_or(kAsciiKnown | (ascii ? kAsciiValue : 0),
+                      std::memory_order_release);
+    };
+
+    uint32_t f = loadFlags(this);
     if (f & kAsciiKnown) return (f & kAsciiValue) != 0;
-    bool ascii;
+
+    // The usual case is a new cons whose children were already examined.
+    // Avoid a temporary stack (and a heap allocation) for this fast path.
     if (f & kConsFlag) {
-        ascii = left->isAscii() && right->isAscii();
-    } else {
-        ascii = true;
-        const char16_t* d = inlineBody();
-        for (uint32_t i = 0; i < len; ++i) {
-            if (d[i] >= 0x80) { ascii = false; break; }
+        const uint32_t lf = loadFlags(left);
+        if (lf & kAsciiKnown) {
+            if (!(lf & kAsciiValue)) {
+                publish(this, false);
+                return false;
+            }
+            const uint32_t rf = loadFlags(right);
+            if (rf & kAsciiKnown) {
+                const bool ascii = (rf & kAsciiValue) != 0;
+                publish(this, ascii);
+                return ascii;
+            }
         }
     }
-    flagsRef.store(f | kAsciiKnown | (ascii ? kAsciiValue : 0),
-                   std::memory_order_release);
-    return ascii;
+
+    // An unflattened rope can be tens of thousands of nodes deep. Resolve
+    // children in postorder, caching each result without native recursion.
+    std::vector<const SStr*> pending{this};
+    while (!pending.empty()) {
+        const SStr* node = pending.back();
+        f = loadFlags(node);
+        if (f & kAsciiKnown) {
+            pending.pop_back();
+        } else if (!(f & kConsFlag)) {
+            bool ascii = true;
+            const char16_t* d = node->inlineBody();
+            for (uint32_t i = 0; i < node->len; ++i) {
+                if (d[i] >= 0x80) { ascii = false; break; }
+            }
+            publish(node, ascii);
+            pending.pop_back();
+        } else {
+            const uint32_t lf = loadFlags(node->left);
+            if (!(lf & kAsciiKnown)) {
+                pending.push_back(node->left);
+                continue;
+            }
+            if (!(lf & kAsciiValue)) {
+                publish(node, false); // right child need not be scanned
+                pending.pop_back();
+                continue;
+            }
+            const uint32_t rf = loadFlags(node->right);
+            if (!(rf & kAsciiKnown)) {
+                pending.push_back(node->right);
+                continue;
+            }
+            publish(node, (rf & kAsciiValue) != 0);
+            pending.pop_back();
+        }
+    }
+    return (loadFlags(this) & kAsciiValue) != 0;
 }
 
 static bool isAsciiOnly(std::u16string_view s) {
@@ -487,7 +538,8 @@ static int compareAsciiCaseInsensitive(std::u16string_view a,
 
 bool sstrContains(std::u16string_view hay, std::u16string_view needle) {
     if (needle.empty()) return true;
-    if (needle.size() > hay.size()) return false;
+    // Unicode lowercasing can expand code units (U+0130 -> i + U+0307),
+    // so source lengths cannot reject a Unicode match.
     // ASCII だけなら小文字化用の u16string を 2 本作らず、その場で
     // 畳みながら走査する（`contains(長い文字列, 短い語)` はループ内で
     // 呼ばれやすく、毎回 2 本のコピーは無駄 — TurboWarp の 3 倍差の主因）。
@@ -495,7 +547,10 @@ bool sstrContains(std::u16string_view hay, std::u16string_view needle) {
     for (char16_t c : hay) if (c >= 0x80) { ascii = false; break; }
     if (ascii)
         for (char16_t c : needle) if (c >= 0x80) { ascii = false; break; }
-    if (ascii) return containsAscii(hay, needle);
+    if (ascii) {
+        if (needle.size() > hay.size()) return false;
+        return containsAscii(hay, needle);
+    }
     // Unicode case folding can expand characters and applies Final_Sigma
     // contextually. Keep the established exact path for those uncommon inputs.
     std::u16string h = u16ToLower(hay);
@@ -505,11 +560,14 @@ bool sstrContains(std::u16string_view hay, std::u16string_view needle) {
 
 bool sstrContains(const SStr* hay, const SStr* needle) {
     if (needle->len == 0) return true;
-    if (needle->len > hay->len) return false;
+    // Do not compare unlowercased UTF-16 lengths here: Unicode lowercase
+    // expansion can make a shorter haystack contain a longer needle.
     // The ASCII property is cached, so a repeated contains() on the same
     // haystack does not rescan it before the search itself.
-    if (hay->isAscii() && needle->isAscii())
+    if (hay->isAscii() && needle->isAscii()) {
+        if (needle->len > hay->len) return false;
         return containsAscii(hay->view(), needle->view());
+    }
     return sstrContains(hay->view(), needle->view());
 }
 

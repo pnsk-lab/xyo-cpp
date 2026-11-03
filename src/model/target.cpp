@@ -89,11 +89,12 @@ Variable* Target::lookupOrCreateList(const std::string& id,
 
 Variable* Target::lookupBroadcastMsg(const std::string& id,
                                      const std::u16string& name) {
-    Variable* msg = nullptr;
-    if (!id.empty()) msg = lookupVariableById(id);
-    else if (!name.empty()) msg = lookupBroadcastByInputValue(name);
-    if (msg) return msg;
-    return nullptr;
+    if (!id.empty()) {
+        auto collision = collidingBroadcasts.find(id);
+        if (collision != collidingBroadcasts.end()) return &collision->second;
+        return lookupVariableById(id);
+    }
+    return name.empty() ? nullptr : lookupBroadcastByInputValue(name);
 }
 
 Variable* Target::lookupBroadcastByInputValue(const std::u16string& name) {
@@ -101,6 +102,9 @@ Variable* Target::lookupBroadcastByInputValue(const std::u16string& name) {
     for (auto& [id, v] : variables) {
         if (v.type == Variable::kBroadcastType &&
             u16ToLower(v.name) == lower) return &v;
+    }
+    for (auto& [id, v] : collidingBroadcasts) {
+        if (u16ToLower(v.name) == lower) return &v;
     }
     return nullptr;
 }
@@ -440,6 +444,7 @@ Target* Target::makeClone() {
     c->rotationStyle = rotationStyle;
     c->effects = effects;
     c->variables = duplicateVariables();
+    c->collidingBroadcasts = collidingBroadcasts;
     c->edgeActivatedHatValues = edgeActivatedHatValues;
     c->soundEffects = soundEffects;
     // JS: _onTargetCreated — ペン状態は複製し、penDown 中なら移動フックも継承

@@ -173,29 +173,30 @@ bool Blocks::getProcedureParamNamesIdsAndDefaults(
     std::vector<std::u16string>& names,
     std::vector<std::string>& ids,
     std::vector<Value>& defaults) {
-    // getProcedureDefinition と同じ基準（同一 proccode は seq 最小の
-    // プロトタイプ = 最初の定義に属するもの）を選ぶ。
-    Block* best = nullptr;
-    for (auto& [id, block] : blocks_) {
-        if (block.opcode == "procedures_prototype" && block.mutation &&
-            block.mutation->attr("proccode") == proccode) {
-            if (!best || block.seq < best->seq) best = &block;
-        }
-    }
-    if (!best) return false;
-    best->mutation->parseArgs();
-    names = best->mutation->argumentNames;
-    ids = best->mutation->argumentIds;
-    defaults = best->mutation->argumentDefaults;
+    const Mutation* prototype = getProcedurePrototype(proccode);
+    if (!prototype) return false;
+    names = prototype->argumentNames;
+    ids = prototype->argumentIds;
+    defaults = prototype->argumentDefaults;
     return true;
+}
+
+const Mutation* Blocks::getProcedurePrototype(const std::string& proccode) {
+    populateProcedureCache();
+    const auto it = cache_.procedurePrototypes.find(proccode);
+    return it == cache_.procedurePrototypes.end() ? nullptr
+        : &*it->second->mutation;
 }
 
 void Blocks::populateProcedureCache() {
     if (cache_.proceduresPopulated) return;
     for (auto& [id, block] : blocks_) {
-        if (block.opcode == "procedures_prototype" && block.mutation) {
-            block.mutation->parseArgs();
-        }
+        if (block.opcode != "procedures_prototype" || !block.mutation) continue;
+        block.mutation->parseArgs();
+        const std::string& code = block.mutation->attr("proccode");
+        auto [it, inserted] = cache_.procedurePrototypes.emplace(code, &block);
+        if (!inserted && block.seq < it->second->seq)
+            it->second = &block;
     }
     cache_.proceduresPopulated = true;
 }
@@ -252,6 +253,7 @@ BlockCached* Blocks::getCachedExecute(const std::string& blockId) {
     auto bc = std::make_unique<BlockCached>();
     BlockCached* self = bc.get();
     self->id = block->id;
+    self->nextBlockId = block->next;
     self->opcode = block->opcode;
     self->fields = block->fields;
     // getInputs: SUBSTACK* を除くコピー
@@ -318,6 +320,12 @@ BlockCached* Blocks::getCachedExecute(const std::string& blockId) {
                          inputCached->ops.begin(), inputCached->ops.end());
         inputCached->parentKey = inputName;
         inputCached->parentValues = &self->argValues;
+        // std::map nodes do not move on insert. Resolve once instead of
+        // searching the same key after every reporter operation. Do not
+        // introduce a new key for inputs with no reporter primitive.
+        inputCached->parentValueSlot =
+            inputCached->definedBlockFunction && inputName != "BROADCAST_INPUT"
+                ? &self->argValues.ref(inputName) : nullptr;
         if (inputCached->isShadowBlock) {
             self->argValues.vals[inputName] = inputCached->shadowValue;
         }
@@ -384,7 +392,7 @@ void Blocks::restoreState(std::unordered_map<std::string, Block> blocks,
 void Blocks::resetCache() {
     cache_.inputs.clear();
     cache_.procedureDefinitions.clear();
-    cache_.procedureParamNames.clear();
+    cache_.procedurePrototypes.clear();
     cache_.executeCached.clear();
     cache_.scripts.clear();
     cache_.monitored.reset();

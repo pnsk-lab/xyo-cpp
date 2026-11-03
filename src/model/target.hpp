@@ -73,6 +73,8 @@ public:
 
     // --- 変数（id → Variable）---
     std::unordered_map<std::string, Variable> variables;
+    // SB3 can reuse an ID for a scalar/list and a broadcast.
+    std::unordered_map<std::string, Variable> collidingBroadcasts;
     /// 実行中スクリプトコメント（未使用だが保持）
     std::map<std::string, JsonValue> comments;
     /// 拡張ごとの保持データ

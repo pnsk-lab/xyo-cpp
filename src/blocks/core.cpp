@@ -24,6 +24,7 @@
 #include "../engine/block_utility.hpp"
 #include "../engine/runtime.hpp"
 #include "../engine/sequencer.hpp"
+#include "../jit/jit.hpp"
 #include "../model/target.hpp"
 #include "../rt/runtime_helpers.hpp"
 
@@ -200,6 +201,43 @@ int getSoundIndex(Value soundName, Target* t) {
     return -1;
 }
 
+void bounceOffEdge(Target* t, Runtime* rt) {
+    if (!t || !rt) return;
+    Target::Bounds bounds;
+    if (!t->getBounds(bounds)) return;
+    double stageW = rt->stageWidth, stageH = rt->stageHeight;
+    double distLeft = std::max(0.0, stageW / 2 + bounds.left);
+    double distTop = std::max(0.0, stageH / 2 - bounds.top);
+    double distRight = std::max(0.0, stageW / 2 - bounds.right);
+    double distBottom = std::max(0.0, stageH / 2 + bounds.bottom);
+    enum class Edge { Left, Top, Right, Bottom };
+    Edge nearest = Edge::Left;
+    double minDist = std::numeric_limits<double>::infinity();
+    if (distLeft < minDist) { minDist = distLeft; nearest = Edge::Left; }
+    if (distTop < minDist) { minDist = distTop; nearest = Edge::Top; }
+    if (distRight < minDist) { minDist = distRight; nearest = Edge::Right; }
+    if (distBottom < minDist) { minDist = distBottom; nearest = Edge::Bottom; }
+    if (minDist > 0) return;
+
+    double radians = (M_PI * (90.0 - t->direction)) / 180.0;
+    double dx = v8math::cos(radians);
+    double dy = -v8math::sin(radians);
+    switch (nearest) {
+    case Edge::Left: dx = std::max(0.2, std::fabs(dx)); break;
+    case Edge::Top: dy = std::max(0.2, std::fabs(dy)); break;
+    case Edge::Right: dx = -std::max(0.2, std::fabs(dx)); break;
+    case Edge::Bottom: dy = -std::max(0.2, std::fabs(dy)); break;
+    }
+
+    // JS engines may differ by one ULP for Math.atan2. Use the native
+    // libm result for motion reflection (rather than the bundled fdlibm
+    // transcendentals) to match the Scratch renderer's boundary directions.
+    double newDir = std::atan2(dy, dx) * 180.0 / M_PI + 90.0;
+    t->setDirection(newDir);
+    double fx, fy;
+    if (t->keepInFence(t->x, t->y, fx, fy)) t->setXY(fx, fy);
+}
+
 namespace {
 
 Value V(double n) { return Value::num(n); }
@@ -287,9 +325,10 @@ Value opLength(const ArgValues& a, BlockUtility&) {
     return V(rt::strLength(v(a, "STRING")));
 }
 Value opContains(const ArgValues& a, BlockUtility&) {
-    SStr* h = SStr::create(u16ToLower(toStr(a.get("STRING1"))));
-    SStr* n = SStr::create(u16ToLower(toStr(a.get("STRING2"))));
-    return V(sstrContains(h, n));
+    // strContains folds ASCII while scanning and handles Unicode lowercasing
+    // only when required. Avoid allocating two already-lowercased strings
+    // for every interpreted contains block.
+    return V(rt::strContains(a.get("STRING1"), a.get("STRING2")));
 }
 Value opMod(const ArgValues& a, BlockUtility&) {
     return V(rt::mod(num(a, "NUM1"), num(a, "NUM2")));
@@ -526,6 +565,7 @@ Value dtSetVar(const ArgValues& a, BlockUtility& u) {
     Variable* var = lookupVar(a, u, "VARIABLE", false);
     if (!var) return Value::undefined();
     var->value = v(a, "VALUE");
+    if (jitMode() == JitMode::HotSpot) var->observeValueType(var->value);
     if (var->isCloud) {
         // cloud requestUpdateVariable — 未実装（クラウド非対応）
     }
@@ -536,6 +576,7 @@ Value dtChangeVar(const ArgValues& a, BlockUtility& u) {
     if (!var) return Value::undefined();
     double nv = cast::toNumber(var->value) + num(a, "VALUE");
     var->value = V(nv);
+    if (jitMode() == JitMode::HotSpot) var->observeValueType(var->value);
     return Value::undefined();
 }
 
@@ -893,35 +934,10 @@ Value motGlideTo(const ArgValues& a, BlockUtility& u) {
     return motGlide(a2, u);
 }
 Value motIfOnEdgeBounce(const ArgValues&, BlockUtility& u) {
-    Target* t = u.target();
-    Target::Bounds bounds;
-    if (!t->getBounds(bounds)) return Value::undefined();
-    Runtime* rt = u.runtime();
-    double stageW = rt->stageWidth, stageH = rt->stageHeight;
-    double distLeft = std::max(0.0, stageW / 2 + bounds.left);
-    double distTop = std::max(0.0, stageH / 2 - bounds.top);
-    double distRight = std::max(0.0, stageW / 2 - bounds.right);
-    double distBottom = std::max(0.0, stageH / 2 + bounds.bottom);
-    std::string nearest;
-    double minDist = std::numeric_limits<double>::infinity();
-    if (distLeft < minDist) { minDist = distLeft; nearest = "left"; }
-    if (distTop < minDist) { minDist = distTop; nearest = "top"; }
-    if (distRight < minDist) { minDist = distRight; nearest = "right"; }
-    if (distBottom < minDist) { minDist = distBottom; nearest = "bottom"; }
-    if (minDist > 0) return Value::undefined();
-    double radians = (M_PI * (90.0 - t->direction)) / 180.0;
-    double dx = v8math::cos(radians);
-    double dy = -v8math::sin(radians);
-    if (nearest == "left") dx = std::max(0.2, std::fabs(dx));
-    else if (nearest == "top") dy = std::max(0.2, std::fabs(dy));
-    else if (nearest == "right") dx = -std::max(0.2, std::fabs(dx));
-    else if (nearest == "bottom") dy = -std::max(0.2, std::fabs(dy));
-    double newDir = v8math::atan2(dy, dx) * 180.0 / M_PI + 90.0;
-    t->setDirection(newDir);
-    double fx, fy;
-    if (t->keepInFence(t->x, t->y, fx, fy)) t->setXY(fx, fy);
+    bounceOffEdge(u.target(), u.runtime());
     return Value::undefined();
 }
+
 Value motSetRotationStyle(const ArgValues& a, BlockUtility& u) {
     u.target()->setRotationStyle(SStr::toUtf8(str(a, "STYLE")));
     return Value::undefined();
@@ -1245,13 +1261,15 @@ Value procCall(const ArgValues& a, BlockUtility& u) {
     const std::string& proccode =
         a.mutation ? a.mutation->attr("proccode") : "";
 
-    std::vector<std::u16string> names;
-    std::vector<std::string> ids;
-    std::vector<Value> defaults;
-    if (!u.getProcedureParamNamesIdsAndDefaults(proccode, names, ids,
-                                              defaults)) {
+    // Reuse the cached signature; recursive calls must not rescan all blocks
+    // or heap-copy the argument names, IDs and defaults at every invocation.
+    const Mutation* prototype =
+        u.thread->target->blocks->getProcedurePrototype(proccode);
+    if (!prototype)
         return isReporter ? Value::emptyStr() : Value::undefined();
-    }
+    const auto& names = prototype->argumentNames;
+    const auto& ids = prototype->argumentIds;
+    const auto& defaults = prototype->argumentDefaults;
 
     u.initParams();
     for (size_t i = 0; i < ids.size(); ++i) {

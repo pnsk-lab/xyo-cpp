@@ -3,6 +3,7 @@
 // 内部 id / 型名は ASCII std::string。
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -25,7 +26,43 @@ struct Variable {
     /// SCALAR_TYPE / BROADCAST_MESSAGE_TYPE の値（broadcast は name と同一）。
     /// LIST_TYPE のときは list を使う。
     Value value = Value::num(0);
-    SList* list = nullptr;   // LIST_TYPE の実体（GC管理）
+    SList* list = nullptr;
+
+    // Monotonic type feedback for HotSpot compilation. The profile is only
+    // a hint: another script, clone or host may change the value at any time.
+    // atomic_ref preserves Variable's copyability (required for clones).
+    enum ObservedKind : uint32_t {
+        kObservedNumber = 1u,
+        kObservedString = 2u,
+        kObservedBoolean = 4u,
+        kObservedColor = 8u,
+        kObservedOther = 16u,
+    };
+    mutable uint32_t observedKinds = 0;
+
+    static uint32_t observedKind(Value v) {
+        if (v.isNumber()) return kObservedNumber;
+        if (v.isString()) return kObservedString;
+        if (v.isBool()) return kObservedBoolean;
+        if (v.isColor()) return kObservedColor;
+        return kObservedOther;
+    }
+
+    void observeValueType(Value v) const {
+        auto kinds = std::atomic_ref<uint32_t>(observedKinds);
+        const uint32_t kind = observedKind(v);
+        if (!(kinds.load(std::memory_order_relaxed) & kind))
+            kinds.fetch_or(kind, std::memory_order_relaxed);
+    }
+
+    uint32_t typeProfile() const {
+        return std::atomic_ref<uint32_t>(observedKinds)
+            .load(std::memory_order_relaxed);
+    }
+
+    bool observedOnlyNumber() const {
+        return typeProfile() == kObservedNumber;
+    }   // LIST_TYPE の実体（GC管理）
 
     static Variable create(std::string id, std::u16string name,
                            std::string type, bool isCloud) {

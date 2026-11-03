@@ -180,6 +180,8 @@ public:
         std::vector<std::string>& ids,
         std::vector<Value>& defaults);
     void populateProcedureCache();
+    // Selected prototype's immutable signature, valid until resetCache().
+    const Mutation* getProcedurePrototype(const std::string& proccode);
 
     /// BlocksExecuteCache.getCached — ブロックごとの BlockCached（ops フラット化済み）
     BlockCached* getCachedExecute(const std::string& blockId);
@@ -211,7 +213,7 @@ private:
     struct Cache {
         std::unordered_map<std::string, InputSet> inputs;
         std::unordered_map<std::string, std::string> procedureDefinitions; // proccode(u8キー) → blockId
-        std::unordered_map<std::string, std::string> procedureParamNames;  // → JSON文字列として [names,ids,defaults] エンコード
+        std::unordered_map<std::string, const Block*> procedurePrototypes; // proccode → first prototype
         std::unordered_map<std::string, std::unique_ptr<BlockCached>> executeCached;
         std::unordered_map<std::string, std::vector<RuntimeScriptCache>> scripts;
         std::optional<std::vector<std::pair<std::string, std::string>>> monitored; // blockId → targetId
@@ -230,6 +232,8 @@ public:
 /// 各入力子ブロックの _ops が順に連結され、最後に自分が push される。
 struct BlockCached {
     std::string id;
+    // Cached immutable successor; avoids another block-id hash lookup after execution.
+    std::string nextBlockId;
     std::string opcode;
     std::map<std::string, BlockField> fields;
     InputSet inputs;
@@ -248,6 +252,9 @@ struct BlockCached {
     /// この op の報告値を親ブロックの argValues[inputName] に書き込むリンク。
     std::string parentKey;
     ArgValues* parentValues = nullptr;
+    // Pre-resolved stable std::map value slot for ordinary reporter inputs.
+    // Special BROADCAST_INPUT still updates an IdName, not a Value.
+    Value* parentValueSlot = nullptr;
 
     /// フラット化済み実行列（子 ops …→ 自分）。所有権は Blocks のキャッシュ内
     /// 個別 BlockCached。_ops は非所有ポインタ列。

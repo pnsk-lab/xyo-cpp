@@ -76,6 +76,16 @@ std::string Thread::popStack() {
     return id;
 }
 
+void Thread::recycleTrashFrames() {
+    constexpr size_t kMaxCachedFrames = 128;
+    for (auto& frame : trashFrames) {
+        if (framePool.size() >= kMaxCachedFrames) break;
+        frame->reset();
+        framePool.push_back(std::move(frame));
+    }
+    trashFrames.clear();
+}
+
 void Thread::stopThisScript() {
     std::string blockID = peekStack();
     while (!blockID.empty()) {
@@ -137,6 +147,18 @@ const std::unordered_map<std::u16string, Value>* Thread::getAllParams() const {
 }
 
 void Thread::goToNextBlock() {
+    // execute() has already resolved the current block. Reuse its immutable
+    // successor instead of performing a second unordered_map lookup. Control
+    // primitives may change the stack, so verify the active block ID first.
+    if (!stack.empty() && !stackFrames.empty()) {
+        const BlockCached* cached = stackFrames.back()->currentBlock;
+        if (cached && cached->id == stack.back()) {
+            reuseStackForNextBlock(cached->nextBlockId);
+            return;
+        }
+    }
+    // Hats, compatibility paths and blocks reached without execute() fall
+    // back to the original lookup.
     reuseStackForNextBlock(target->blocks->getNextBlock(peekStack()));
 }
 

@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include "core/cast.hpp"
+#include "blocks/core.hpp"
 #include "engine/runtime.hpp"
 #include "jit/jit.hpp"
 #include "load/sb3.hpp"
@@ -18,6 +19,7 @@ void xyo_mot_sety(JitCtx*, uint64_t);
 void xyo_mot_changex(JitCtx*, uint64_t);
 void xyo_mot_changey(JitCtx*, uint64_t);
 void xyo_mot_setxy_num(JitCtx*, double, double);
+void xyo_mot_edgebounce(JitCtx*);
 }
 namespace {
 struct Event { char kind; double x,y,oldX,oldY; };
@@ -26,6 +28,18 @@ void moved(Target* target, double x, double y, bool force) {
     events->push_back({'m',target->x,target->y,x,y});
     if (force) events->push_back({'!',0,0,0,0});
 }
+struct BounceRenderer : RendererAPI {
+    Target* target = nullptr;
+    void getDrawableBounds(int, double* b) const override {
+        // 40x20 box centered on the sprite (left, right, top, bottom).
+        b[0] = target->x - 20;
+        b[1] = target->x + 20;
+        b[2] = target->y + 10;
+        b[3] = target->y - 10;
+    }
+    bool hasDrawable(int) const override { return true; }
+};
+
 struct FenceRenderer : RendererAPI {
     void getFencedPosition(int, double& x,double& y,bool fence) const override {
         events->push_back({'f',x,y,0,0});
@@ -104,7 +118,53 @@ int test_motion_numeric_main() {
         check(rt.refreshTargets==oldRefresh && rt.redrawRequested==oldRedraw);
         check(sameEvents(oldEvents,newEvents));
     }
-    target->onTargetMoved=nullptr;target->isStage=false;rt.renderer=nullptr;events=nullptr;
+    // Interpreter/JIT edge bounce must use identical direction math,
+    // corner priority and push-back regardless of visibility.
+    target->onTargetMoved=nullptr;
+    target->isStage=false;
+    target->dragging=false;
+    events=nullptr;
+    BounceRenderer bounceRenderer;
+    bounceRenderer.target = target;
+    rt.renderer = &bounceRenderer;
+    struct BounceCase {
+        double x, y, direction, expectedDirection;
+        bool hidden = false;
+    };
+    for (const BounceCase test : {
+            BounceCase{0, 0, 37, 37},
+            BounceCase{230, 0, 37, -37},
+            BounceCase{230, 0, 90, -90},
+            BounceCase{240, 180, 45, 135}, // top wins over right
+            BounceCase{-240, -180, -135, 135}, // left wins over bottom
+            BounceCase{0, 175, 0, 180},
+            BounceCase{230, 0, 90, -90, true}, // hidden sprites bounce
+        }) {
+        auto resetBounce = [&] {
+            target->x = test.x;
+            target->y = test.y;
+            target->direction = test.direction;
+            target->visible = !test.hidden;
+        };
+        resetBounce();
+        bounceOffEdge(target, &rt);
+        const double interpDir = target->direction;
+        const double interpX = target->x, interpY = target->y;
+        resetBounce();
+        xyo_mot_edgebounce(&ctx);
+        check(same(target->direction, interpDir));
+        check(same(target->x, interpX) && same(target->y, interpY));
+        check(std::abs(target->direction - test.expectedDirection) < 1e-10);
+#if defined(__linux__) && defined(__GLIBC__) && defined(__x86_64__)
+        // Scratch-render's canonical x86_64/glibc edge case is sensitive
+        // to the least significant bits of atan2. The previous fdlibm
+        // implementation yielded -36.999999999999986 here.
+        if (test.x == 230 && test.y == 0 && test.direction == 37)
+            check(target->direction == -37.00000000000003);
+#endif
+        check(std::abs(target->x) <= 220 && std::abs(target->y) <= 170);
+    }
+    rt.renderer=nullptr;
     std::printf("numeric motion: %d checks, %d failures\n",checks,failures);
     return failures;
 #endif

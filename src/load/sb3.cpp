@@ -553,7 +553,10 @@ Target* loadTargetObject(Runtime& runtime, const JsonValue& obj,
         Variable v = Variable::create(replaceUnsafeChars(bid),
                                       utf8ToU16(bval.asString()),
                                       Variable::kBroadcastType, false);
-        target->variables.emplace(v.id, std::move(v));
+        if (target->variables.find(v.id) != target->variables.end())
+            target->collidingBroadcasts.emplace(v.id, std::move(v));
+        else
+            target->variables.emplace(v.id, std::move(v));
     }
 
     if (obj.has("x")) target->x = obj.get("x").asNumber();

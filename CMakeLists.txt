@@ -19,7 +19,16 @@ option(XYO_FULL_BUILD "Require all supported native rendering and JIT features (
 # compile-time switches so each variant has a fixed runtime and JIT path.
 option(XYO_STRING_CONS_POOL "Separate cons allocations into dedicated GC slabs" OFF)
 option(XYO_STRING_JOIN_SPECIALIZED "Lower dynamic string/string joins through a typed helper" OFF)
-option(XYO_DISABLE_RT_PROF "Compile out optional runtime profiling instrumentation" OFF)
+# Production binaries should not pay an instrumentation branch on every
+# runtime helper call. Profile builds retain XYO_PROF=1 diagnostics; pass
+# -DXYO_DISABLE_RT_PROF=OFF to explicitly profile a Release build.
+set(_xyo_disable_rt_prof_default OFF)
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+  set(_xyo_disable_rt_prof_default ON)
+endif()
+option(XYO_DISABLE_RT_PROF "Compile out optional runtime profiling instrumentation"
+       ${_xyo_disable_rt_prof_default})
+unset(_xyo_disable_rt_prof_default)
 
 # --- LLVM ---
 option(XYO_STATIC_LLVM "Link LLVM statically (static archives required)" OFF)

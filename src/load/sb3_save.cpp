@@ -143,6 +143,8 @@ JsonObject targetToJson(Runtime& rt, Target& t,
             vars[id] = JsonValue(std::move(a));
         }
     }
+    for (const auto& [id, v] : t.collidingBroadcasts)
+        broadcasts[id] = JsonValue(SStr::toUtf8(v.name));
     o["variables"] = JsonValue(std::move(vars));
     o["lists"] = JsonValue(std::move(lists));
     o["broadcasts"] = JsonValue(std::move(broadcasts));

@@ -273,6 +273,42 @@ int test_sstr_cons_main() {
         }
     }
 
+    // Long, unflattened ropes must not recurse through every cons node when
+    // computing the ASCII property. An earlier recursive implementation
+    // overflowed the native stack on a sufficiently deep left/right chain.
+    {
+        Gc::DeferCollect guard;
+        constexpr int kDepth = 60000;
+        SStr* left = SStr::create(u"a");
+        SStr* right = SStr::create(u"a");
+        SStr* unit = SStr::create(u"a");
+        for (int i = 0; i < kDepth; ++i) {
+            left = sstrCons(left, unit);
+            right = sstrCons(unit, right);
+        }
+        CHECK(left->body == nullptr);
+        CHECK(right->body == nullptr);
+        CHECK(left->isAscii());
+        CHECK(right->isAscii());
+        CHECK(left->body == nullptr);
+        CHECK(right->body == nullptr);
+        CHECK(left->left->isAscii()); // intermediate cache from postorder walk
+        CHECK(right->right->isAscii());
+        CHECK(sstrCons(left, SStr::create(u"\u00e9"))->isAscii() == false);
+    }
+
+    // Scratch applies Unicode toLowerCase *before* includes. UTF-16 length
+    // checks on the original operands would reject an expanding lowercase.
+    {
+        SStr* expanded = SStr::create(u"\u0130");
+        SStr* needle = SStr::create(u"i\u0307");
+        CHECK(sstrContains(expanded, needle));
+        CHECK(sstrContains(expanded->view(), needle->view()));
+        CHECK(rt::strContains(Value::string(expanded), Value::string(needle)));
+        CHECK(!sstrContains(SStr::create(u"i"), needle));
+        CHECK(!sstrContains(std::u16string_view(u"i"), needle->view()));
+    }
+
     // Cached ASCII property: computed lazily, composed for cons nodes, and
     // still correct after the rope is flattened.
     {

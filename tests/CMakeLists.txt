@@ -19,6 +19,17 @@ if(TEST_SOURCES)
     ENVIRONMENT "XYO_JIT_MODE=eager")
 endif()
 
+# Focused interpreter-mode regressions: event-start reentrancy and
+# broadcast/scalar ID collisions. Keep separate from xyo-tests, whose
+# scheduler checks intentionally run in eager-JIT mode.
+add_executable(xyo-interpreter-parity-regressions
+  differential/interpreter_parity_regressions.cpp)
+target_link_libraries(xyo-interpreter-parity-regressions PRIVATE xyo)
+add_test(NAME xyo-interpreter-parity-regressions
+  COMMAND xyo-interpreter-parity-regressions)
+set_tests_properties(xyo-interpreter-parity-regressions PROPERTIES
+  ENVIRONMENT "XYO_JIT_MODE=off")
+
 file(GLOB RENDER_TEST_SOURCES CONFIGURE_DEPENDS render/*.cpp)
 if(RENDER_TEST_SOURCES AND SDL2_FOUND)
   add_executable(xyo-render-tests ${RENDER_TEST_SOURCES})

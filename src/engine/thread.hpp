@@ -98,6 +98,7 @@ struct StackFrame {
     std::unordered_map<std::u16string, Value> params;
     std::unique_ptr<ExecContext> executionContext;
     const BlockCached* op = nullptr;              // 実行中の BlockCached
+    const BlockCached* currentBlock = nullptr;    // このフレームの命令ブロック
 
     void reset(bool keepWarp = false) {
         bool w = warpMode;
@@ -112,6 +113,7 @@ struct StackFrame {
         params.clear();
         executionContext.reset();
         op = nullptr;
+        currentBlock = nullptr;
     }
 };
 
@@ -193,6 +195,8 @@ public:
     void pushStack(const std::string& blockId);
     void reuseStackForNextBlock(const std::string& blockId);
     std::string popStack();
+    // Reuse interpreter frames once execute() has finished reading popped ones.
+    void recycleTrashFrames();
     /// 現在スクリプトを手続き呼び出し境界までポップ
     void stopThisScript();
     /// トップのブロック id（空なら ""）

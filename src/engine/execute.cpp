@@ -15,6 +15,19 @@ namespace xyo {
 // 万一 worker で compat が走っても破壊しないようにする）
 static thread_local BlockUtility g_util;
 
+// Runtime::startHats() can synchronously execute another thread while a
+// primitive is running (e.g. switch backdrop and wait). The nested execute()
+// must not leave g_util bound to the new thread when the caller resumes.
+struct ScopedBlockUtility {
+    BlockUtility saved;
+    ScopedBlockUtility(Sequencer& seq, Thread& thread) : saved(g_util) {
+        g_util.sequencer = &seq;
+        g_util.thread = &thread;
+        g_util.jitCompatEc = nullptr;
+    }
+    ~ScopedBlockUtility() { g_util = saved; }
+};
+
 /// JS truthiness（`if (v)` / `!v`）。Scratch キャストではなく JS の意味。
 static bool jsTruthy(Value v) {
     if (v.isUndefined() || v.isNaN()) return false;
@@ -73,15 +86,16 @@ static void handleReport(Value resolvedValue, Sequencer& seq, Thread& thread,
 }
 
 /// BROADCAST_INPUT 入力書き込み（JS: argValues.BROADCAST_OPTION.name = toString(v)）
-static void writeInputValue(ArgValues* parentValues, const std::string& inputName,
-                            Value inputValue) {
-    if (inputName == "BROADCAST_INPUT") {
-        IdName& bo = parentValues->refObj("BROADCAST_OPTION");
+static void writeInputValue(BlockCached* op, Value inputValue) {
+    if (op->parentValueSlot) {
+        *op->parentValueSlot = inputValue;
+    } else if (op->parentKey == "BROADCAST_INPUT") {
+        IdName& bo = op->parentValues->refObj("BROADCAST_OPTION");
         bo.id.clear();
         SStr* s = cast::toString(inputValue);
         bo.name = s->view();
     } else {
-        parentValues->ref(inputName) = inputValue;
+        op->parentValues->ref(op->parentKey) = inputValue;
     }
 }
 
@@ -105,10 +119,9 @@ static void resolveThreadOps(Value resolvedValue, Sequencer& seq, Thread& thread
 
 void execute(Sequencer& sequencer, Thread& thread) {
     Runtime& runtime = sequencer.runtime;
-    g_util.sequencer = &sequencer;
-    g_util.thread = &thread;
+    ScopedBlockUtility utilityScope(sequencer, thread);
 
-    const std::string currentBlockId = thread.peekStack();
+    const std::string& currentBlockId = thread.stack.back();
     StackFrame* currentStackFrame = thread.peekStackFrame();
 
     Blocks* blockContainer = thread.blockContainer;
@@ -118,10 +131,13 @@ void execute(Sequencer& sequencer, Thread& thread) {
         blockCached = blockContainer->getCachedExecute(currentBlockId);
         if (!blockCached) {
             sequencer.retireThread(thread);
-            thread.trashFrames.clear();
+            thread.recycleTrashFrames();
             return;
         }
     }
+
+    // The scheduler can advance to the cached successor without re-hashing the ID.
+    currentStackFrame->currentBlock = blockCached;
 
     auto& ops = blockCached->ops;
     const size_t length = ops.size();
@@ -136,7 +152,7 @@ void execute(Sequencer& sequencer, Thread& thread) {
                 if (o->id == rep.opCachedId) { found = o; break; }
             }
             if (found && found->parentValues) {
-                writeInputValue(found->parentValues, found->parentKey, rep.inputValue);
+                writeInputValue(found, rep.inputValue);
             }
         }
         if (!reported.empty()) {
@@ -163,7 +179,7 @@ void execute(Sequencer& sequencer, Thread& thread) {
             Value inputValue = thread.justReported;
             thread.justReported = Value::undefined();
             if (opCached->parentValues) {
-                writeInputValue(opCached->parentValues, opCached->parentKey, inputValue);
+                writeInputValue(opCached, inputValue);
             }
             i += 1;
         }
@@ -213,7 +229,7 @@ void execute(Sequencer& sequencer, Thread& thread) {
             if (lastOperation) {
                 handleReport(rv, sequencer, thread, opCached, lastOperation);
             } else if (opCached->parentValues) {
-                writeInputValue(opCached->parentValues, opCached->parentKey, rv);
+                writeInputValue(opCached, rv);
             }
         } else if (thread.status == STATUS_DONE) {
             break;
@@ -222,7 +238,7 @@ void execute(Sequencer& sequencer, Thread& thread) {
 
     // ポップ済みフレームは execute 内のポインタ生存期間を守るためだけに
     // 保持していた — ここで解放（JS の _StackFrame.release 相当）
-    thread.trashFrames.clear();
+    thread.recycleTrashFrames();
 }
 
 /// 非同期プリミティブ完了時の再開（JS promise .then 相当）。
@@ -238,7 +254,7 @@ void resolveWait(Sequencer& seq, Thread& thread, Value resolvedValue) {
     }
     resolveThreadOps(resolvedValue, seq, thread, op, sf->suspendLast);
     thread.status = STATUS_RUNNING;
-    thread.trashFrames.clear();
+    thread.recycleTrashFrames();
 }
 
 } // namespace xyo

@@ -314,24 +314,25 @@ void Sequencer::stepToProcedure(Thread& thread, const std::string& procedureCode
     const std::string definition =
         thread.target->blocks->getProcedureDefinition(procedureCode);
     if (definition.empty()) return;
-    const bool isRecursive = thread.isRecursiveCall(procedureCode);
+
+    const Block* definitionBlock = thread.target->blocks->getBlock(definition);
+    const BlockInput* cb = definitionBlock->inputs.find("custom_block");
+    const Block* innerBlock = cb ? thread.target->blocks->getBlock(cb->block) : nullptr;
+    const bool doWarp = innerBlock && innerBlock->mutation &&
+                        innerBlock->mutation->warp();
+
+    // Recursion detection inspects up to five ancestor blocks, including
+    // hash lookups. Its result is only used for non-warp procedures. Keep it
+    // before pushStack() so the inspected ancestors are identical to before.
+    const bool isRecursive = !doWarp && thread.isRecursiveCall(procedureCode);
     thread.pushStack(definition);
     if (thread.peekStackFrame()->warpMode &&
         warpBudgetExhausted(thread)) {
         thread.status = STATUS_YIELD;
-    } else {
-        const Block* definitionBlock = thread.target->blocks->getBlock(definition);
-        const BlockInput* cb = definitionBlock->inputs.find("custom_block");
-        const Block* innerBlock = cb ? thread.target->blocks->getBlock(cb->block) : nullptr;
-        bool doWarp = false;
-        if (innerBlock && innerBlock->mutation) {
-            doWarp = innerBlock->mutation->warp();
-        }
-        if (doWarp) {
-            thread.peekStackFrame()->warpMode = true;
-        } else if (isRecursive) {
-            thread.status = STATUS_YIELD;
-        }
+    } else if (doWarp) {
+        thread.peekStackFrame()->warpMode = true;
+    } else if (isRecursive) {
+        thread.status = STATUS_YIELD;
     }
 }
 

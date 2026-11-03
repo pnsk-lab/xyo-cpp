@@ -24,6 +24,7 @@
 #include <thread>
 
 #include "core/cast.hpp"
+#include "core/sstr.hpp"
 #include "engine/runtime.hpp"
 #include "engine/sequencer.hpp"
 #include "engine/thread.hpp"
@@ -33,6 +34,7 @@
 #include "model/variable.hpp"
 
 extern "C" int32_t xyo_wait_should_yield(xyo::JitCtx*);
+extern "C" int32_t xyo_warp_yield_due(xyo::JitCtx*);
 
 namespace {
 using namespace xyo;
@@ -145,6 +147,45 @@ double onePass(bool danger, bool warp, JitMode mode) {
         }
     }
     return counter(rt);
+}
+
+// A running warp loop keeps typed values in registers on timer polls, but
+// must publish them before a real yield and reload another script's writes.
+void testWarpYieldReload(JitMode mode) {
+    setJitMode(mode);
+    Runtime rt;
+    if (!loadSb3(rt, projectJson(true), nullptr).ok) {
+        check(false, "load warp interleaving project");
+        return;
+    }
+    rt.warpTimeMs = 0.0;  // guaranteed checkpoint on the first poll
+    rt.dangerMode = false;
+    rt.greenFlag();
+    check(rt.threads.size() == 1, "one warp script before interleaving");
+    if (rt.threads.empty()) return;
+    rt.sequencer->timer.start();
+    rt.sequencer->stepThread(*rt.threads.front());
+
+    Target* target = rt.getSpriteTargetByName(u"S");
+    Variable* v = target ? target->lookupVariableById("v") : nullptr;
+    if (!v) {
+        check(false, "resolve warp shared variable");
+        return;
+    }
+    const double iterationsBeforeYield = cast::toNumber(v->value);
+    check(iterationsBeforeYield > 0 && iterationsBeforeYield < kIterations,
+          "warp check yielded with promoted variable spilled");
+    if (!(iterationsBeforeYield > 0 && iterationsBeforeYield < kIterations))
+        return;
+
+    // Simulate another script modifying the value while this warp fiber is
+    // suspended. Scratch change-variable must coerce the new string "040".
+    v->value = Value::string(SStr::fromUtf8("040"));
+    rt.runUntilDone(10000);
+    check(rt.threads.empty(), "interleaved warp loop terminates");
+    check(cast::toNumber(v->value) ==
+              40.0 + kIterations - iterationsBeforeYield,
+          "warp resumes from externally changed string, not stale SSA");
 }
 
 const char* modeName(JitMode m) {
@@ -263,6 +304,7 @@ int test_danger_main() {
     GpuEnvGuard gpuDisabled;
     const JitMode modes[] = {JitMode::Off, JitMode::Eager};
     for (JitMode mode : modes) {
+        testWarpYieldReload(mode);
         // 予算あり: 数パスでは終わらない（予算切れで yield して譲る）。
         const double limited = onePass(false, true, mode);
         if (!(limited > 0 && limited < kIterations))
@@ -315,6 +357,17 @@ int test_danger_main() {
         c.runtime = &rt;
         c.sequencer = rt.sequencer.get();
         c.isWarp = 1;
+        rt.dangerMode = false;
+        rt.warpTimeMs = 1.0e9;
+        check(xyo_warp_yield_due(&c) == 0,
+              "warp poll never yields before the time budget expires");
+        rt.warpTimeMs = -1.0;
+        check(xyo_warp_yield_due(&c) == 1,
+              "warp poll reports when a scheduler handoff is required");
+        rt.dangerMode = true;
+        check(xyo_warp_yield_due(&c) == 0,
+              "danger warp poll never forces a handoff");
+        rt.warpTimeMs = 500.0;
         rt.dangerMode = false;
         check(xyo_wait_should_yield(&c) == 0,
               "normal warp waits yield only when stuck");

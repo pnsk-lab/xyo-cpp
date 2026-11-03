@@ -4,10 +4,13 @@
 #include "llvm_compat.hpp"
 
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
+#include <llvm/ExecutionEngine/Orc/IRTransformLayer.h>
+#include <llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h>
 #include <llvm/ExecutionEngine/Orc/ObjectTransformLayer.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
+#include <llvm/IR/PassInstrumentation.h>
 #include <llvm/Support/DynamicLibrary.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/TargetSelect.h>
@@ -53,6 +56,7 @@ int32_t xyo_is_stuck(JitCtx*);
 int32_t xyo_wait_should_yield(JitCtx*);
 void xyo_wait_yield(JitCtx*);
 void xyo_loop_yield(JitCtx*);
+int32_t xyo_warp_yield_due(JitCtx*);
 void xyo_empty_repeat_warp(JitCtx*, double);
 double xyo_to_num(uint64_t);
 int32_t xyo_truthy(uint64_t);
@@ -98,6 +102,7 @@ void xyo_rt_setarg(const void*, const char*, uint64_t);
 
 // --- rt_blocks.cpp: ブロック直接ヘルパ ---
 uint64_t xyo_join(uint64_t, uint64_t);
+uint64_t xyo_join_suffix(uint64_t, uint64_t);
 #if defined(XYO_STRING_JOIN_SPECIALIZED)
 uint64_t xyo_join_strings(uint64_t, uint64_t);
 #endif
@@ -222,6 +227,7 @@ const std::pair<const char*, void*> kRtSymbols[] = {
     {"xyo_wait_should_yield", (void*)&xyo_wait_should_yield},
     {"xyo_wait_yield", (void*)&xyo_wait_yield},
     {"xyo_loop_yield", (void*)&xyo_loop_yield},
+    {"xyo_warp_yield_due", (void*)&xyo_warp_yield_due},
     {"xyo_empty_repeat_warp", (void*)&xyo_empty_repeat_warp},
     {"xyo_to_num", (void*)&xyo_to_num},
     {"xyo_truthy", (void*)&xyo_truthy},
@@ -282,6 +288,7 @@ const std::pair<const char*, void*> kRtSymbols[] = {
     {"xyo_proc_pop", (void*)&xyo_proc_pop},
     {"xyo_rt_setarg", (void*)&xyo_rt_setarg},
     {"xyo_join", (void*)&xyo_join},
+    {"xyo_join_suffix", (void*)&xyo_join_suffix},
 #if defined(XYO_STRING_JOIN_SPECIALIZED)
     {"xyo_join_strings", (void*)&xyo_join_strings},
 #endif
@@ -466,6 +473,7 @@ const std::vector<std::pair<const char*, void*>>& hostLibcallSymbols() {
 struct JitEngine::Impl {
     llvm::orc::ThreadSafeContext tsc;
     std::unique_ptr<llvm::orc::LLJIT> jit;
+    bool lazyProcedures = false;
     JitPinned pinned;
     /// AOT: 文字列 c_str の安定置き場（deque は push_back で
     /// 既存要素のアドレスを変えない）
@@ -477,6 +485,21 @@ struct JitEngine::Impl {
     std::vector<std::unique_ptr<gpu::ParallelLoop>> aotGpuProgs;
 };
 
+// Keep eager and on-demand LLVM pipelines on the same optimization tier.
+static llvm::OptimizationLevel jitIrOptimizationLevel() {
+    if (const char* setting = std::getenv("XYO_JIT_OPT_LEVEL")) {
+        if (std::strcmp(setting, "1") == 0)
+            return llvm::OptimizationLevel::O1;
+        if (std::strcmp(setting, "2") == 0)
+            return llvm::OptimizationLevel::O2;
+        if (std::strcmp(setting, "3") == 0)
+            return llvm::OptimizationLevel::O3;
+    }
+    return std::getenv("XYO_JIT_O2")
+        ? llvm::OptimizationLevel::O2
+        : llvm::OptimizationLevel::O3;
+}
+
 JitEngine::JitEngine() {
     llvm::InitializeNativeTarget();
     llvm::InitializeNativeTargetAsmPrinter();
@@ -485,13 +508,95 @@ JitEngine::JitEngine() {
     impl_->tsc = llvm::orc::ThreadSafeContext(
         std::make_unique<llvm::LLVMContext>());
 
-    auto jitOr = llvm::orc::LLJITBuilder().create();
-    if (!jitOr) {
-        std::fprintf(stderr, "xyo-jit: LLJIT init failed\n");
-        impl_.reset();
-        return;
+    llvm::orc::LLJITBuilder builder;
+    // Experimental backend-only compilation tiers. The IR optimization
+    // pipeline stays unchanged; this isolates machine-code lowering cost
+    // from O3's middle-end work when investigating large Scratch scripts.
+    // The default target/code-generation settings are entirely unchanged.
+    if (const char* level = std::getenv("XYO_JIT_CODEGEN_OPT")) {
+        llvm::CodeGenOptLevel opt;
+        if (std::strcmp(level, "less") == 0)
+            opt = llvm::CodeGenOptLevel::Less;
+        else if (std::strcmp(level, "none") == 0)
+            opt = llvm::CodeGenOptLevel::None;
+        else
+            opt = llvm::CodeGenOptLevel::Default;
+        if (auto host = llvm::orc::JITTargetMachineBuilder::detectHost()) {
+            host->setCodeGenOptLevel(opt);
+            builder.setJITTargetMachineBuilder(std::move(*host));
+        } else {
+            std::fprintf(stderr, "xyo-jit: cannot configure JIT codegen level\n");
+            llvm::consumeError(host.takeError());
+        }
     }
-    auto jit = std::move(*jitOr);
+    const char* lazySetting = std::getenv("XYO_JIT_LAZY_PROCEDURES");
+    impl_->lazyProcedures = lazySetting && lazySetting[0] &&
+                             lazySetting[0] != '0';
+    std::unique_ptr<llvm::orc::LLJIT> jit;
+    if (impl_->lazyProcedures) {
+        llvm::orc::LLLazyJITBuilder lazyBuilder;
+        if (builder.getJITTargetMachineBuilder())
+            lazyBuilder.setJITTargetMachineBuilder(
+                std::move(*builder.getJITTargetMachineBuilder()));
+        // Runtime worker threads can trigger lazy resolution concurrently.
+        // A shared single-threaded IRCompiler/TargetMachine is unsafe here.
+        lazyBuilder.setNumCompileThreads(2);
+        auto result = lazyBuilder.create();
+        if (!result) {
+            std::fprintf(stderr, "xyo-jit: LLLazyJIT init failed\n");
+            llvm::consumeError(result.takeError());
+            impl_.reset();
+            return;
+        }
+        jit = std::move(*result);
+    } else {
+        auto result = builder.create();
+        if (!result) {
+            std::fprintf(stderr, "xyo-jit: LLJIT init failed\n");
+            llvm::consumeError(result.takeError());
+            impl_.reset();
+            return;
+        }
+        jit = std::move(*result);
+    }
+    // Optional experiment: optimize only partitions actually materialized
+    // by LLLazyJIT. A module flag survives ORC's function partitioning and
+    // distinguishes these from the small scripts already optimized at emit.
+    if (impl_->lazyProcedures &&
+        std::getenv("XYO_JIT_LAZY_IR_OPT")) {
+        jit->getIRTransformLayer().setTransform(
+            [](llvm::orc::ThreadSafeModule tsm,
+               llvm::orc::MaterializationResponsibility&)
+                -> llvm::Expected<llvm::orc::ThreadSafeModule> {
+                tsm.withModuleDo([](llvm::Module& module) {
+                    if (!module.getModuleFlag("xyo.lazy.optimize"))
+                        return;
+                    const auto began = std::chrono::steady_clock::now();
+                    llvm::PassBuilder pb;
+                    llvm::LoopAnalysisManager lam;
+                    llvm::FunctionAnalysisManager fam;
+                    llvm::CGSCCAnalysisManager cgam;
+                    llvm::ModuleAnalysisManager mam;
+                    pb.registerModuleAnalyses(mam);
+                    pb.registerCGSCCAnalyses(cgam);
+                    pb.registerFunctionAnalyses(fam);
+                    pb.registerLoopAnalyses(lam);
+                    pb.crossRegisterProxies(lam, fam, cgam, mam);
+                    auto mpm = pb.buildPerModuleDefaultPipeline(
+                        jitIrOptimizationLevel());
+                    mpm.run(module, mam);
+                    if (std::getenv("XYO_JIT_TIMING")) {
+                        const double elapsed =
+                            std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - began)
+                                .count();
+                        std::fprintf(stderr, "[jit-lazy-ir] %.3fms\n",
+                                     elapsed);
+                    }
+                });
+                return std::move(tsm);
+            });
+    }
     // Inspect the exact JIT machine code, not an AOT approximation. Disabled
     // by default; prefix-N.o files contain the objects before linking.
     if (const char* p = std::getenv("XYO_JIT_DUMP_OBJECT")) {
@@ -751,7 +856,15 @@ const CompiledScript* JitEngine::compile(Thread& thread, Runtime& runtime,
     if (entry.code) return entry.code.get();
     if (failed_.count(top)) return nullptr;
 
-    const auto tStart = std::chrono::steady_clock::now();
+    using Clock = std::chrono::steady_clock;
+    const auto tStart = Clock::now();
+    const bool timing = std::getenv("XYO_JIT_TIMING") != nullptr;
+    double emitMs = 0, optMs = 0, submitMs = 0;
+    size_t irFunctions = 0, irInstructions = 0;
+    bool lazyThisScript = false;
+    auto msBetween = [](Clock::time_point begin, Clock::time_point end) {
+        return std::chrono::duration<double, std::milli>(end - begin).count();
+    };
     auto cs = std::make_unique<CompiledScript>();
     std::vector<std::string> fnNames;
     std::map<std::string, std::string> procNameMap;
@@ -764,13 +877,50 @@ const CompiledScript* JitEngine::compile(Thread& thread, Runtime& runtime,
         mod->setDataLayout(impl_->jit->getDataLayout());
         mod->setTargetTriple(
             llvmc::tripleArg(impl_->jit->getTargetTriple()));
+        const auto tEmit = Clock::now();
         emitOk = jitEmitScript(*mod, *lc, runtime, thread.target, blocks,
                                topId, entryName, *cs, impl_->pinned, fnNames,
                                procNameMap, nullptr);
+        if (timing) emitMs = msBetween(tEmit, Clock::now());
         if (emitOk) {
+            if (timing || impl_->lazyProcedures) {
+                for (const llvm::Function& generated : *mod) {
+                    if (generated.isDeclaration()) continue;
+                    ++irFunctions;
+                    for (const llvm::BasicBlock& bb : generated)
+                        irInstructions += bb.size();
+                }
+            }
             // O3 by default (XYO_JIT_O2=1 to revert) — varSlotData/alloca
             // タグチェック除去・式共有を行わないと生成コードが数倍遅い
-            llvm::PassBuilder pb;
+            struct PassFrame { std::string name; Clock::time_point started; double childMs = 0; };
+            std::vector<PassFrame> passFrames;
+            std::map<std::string, std::pair<double, uint64_t>> passTimes;
+            const bool profilePasses = std::getenv("XYO_JIT_PASS_TIMING") != nullptr;
+            llvm::PassInstrumentationCallbacks pic;
+            if (profilePasses) {
+                pic.registerBeforeNonSkippedPassCallback(
+                    [&](llvm::StringRef name, llvm::Any) {
+                        passFrames.push_back({name.str(), Clock::now(), 0});
+                    });
+                auto finish = [&](llvm::StringRef) {
+                    if (passFrames.empty()) return;
+                    PassFrame frame = std::move(passFrames.back());
+                    passFrames.pop_back();
+                    double ms = msBetween(frame.started, Clock::now());
+                    if (!passFrames.empty()) passFrames.back().childMs += ms;
+                    auto& entry = passTimes[frame.name];
+                    entry.first += std::max(0.0, ms - frame.childMs);
+                    ++entry.second;
+                };
+                pic.registerAfterPassCallback(
+                    [finish](llvm::StringRef name, llvm::Any,
+                             const llvm::PreservedAnalyses&) { finish(name); });
+                pic.registerAfterPassInvalidatedCallback(
+                    [finish](llvm::StringRef name,
+                             const llvm::PreservedAnalyses&) { finish(name); });
+            }
+            llvm::PassBuilder pb(nullptr, llvm::PipelineTuningOptions(), std::nullopt, profilePasses ? &pic : nullptr);
             llvm::LoopAnalysisManager lam;
             llvm::FunctionAnalysisManager fam;
             llvm::CGSCCAnalysisManager cgam;
@@ -780,18 +930,47 @@ const CompiledScript* JitEngine::compile(Thread& thread, Runtime& runtime,
             pb.registerFunctionAnalyses(fam);
             pb.registerLoopAnalyses(lam);
             pb.crossRegisterProxies(lam, fam, cgam, mam);
-            llvm::ModulePassManager mpm = pb.buildPerModuleDefaultPipeline(
-                std::getenv("XYO_JIT_O2") ? llvm::OptimizationLevel::O2
-                                          : llvm::OptimizationLevel::O3);
-            mpm.run(*mod, mam);
+            // Optional IR optimization tier for compile-time experiments.
+            // Preserve the original O3 default and legacy O2 override.
+            llvm::ModulePassManager mpm =
+                pb.buildPerModuleDefaultPipeline(jitIrOptimizationLevel());
+            const auto tOptimize = Clock::now();
+            const bool deferIR =
+                impl_->lazyProcedures &&
+                std::getenv("XYO_JIT_LAZY_IR_OPT") &&
+                irFunctions >= 16;
+            if (deferIR) {
+                mod->addModuleFlag(llvm::Module::Warning,
+                                   "xyo.lazy.optimize", 1);
+            } else {
+                mpm.run(*mod, mam);
+            }
+            if (timing) optMs = msBetween(tOptimize, Clock::now());
+            if (profilePasses) {
+                for (const auto& [name, data] : passTimes) {
+                    if (data.first > 5.0)
+                        std::fprintf(stderr, "[jit-pass] %s %.3fms %llu %s\n", topId.c_str(), data.first, (unsigned long long)data.second, name.c_str());
+                }
+            }
             if (const char* d = std::getenv("XYO_JIT_DUMP2"))
                 if (d[0] != '\0') mod->print(llvm::errs(), nullptr);
-            if (auto err = impl_->jit->addIRModule(
-                    llvm::orc::ThreadSafeModule(std::move(mod),
-                                                impl_->tsc))) {
+            const auto tSubmit = Clock::now();
+            // Lazy compilation is worthwhile only when a top-level script
+            // has substantial distinct procedure bodies. Small scripts use
+            // the normal ORC layer and avoid call-through trampoline cost.
+            constexpr size_t kLazyMinFunctions = 16;
+            lazyThisScript = impl_->lazyProcedures &&
+                             irFunctions >= kLazyMinFunctions;
+            llvm::orc::ThreadSafeModule tsm(std::move(mod), impl_->tsc);
+            llvm::Error err = lazyThisScript
+                ? static_cast<llvm::orc::LLLazyJIT*>(
+                      impl_->jit.get())->addLazyIRModule(std::move(tsm))
+                : impl_->jit->addIRModule(std::move(tsm));
+            if (err) {
                 llvm::consumeError(std::move(err));
                 emitOk = false;
             }
+            if (timing) submitMs = msBetween(tSubmit, Clock::now());
         }
     });
     if (!emitOk) {
@@ -802,6 +981,7 @@ const CompiledScript* JitEngine::compile(Thread& thread, Runtime& runtime,
         return nullptr;
     }
 
+    const auto tLookup = Clock::now();
     auto addrOr = impl_->jit->lookup(entryName);
     if (!addrOr) {
         llvm::consumeError(addrOr.takeError());
@@ -809,14 +989,28 @@ const CompiledScript* JitEngine::compile(Thread& thread, Runtime& runtime,
         return nullptr;
     }
     cs->entry = reinterpret_cast<ScriptFn>(addrOr->getValue());
-    for (auto& [vkey, fname] : procNameMap) {
-        auto a = impl_->jit->lookup(fname);
-        if (!a) { llvm::consumeError(a.takeError()); continue; }
-        cs->procedures[vkey] = reinterpret_cast<ScriptFn>(a->getValue());
+    // Looking up every procedure in lazy mode defeats on-demand function
+    // materialization. Generated Scratch code calls via ORC trampolines;
+    // no runtime consumer reads CompiledScript::procedures in this path.
+    if (!lazyThisScript) {
+        for (auto& [vkey, fname] : procNameMap) {
+            auto a = impl_->jit->lookup(fname);
+            if (!a) { llvm::consumeError(a.takeError()); continue; }
+            cs->procedures[vkey] = reinterpret_cast<ScriptFn>(a->getValue());
+        }
     }
 
     CompiledScript* raw = cs.get();
     entry.code = std::move(cs);
+    if (timing) {
+        const auto tDone = Clock::now();
+        std::fprintf(stderr,
+            "[jit-timing] %s emit=%.3fms opt=%.3fms submit=%.3fms "
+            "lookup=%.3fms total=%.3fms funcs=%zu ir=%zu\n",
+            topId.c_str(), emitMs, optMs, submitMs,
+            msBetween(tLookup, tDone), msBetween(tStart, tDone),
+            irFunctions, irInstructions);
+    }
     if (verbose) {
         const double ms = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - tStart)

@@ -70,6 +70,26 @@ struct Codegen {
     const bool slotReload = std::getenv("XYO_JIT_SLOT_RELOAD") != nullptr;
     const bool genericLiteralNum = std::getenv("XYO_JIT_LITERAL_NUM_GENERIC") != nullptr;
     const bool genericMathBox = std::getenv("XYO_JIT_MATH_BOX_GENERIC") != nullptr;
+    const bool typeProfileDisabled = [] {
+        const char* mode = std::getenv("XYO_JIT_TYPE_PROFILE");
+        return mode && mode[0] == '0';
+    }();
+    // Compiled-code A/B switch; never read getenv in a generated hot path.
+    const bool safeArithCanon = [] {
+        const char* mode = std::getenv("XYO_JIT_SAFE_ARITH_CANON");
+        return !mode || mode[0] != '0';
+    }();
+    const bool splitModNan = [] {
+        const char* mode = std::getenv("XYO_JIT_MOD_NAN_SPLIT");
+        return !mode || mode[0] != '0';
+    }();
+    // Outline the cold variable-divisor fallback into a no-inline helper,
+    // retaining the i32/i64/floating semantics without bloating the hot loop.
+    // Setting this to zero restores the previous inline lowering for A/B.
+    const bool modOutlineWide = [] {
+        const char* mode = std::getenv("XYO_JIT_MOD_OUTLINE_WIDE");
+        return !mode || mode[0] != '0';
+    }();
 
     // 手続き variantKey(proccode|warp) → 宣言済み Function
     std::map<std::string, Function*> procFns;
@@ -536,7 +556,8 @@ struct Codegen {
     /// fiber=nullptr での同期実行を壊すため新規 yield 追加時は必ず更新）。
     static bool helperMayYield(const char* n) {
         static const std::unordered_set<std::string_view> k = {
-            "xyo_yield", "xyo_yield_fast", "xyo_loop_yield", "xyo_wait_yield", "xyo_rt_wait", "xyo_stop_all",
+            "xyo_yield", "xyo_yield_fast", "xyo_loop_yield",
+            "xyo_wait_yield", "xyo_rt_wait", "xyo_stop_all",
             "xyo_stop_script", "xyo_broadcast_wait_v", "xyo_rt_compat",
             "xyo_rt_reporter", "xyo_mot_glidexy", "xyo_mot_glideto",
             "xyo_looks_saysecs", "xyo_looks_thinksecs",
@@ -734,10 +755,25 @@ struct Codegen {
             b.CreateICmpEQ(b.CreateAnd(n, ci64(63)), ci64(0));
         hotBr(due, chkBB, done, 1, 63);
         b.SetInsertPoint(chkBB);
-        spillPromoted();
-        call1("xyo_loop_yield", voidt, ctxArg);
-        reloadPromoted();
-        b.CreateBr(done);
+        if (promoted.empty() && promotedLists.empty()) {
+            call1("xyo_loop_yield", voidt, ctxArg);
+            b.CreateBr(done);
+        } else {
+            // A warp time check reads only the scheduler clock. It cannot
+            // mutate variables or run another script. Check FIRST; spill and
+            // reload only on the actual handoff. This keeps the typed SSA
+            // values intact on the overwhelmingly common non-yield path.
+            llvm::Value* shouldYield =
+                call1("xyo_warp_yield_due", i32t, ctxArg);
+            BasicBlock* handoff = newBB("yield.handoff");
+            hotBr(b.CreateICmpNE(shouldYield, ci32(0)),
+                  handoff, done, 1, 100000);
+            b.SetInsertPoint(handoff);
+            spillPromoted();
+            call1("xyo_yield", voidt, ctxArg);
+            reloadPromoted();
+            b.CreateBr(done);
+        }
         b.SetInsertPoint(done);
     }
     llvm::Value* loadIsWarp() {
@@ -764,6 +800,8 @@ struct Codegen {
     }
     /// emitCanon 等で num タグが保証される SSA 値（再チェック省略用）
     std::unordered_set<llvm::Value*> knownNum;
+    // Feedback is a prediction, not a proof. All uses still guard the bits.
+    std::unordered_set<llvm::Value*> likelyNumLoads;
     // A reporter read of a for-each index is finite when the loop body is
     // a yield-free chain and never writes that index. Such a delta cannot
     // produce NaN when added to a non-NaN promoted accumulator.
@@ -848,6 +886,29 @@ struct Codegen {
         knownNumOk[r] = b.CreateNot(isn);
         return r;
     }
+    // Arithmetic facts describe the generated f64 SSA value, not a mutable
+    // Scratch variable. They never survive a load or an interpreter handoff.
+    // Scratch's toNumber() is non-NaN even for an invalid numeric string.
+    std::unordered_set<llvm::Value*> finiteArithmetic;
+    bool arithmeticFinite(llvm::Value* v) const {
+        if (finiteArithmetic.count(v)) return true;
+        const auto* c = llvm::dyn_cast<llvm::ConstantFP>(v);
+        return c && c->getValueAPF().isFinite();
+    }
+    bool arithmeticFiniteNonzero(llvm::Value* v) const {
+        const auto* c = llvm::dyn_cast<llvm::ConstantFP>(v);
+        return c && c->getValueAPF().isFinite() && !c->getValueAPF().isZero();
+    }
+    // A non-NaN IEEE double is already Scratch's canonical numeric Value.
+    // Keep the boxed result for comparisons/observers but avoid a redundant
+    // fcmp-unordered + two selects when the transfer function proves this.
+    llvm::Value* emitCanonKnownNonNaN(llvm::Value* d) {
+        llvm::Value* bits = b.CreateBitCast(d, i64t);
+        knownNum.insert(bits);
+        knownNumD[bits] = d;
+        knownNumOk[bits] = b.getInt1(true);
+        return bits;
+    }
     /// 定数 i64 が number 値ならその double を返す（定数畳み込み用）
     std::optional<double> constNumV(llvm::Value* v) {
         auto* ci = dyn_cast<ConstantInt>(v);
@@ -896,6 +957,27 @@ struct Codegen {
             if (it != literalNums.end()) return cf64(it->second);
         }
         if (knownNum.count(bits)) return emitNotNaN(emitAsF64(bits));
+        if (likelyNumLoads.count(bits)) {
+            // Monomorphic numeric variables use a small fast path. A change
+            // by a different script/clone/monitor falls through to Scratch's
+            // general conversion, including NaN, strings and booleans.
+            BasicBlock* fast = BasicBlock::Create(lc, "profile.number", fn);
+            BasicBlock* slow = BasicBlock::Create(lc, "profile.other", fn);
+            BasicBlock* done = BasicBlock::Create(lc, "profile.done", fn);
+            hotBr(b.CreateICmpSLT(bits, ci64(val::kNan)),
+                  fast, slow, 200, 1);
+            b.SetInsertPoint(fast);
+            llvm::Value* d = emitNotNaN(emitAsF64(bits));
+            b.CreateBr(done);
+            b.SetInsertPoint(slow);
+            llvm::Value* fallback = call1("xyo_to_num", f64t, bits);
+            b.CreateBr(done);
+            b.SetInsertPoint(done);
+            auto* result = b.CreatePHI(f64t, 2);
+            result->addIncoming(d, fast);
+            result->addIncoming(fallback, slow);
+            return result;
+        }
         // Plain-double fast path. `bits < kFalse` is a *signed* compare:
         // every IEEE double (negative ones included, plus +-inf and negative
         // NaN payloads) and kNan sort below the 0x7FF8 payload tags, while
@@ -1259,7 +1341,7 @@ struct Codegen {
                 b.CreateStore(d0, ds);
                 // 比較に d を使ってよいのは初期値が素の double のとき。
                 oks = entryAlloca(b.getInt1Ty(), 1, "pvok");
-                b.CreateStore(numericCmpOk(init, d0), oks);
+                b.CreateStore(numericCmpOk(init, d0, true), oks);
             }
             promoted.push_back({f, slot, ds, oks, numeric});
         }
@@ -1383,7 +1465,7 @@ struct Codegen {
             if (p.numeric) {
                 llvm::Value* d = emitToNumF64(ld);
                 b.CreateStore(d, p.dslot);
-                b.CreateStore(numericCmpOk(ld, d), p.okslot);
+                b.CreateStore(numericCmpOk(ld, d, true), p.okslot);
             }
         }
         // A yielded script may resize or clear a list. Keep only the SList*
@@ -1438,9 +1520,45 @@ struct Codegen {
     /// 影の d だけでは足りない — toNum(" ")==0 だが cast::compare は
     /// 空白のみの文字列を文字列比較する（"1000" のような数値文字列は
     /// 数値比較でよいので d がそのまま使える）。
-    llvm::Value* numericCmpOk(llvm::Value* bits, llvm::Value* d) {
-        return b.CreateAnd(b.CreateICmpSLT(bits, ci64(val::kNan)),
-                           b.CreateFCmpORD(d, d));
+    llvm::Value* numericCmpOk(llvm::Value* bits, llvm::Value* d,
+                              bool checkCachedString = false) {
+        // A Scratch numeric shadow such as "0" or "1" is stored as a
+        // string, not an IEEE double. constValue already recorded exactly
+        // whether this immutable literal participates in numeric comparison
+        // (whitespace-only strings and NaN do not). Preserve its numeric
+        // shadow for all writes, including after loop-promotion reloads.
+        if (auto it = literalCmpNums.find(bits); it != literalCmpNums.end())
+            return b.getInt1(!std::isnan(it->second));
+        if (auto it = knownNumOk.find(bits); it != knownNumOk.end())
+            return it->second;
+        llvm::Value* numeric = b.CreateAnd(
+            b.CreateICmpSLT(bits, ci64(val::kNan)),
+            b.CreateFCmpORD(d, d));
+        if (!checkCachedString) return numeric;
+        // A promoted value may be reloaded after a yield. The stored boxed
+        // value can then be a numeric string supplied by another script,
+        // even if it did not originate from this function's literal table.
+        // emitToNumF64(bits) already populated the string's immutable
+        // parse cache; state 1/4 is exactly the numeric-comparison subset.
+        BasicBlock* stringBB = newBB("cmpok.string");
+        BasicBlock* doneBB = newBB("cmpok.done");
+        llvm::Value* isStr = b.CreateICmpEQ(
+            b.CreateLShr(bits, ci64(48)), ci64(val::kTagStr >> 48));
+        b.CreateCondBr(isStr, stringBB, doneBB);
+        BasicBlock* numBB = b.GetInsertBlock();
+        b.SetInsertPoint(stringBB);
+        llvm::Value* sp = b.CreateIntToPtr(
+            b.CreateAnd(bits, ci64(val::kPtrMask)), ptrt);
+        llvm::Value* state = loadSStrCache(i32t, sp, kSStrNumStateOff, true);
+        llvm::Value* isNumericStr = b.CreateOr(
+            b.CreateICmpEQ(state, ci32(1)),
+            b.CreateICmpEQ(state, ci32(4)));
+        b.CreateBr(doneBB);
+        b.SetInsertPoint(doneBB);
+        PHINode* ok = b.CreatePHI(b.getInt1Ty(), 2);
+        ok->addIncoming(numeric, numBB);
+        ok->addIncoming(isNumericStr, stringBB);
+        return ok;
     }
     /// (bits, d) の整合ペアを書き込む。NaN は bits=kNan / d=0 に落とす
     /// （Scratch の正準表現 + toNum(NaN)=0 を、読み出し側の検査なしで保つ）。
@@ -1454,6 +1572,29 @@ struct Codegen {
         knownNumD[bits] = d;
         knownNumOk[bits] = o;
     }
+    // Sample the resolved variable once while emitting this module. A
+    // guard on each read keeps the compiled code valid across type changes.
+    std::unordered_map<const BlockField*, bool> numberProfileCache;
+    bool profiledNumber(const BlockField* f) {
+        if (!f || aot || typeProfileDisabled || !target) return false;
+        if (auto it = numberProfileCache.find(f);
+            it != numberProfileCache.end()) return it->second;
+        Variable* v = target->lookupVariableById(f->id);
+        if (!v && f->value.isString()) {
+            if (SStr* name = f->value.asStrPtr())
+                v = target->lookupVariableByNameAndType(
+                    std::u16string(name->view()), Variable::kScalarType);
+        }
+        bool numeric = false;
+        if (v && v->type == Variable::kScalarType) {
+            // Include initial SB3/host values not observed by the interpreter.
+            v->observeValueType(v->value);
+            numeric = v->observedOnlyNumber();
+        }
+        numberProfileCache.emplace(f, numeric);
+        return numeric;
+    }
+
     llvm::Value* emitVarGet(const BlockField* f) {
         // jitVar（lookupOrCreate）は常に非 null — helper の v? ガードと等価
         llvm::Value* vp = varValuePtr(f);
@@ -1465,6 +1606,8 @@ struct Codegen {
                 knownNumD[bits] = b.CreateLoad(f64t, p->dslot);
                 knownNumOk[bits] = b.CreateLoad(b.getInt1Ty(), p->okslot);
             }
+        } else if (profiledNumber(f)) {
+            likelyNumLoads.insert(bits);
         }
         return bits;
     }
@@ -1482,6 +1625,8 @@ struct Codegen {
     void emitVarChange(const BlockField* f, llvm::Value* delta) {
         llvm::Value* vp = varValuePtr(f);
         llvm::Value* cur = b.CreateLoad(i64t, vp);
+        if (!findPromoted(f) && profiledNumber(f))
+            likelyNumLoads.insert(cur);
         // xyo_var_change と同型: numCanonical(toNum(cur)+toNum(delta)).
         // emitToNumF64 never yields NaN, so a finite constant delta cannot
         // produce NaN here (inf + finite = +-inf) and canon collapses.
@@ -1568,16 +1713,80 @@ struct Codegen {
 
     // --- 算術・比較の fast path -------------------------------------------
 
+
+    // Shared slow path for dynamic-divisor modulo, emitted as one private
+    // no-inline function per JIT/AOT module. It preserves signed wide integer
+    // remainder and the original floating fallback, including signed zero.
+    // The caller's i32 fast path remains contiguous in the hot function.
+    llvm::Function* modWideVariableFn() {
+        constexpr const char* name = "__xyo_mod_var_wide";
+        if (auto* existing = mod.getFunction(name)) return existing;
+        auto* f = Function::Create(
+            FunctionType::get(f64t, {f64t, f64t}, false),
+            GlobalValue::InternalLinkage, name, mod);
+        f->addFnAttr(Attribute::NoInline);
+        f->addFnAttr(Attribute::Cold);
+        auto args = f->arg_begin();
+        llvm::Value* fa = &*args++;
+        llvm::Value* fb = &*args;
+        IRBuilder<> ir(lc);
+        auto* entry = BasicBlock::Create(lc, "entry", f);
+        auto* check = BasicBlock::Create(lc, "check", f);
+        auto* integer = BasicBlock::Create(lc, "integer", f);
+        auto* slow = BasicBlock::Create(lc, "float", f);
+        ir.SetInsertPoint(entry);
+        const auto bounded = [&](llvm::Value* v) {
+            return ir.CreateAnd(
+                ir.CreateFCmpOGT(v, ConstantFP::get(f64t, -4503599627370496.0)),
+                ir.CreateFCmpOLT(v, ConstantFP::get(f64t, 4503599627370496.0)));
+        };
+        llvm::Value* range = ir.CreateAnd(
+            ir.CreateAnd(bounded(fa), bounded(fb)),
+            ir.CreateAnd(ir.CreateFCmpONE(fa, ConstantFP::get(f64t, 0.0)),
+                         ir.CreateFCmpONE(fb, ConstantFP::get(f64t, 0.0))));
+        ir.CreateCondBr(range, check, slow);
+
+        ir.SetInsertPoint(check);
+        llvm::Value* ni = ir.CreateFPToSI(fa, i64t);
+        llvm::Value* di = ir.CreateFPToSI(fb, i64t);
+        llvm::Value* ints = ir.CreateAnd(
+            ir.CreateFCmpOEQ(ir.CreateSIToFP(ni, f64t), fa),
+            ir.CreateFCmpOEQ(ir.CreateSIToFP(di, f64t), fb));
+        ir.CreateCondBr(ints, integer, slow);
+
+        ir.SetInsertPoint(integer);
+        llvm::Value* rem = ir.CreateSRem(ni, di);
+        llvm::Value* adjust = ir.CreateAnd(
+            ir.CreateXor(ir.CreateICmpSLT(rem, ConstantInt::get(i64t, 0)),
+                         ir.CreateICmpSLT(di, ConstantInt::get(i64t, 0))),
+            ir.CreateICmpNE(rem, ConstantInt::get(i64t, 0)));
+        llvm::Value* wrapped = ir.CreateSelect(
+            adjust, ir.CreateAdd(rem, di), rem);
+        llvm::Value* numeric = ir.CreateSIToFP(wrapped, f64t);
+        llvm::Value* negativeZero = ir.CreateAnd(
+            ir.CreateICmpEQ(rem, ConstantInt::get(i64t, 0)),
+            ir.CreateICmpSLT(ni, ConstantInt::get(i64t, 0)));
+        ir.CreateRet(ir.CreateSelect(
+            negativeZero, ConstantFP::get(f64t, -0.0), numeric));
+
+        ir.SetInsertPoint(slow);
+        llvm::Value* r0 = ir.CreateFRem(fa, fb);
+        llvm::Value* signDiff = ir.CreateFCmpOLT(
+            ir.CreateFDiv(r0, fb), ConstantFP::get(f64t, 0.0));
+        ir.CreateRet(ir.CreateSelect(signDiff, ir.CreateFAdd(r0, fb), r0));
+        return f;
+    }
+
     enum class AOp { Add, Sub, Mul, Div, Mod };
     /// xyo_add/sub/mul/div/mod と同型 — numCanonical(toNum(a) op
     /// toNum(b)) を直接 emit（helper 呼出しなし）。
-    llvm::Value* emitArith(Block* blk, const char* in1, const char* in2,
-                           AOp aop) {
-        llvm::Value* a = emitInputOf(blk, in1);
-        llvm::Value* bv = emitInputOf(blk, in2);
-        llvm::Value* fa = emitToNumF64(a);
-        llvm::Value* fb = emitToNumF64(bv);
+    llvm::Value* emitArithNumeric(llvm::Value* fa, llvm::Value* fb,
+                                 AOp aop) {
         llvm::Value* r;
+        // A native integer remainder can never produce NaN. Preserve the
+        // floating fallback's NaN bit as a separate SSA flag, so only the
+        // cold fmod path pays for an unordered FP comparison.
+        llvm::Value* modNan = nullptr;
         switch (aop) {
         case AOp::Add: r = b.CreateFAdd(fa, fb); break;
         case AOp::Sub: r = b.CreateFSub(fa, fb); break;
@@ -1651,16 +1860,31 @@ struct Codegen {
                 b.CreateBr(merge);
                 b.SetInsertPoint(slow);
                 llvm::Value* slowResult = slowMod();
+                llvm::Value* slowNan = splitModNan
+                    ? b.CreateFCmpUNO(slowResult, slowResult) : nullptr;
                 b.CreateBr(merge);
                 b.SetInsertPoint(merge);
                 PHINode* result = b.CreatePHI(f64t, 2);
                 result->addIncoming(fastResult, fast);
                 result->addIncoming(slowResult, slow);
+                llvm::Value* nanWide = nullptr;
+                if (splitModNan) {
+                    auto* phi = b.CreatePHI(b.getInt1Ty(), 2);
+                    phi->addIncoming(b.getInt1(false), fast);
+                    phi->addIncoming(slowNan, slow);
+                    nanWide = phi;
+                }
                 b.CreateBr(finalMerge);
                 b.SetInsertPoint(finalMerge);
                 PHINode* merged = b.CreatePHI(f64t, 2);
                 merged->addIncoming(res32, smallFast);
                 merged->addIncoming(result, merge);
+                if (splitModNan) {
+                    auto* phi = b.CreatePHI(b.getInt1Ty(), 2);
+                    phi->addIncoming(b.getInt1(false), smallFast);
+                    phi->addIncoming(nanWide, merge);
+                    modNan = phi;
+                }
                 r = merged;
             } else {
                 // Positive integral operands fitting i32 can use the shorter
@@ -1687,6 +1911,25 @@ struct Codegen {
                 llvm::Value* smallResult = b.CreateUIToFP(
                     b.CreateURem(smallN, smallD), f64t);
                 b.CreateBr(both);
+                b.SetInsertPoint(wide);
+                if (modOutlineWide) {
+                    llvm::Value* wideResult = b.CreateCall(
+                        modWideVariableFn(), {fa, fb});
+                    llvm::Value* wideNan = splitModNan
+                        ? b.CreateFCmpUNO(wideResult, wideResult) : nullptr;
+                    b.CreateBr(both);
+                    b.SetInsertPoint(both);
+                    auto* joined = b.CreatePHI(f64t, 2);
+                    joined->addIncoming(smallResult, smallFast);
+                    joined->addIncoming(wideResult, wide);
+                    if (splitModNan) {
+                        auto* flag = b.CreatePHI(b.getInt1Ty(), 2);
+                        flag->addIncoming(b.getInt1(false), smallFast);
+                        flag->addIncoming(wideNan, wide);
+                        modNan = flag;
+                    }
+                    r = joined;
+                } else {
                 b.SetInsertPoint(wide);
                 // Variable divisor: exact integer operands also admit a
                 // native signed remainder. Both conversions are performed
@@ -1730,22 +1973,82 @@ struct Codegen {
                 b.CreateBr(merge);
                 b.SetInsertPoint(slow);
                 llvm::Value* fallback = slowMod();
+                llvm::Value* slowNan = splitModNan
+                    ? b.CreateFCmpUNO(fallback, fallback) : nullptr;
                 b.CreateBr(merge);
                 b.SetInsertPoint(merge);
                 PHINode* phi = b.CreatePHI(f64t, 2);
                 phi->addIncoming(result, fast);
                 phi->addIncoming(fallback, slow);
+                llvm::Value* nanWide = nullptr;
+                if (splitModNan) {
+                    auto* flag = b.CreatePHI(b.getInt1Ty(), 2);
+                    flag->addIncoming(b.getInt1(false), fast);
+                    flag->addIncoming(slowNan, slow);
+                    nanWide = flag;
+                }
                 b.CreateBr(both);
                 b.SetInsertPoint(both);
                 PHINode* joined = b.CreatePHI(f64t, 2);
                 joined->addIncoming(smallResult, smallFast);
                 joined->addIncoming(phi, merge);
+                if (splitModNan) {
+                    auto* flag = b.CreatePHI(b.getInt1Ty(), 2);
+                    flag->addIncoming(b.getInt1(false), smallFast);
+                    flag->addIncoming(nanWide, merge);
+                    modNan = flag;
+                }
                 r = joined;
+                }
             }
             break;
         }
         }
-        return emitCanon(r);
+        // Both operands arrived through emitToNumF64(), so neither is NaN.
+        // IEEE-754 add/sub with one finite operand cannot produce NaN;
+        // multiply/divide with a finite nonzero factor/divisor cannot either.
+        // Do not use fast-math: infinity, signed zero and overflow stay exact.
+        // The general modulo path still needs canonicalization (fmod(inf,m)
+        // is NaN), but its numeric coercion is always finite after repair.
+        if (modNan) {
+            // The integer paths have a constant false flag. Only the floating
+            // fallback computes isNaN, while preserving NaN-box canonical form
+            // and its toNumber zero shadow.
+            llvm::Value* boxed = b.CreateSelect(modNan, ci64(val::kNan),
+                                                 b.CreateBitCast(r, i64t));
+            llvm::Value* number = b.CreateSelect(modNan, cf64(0.0), r);
+            knownNum.insert(boxed);
+            knownNumD[boxed] = number;
+            knownNumOk[boxed] = b.CreateNot(modNan);
+            finiteArithmetic.insert(number);
+            return boxed;
+        }
+        const bool finiteA = arithmeticFinite(fa);
+        const bool finiteB = arithmeticFinite(fb);
+        const bool noNaN =
+            (aop == AOp::Add || aop == AOp::Sub) ? (finiteA || finiteB) :
+            aop == AOp::Mul ? (finiteA && finiteB) ||
+                                 arithmeticFiniteNonzero(fa) ||
+                                 arithmeticFiniteNonzero(fb) :
+            aop == AOp::Div ? arithmeticFiniteNonzero(fb) :
+            false;
+        if (noNaN && safeArithCanon)
+            return emitCanonKnownNonNaN(r);
+        llvm::Value* result = emitCanon(r);
+        if (aop == AOp::Mod)
+            finiteArithmetic.insert(knownNumD[result]);
+        return result;
+    }
+
+    llvm::Value* emitArith(Block* blk, const char* in1, const char* in2,
+                           AOp aop) {
+        llvm::Value* a = emitInputOf(blk, in1);
+        llvm::Value* bv = emitInputOf(blk, in2);
+        // C++ function argument evaluation order is unspecified. Emit both
+        // conversions in Scratch's left-to-right evaluation order.
+        llvm::Value* fa = emitToNumF64(a);
+        llvm::Value* fb = emitToNumF64(bv);
+        return emitArithNumeric(fa, fb, aop);
     }
 
     /// cast::compare 意味での数値変換。*okOut=true なら f64 が有効
@@ -1786,6 +2089,16 @@ struct Codegen {
         if (knownNum.count(bits)) {
             *okOut = b.CreateICmpNE(bits, ci64(val::kNan));
             return emitAsF64(bits);
+        }
+        if (likelyNumLoads.count(bits)) {
+            // Only a non-NaN numeric payload is safe for native comparison.
+            // A mismatched type makes okOut false; the caller invokes the
+            // generic Scratch comparison (including numeric strings).
+            llvm::Value* d = emitAsF64(bits);
+            *okOut = b.CreateAnd(
+                b.CreateICmpSLT(bits, ci64(val::kNan)),
+                b.CreateFCmpORD(d, d));
+            return d;
         }
         // 数値として解釈できる文字列リテラル（"1000" など）は比較を
         // コンパイル時に畳む。literalNums は cast::toNumber の結果で、
@@ -2147,6 +2460,60 @@ struct Codegen {
     llvm::Value* emitEq(Block* blk) {
         llvm::Value* a = emitInputOf(blk, "OPERAND1");
         llvm::Value* bv = emitInputOf(blk, "OPERAND2");
+        // When comparing a numeric producer or promoted numeric shadow with
+        // a valid numeric literal, use the cached double and numeric-compare
+        // predicate. Other types still require Scratch's string comparator.
+        auto numericLiteral = [&](llvm::Value* v) -> std::optional<double> {
+            if (auto c = constNumV(v); c && !std::isnan(*c)) return c;
+            if (auto it = literalCmpNums.find(v);
+                it != literalCmpNums.end() && !std::isnan(it->second))
+                return it->second;
+            return std::nullopt;
+        };
+        // Equality is commutative, but evaluating the input reporters is not.
+        // Both reporters were evaluated in Scratch's left-to-right order above.
+        // Reuse the proven numeric-shadow fast path even when the immutable
+        // numeric literal is the *left* operand (previously only RHS worked).
+        auto emitNumericLiteralEq = [&](llvm::Value* candidate,
+                                        double literal) -> llvm::Value* {
+            auto di = knownNumD.find(candidate);
+            auto oi = knownNumOk.find(candidate);
+            if (di == knownNumD.end() || oi == knownNumOk.end())
+                return nullptr;
+            llvm::Value* numberEquals =
+                b.CreateFCmpOEQ(di->second, cf64(literal));
+            if (knownNum.count(candidate))
+                return b.CreateZExt(
+                    b.CreateAnd(oi->second, numberEquals), i32t);
+            BasicBlock* fast = newBB("eq.numeric.fast");
+            BasicBlock* slow = newBB("eq.numeric.slow");
+            BasicBlock* done = newBB("eq.numeric.merge");
+            b.CreateCondBr(oi->second, fast, slow);
+            b.SetInsertPoint(fast);
+            llvm::Value* fastResult = b.CreateZExt(numberEquals, i32t);
+            b.CreateBr(done);
+            b.SetInsertPoint(slow);
+            llvm::Value* fallback = call2("xyo_eq", i32t, a, bv);
+            b.CreateBr(done);
+            b.SetInsertPoint(done);
+            PHINode* result = b.CreatePHI(i32t, 2);
+            result->addIncoming(fastResult, fast);
+            result->addIncoming(fallback, slow);
+            return result;
+        };
+        if (!std::getenv("XYO_JIT_DISABLE_EQ_NUMERIC")) {
+            if (auto c = numericLiteral(bv)) {
+                if (llvm::Value* result = emitNumericLiteralEq(a, *c))
+                    return result;
+            }
+            // A/B diagnostic switch; default behavior is symmetric.
+            if (!std::getenv("XYO_JIT_DISABLE_EQ_SYMMETRIC")) {
+                if (auto c = numericLiteral(a)) {
+                    if (llvm::Value* result = emitNumericLiteralEq(bv, *c))
+                        return result;
+                }
+            }
+        }
         // Always emit BOTH operands, in order, before selecting a fast path.
         if (!genericEq) {
             if (auto word = eqAsciiWord(blk, "OPERAND2"))
@@ -2516,6 +2883,39 @@ struct Codegen {
             if (vb == val::kTrue) return b.getInt1(true);
             if (vb == val::kFalse) return b.getInt1(false);
         }
+        // Arithmetic reporters emitted by this code generator carry a
+        // canonical numeric result, even when the Scratch value is NaN.
+        // Reuse its unboxed SSA shadow rather than redispatching the boxed
+        // result through numeric/boolean/string tests and a helper edge.
+        // The shadow is cast::toNumber(value), so canonical NaN is already 0.
+        if (knownNum.count(bits)) {
+            if (auto it = knownNumD.find(bits); it != knownNumD.end())
+                return b.CreateFCmpONE(it->second, cf64(0.0));
+            return b.CreateFCmpONE(emitAsF64(bits), cf64(0.0));
+        }
+        // Feedback is a prediction, not a proof. Only plain IEEE-754
+        // numbers may enter this specialized branch; a later script/clone
+        // writing boolean or string still takes the full Scratch truthiness
+        // semantics, including "0", "false" and nonempty numeric strings.
+        if (likelyNumLoads.count(bits)) {
+            BasicBlock* fast = newBB("truthy.profile.number");
+            BasicBlock* slow = newBB("truthy.profile.other");
+            BasicBlock* merge = newBB("truthy.profile.done");
+            hotBr(b.CreateICmpSLT(bits, ci64(val::kNan)),
+                  fast, slow, 200, 1);
+            b.SetInsertPoint(fast);
+            llvm::Value* result = b.CreateFCmpONE(emitAsF64(bits), cf64(0.0));
+            b.CreateBr(merge);
+            b.SetInsertPoint(slow);
+            llvm::Value* generic = b.CreateICmpNE(
+                call1("xyo_truthy", i32t, bits), ci32(0));
+            b.CreateBr(merge);
+            b.SetInsertPoint(merge);
+            PHINode* truthy = b.CreatePHI(b.getInt1Ty(), 2);
+            truthy->addIncoming(result, fast);
+            truthy->addIncoming(generic, slow);
+            return truthy;
+        }
         // Comparisons / boolean operators already carry an i1 condition.
         // Recover it before boxing adds tag tests and a false-side helper call.
         if (auto* sel = dyn_cast<SelectInst>(bits)) {
@@ -2540,8 +2940,7 @@ struct Codegen {
         b.CreateCondBr(goNum, numBB, slowBB);
         b.SetInsertPoint(numBB);
         llvm::Value* tn = b.CreateOr(
-            isTrue,
-            b.CreateFCmpONE(emitAsF64(bits), cf64(0.0)));
+            isTrue, b.CreateFCmpONE(emitAsF64(bits), cf64(0.0)));
         b.CreateBr(merge);
         b.SetInsertPoint(slowBB);
         llvm::Value* th = call1("xyo_truthy", i32t, bits);
@@ -2941,10 +3340,13 @@ struct Codegen {
             // Shared cast semantics include empty strings, NaN -> 0 and -0/Inf.
             if (!genericLiteralNum) {
                 literalNums[bits] = cast::toNumber(v);
+                // Scratch comparison must distinguish a failed numeric
+                // parse from numeric zero. cast::toNumber maps NaN to 0
+                // for arithmetic, but compare("abc", 0) is string-based.
                 literalCmpNums[bits] =
                     cast::isWhiteSpace(v)
                         ? std::numeric_limits<double>::quiet_NaN()
-                        : cast::toNumber(v);
+                        : cast::toNumberOrNaN(v);
             }
             return bits;
         }
@@ -3201,6 +3603,14 @@ struct Codegen {
                 if (SStr* s = right->value.asStrPtr()) joined.append(s->view());
                 // Reuse the JIT pin / relocatable AOT StrLit boundary.
                 return constValue(Value::string(SStr::create(joined)));
+            }
+            if (right && !std::getenv("XYO_JIT_DISABLE_JOIN_SUFFIX")) {
+                // Joining a live value to an immutable text literal needs
+                // no generic dispatch for the common string/string case.
+                // Keep the dynamic left reporter's evaluation unchanged.
+                llvm::Value* dynamic = emitInputOf(blk, "STRING1");
+                llvm::Value* suffix = constValue(right->value);
+                return call2("xyo_join_suffix", i64t, dynamic, suffix);
             }
         }
 
@@ -4112,15 +4522,75 @@ struct Codegen {
     };
     std::vector<ProcCallSite> procCallSites;
 
-    /// Yield/compat も再帰も発生しない手続きの stack push/pop を省略。
-    /// 再帰関数は Scratch の isRecursiveCall が直近の呼出しフレームを
-    /// 観測するため、明示的な待機ブロックがなくてもフレームを維持する。
-    /// 再帰を含む SCC だけフレームを保持して一般的な leaf の性能を維持。
+    /// Stack frames are invisible within a small, purely scalar warp
+    /// procedure graph that never yields. Recursive calls in such a graph
+    /// must not pay for Scratch's interpreter stack on every native call.
+    /// All reachable definitions must be warp; non-warp recursion needs its
+    /// frames for Scratch's bounded isRecursiveCall check.
+    bool canElideWarpRecursiveFrames(Function* start) {
+        static const std::unordered_set<std::string_view> kStackInvisible = {
+            "data_variable", "data_setvariableto", "data_changevariableby",
+            "operator_add", "operator_subtract", "operator_multiply",
+            "operator_divide", "operator_mod", "operator_round",
+            "operator_lt", "operator_gt", "operator_equals",
+            "operator_and", "operator_or", "operator_not",
+            "argument_reporter_string_number", "argument_reporter_boolean",
+            "argument_reporter", "control_if", "control_if_else",
+            "procedures_call",
+        };
+        std::unordered_set<Function*> seenProcs;
+        std::function<bool(Function*)> check = [&](Function* f) -> bool {
+            if (!seenProcs.insert(f).second) return true;
+            auto direct = fnDirect.find(f);
+            if (direct != fnDirect.end() && direct->second) return false;
+
+            // Only actual warp definitions are permitted. Looking up the
+            // definition again avoids trusting the caller's warp state.
+            std::string proccode;
+            bool found = false;
+            for (const auto& [key, candidate] : procFns) {
+                if (candidate != f) continue;
+                if (!key.ends_with("|w")) return false;
+                proccode = key.substr(0, key.size() - 2);
+                found = true;
+                break;
+            }
+            if (!found) return false;
+            const std::string defId = blocks->getProcedureDefinition(proccode);
+            Block* def = defId.empty() ? nullptr : getBlock(defId);
+            if (!def) return false;
+
+            std::vector<std::string> todo{def->next};
+            std::unordered_set<std::string> seenBlocks;
+            while (!todo.empty()) {
+                std::string id = std::move(todo.back());
+                todo.pop_back();
+                if (id.empty() || !seenBlocks.insert(id).second) continue;
+                Block* node = getBlock(id);
+                if (!node) return false;
+                if (node->shadow) continue;
+                if (!kStackInvisible.contains(node->opcode)) return false;
+                if (!node->next.empty()) todo.push_back(node->next);
+                for (const auto& [name, in] : node->inputs.items) {
+                    (void)name;
+                    if (!in.block.empty()) todo.push_back(in.block);
+                    if (!in.shadow.empty()) todo.push_back(in.shadow);
+                }
+            }
+            auto edges = callEdges.find(f);
+            if (edges != callEdges.end())
+                for (Function* callee : edges->second)
+                    if (!check(callee)) return false;
+            return true;
+        };
+        return check(start);
+    }
+
+    /// Remove interpreter stack frames from native procedure calls only when
+    /// unobservable. Non-warp recursive procedures need the stack for the
+    /// six-ancestor recursion check and may yield on recursive entry.
     void elideLeafProcFrames() {
         if (procCallSites.empty()) return;
-        // A procedure is recursive when its call graph can return to itself.
-        // Its call frames must remain visible to Scratch's bounded stack scan
-        // even if its body has no explicit wait/loop yield helper.
         std::unordered_set<Function*> cyclic;
         for (auto& [name, start] : procFns) {
             std::unordered_set<Function*> seen;
@@ -4133,22 +4603,35 @@ struct Codegen {
                 }
                 return false;
             };
-            if (visits(start)) {
-                cyclic.insert(start);
-                fnDirect[start] = true;
+            if (visits(start)) cyclic.insert(start);
+        }
+
+        std::unordered_set<Function*> safeRecursive;
+        for (Function* f : cyclic) {
+            if (canElideWarpRecursiveFrames(f)) {
+                safeRecursive.insert(f);
+            } else {
+                fnDirect[f] = true; // preserve conservative mayYield
             }
         }
+
         for (auto& s : procCallSites) {
-            if (cyclic.count(s.callee)) {
-                s.push->setArgOperand(6, ci32(1));
-                continue;
-            }
-            auto dit = fnDirect.find(s.callee);
-            if (dit != fnDirect.end() && dit->second) {
+            if (cyclic.contains(s.callee)) {
+                if (!safeRecursive.contains(s.callee)) {
+                    s.push->setArgOperand(6, ci32(1));
+                    continue;
+                }
                 if (verbose) std::fprintf(stderr,
-                    "xyo-jit: frame keep (yield) %s\n",
+                    "xyo-jit: frame elide (pure warp recursion) %s\n",
                     s.proccode.c_str());
-                continue;
+            } else {
+                auto dit = fnDirect.find(s.callee);
+                if (dit != fnDirect.end() && dit->second) {
+                    if (verbose) std::fprintf(stderr,
+                        "xyo-jit: frame keep (yield) %s\n",
+                        s.proccode.c_str());
+                    continue;
+                }
             }
             s.push->eraseFromParent();
             s.pop->eraseFromParent();
@@ -4161,7 +4644,13 @@ struct Codegen {
     /// 意味論に関わる判定（fnDirect/callEdges/elide）は emit 時点の
     /// グラフで済んでいるため、IR レベルの inline は安全。
     void inlineSmallProcCalls() {
-        constexpr unsigned kMaxProcInsts = 220;
+        // Diagnostic knob for the code-size versus call-overhead tradeoff:
+        // LLVM's normal inliner remains active regardless of this setting.
+        // Zero skips the explicit Scratch-procedure inlining pass.
+        unsigned maxProcInsts = 220;
+        if (const char* limit = std::getenv("XYO_JIT_INLINE_LIMIT"))
+            maxProcInsts = unsigned(std::strtoul(limit, nullptr, 10));
+        if (maxProcInsts == 0) return;
         std::unordered_map<Function*, unsigned> cost;
         llvm::InlineFunctionInfo ifi;
         for (auto& s : procCallSites) {
@@ -4172,7 +4661,7 @@ struct Codegen {
                 for (auto& bb : *s.callee) n += unsigned(bb.size());
                 it = cost.emplace(s.callee, n).first;
             }
-            if (it->second > kMaxProcInsts) continue;
+            if (it->second > maxProcInsts) continue;
             llvm::InlineFunction(*s.call, ifi);
         }
     }

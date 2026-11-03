@@ -150,6 +150,21 @@ uint64_t xyo_join(uint64_t a, uint64_t b) {
     XYO_RT_PROF(kStr);
     return toB(rt::join(toV(a), toV(b)));
 }
+// JIT uses this for join(dynamic, text shadow). The suffix is guaranteed
+// to be a string literal by the code generator. The dynamic value remains
+// generic: other types preserve the normal Scratch coercion behavior.
+uint64_t xyo_join_suffix(uint64_t a, uint64_t suffix) {
+    XYO_RT_PROF(kStr);
+    Value lhs = toV(a);
+    if (!lhs.isString()) return toB(rt::join(lhs, toV(suffix)));
+    SStr* s1 = lhs.asStrPtr();
+    SStr* s2 = toV(suffix).asStrPtr();
+    if (!s1 || s1->len == 0) return suffix;
+    if (!s2 || s2->len == 0) return a;
+    if (size_t(s1->len) + s2->len >= 16)
+        return toB(Value::string(sstrCons(s1, s2)));
+    return toB(Value::string(sstrConcat(s1->view(), s2->view())));
+}
 #if defined(XYO_STRING_JOIN_SPECIALIZED)
 uint64_t xyo_join_strings(uint64_t a, uint64_t b) {
     XYO_RT_PROF(kStr);
@@ -387,32 +402,7 @@ void xyo_mot_glideto(JitCtx* c, uint64_t secs, uint64_t to) {
 }
 void xyo_mot_edgebounce(JitCtx* c) {
     XYO_RT_PROF(kBlocks);
-    Target* t = c->target;
-    Target::Bounds bounds;
-    if (!t->getBounds(bounds)) return;
-    Runtime* rt = c->runtime;
-    double stageW = rt->stageWidth, stageH = rt->stageHeight;
-    double distLeft = std::max(0.0, stageW / 2 + bounds.left);
-    double distTop = std::max(0.0, stageH / 2 - bounds.top);
-    double distRight = std::max(0.0, stageW / 2 - bounds.right);
-    double distBottom = std::max(0.0, stageH / 2 + bounds.bottom);
-    const char* nearest = "";
-    double minDist = std::numeric_limits<double>::infinity();
-    if (distLeft < minDist) { minDist = distLeft; nearest = "left"; }
-    if (distTop < minDist) { minDist = distTop; nearest = "top"; }
-    if (distRight < minDist) { minDist = distRight; nearest = "right"; }
-    if (distBottom < minDist) { minDist = distBottom; nearest = "bottom"; }
-    if (minDist > 0) return;
-    double radians = (M_PI * (90.0 - t->direction)) / 180.0;
-    double dx = v8math::cos(radians);
-    double dy = -v8math::sin(radians);
-    if (std::strcmp(nearest, "left") == 0) dx = std::max(0.2, std::fabs(dx));
-    else if (std::strcmp(nearest, "top") == 0) dy = std::max(0.2, std::fabs(dy));
-    else if (std::strcmp(nearest, "right") == 0) dx = -std::max(0.2, std::fabs(dx));
-    else if (std::strcmp(nearest, "bottom") == 0) dy = -std::max(0.2, std::fabs(dy));
-    t->setDirection(v8math::atan2(dy, dx) * 180.0 / M_PI + 90.0);
-    double fx, fy;
-    if (t->keepInFence(t->x, t->y, fx, fy)) t->setXY(fx, fy);
+    bounceOffEdge(c->target, c->runtime);
 }
 void xyo_mot_setrotstyle(JitCtx* c, uint64_t style) {
     XYO_RT_PROF(kBlocks);
