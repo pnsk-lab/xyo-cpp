@@ -1,11 +1,18 @@
 // xyo-cpp: UTF-16 文字列操作 + SStr 生成。
 #include "sstr.hpp"
+#include "cast.hpp"
+#include "jsnum.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <memory>
+#include <mutex>
+#include <new>
+#include <limits>
 
 namespace xyo {
 
@@ -26,6 +33,348 @@ struct StrDebug {
 };
 StrDebug& strDebug() { static StrDebug d; return d; }
 } // namespace
+
+
+// Experimental append-only log. Each immutable SStr snapshot holds (log, prefix
+// length). Later appends only write *past* that prefix; a fork from an old
+// snapshot allocates a new log. Fixed chunks avoid invalidating existing bytes
+// when the vector grows, and preserve UTF-16 code-unit indexing.
+struct AppendLog {
+    static constexpr uint32_t kChunk = 256;
+    std::mutex mutex;
+    std::vector<std::unique_ptr<char16_t[]>> chunks;
+    uint32_t length = 0;
+    bool ascii = true;
+
+    void append(std::u16string_view text) { // lock must be held
+        size_t pos = 0;
+        while (pos < text.size()) {
+            if (length == UINT32_MAX) std::abort();
+            const uint32_t offset = length % kChunk;
+            if (offset == 0) {
+                chunks.push_back(std::make_unique<char16_t[]>(kChunk));
+                Gc::get().noteExternalAllocation(kChunk * sizeof(char16_t));
+            }
+            const size_t n = std::min<size_t>(
+                {size_t(kChunk - offset), text.size() - pos,
+                 size_t(UINT32_MAX - length)});
+            if (n == 0) std::abort();
+            const char16_t* src = text.data() + pos;
+            std::memcpy(chunks[length / kChunk].get() + offset,
+                        src, n * sizeof(char16_t));
+            if (ascii)
+                for (size_t i = 0; i < n; ++i)
+                    if (src[i] >= 128) { ascii = false; break; }
+            length += static_cast<uint32_t>(n);
+            pos += n;
+        }
+    }
+    void appendAscii(std::string_view text) { // lock must be held
+        size_t pos = 0;
+        while (pos < text.size()) {
+            if (length == UINT32_MAX) std::abort();
+            const uint32_t offset = length % kChunk;
+            if (offset == 0) {
+                chunks.push_back(std::make_unique<char16_t[]>(kChunk));
+                Gc::get().noteExternalAllocation(kChunk * sizeof(char16_t));
+            }
+            const size_t n = std::min<size_t>(
+                {kChunk - offset, text.size() - pos, UINT32_MAX - length});
+            if (n == 0) std::abort();
+            char16_t* target = chunks[length / kChunk].get() + offset;
+            for (size_t i = 0; i < n; ++i) {
+                // jsnum::toString emits only 7-bit ASCII.
+                target[i] = static_cast<unsigned char>(text[pos + i]);
+            }
+            length += static_cast<uint32_t>(n);
+            pos += n;
+        }
+    }
+    void copy(char16_t* out, uint32_t n) const { // lock must be held
+        uint32_t at = 0;
+        while (at < n) {
+            const uint32_t take = std::min(kChunk, n - at);
+            std::memcpy(out + at, chunks[at / kChunk].get(), take * sizeof(char16_t));
+            at += take;
+        }
+    }
+    char16_t unitAt(uint32_t i) const { // lock must be held
+        return chunks[i / kChunk][i % kChunk];
+    }
+};
+
+void destroyAppendLog(void* ptr) {
+    static_cast<AppendLog*>(ptr)->~AppendLog();
+}
+size_t appendLogExternalBytes(void* ptr) {
+    auto* log = static_cast<AppendLog*>(ptr);
+    // GC may read accounting while another worker is appending chunks.
+    std::lock_guard lock(log->mutex);
+    return log->chunks.size() * AppendLog::kChunk * sizeof(char16_t);
+}
+
+const char16_t* SStr::appendBody() const {
+    auto* self = const_cast<SStr*>(this);
+    if (auto* ready = std::atomic_ref<char16_t*>(self->body)
+                          .load(std::memory_order_acquire))
+        return ready;
+    const size_t n = len;
+    auto* buf = static_cast<char16_t*>(std::malloc((n + 1) * sizeof(char16_t)));
+    if (!buf) std::abort();
+    auto* log = reinterpret_cast<AppendLog*>(left);
+    {
+        std::lock_guard lock(log->mutex);
+        log->copy(buf, len);
+    }
+    buf[n] = 0;
+    char16_t* expected = nullptr;
+    if (!std::atomic_ref<char16_t*>(self->body).compare_exchange_strong(
+            expected, buf, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        std::free(buf);
+        return expected;
+    }
+    return buf;
+}
+
+// Important: allocation can trigger GC, so hold the collector's deferral guard
+// while constructing the log and publishing the snapshot.
+static SStr* makeAppendSnapshot(AppendLog* log, uint32_t length, bool ascii) {
+    auto* result = static_cast<SStr*>(Gc::get().alloc(GcType::Str, sizeof(SStr)));
+    result->len = length;
+    result->hash = 0;
+    result->initCaches();
+    result->flags = SStr::kAppendFlag | SStr::kAsciiKnown |
+                    (ascii ? SStr::kAsciiValue : 0);
+    result->left = reinterpret_cast<SStr*>(log); // GC-owned AppendLog pointer
+    return result;
+}
+
+SStr* sstrConsOrAppend(SStr* a, SStr* b) {
+    static const bool enabled = [] {
+        const char* v = std::getenv("XYO_STRING_APPEND_LOG");
+        return v && v[0] == '1';
+    }();
+    if (!enabled || !a || !b || b->len > 256 ||
+        size_t(a->len) + b->len > std::numeric_limits<uint32_t>::max())
+        return sstrCons(a, b);
+
+    // Extract RHS before locking a log (RHS might refer to that same log).
+    // The small append limit bounds temporary copying.
+    std::u16string rhs(b->view());
+    const bool ascii = a->isAscii() && b->isAscii();
+    Gc::DeferCollect defer;
+    if (a->isAppend()) {
+        auto* log = reinterpret_cast<AppendLog*>(a->left);
+        std::lock_guard lock(log->mutex);
+        if (log->length == a->len) {
+            log->append(rhs);
+            return makeAppendSnapshot(log, log->length, ascii);
+        }
+        // The old prefix has since been extended; fork to preserve both values.
+    }
+    auto* log = new (Gc::get().alloc(GcType::AppendLog, sizeof(AppendLog)))
+        AppendLog();
+    const auto prefix = a->view();
+    {
+        std::lock_guard lock(log->mutex);
+        log->append(prefix);
+        log->append(rhs);
+    }
+    return makeAppendSnapshot(log, log->length, ascii);
+}
+
+// These helpers are only emitted for a structurally proven single-variable
+// self-append loop. No observer can see the intermediate value until a Scratch
+// yield. In the JIT, a transient is a GC-owned AppendLog rooted through an
+// immutable prefix snapshot stored in the variable. Only a real yield or loop
+// exit publishes the grown prefix. The log's chunks never modify old indices.
+extern "C" {
+
+void* xyo_transient_begin(uint64_t initial, uint64_t* variable) {
+    Gc::DeferCollect defer;
+    const Value current{initial};
+    SStr* source = cast::toString(current);
+    auto* log = new (Gc::get().alloc(GcType::AppendLog, sizeof(AppendLog)))
+        AppendLog();
+    if (source && source->len) {
+        std::lock_guard lock(log->mutex);
+        log->append(source->view());
+    }
+    SStr* root = makeAppendSnapshot(log, log->length, log->ascii);
+    *variable = Value::string(root).bits;
+    return log;
+}
+
+void xyo_transient_append(void* pointer, uint64_t suffixBits) {
+    auto* log = static_cast<AppendLog*>(pointer);
+    const Value suffix{suffixBits};
+    SStr* text = suffix.asStrPtr(); // the JIT proved an immutable text literal
+    if (!text || !text->len) return;
+    const auto characters = text->view();
+    std::lock_guard lock(log->mutex);
+    log->append(characters);
+}
+
+// JIT has proved RHS is a side-effect-free reporter independent of the
+// destination variable. This handles dynamic arithmetic and numeric inputs
+// while preserving JS number-to-string formatting and UTF-16 semantics.
+void xyo_transient_append_value(void* pointer, uint64_t bits) {
+    auto* log = static_cast<AppendLog*>(pointer);
+    const Value value{bits};
+    if (value.isNumber()) {
+        const double d = value.asNumberUnchecked();
+        // Small integral values dominate Scratch variable arithmetic. Format
+        // directly into stack UTF-16 units, avoiding an intermediate std::string
+        // or SStr allocation. Casting only after proving a safe finite range
+        // also preserves NaN, infinity, exponent and -0 formatting in the
+        // general JavaScript number-to-string path.
+        if (d >= -999999999.0 && d <= 999999999.0) {
+            const int32_t n = static_cast<int32_t>(d);
+            if (double(n) == d) {
+                char16_t digits[12];
+                unsigned len = 0;
+                uint32_t magnitude = static_cast<uint32_t>(n < 0 ? -n : n);
+                do {
+                    digits[len++] = char16_t(u'0' + (magnitude % 10));
+                    magnitude /= 10;
+                } while (magnitude);
+                if (n < 0) digits[len++] = u'-';
+                std::reverse(digits, digits + len);
+                std::lock_guard lock(log->mutex);
+                log->append(std::u16string_view(digits, len));
+                return;
+            }
+        }
+        const std::string ascii = jsnum::toString(d);
+        std::lock_guard lock(log->mutex);
+        log->appendAscii(ascii);
+        return;
+    }
+    SStr* str = cast::toString(value);
+    const auto characters = str->view();
+    std::lock_guard lock(log->mutex);
+    log->append(characters);
+}
+
+// Specialized for compile-time literals up to 4 UTF-16 code units: avoids
+// dereferencing an SStr and calling view()/data() on every loop iteration.
+void xyo_transient_append_packed(void* pointer, uint64_t packed, uint32_t length) {
+    if (length == 0 || length > 4) std::abort();
+    char16_t units[4];
+    for (uint32_t i = 0; i < length; ++i)
+        units[i] = char16_t((packed >> (16 * i)) & 0xffff);
+    auto* log = static_cast<AppendLog*>(pointer);
+    std::lock_guard lock(log->mutex);
+    log->append(std::u16string_view(units, length));
+}
+
+// Repeated literal appends share one FFI call and mutex acquisition for up to
+// 64 logical warp iterations. The JIT only groups iterations between ordinary
+// 64-iteration yield checkpoints; it advances the same logical poll counter.
+void xyo_transient_append_repeat_packed(void* pointer, uint64_t packed,
+                                        uint64_t metadata) {
+    const uint32_t length = uint32_t(metadata >> 32);
+    const uint32_t repeats = uint32_t(metadata);
+    if (length == 0 || length > 4 || repeats == 0 || repeats > 64)
+        std::abort();
+    char16_t buffer[256];
+    for (uint32_t r = 0; r < repeats; ++r)
+        for (uint32_t c = 0; c < length; ++c)
+            buffer[r * length + c] = char16_t((packed >> (16 * c)) & 0xffff);
+    auto* log = static_cast<AppendLog*>(pointer);
+    std::lock_guard lock(log->mutex);
+    log->append(std::u16string_view(buffer, size_t(repeats) * length));
+}
+
+// Batch arbitrary constant UTF-16 text without paying for a lock or SStr
+// lookup on each logical iteration. The JIT keeps normal warp checkpoints.
+void xyo_transient_append_repeat_string(void* pointer, uint64_t suffixBits,
+                                        uint32_t repeats) {
+    if (repeats == 0 || repeats > 64) std::abort();
+    const Value suffix{suffixBits};
+    SStr* text = suffix.asStrPtr();
+    if (!text || !text->len) return;
+    const auto characters = text->view();
+    auto* log = static_cast<AppendLog*>(pointer);
+    std::lock_guard lock(log->mutex);
+    for (uint32_t i = 0; i < repeats; ++i)
+        log->append(characters);
+}
+
+// When the loop body only appends the value of a pure reporter, evaluate
+// that reporter once per 64-iteration scheduling group. The JIT re-evaluates
+// it after each possible yield, so writes by other Scratch scripts are seen
+// at the same checkpoints as the scalar implementation.
+void xyo_transient_append_repeat_value(void* pointer, uint64_t bits,
+                                       uint32_t repeats) {
+    if (repeats == 0 || repeats > 64) std::abort();
+    const Value value{bits};
+    SStr* str = cast::toString(value);
+    if (!str || !str->len) return;
+    const auto data = str->view();
+    auto* log = static_cast<AppendLog*>(pointer);
+    std::lock_guard lock(log->mutex);
+    for (uint32_t i = 0; i < repeats; ++i)
+        log->append(data);
+}
+
+void xyo_transient_flush(void* pointer, uint64_t* variable) {
+    auto* log = static_cast<AppendLog*>(pointer);
+    // The preceding published snapshot keeps the log rooted while allocating.
+    Gc::DeferCollect defer;
+    std::lock_guard lock(log->mutex);
+    const Value prior{*variable};
+    if (prior.isString()) {
+        SStr* s = prior.asStrPtr();
+        if (s && s->isAppend() &&
+            reinterpret_cast<AppendLog*>(s->left) == log && s->len == log->length)
+            return;
+    }
+    *variable = Value::string(makeAppendSnapshot(log, log->length, log->ascii)).bits;
+}
+
+// End-of-loop publication: short strings become flat, restoring the JIT's
+// inline letter-of path and avoiding a per-character append-log mutex.
+void xyo_transient_finish(void* pointer, uint64_t* variable) {
+    auto* log = static_cast<AppendLog*>(pointer);
+    if (log->length > 4096) {
+        xyo_transient_flush(pointer, variable);
+        return;
+    }
+    Gc::DeferCollect defer;
+    std::lock_guard lock(log->mutex);
+    const auto n = log->length;
+    auto* result = static_cast<SStr*>(
+        Gc::get().alloc(GcType::Str, sizeof(SStr) + (size_t(n) + 1) * 2));
+    result->len = n;
+    result->hash = 0;
+    result->initCaches();
+    result->flags = SStr::kAsciiKnown | (log->ascii ? SStr::kAsciiValue : 0);
+    log->copy(result->inlineBody(), n);
+    result->inlineBody()[n] = 0;
+    *variable = Value::string(result).bits;
+}
+
+// A yield is an observer/GC boundary. Recover the log exclusively through the
+// *current* immutable snapshot, which roots it. Never dereference oldLog: the
+// suspended frame's raw pointer may have become stale when another script
+// overwrote the variable and GC reclaimed the old log. If the current prefix
+// is not the tail, fork so that old snapshots remain immutable.
+void* xyo_transient_resume(void* /*oldLog*/, uint64_t* variable) {
+    const Value observed{*variable};
+    if (observed.isString()) {
+        SStr* snapshot = observed.asStrPtr();
+        if (snapshot && snapshot->isAppend()) {
+            auto* rootedLog = reinterpret_cast<AppendLog*>(snapshot->left);
+            std::lock_guard lock(rootedLog->mutex);
+            if (snapshot->len == rootedLog->length)
+                return rootedLog;
+        }
+    }
+    return xyo_transient_begin(observed.bits, variable);
+}
+
+} // extern "C"
 
 // --- 連結ノード（cons string） -------------------------------------
 //
@@ -57,6 +406,11 @@ const char16_t* SStr::consBody() const {
     while (!stack.empty()) {
         const SStr* s = stack.back();
         stack.pop_back();
+        if (s->isAppend()) {
+            std::memcpy(buf + at, s->data(), size_t(s->len) * sizeof(char16_t));
+            at += s->len;
+            continue;
+        }
         if (s->isCons()) {
             // 既に materialize 済みならそれを丸ごとコピー（部分木を辿らない）
             if (char16_t* pb = std::atomic_ref<char16_t*>(
@@ -91,9 +445,18 @@ const char16_t* SStr::consBody() const {
 }
 
 char16_t SStr::unitAt(uint32_t index) const {
+    if (isAppend()) {
+        if (auto* flat = std::atomic_ref<char16_t*>(
+                const_cast<SStr*>(this)->body).load(std::memory_order_acquire))
+            return flat[index];
+        auto* log = reinterpret_cast<AppendLog*>(left);
+        std::lock_guard lock(log->mutex);
+        return log->unitAt(index);
+    }
     const uint32_t originalIndex = index;
     const SStr* node = this;
     for (unsigned depth = 0; depth < 32; ++depth) {
+        if (node->isAppend()) return node->unitAt(index);
         if (!node->isCons()) return node->inlineBody()[index];
         if (auto* flat = std::atomic_ref<char16_t*>(
                 const_cast<SStr*>(node)->body).load(std::memory_order_acquire))

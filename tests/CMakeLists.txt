@@ -68,6 +68,17 @@ if(TARGET xyo-cli)
               --binary "$<TARGET_FILE:xyo-cli>"
               --out "${CMAKE_CURRENT_BINARY_DIR}/jit-repeat-i32-fixtures")
     set_tests_properties(xyo-jit-repeat-i32 PROPERTIES TIMEOUT 180)
+
+    # Verify transient string escape proofs using real Scratch SB3 programs.
+    # Includes independent variable updates, nested joins, multiple builders,
+    # Unicode, while/until/for-each, and proof rejection for side effects.
+    add_test(NAME xyo-jit-transient-strings
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/bench/algos/bench_transient_extended.py"
+              --binary "$<TARGET_FILE:xyo-cli>"
+              --out "${CMAKE_CURRENT_BINARY_DIR}/jit-transient-fixtures"
+              --n 257)
+    set_tests_properties(xyo-jit-transient-strings PROPERTIES TIMEOUT 180)
   endif()
 endif()
 

@@ -505,13 +505,10 @@ void xyo_broadcast_wait_v(JitCtx* c, uint64_t v) {
     for (;;) {
         bool waiting = false, allWaiting = true;
         for (Thread* t : started) {
-            bool inList = false;
-            for (Thread* x : rt->threads)
-                if (x == t) { inList = true; break; }
-            if (inList) {
+            if (rt->containsThread(t)) {
                 waiting = true;
                 // Membership is already known. isWaitingThread() would
-                // redundantly scan runtime.threads a second time.
+                // redundantly check runtime membership a second time.
                 if (t->status != STATUS_PROMISE_WAIT &&
                     t->status != STATUS_YIELD_TICK &&
                     !t->stack.empty() && t->status != STATUS_DONE)

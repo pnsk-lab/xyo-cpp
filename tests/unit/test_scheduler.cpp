@@ -279,6 +279,65 @@ void testSharedYieldChain() {
     }
 }
 
+void testBroadcastYieldChain() {
+    Runtime rt;
+    std::string stage = target("Stage", "{}", true);
+    const auto listAt = stage.find("\"items\":[\"items\",[]]");
+    stage.replace(listAt, std::string("\"items\":[\"items\",[]]").size(),
+                  "\"log\":[\"log\",[]]");
+    std::string json = "{\"targets\":[" + stage;
+    for (int i = 0; i < 4; ++i) {
+        const std::string recv =
+            "{\"recv\":{\"opcode\":\"event_whenbroadcastreceived\","
+            "\"topLevel\":true,\"next\":\"loop\",\"inputs\":{},"
+            "\"fields\":{\"BROADCAST_OPTION\":[\"PING\",null]}},"
+            "\"loop\":" + block("control_repeat", nullptr,
+                "{\"TIMES\":[1,[4,\"" + std::to_string(3 + i) +
+                "\"]],\"SUBSTACK\":[2,\"append\"]}") +
+            ",\"append\":" + block("data_addtolist", nullptr,
+                "{\"ITEM\":[1,[4,\"" + std::to_string(i) + "\"]]}",
+                "{\"LIST\":[\"log\",\"log\"]}") + "}";
+        json += "," + target("R" + std::to_string(i), recv, false, i + 1);
+    }
+    json += "],\"monitors\":[],\"extensions\":[],\"meta\":{}}";
+    check(loadSb3(rt, json, nullptr).ok, "load broadcast shared-list chain fixture");
+    if (rt.targets.size() != 5) return;
+    std::map<std::string, std::u16string> match{{"BROADCAST_OPTION", u"PING"}};
+    auto old = rt.startHats("event_whenbroadcastreceived", &match, nullptr);
+    check(old.size() == 4, "broadcast starts four distinct receivers");
+    if (old.size() != 4) return;
+    std::vector<int> order;
+    for (Thread* t : rt.threads) {
+        order.push_back(int(t->target->getName().back() - u'0'));
+        rt.sequencer->stepThread(*t);
+    }
+    // Force fresh receiver identities, as broadcast-and-wait does, while all
+    // previous fibers are suspended. This isolates the restart/chain boundary.
+    auto fresh = rt.startHats("event_whenbroadcastreceived", &match, nullptr);
+    bool replaced = fresh.size() == old.size();
+    for (Thread* t : old)
+        replaced &= !rt.containsThread(t) && t->fiber == nullptr;
+    check(replaced, "rebroadcast removes every suspended old receiver identity");
+    const bool eligible = rt.sequencer->parallelEnabled() &&
+        !fresh.empty() && fresh[0]->isCompiled;
+    rt.runUntilDone(100);
+    check(rt.threads.empty(), "mixed-lifetime broadcast fibers all terminate");
+    std::vector<int> expected = order;
+    for (int pass = 0; pass < 6; ++pass)
+        for (int id : order)
+            if (pass < 3 + id) expected.push_back(id);
+    Variable* log = rt.getTargetForStage()->lookupVariableById("log");
+    bool exact = log && log->list && log->list->len == expected.size();
+    if (exact)
+        for (size_t i = 0; i < expected.size(); ++i)
+            exact &= cast::toNumber(log->list->items[i]) == expected[i];
+    check(exact, "broadcast chain preserves shared-list order without stale receiver effects");
+    if (eligible && std::getenv("XYO_FIBER_CHAIN") == nullptr &&
+        std::getenv("XYO_PROF") == nullptr)
+        check(rt.sequencer->parallelStats().chainedPasses > 0,
+              "broadcast receivers exercise direct fiber chain");
+}
+
 void testSelfBroadcastDoesNotRecycleActiveFiber() {
     // A broadcast can target the script currently executing it. The active
     // fiber must never be retired or reset while its own stack is live.
@@ -403,6 +462,262 @@ void testBroadcastReceiverReuse() {
           "only executed receiver effects are visible after replacement");
 }
 
+void testThreadMembership() {
+    Runtime rt;
+    const auto loaded = loadSb3(rt, project(false, false), nullptr);
+    check(loaded.ok, "load thread membership fixture");
+    if (!loaded.ok) return;
+    Target* stage = rt.getTargetForStage();
+    // Avoid compilation: inspect identity without executing these dummy blocks.
+    Thread* a = rt.pushThread("membership-a", stage, false, true);
+    Thread* b = rt.pushThread("membership-b", stage, false, true);
+    Thread* c = rt.pushThread("membership-c", stage, false, true);
+    check(rt.containsThread(a) && rt.containsThread(b) && rt.containsThread(c),
+          "new threads are members");
+    check(rt.isActiveThread(a), "nonempty running member is active");
+    a->status = STATUS_DONE;
+    check(rt.containsThread(a) && !rt.isActiveThread(a),
+          "DONE member remains present but is not active");
+    a->status = STATUS_RUNNING;
+    a->stack.clear();
+    check(rt.containsThread(a) && !rt.isActiveThread(a),
+          "empty-stack member remains present but is not active");
+    a->pushStack("membership-a");
+
+    rt.threads[0] = c;
+    rt.threads[2] = a;
+    check(rt.containsThread(a) && rt.containsThread(c) && rt.isActiveThread(a),
+          "public reorder repairs stale membership hints");
+    rt.threads.erase(rt.threads.begin() + 1);
+    check(!rt.containsThread(b) && !rt.isActiveThread(b),
+          "public erase rejects removed identity at a reused index");
+    check(rt.containsThread(a) && rt.containsThread(c),
+          "public erase preserves shifted members");
+    rt.threads.push_back(b);
+    check(rt.containsThread(b) && rt.isActiveThread(b),
+          "public reinsertion finds a previously absent thread");
+
+    // Self-restart replaces identity but the old script runs until its next yield.
+    rt.sequencer->activeThread = a;
+    Thread* replacement = rt.restartThread(a);
+    check(replacement != a && rt.containsThread(replacement),
+          "restart installs new identity in the same scheduling slot");
+    check(!rt.containsThread(a) && !rt.isActiveThread(a),
+          "restart rejects old identity despite its stale index hint");
+    check(a->status == STATUS_RUNNING && !a->stack.empty(),
+          "active old thread survives restart until sequencer boundary");
+    rt.sequencer->activeThread = nullptr;
+
+    rt.sequencer->stepping = &rt.threads;
+    rt.stopAll();
+    check(rt.threads.empty() && rt.sequencer->stepping != &rt.threads &&
+          rt.sequencer->stepping->size() == 3,
+          "stopAll detaches current pass while preserving its list");
+    check(!rt.containsThread(c) && !rt.containsThread(replacement) &&
+          !rt.containsThread(b),
+          "detached pass identities are not current runtime members");
+    Thread* fresh = rt.pushThread("membership-fresh", stage, false, true);
+    check(rt.containsThread(fresh) && rt.isActiveThread(fresh),
+          "new spawn after detach belongs to new runtime list");
+    check(!rt.containsThread(c) && !rt.containsThread(replacement) &&
+          !rt.containsThread(b),
+          "new spawn does not revive detached identities with matching hints");
+    check((*rt.sequencer->stepping)[0] == c,
+          "new spawn leaves detached pass order unchanged");
+    rt.sequencer->stepping = nullptr;
+    rt.sequencer->detachedLists.clear();
+}
+
+void testThreadReclamation() {
+    Runtime rt;
+    const auto own = [&](bool done = true) {
+        auto thread = std::make_unique<Thread>("reclaim");
+        Thread* t = thread.get();
+        t->pushStack("reclaim");
+        if (done) {
+            t->status = STATUS_DONE;
+            t->stack.clear();
+        }
+        rt.ownedThreads.push_back(std::move(thread));
+        return t;
+    };
+    Thread* first = own(false);
+    for (int i = 0; i < 2048; ++i) own();
+    Thread* joined = own();
+    Thread* compat = own();
+    Thread* nested = own();
+    Thread* lastDone = own();
+    Thread* waiting = own();
+    Thread* detached = own();
+    Thread* active = own();
+    Thread* mapped = own();
+    Thread* jitJoined = own();
+    Thread* trashJoined = own();
+    Thread* last = own(false);
+    rt.threads = {first, last};
+    first->stackFrames.back()->executionContext = std::make_unique<ExecContext>();
+    first->stackFrames.back()->executionContext->startedThreads = {joined};
+    first->compatibilityStackFrame.startedThreads = {compat};
+    joined->compatibilityStackFrame.startedThreads = {nested};
+    first->trashFrames.push_back(std::make_unique<StackFrame>());
+    first->trashFrames.back()->executionContext = std::make_unique<ExecContext>();
+    first->trashFrames.back()->executionContext->startedThreads = {trashJoined};
+    std::vector<Thread*> jitHandles{jitJoined};
+    first->jitCtx = new JitCtx{};
+    first->jitCtx->joinRefs = &jitHandles;
+    rt.lastStepDoneThreads = {lastDone};
+    Runtime::WaitEntry entry;
+    entry.thread = waiting;
+    rt.waitQueue.push_back(entry);
+    auto oldPass = std::make_unique<std::vector<Thread*>>();
+    oldPass->push_back(detached);
+    rt.sequencer->stepping = oldPass.get();
+    rt.sequencer->detachedLists.push_back(std::move(oldPass));
+    rt.sequencer->activeThread = active;
+    rt.threadMap["retained"] = mapped;
+    rt.ownedThreads.push_back(nullptr);
+    first->justReported = Value::string(SStr::create(u"retained GC root"));
+    Gc::get().collect();
+    check(first->justReported.isString() &&
+          first->justReported.asStrPtr()->view() == u"retained GC root",
+          "GC safely visits owned roots even with an empty ownership slot");
+
+    rt.reclaimThreads();
+    check(rt.ownedThreads.size() == 12,
+          "reclamation compacts dead historical entries and null slots");
+    check(rt.ownedThreads.front().get() == first && rt.ownedThreads.back().get() == last,
+          "ownership compaction preserves endpoint addresses and order");
+    bool retained = true;
+    for (Thread* expected : {joined, compat, nested, lastDone, waiting, detached,
+                             active, mapped, jitJoined, trashJoined}) {
+        bool found = false;
+        for (const auto& owned : rt.ownedThreads) found |= owned.get() == expected;
+        retained &= found;
+    }
+    check(retained, "join, compat, trash, queue, detached and active handles survive reclamation");
+    check(rt.reclaimAt == 12 + 12 / 4 + 1024,
+          "next reclamation threshold depends on survivors rather than spawn history");
+    Gc::get().collect();
+    check(first->justReported.asStrPtr()->view() == u"retained GC root",
+          "GC roots survive ownership compaction");
+
+    first->stackFrames.back()->executionContext.reset();
+    first->compatibilityStackFrame.startedThreads.clear();
+    first->trashFrames.clear();
+    first->jitCtx->joinRefs = nullptr;
+    rt.lastStepDoneThreads.clear();
+    rt.waitQueue.clear();
+    rt.threadMap.clear();
+    rt.sequencer->stepping = nullptr;
+    rt.sequencer->detachedLists.clear();
+    rt.sequencer->activeThread = nullptr;
+    rt.reclaimThreads();
+    check(rt.ownedThreads.size() == 2 && rt.ownedThreads[0].get() == first &&
+          rt.ownedThreads[1].get() == last,
+          "released handles and their transitive join references are reclaimed");
+    delete first->jitCtx;
+    first->jitCtx = nullptr;
+    first->status = last->status = STATUS_DONE;
+    first->stack.clear();
+    last->stack.clear();
+    rt.threads.clear();
+    rt.reclaimThreads();
+    check(rt.ownedThreads.empty() && rt.reclaimAt == 1024,
+          "fully completed workload leaves no historical ownership storage");
+    Gc::get().collect();
+}
+
+void testFrameAddressStability() {
+    Thread thread("frames");
+    std::vector<StackFrame*> frames;
+    std::vector<ExecContext*> contexts;
+    for (int i = 0; i < 512; ++i) {
+        thread.pushStack("depth-" + std::to_string(i));
+        StackFrame* frame = thread.peekStackFrame();
+        frame->executionContext = std::make_unique<ExecContext>();
+        frame->executionContext->returnValue = Value::num(i);
+        frames.push_back(frame);
+        contexts.push_back(frame->executionContext.get());
+    }
+    bool stable = true;
+    for (size_t i = 0; i < frames.size(); ++i)
+        stable &= thread.stackFrames[i].get() == frames[i] &&
+                  frames[i]->executionContext.get() == contexts[i] &&
+                  cast::toNumber(contexts[i]->returnValue) == double(i);
+    check(stable, "512 frame growth preserves StackFrame and ExecContext addresses");
+    for (size_t i = 0; i < frames.size(); ++i) thread.popStack();
+    stable = thread.stackFrames.empty() && thread.trashFrames.size() == frames.size();
+    for (size_t i = 0; i < frames.size(); ++i) {
+        const size_t original = frames.size() - 1 - i;
+        stable &= thread.trashFrames[i].get() == frames[original] &&
+                  frames[original]->executionContext.get() == contexts[original] &&
+                  cast::toNumber(contexts[original]->returnValue) == double(original);
+    }
+    check(stable, "stack-to-trash movement preserves frame/context references until recycle");
+}
+
+void testWaitUntilChain() {
+    Runtime rt;
+    std::string stage = target("Stage", "{}", true);
+    const auto listAt = stage.find("\"items\":[\"items\",[]]");
+    stage.replace(listAt, std::string("\"items\":[\"items\",[]]").size(),
+                  "\"log\":[\"log\",[]]");
+    std::string json = "{\"targets\":[" + stage;
+    for (int i = 0; i < 4; ++i) {
+        const std::string recv =
+            "{\"recv\":{\"opcode\":\"event_whenbroadcastreceived\","
+            "\"topLevel\":true,\"next\":\"wait\",\"inputs\":{},"
+            "\"fields\":{\"BROADCAST_OPTION\":[\"PING\",null]}},"
+            "\"wait\":" + block("control_wait_until", "append",
+                "{\"CONDITION\":[2,\"eq\"]}") +
+            ",\"eq\":" + block("operator_equals", nullptr,
+                "{\"OPERAND1\":[2,\"gate\"],\"OPERAND2\":[1,[4,\"1\"]]}") +
+            ",\"gate\":" + block("data_variable", nullptr, "{}",
+                "{\"VARIABLE\":[\"s\",\"s\"]}") +
+            ",\"append\":" + block("data_addtolist", nullptr,
+                "{\"ITEM\":[1,[4,\"" + std::to_string(i) + "\"]]}",
+                "{\"LIST\":[\"log\",\"log\"]}") + "}";
+        json += "," + target("R" + std::to_string(i), recv, false, i + 1);
+    }
+    // Writer is first in executable order (reverse layer order). It yields
+    // several times before opening the shared gate, then appends a sentinel.
+    const std::string writer =
+        "{\"recv\":{\"opcode\":\"event_whenbroadcastreceived\","
+        "\"topLevel\":true,\"next\":\"loop\",\"inputs\":{},"
+        "\"fields\":{\"BROADCAST_OPTION\":[\"PING\",null]}},"
+        "\"loop\":" + block("control_repeat", "open",
+            "{\"TIMES\":[1,[4,\"4\"]],\"SUBSTACK\":[2,\"inc\"]}") +
+        ",\"inc\":" + block("data_changevariableby", nullptr,
+            "{\"VALUE\":[1,[4,\"1\"]]}", "{\"VARIABLE\":[\"v\",\"v\"]}") +
+        ",\"open\":" + block("data_setvariableto", "sentinel",
+            "{\"VALUE\":[1,[4,\"1\"]]}", "{\"VARIABLE\":[\"s\",\"s\"]}") +
+        ",\"sentinel\":" + block("data_addtolist", nullptr,
+            "{\"ITEM\":[1,[4,\"-1\"]]}", "{\"LIST\":[\"log\",\"log\"]}") + "}";
+    json += "," + target("Writer", writer, false, 5);
+    json += "],\"monitors\":[],\"extensions\":[],\"meta\":{}}";
+    const auto loaded = loadSb3(rt, json, nullptr);
+    check(loaded.ok, "load wait-until receiver chain fixture");
+    if (!loaded.ok) return;
+    rt.getTargetForStage()->lookupVariableById("s")->value = Value::num(0);
+    std::map<std::string, std::u16string> match{{"BROADCAST_OPTION", u"PING"}};
+    const auto receivers = rt.startHats("event_whenbroadcastreceived", &match, nullptr);
+    bool eligible = rt.sequencer->parallelEnabled() && receivers.size() == 5;
+    for (Thread* t : receivers) eligible &= rt.sequencer->parallelEligible(*t);
+    rt.runUntilDone(100);
+    check(rt.threads.empty(), "wait-until receivers terminate after writer opens gate");
+    Variable* log = rt.getTargetForStage()->lookupVariableById("log");
+    const int expected[] = {-1, 3, 2, 1, 0};
+    bool exact = log && log->list && log->list->len == 5;
+    if (exact)
+        for (size_t i = 0; i < 5; ++i)
+            exact &= cast::toNumber(log->list->items[i]) == expected[i];
+    check(exact, "wait-until chain observes writer before appending in receiver order");
+    if (eligible && std::getenv("XYO_FIBER_CHAIN") == nullptr &&
+        std::getenv("XYO_PROF") == nullptr)
+        check(rt.sequencer->parallelStats().chainedPasses > 0,
+              "pure wait-until receivers exercise direct fiber chain");
+}
+
 void testFractionalLayerMovement() {
     Runtime rt;
     const auto loaded = loadSb3(rt, project(false, false), nullptr);
@@ -466,12 +781,17 @@ void testPool() {
 
 int test_scheduler_main() {
     testPool();
+    testThreadMembership();
+    testThreadReclamation();
+    testFrameAddressStability();
+    testWaitUntilChain();
     testFractionalLayerMovement();
     testCompute(false, false);
     testCompute(true, false);
     testCompute(false, true);
     testSharedOrder();
     testSharedYieldChain();
+    testBroadcastYieldChain();
     testBroadcastReceiverReuse();
     testSelfBroadcastDoesNotRecycleActiveFiber();
     testCompatBarrier();

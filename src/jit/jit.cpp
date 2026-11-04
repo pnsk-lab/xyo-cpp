@@ -103,6 +103,17 @@ void xyo_rt_setarg(const void*, const char*, uint64_t);
 // --- rt_blocks.cpp: ブロック直接ヘルパ ---
 uint64_t xyo_join(uint64_t, uint64_t);
 uint64_t xyo_join_suffix(uint64_t, uint64_t);
+void* xyo_transient_begin(uint64_t, uint64_t*);
+void xyo_transient_append(void*, uint64_t);
+void xyo_transient_append_value(void*, uint64_t);
+void xyo_transient_append_packed(void*, uint64_t, uint32_t);
+void xyo_transient_append_repeat_packed(void*, uint64_t, uint64_t);
+void xyo_transient_append_repeat_string(void*, uint64_t, uint32_t);
+void xyo_transient_append_repeat_value(void*, uint64_t, uint32_t);
+void xyo_transient_flush(void*, uint64_t*);
+void xyo_transient_finish(void*, uint64_t*);
+void* xyo_transient_resume(void*, uint64_t*);
+
 #if defined(XYO_STRING_JOIN_SPECIALIZED)
 uint64_t xyo_join_strings(uint64_t, uint64_t);
 #endif
@@ -289,6 +300,20 @@ const std::pair<const char*, void*> kRtSymbols[] = {
     {"xyo_rt_setarg", (void*)&xyo_rt_setarg},
     {"xyo_join", (void*)&xyo_join},
     {"xyo_join_suffix", (void*)&xyo_join_suffix},
+    {"xyo_transient_begin", (void*)&xyo_transient_begin},
+    {"xyo_transient_append", (void*)&xyo_transient_append},
+    {"xyo_transient_append_value", (void*)&xyo_transient_append_value},
+    {"xyo_transient_append_packed", (void*)&xyo_transient_append_packed},
+    {"xyo_transient_append_repeat_packed",
+        (void*)&xyo_transient_append_repeat_packed},
+    {"xyo_transient_append_repeat_string",
+        (void*)&xyo_transient_append_repeat_string},
+    {"xyo_transient_append_repeat_value",
+        (void*)&xyo_transient_append_repeat_value},
+    {"xyo_transient_flush", (void*)&xyo_transient_flush},
+    {"xyo_transient_finish", (void*)&xyo_transient_finish},
+    {"xyo_transient_resume", (void*)&xyo_transient_resume},
+
 #if defined(XYO_STRING_JOIN_SPECIALIZED)
     {"xyo_join_strings", (void*)&xyo_join_strings},
 #endif
@@ -932,7 +957,27 @@ const CompiledScript* JitEngine::compile(Thread& thread, Runtime& runtime,
         "xyo_script_" + std::to_string(scriptCounter_++);
     bool emitOk = false;
 
-    llvmc::withContext(impl_->tsc, [&](llvm::LLVMContext* lc) {
+    // Each script owns its IR context when requested. A global context can
+    // retain uniqued types and metadata long after individual JIT modules
+    // have been materialized. In the isolated mode, ORC can release the
+    // context together with the script's IR.
+    const char* contextSetting = std::getenv("XYO_JIT_ISOLATED_CONTEXT");
+    const bool isolatedContext = contextSetting
+        ? contextSetting[0] != '0'
+        : impl_->lazyProcedures;
+    llvm::orc::ThreadSafeContext scriptContext =
+        isolatedContext
+            ? llvm::orc::ThreadSafeContext(
+                  std::make_unique<llvm::LLVMContext>())
+            : impl_->tsc;
+    llvmc::withContext(scriptContext, [&](llvm::LLVMContext* lc) {
+        // Names for temporary SSA values are never used by native code.
+        // LLVM otherwise allocates and uniques a string for each one.
+        // Preserve them explicitly for IR diagnostics and inspection.
+        if (!std::getenv("XYO_JIT_KEEP_VALUE_NAMES") &&
+            !std::getenv("XYO_JIT_DUMP") &&
+            !std::getenv("XYO_JIT_DUMP2"))
+            lc->setDiscardValueNames(true);
         auto mod = std::make_unique<llvm::Module>("xyo_script", *lc);
         mod->setDataLayout(impl_->jit->getDataLayout());
         mod->setTargetTriple(
@@ -1025,7 +1070,8 @@ const CompiledScript* JitEngine::compile(Thread& thread, Runtime& runtime,
             // has substantial distinct procedure bodies. Small scripts use
             // the normal ORC layer and avoid call-through trampoline cost.
             lazyThisScript = deferIR;
-            llvm::orc::ThreadSafeModule tsm(std::move(mod), impl_->tsc);
+            llvm::orc::ThreadSafeModule tsm(
+                std::move(mod), scriptContext);
             llvm::Error err = lazyThisScript
                 ? impl_->lazyJit->addLazyIRModule(std::move(tsm))
                 : impl_->jit->addIRModule(std::move(tsm));

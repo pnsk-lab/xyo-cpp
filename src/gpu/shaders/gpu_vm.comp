@@ -62,7 +62,10 @@ void updRgba() {
 }
 float rnd() {
     seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
-    return float(seed) * (1.0 / 4294967296.0);
+    // float(uint32_max) rounds to 2^32. Without the clamp rnd()
+    // occasionally becomes exactly 1.0, violating Scratch [0,1).
+    return min(float(seed) * (1.0 / 4294967296.0),
+               uintBitsToFloat(0x3f7fffffu));
 }
 float wrapC(float v) { v = mod(v, 100.0); return v < 0.0 ? v + 100.0 : v; }
 
@@ -216,7 +219,9 @@ void main() {
             float r;
             if (floor(lo) == lo && floor(hi) == hi &&
                 lo > -2147483648.0 && hi < 2147483648.0)
-                r = lo + floor(rnd() * (hi - lo + 1.0));
+                // Even a rounded f32 multiplication cannot escape the
+                // inclusive integer interval after the final clamp.
+                r = clamp(lo + floor(rnd() * (hi - lo + 1.0)), lo, hi);
             else r = lo + rnd() * (hi - lo);
             push(r);
         } break;

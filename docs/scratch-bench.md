@@ -1,5 +1,11 @@
 # scratch-bench で xyo を測る（`scratch-bench/`）
 
+> scheduler の追加改善: [scheduler 最適化記録](scheduler-performance.md)。
+> 第1段階は単独測定で `sched_threads` **2.63倍**、scheduler 集計 **+22.0%**。
+> 第2段階はその改善済み版から、元の全体ベンチ各3回で scheduler 集計がさらに **+31.1%**
+> （fanout **1.76倍**、fanwait **1.89倍**、waituntil **1.74倍**）。
+> 第2段階の scheduler 単独測定は各7回で **+43.0%**。以下の数値はこれらの改善以前の測定記録。
+
 [gradylink/scratch-bench](https://github.com/gradylink/scratch-bench) のコピーを
 `scratch-bench/` に置き、そこへ **xyo-cpp ランタイムを追加した**（`xyo-cpp` という
 id で、他の VM と同じ `bun run bench --runtime xyo-cpp` で回る）。フォーク側の

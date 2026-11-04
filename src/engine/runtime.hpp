@@ -313,6 +313,8 @@ public:
                        const Block* topHint = nullptr);
     void stopThread(Thread* thread);
     Thread* restartThread(Thread* thread, const Block* topHint = nullptr);
+    // Array membership, including DONE threads not yet compacted away.
+    bool containsThread(Thread* thread) const;
     bool isActiveThread(Thread* thread) const;
     bool isWaitingThread(Thread* thread) const;
     void toggleScript(const std::string& topBlockId, Target* target,

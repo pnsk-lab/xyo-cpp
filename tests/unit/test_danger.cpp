@@ -25,6 +25,7 @@
 #include <thread>
 
 #include "core/cast.hpp"
+#include "core/json.hpp"
 #include "core/sstr.hpp"
 #include "engine/runtime.hpp"
 #include "engine/sequencer.hpp"
@@ -190,6 +191,305 @@ void testWarpYieldReload(JitMode mode) {
           "warp resumes from externally changed string, not stale SSA");
 }
 
+
+// Two genuine green-flag scripts share variable "v". The warp script uses
+// the transient append pattern, yields after its first checkpoint (budget=0),
+// and the second script then overwrites the same variable. The suspended warp
+// script MUST resume from the new value, not its cached append-only prefix.
+std::string transientInterleaveProjectJson() {
+    JsonValue root = jsonParse(projectJson(true));
+    auto& sprite = root.objectRef().at("targets").arrayRef().at(1).objectRef();
+    auto& blocks = sprite.at("blocks").objectRef();
+    auto& set = blocks.at("inc").objectRef();
+    set["opcode"] = JsonValue(std::string("data_setvariableto"));
+    set["inputs"] = jsonParse(R"({"VALUE":[2,"join"]})");
+    blocks["join"] = jsonParse(R"({"opcode":"operator_join",
+        "next":null,"parent":"inc",
+        "inputs":{"STRING1":[2,"read"],"STRING2":[1,[10,"ab"]]},
+        "fields":{},"shadow":false})");
+    blocks["read"] = jsonParse(R"({"opcode":"data_variable",
+        "next":null,"parent":"join","inputs":{},
+        "fields":{"VARIABLE":["v","v"]},"shadow":false})");
+    blocks["hat_write"] = jsonParse(R"({"opcode":"event_whenflagclicked",
+        "topLevel":true,"x":250,"y":0,"next":"overwrite",
+        "inputs":{},"fields":{},"shadow":false})");
+    blocks["overwrite"] = jsonParse(R"({"opcode":"data_setvariableto",
+        "next":null,"parent":"hat_write",
+        "inputs":{"VALUE":[1,[10,"external"]]},
+        "fields":{"VARIABLE":["v","v"]},"shadow":false})");
+    sprite.at("variables").objectRef()["v"] =
+        jsonParse(R"(["v","seed"])");
+    return jsonStringify(root);
+}
+
+void testTransientWarpInterleaving(JitMode mode) {
+    setJitMode(mode);
+    Runtime rt;
+    const auto project = transientInterleaveProjectJson();
+    if (!loadSb3(rt, project, nullptr).ok) {
+        check(false, "transient interleaving project loads");
+        return;
+    }
+    rt.warpTimeMs = 0.0;
+    rt.dangerMode = false;
+    rt.greenFlag();
+
+    Thread* appender = nullptr;
+    Thread* overwriter = nullptr;
+    for (Thread* thread : rt.threads) {
+        if (thread->topBlock == "hat") appender = thread;
+        if (thread->topBlock == "hat_write") overwriter = thread;
+    }
+    check(appender && overwriter, "two real concurrent Scratch scripts");
+    if (!appender || !overwriter) return;
+
+    Target* target = rt.getSpriteTargetByName(u"S");
+    Variable* var = target ? target->lookupVariableById("v") : nullptr;
+    if (!var) {
+        check(false, "resolve transient shared variable");
+        return;
+    }
+    rt.sequencer->timer.start();
+    rt.sequencer->stepThread(*appender);
+    const std::u16string initialPrefix(cast::toString(var->value)->view());
+    const bool yielded = initialPrefix.starts_with(u"seedab") &&
+                         initialPrefix.size() < size_t(4 + 2 * kIterations) &&
+                         (initialPrefix.size() - 4) % 2 == 0;
+    check(yielded && appender->status != STATUS_DONE,
+          "warp published its partial prefix before a real yield");
+    if (mode == JitMode::Eager &&
+        (!std::getenv("XYO_JIT_TRANSIENT_STRINGS") ||
+         std::getenv("XYO_JIT_TRANSIENT_STRINGS")[0] != '0')) {
+        check(appender->isCompiled && var->value.isString() &&
+              var->value.asStrPtr() && var->value.asStrPtr()->isAppend(),
+              "JIT really selected and published transient append snapshot");
+    }
+    if (!yielded) return;
+    const size_t completed = (initialPrefix.size() - 4) / 2;
+
+    rt.sequencer->stepThread(*overwriter);
+    check(cast::toString(var->value)->view() == u"external",
+          "independent Scratch script overwrote shared variable");
+
+    // A GC pass while the first fiber is suspended must not resurrect or
+    // dereference an old log pointer after the overwrite.
+    Gc::get().collect();
+    rt.runUntilDone(2000);
+    check(rt.threads.empty(), "suspended transient fiber terminates");
+
+    const auto finalText = cast::toString(var->value)->view();
+    std::u16string expected = u"external";
+    for (size_t i = completed; i < size_t(kIterations); ++i)
+        expected += u"ab";
+    check(finalText == expected,
+          "transient resumed from second script write with exact suffix");
+}
+
+// A RHS reporter may be invariant *between* warp scheduling checkpoints,
+// but must be re-read after the first fiber yields. This proves batching
+// does not turn an external script's changes into a permanently cached value.
+std::string transientRhsProjectJson(bool numeric) {
+    JsonValue root = jsonParse(transientInterleaveProjectJson());
+    auto& sprite = root.objectRef().at("targets").arrayRef().at(1).objectRef();
+    auto& vars = sprite.at("variables").objectRef();
+    vars["rhs"] = numeric
+        ? jsonParse(R"(["rhs",1])")
+        : jsonParse(R"(["rhs","A"])");
+    auto& blocks = sprite.at("blocks").objectRef();
+    blocks["rhsRead"] = jsonParse(R"({"opcode":"data_variable",
+        "next":null,"parent":"join","inputs":{},
+        "fields":{"VARIABLE":["rhs","rhs"]},"shadow":false})");
+    blocks.at("join").objectRef().at("inputs").objectRef()["STRING2"] =
+        jsonParse(R"([2,"rhsRead"])");
+    blocks.at("overwrite").objectRef().at("fields").objectRef()["VARIABLE"] =
+        jsonParse(R"(["rhs","rhs"])");
+    blocks.at("overwrite").objectRef().at("inputs").objectRef()["VALUE"] =
+        numeric ? jsonParse(R"([1,[4,"7"]])")
+                : jsonParse(R"([1,[10,"B"]])");
+    return jsonStringify(root);
+}
+
+void testTransientRhsAfterYield(JitMode mode, bool numeric) {
+    setJitMode(mode);
+    Runtime rt;
+    const auto project = transientRhsProjectJson(numeric);
+    if (!loadSb3(rt, project, nullptr).ok) {
+        check(false, "transient RHS-change project loads");
+        return;
+    }
+    rt.warpTimeMs = 0.0;
+    rt.dangerMode = false;
+    rt.greenFlag();
+    Thread* appender = nullptr;
+    Thread* overwriter = nullptr;
+    for (Thread* thread : rt.threads) {
+        if (thread->topBlock == "hat") appender = thread;
+        if (thread->topBlock == "hat_write") overwriter = thread;
+    }
+    check(appender && overwriter, "RHS test has two Scratch scripts");
+    if (!appender || !overwriter) return;
+
+    Target* target = rt.getSpriteTargetByName(u"S");
+    Variable* s = target ? target->lookupVariableById("v") : nullptr;
+    Variable* rhs = target ? target->lookupVariableById("rhs") : nullptr;
+    if (!s || !rhs) {
+        check(false, "resolve RHS and destination variables");
+        return;
+    }
+
+    rt.sequencer->timer.start();
+    rt.sequencer->stepThread(*appender);
+    const std::u16string prefix(cast::toString(s->value)->view());
+    const std::u16string expectedFirst = numeric ? u"seed1" : u"seedA";
+    const bool yielded = prefix.starts_with(expectedFirst) &&
+                         prefix.size() < size_t(4 + kIterations);
+    check(yielded && appender->status != STATUS_DONE,
+          "dynamic RHS batch yielded before completion");
+    if (!yielded) return;
+    const size_t completed = prefix.size() - 4;
+
+    rt.sequencer->stepThread(*overwriter);
+    const std::u16string newRhs = numeric ? u"7" : u"B";
+    check(cast::toString(rhs->value)->view() == newRhs,
+          "independent script changed RHS variable");
+    Gc::get().collect();
+    rt.runUntilDone(2500);
+    check(rt.threads.empty(), "dynamic RHS batching completes");
+    const std::u16string value(cast::toString(s->value)->view());
+    std::u16string expected = u"seed";
+    expected.append(completed, numeric ? u'1' : u'A');
+    expected.append(kIterations - completed, numeric ? u'7' : u'B');
+    check(value == expected,
+          "dynamic RHS re-evaluated after real yield with identical output");
+}
+
+// A pair of independent transient builders must publish both snapshots on
+// a real yield, then independently rebase only the overwritten variable.
+std::string transientMultiYieldProjectJson() {
+    JsonValue root = jsonParse(transientInterleaveProjectJson());
+    auto& sprite = root.objectRef().at("targets").arrayRef().at(1).objectRef();
+    sprite.at("variables").objectRef()["aux"] =
+        jsonParse(R"(["aux","auxstart"])");
+    auto& blocks = sprite.at("blocks").objectRef();
+    blocks.at("inc").objectRef()["next"] = JsonValue(std::string("aux_append"));
+    blocks["aux_append"] = jsonParse(R"({"opcode":"data_setvariableto",
+        "next":null,"parent":"loop",
+        "inputs":{"VALUE":[2,"aux_join"]},
+        "fields":{"VARIABLE":["aux","aux"]},"shadow":false})");
+    blocks["aux_join"] = jsonParse(R"({"opcode":"operator_join",
+        "next":null,"parent":"aux_append",
+        "inputs":{"STRING1":[2,"aux_read"],"STRING2":[1,[10,"cd"]]},
+        "fields":{},"shadow":false})");
+    blocks["aux_read"] = jsonParse(R"({"opcode":"data_variable",
+        "next":null,"parent":"aux_join",
+        "inputs":{},"fields":{"VARIABLE":["aux","aux"]},
+        "shadow":false})");
+    blocks.at("overwrite").objectRef().at("inputs").objectRef()["VALUE"] =
+        jsonParse(R"([1,[10,"other"]])");
+    blocks.at("overwrite").objectRef().at("fields").objectRef()["VARIABLE"] =
+        jsonParse(R"(["aux","aux"])");
+    return jsonStringify(root);
+}
+void testTransientMultiYield(JitMode mode) {
+    setJitMode(mode);
+    Runtime rt;
+    const auto source = transientMultiYieldProjectJson();
+    if (!loadSb3(rt, source, nullptr).ok) {
+        check(false, "load multi-variable yield project");
+        return;
+    }
+    rt.warpTimeMs = 0.0;
+    rt.dangerMode = false;
+    rt.greenFlag();
+    Thread* producer = nullptr;
+    Thread* writer = nullptr;
+    for (Thread* t : rt.threads) {
+        if (t->topBlock == "hat") producer = t;
+        if (t->topBlock == "hat_write") writer = t;
+    }
+    if (!producer || !writer) {
+        check(false, "two multi-variable scripts");
+        return;
+    }
+    Target* target = rt.getSpriteTargetByName(u"S");
+    Variable* v = target ? target->lookupVariableById("v") : nullptr;
+    Variable* aux = target ? target->lookupVariableById("aux") : nullptr;
+    if (!v || !aux) {
+        check(false, "multi-variable yield slots");
+        return;
+    }
+    rt.sequencer->timer.start();
+    rt.sequencer->stepThread(*producer);
+    const std::u16string before(cast::toString(v->value)->view());
+    const std::u16string beforeAux(cast::toString(aux->value)->view());
+    bool yielded = before.starts_with(u"seedab") &&
+                   beforeAux.starts_with(u"auxstartcd") &&
+                   before.size() < size_t(4 + 2*kIterations);
+    check(yielded && producer->status != STATUS_DONE,
+          "both multi-variable snapshots published before yield");
+    if (!yielded) return;
+    size_t iterations = (before.size() - 4) / 2;
+    check(beforeAux.size() == 8 + 2*iterations,
+          "multi-variable snapshots from identical loop count");
+
+    rt.sequencer->stepThread(*writer);
+    check(cast::toString(aux->value)->view() == u"other",
+          "second shared variable overwritten independently");
+    Gc::get().collect();
+    rt.runUntilDone(2000);
+    check(rt.threads.empty(), "multi-variable resume completes");
+
+    std::u16string expectedV = u"seed";
+    std::u16string expectedAux = u"other";
+    for (size_t i = 0; i < size_t(kIterations); ++i)
+        expectedV += u"ab";
+    for (size_t i = iterations; i < size_t(kIterations); ++i)
+        expectedAux += u"cd";
+    check(cast::toString(v->value)->view() == expectedV,
+          "unmodified transient continues from its own snapshot");
+    check(cast::toString(aux->value)->view() == expectedAux,
+          "overwritten transient rebases independently");
+}
+
+// The optimization must preserve Scratch repeat's >=0.5 IEEE boundary
+// even when the last batch is partial or a loop starts at a nonzero poll phase.
+void testTransientRepeatEdges() {
+    setJitMode(JitMode::Eager);
+    struct Case { double count; size_t expected; };
+    const Case cases[] = {
+        {0, 0}, {0.49, 0}, {0.5, 1}, {1.5, 2},
+        {63.49, 63}, {63.5, 64}, {64.49, 64}, {64.5, 65},
+        {65.5, 66}, {127.49, 127}, {127.5, 128}, {128.5, 129}
+    };
+    for (const auto test : cases) {
+        JsonValue root = jsonParse(transientInterleaveProjectJson());
+        auto& blocks = root.objectRef().at("targets").arrayRef().at(1)
+                           .objectRef().at("blocks").objectRef();
+        blocks.erase("hat_write");
+        blocks.erase("overwrite");
+        blocks.at("loop").objectRef().at("inputs").objectRef()["TIMES"] =
+            jsonParse("[1,[4,\"" + std::to_string(test.count) + "\"]]");
+        Runtime rt;
+        if (!loadSb3(rt, jsonStringify(root), nullptr).ok) {
+            check(false, "transient repeat edge project loads");
+            continue;
+        }
+        rt.warpTimeMs = 0.0;
+        rt.greenFlag();
+        rt.runUntilDone(1000);
+        Target* target = rt.getSpriteTargetByName(u"S");
+        Variable* v = target ? target->lookupVariableById("v") : nullptr;
+        std::u16string expected = u"seed";
+        for (size_t i = 0; i < test.expected; ++i)
+            expected += u"ab";
+        const bool ok = rt.threads.empty() && v && v->value.isString() &&
+                        v->value.asStrPtr() &&
+                        v->value.asStrPtr()->view() == expected;
+        if (!ok) std::printf("transient repeat failed at %.6g\n", test.count);
+        check(ok, "batched repeat preserves fractional iteration count");
+    }
+}
+
 const char* modeName(JitMode m) {
     return m == JitMode::Off ? "interp" : "jit";
 }
@@ -345,8 +645,13 @@ void testSampledWarpClock() {
 int test_danger_main() {
     GpuEnvGuard gpuDisabled;
     testSampledWarpClock();
+    testTransientRepeatEdges();
     const JitMode modes[] = {JitMode::Off, JitMode::Eager};
     for (JitMode mode : modes) {
+        testTransientWarpInterleaving(mode);
+        testTransientMultiYield(mode);
+        testTransientRhsAfterYield(mode, false);
+        testTransientRhsAfterYield(mode, true);
         testWarpYieldReload(mode);
         // 予算あり: 数パスでは終わらない（予算切れで yield して譲る）。
         const double limited = onePass(false, true, mode);

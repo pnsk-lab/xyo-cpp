@@ -21,6 +21,17 @@
 #include "core/sstr.hpp"
 #include "rt/runtime_helpers.hpp"
 
+extern "C" void* xyo_transient_begin(uint64_t initial, uint64_t* variable);
+extern "C" void xyo_transient_append(void* log, uint64_t suffix);
+extern "C" void xyo_transient_append_value(void* log, uint64_t value);
+extern "C" void xyo_transient_append_packed(void* log, uint64_t packed, uint32_t length);
+extern "C" void xyo_transient_append_repeat_packed(void* log, uint64_t packed, uint64_t metadata);
+extern "C" void xyo_transient_append_repeat_string(void*, uint64_t, uint32_t);
+extern "C" void xyo_transient_append_repeat_value(void*, uint64_t, uint32_t);
+extern "C" void xyo_transient_flush(void* log, uint64_t* variable);
+extern "C" void xyo_transient_finish(void* log, uint64_t* variable);
+extern "C" void* xyo_transient_resume(void* log, uint64_t* variable);
+
 namespace {
 using namespace xyo;
 int checks = 0, failures = 0;
@@ -48,7 +59,7 @@ int test_sstr_cons_main() {
         // 8 連結（16 文字）を超えると cons になる — まだ flatten していない
         SStr* c = chain("ab", 12);           // 24 文字
         CHECK(c->len == 24);
-        CHECK(c->isCons());
+        CHECK(c->isComposite());
         CHECK(c->body == nullptr);           // 遅延（まだ本文を作っていない）
         std::u16string want;
         for (int i = 0; i < 12; ++i) want += u"ab";
@@ -82,6 +93,122 @@ int test_sstr_cons_main() {
         CHECK(cast::toString(rt::letterOf(Value::num(16.75), Value::string(c)))->view()
               == std::u16string_view(expected.data() + 15, 1));
         CHECK(rt::letterOf(Value::num(-1), Value::string(c)) == Value::emptyStr());
+    }
+
+
+    // Append-log snapshots remain immutable even when a shared log grows or forks.
+    {
+        Value base = ns("abcdefghijklmnop");
+        Value a = rt::join(base, ns("A"));
+        Value saved = a;
+        Value b = rt::join(a, ns("B"));
+        Value fork = rt::join(saved, ns("C"));
+        Value d = rt::join(b, ns("D"));
+        CHECK(cast::toString(saved)->view() == u"abcdefghijklmnopA");
+        CHECK(cast::toString(b)->view() == u"abcdefghijklmnopAB");
+        CHECK(cast::toString(fork)->view() == u"abcdefghijklmnopAC");
+        CHECK(cast::toString(d)->view() == u"abcdefghijklmnopABD");
+        CHECK(cast::toString(a)->unitAt(16) == u'A');
+        CHECK(cast::toString(fork)->unitAt(17) == u'C');
+        if (const char* enabled = std::getenv("XYO_STRING_APPEND_LOG");
+            enabled && enabled[0] == '1') {
+            CHECK(cast::toString(a)->isAppend());
+            CHECK(cast::toString(fork)->isAppend());
+        }
+        Gc::get().collect();
+        CHECK(cast::toString(saved)->view() == u"abcdefghijklmnopA");
+        CHECK(cast::toString(fork)->view() == u"abcdefghijklmnopAC");
+        CHECK(cast::toString(d)->view() == u"abcdefghijklmnopABD");
+    }
+
+    // A transient builder does not allocate a new GC snapshot on each append.
+    // Yield publication and a concurrent Scratch variable overwrite must keep
+    // old snapshots immutable, then rebase subsequent appends on the new value.
+    {
+        uint64_t slot = ns("prefix-").bits;
+        void* log = xyo_transient_begin(slot, &slot);
+        Value previous{slot};
+        Value suffix = ns("xy");
+        for (int i = 0; i < 64; ++i)
+            xyo_transient_append(log, suffix.bits);
+        xyo_transient_flush(log, &slot);
+        Value yielded{slot};
+        CHECK(yielded.asStrPtr()->len == 135);
+        CHECK(yielded.asStrPtr()->unitAt(7) == u'x');
+        CHECK(previous.asStrPtr()->view() == u"prefix-");
+        std::u16string expected = u"prefix-";
+        for (int i = 0; i < 64; ++i) expected += u"xy";
+        CHECK(yielded.asStrPtr()->view() == expected);
+        slot = ns("other").bits;  // another script overwrote the variable
+        log = xyo_transient_resume(log, &slot);
+        xyo_transient_append(log, Value::string(SStr::create(u"\xD83D\xDE00")).bits);
+        xyo_transient_finish(log, &slot);
+        Value finished{slot};
+        CHECK(finished.asStrPtr()->view() == u"other\xD83D\xDE00");
+        CHECK(!finished.asStrPtr()->isAppend());  // short-string flatification
+        CHECK(yielded.asStrPtr()->unitAt(7) == u'x');
+        Gc::get().collect();
+        CHECK(finished.asStrPtr()->view() == u"other\xD83D\xDE00");
+        CHECK(yielded.asStrPtr()->view().size() == 135);
+    }
+
+    // A published prefix retains the same log across a GC and a yield
+    // when no other script has replaced the observed variable.
+    {
+        uint64_t slot = ns("seed").bits;
+        void* log = xyo_transient_begin(slot, &slot);
+        xyo_transient_append_packed(log, uint64_t(u'A') | (uint64_t(u'B') << 16), 2);
+        xyo_transient_flush(log, &slot);
+        Value old{slot};
+        Gc::get().collect();
+        void* resumed = xyo_transient_resume(log, &slot);
+        CHECK(resumed == log);
+        xyo_transient_append_packed(resumed, uint64_t(u'C'), 1);
+        xyo_transient_finish(resumed, &slot);
+        CHECK(old.asStrPtr()->view() == u"seedAB");
+        CHECK(Value{slot}.asStrPtr()->view() == u"seedABC");
+    }
+
+    // JIT dynamic reporter and packed UTF-16 literal append helpers. This
+    // checks the fast integer path, JS formatting fallback and surrogate units.
+    {
+        uint64_t slot = ns("start:").bits;
+        void* log = xyo_transient_begin(slot, &slot);
+        xyo_transient_append_value(log, Value::num(-128).bits);
+        xyo_transient_append_value(log, Value::num(0).bits);
+        xyo_transient_append_value(log, Value::num(1024).bits);
+        xyo_transient_append_value(log, Value::num(0.5).bits);
+        xyo_transient_append_value(log, Value::nan().bits);
+        xyo_transient_append_value(log, Value::boolean(true).bits);
+        constexpr uint64_t emoji = uint64_t(0xD83D) | (uint64_t(0xDE00) << 16);
+        xyo_transient_append_packed(log, emoji, 2);
+        xyo_transient_finish(log, &slot);
+        CHECK(Value{slot}.asStrPtr()->view() == u"start:-128010240.5NaNtrue\xD83D\xDE00");
+    }
+    {
+        uint64_t slot = ns("p:").bits;
+        void* log = xyo_transient_begin(slot, &slot);
+        constexpr uint64_t emoji = uint64_t(0xD83D) | (uint64_t(0xDE00) << 16);
+        const uint64_t meta = (uint64_t(2) << 32) | uint64_t(64);
+        xyo_transient_append_repeat_packed(log, emoji, meta);
+        xyo_transient_finish(log, &slot);
+        std::u16string expected = u"p:";
+        for (int i = 0; i < 64; ++i) expected += u"\xD83D\xDE00";
+        CHECK(Value{slot}.asStrPtr()->view() == expected);
+    }
+
+    // 64-way batches: long Unicode literal and dynamic reporter value.
+    {
+        uint64_t slot = ns("s:").bits;
+        void* log = xyo_transient_begin(slot, &slot);
+        Value suffix = Value::string(SStr::create(u"漢字\xD83D\xDE00"));
+        xyo_transient_append_repeat_string(log, suffix.bits, 64);
+        xyo_transient_append_repeat_value(log, Value::num(7).bits, 64);
+        xyo_transient_finish(log, &slot);
+        std::u16string expected = u"s:";
+        for (int i = 0; i < 64; ++i) expected += u"漢字\xD83D\xDE00";
+        expected.append(64, u'7');
+        CHECK(Value{slot}.asStrPtr()->view() == expected);
     }
 
     // --- 数値変換・比較・検索は view 経由で flat と同じ ---------------
@@ -141,7 +268,7 @@ int test_sstr_cons_main() {
             for (int i = 0; i < 40; ++i)
                 root = rt::join(root, ns("abcdefgh"));   // 320 文字の鎖
             c = cast::toString(root);
-            CHECK(c->isCons());
+            CHECK(c->isComposite());
             // ここで collect: 子ノードはルート（スタック上の Value）から
             // 辿れるので生き残る必要がある。
             Gc::get().collect();
@@ -155,7 +282,7 @@ int test_sstr_cons_main() {
     {
         SStr* prefix = chain("ab", 1000);
         Value result = rt::join(Value::string(prefix), Value::num(12.5));
-        CHECK(result.asStrPtr()->isCons());
+        CHECK(result.asStrPtr()->isComposite());
         CHECK(prefix->body == nullptr);
         CHECK(result.asStrPtr()->view() == std::u16string(prefix->view()) + u"12.5");
         Value mixed = Value::emptyStr();

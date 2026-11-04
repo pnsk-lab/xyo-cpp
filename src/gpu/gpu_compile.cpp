@@ -240,6 +240,27 @@ struct Compiler {
         return blocks->getBlock(in->shadow);
     }
 
+    // Scratch's integer random uses double precision and includes both
+    // endpoints. The GPU VM stores f32 and its RAND instruction falls back
+    // to fractional output beyond the i32 range; e.g. random(0, 3e9)
+    // becomes nonintegral. Only permit simple, statically bounded integer
+    // literals whose entire range and inclusive width are exactly f32.
+    // Dynamic/compound endpoints and fractional Scratch inputs run on CPU.
+    bool safeRandomEndpoint(const BlockInput* in) {
+        const Block* src = blockOf(in);
+        if (!src) src = shadowOf(in);
+        if (!src || !literalOpcode(src->opcode) ||
+            src->opcode == "colour_picker" || src->fields.size() != 1)
+            return false;
+        const Value v = src->fields.begin()->second.value;
+        if (!cast::isInt(v)) return false;
+        const double d = cast::toNumber(v);
+        // abs <= 2^23-1 ensures inclusive widths stay <= 2^24 and
+        // hi+1 remains exactly representable in IEEE754 binary32.
+        return std::isfinite(d) && d >= -8388607.0 &&
+               d <= 8388607.0 && double(float(d)) == d;
+    }
+
     bool compileInput(const Block* parent, const char* name) {
         const BlockInput* in = parent->inputs.find(name);
         if (!in) { emitF(OP_PUSH, 0.0f); return true; }
@@ -311,6 +332,12 @@ struct Compiler {
                 return ok;
             }
         if (op == "operator_random") {
+            if (!safeRandomEndpoint(b->inputs.find("FROM")) ||
+                !safeRandomEndpoint(b->inputs.find("TO"))) {
+                fail("random endpoints require exact small integer literals "
+                     "(f32 GPU VM cannot preserve Scratch semantics)");
+                return false;
+            }
             if (!compileInput(b, "FROM") || !compileInput(b, "TO"))
                 return false;
             emit(OP_RAND);

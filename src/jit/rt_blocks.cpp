@@ -162,7 +162,7 @@ uint64_t xyo_join_suffix(uint64_t a, uint64_t suffix) {
     if (!s1 || s1->len == 0) return suffix;
     if (!s2 || s2->len == 0) return a;
     if (size_t(s1->len) + s2->len >= 16)
-        return toB(Value::string(sstrCons(s1, s2)));
+        return toB(Value::string(sstrConsOrAppend(s1, s2)));
     return toB(Value::string(sstrConcat(s1->view(), s2->view())));
 }
 #if defined(XYO_STRING_JOIN_SPECIALIZED)

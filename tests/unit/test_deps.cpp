@@ -96,6 +96,30 @@ struct AnalysisFixture {
 void testAnalysis() {
     {
         AnalysisFixture fixture;
+        Block wait = AnalysisFixture::make("entry", "control_wait_until", "write");
+        wait.inputs.set("CONDITION", {"condition", ""});
+        fixture.add(std::move(wait));
+        fixture.variable("condition", "a", false);
+        fixture.variable("write", "b", true);
+        const auto set = fixture.analyze();
+        check(set.workerSafe() && !set.spawn &&
+              set.reads.count(fixture.key("a")) && set.writes.count(fixture.key("b")),
+              "wait-until only yields its own thread and retains condition/tail dependencies");
+        fixture.sprite.blocks->getBlock("condition")->opcode = "sensing_keypressed";
+        check(!fixture.analyze().workerSafe() && fixture.analyze().mainThread,
+              "wait-until with caller-thread IO condition stays serial");
+        fixture.sprite.blocks->getBlock("condition")->opcode = "extension_unknown_operation";
+        check(!fixture.analyze().workerSafe() && fixture.analyze().unknown,
+              "wait-until with unknown condition stays serial");
+    }
+    {
+        AnalysisFixture fixture;
+        fixture.add(AnalysisFixture::make("entry", "control_wait"));
+        check(fixture.analyze().spawn && !fixture.analyze().workerSafe(),
+              "timed wait remains serial because it mutates runtime wait state");
+    }
+    {
+        AnalysisFixture fixture;
         fixture.call("entry", "A");
         fixture.definition("defA", "protoA", "A", "writeA");
         fixture.variable("writeA", "a", true, "recurse", "readB");

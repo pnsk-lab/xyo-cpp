@@ -198,6 +198,7 @@ std::vector<Thread*> Sequencer::stepThreads() {
             for (size_t i = 0; i < runtime.threads.size(); ++i) {
                 Thread* t = runtime.threads[i];
                 if (!t->stack.empty() && t->status != STATUS_DONE) {
+                    t->runtimeIndex = nextActive;
                     runtime.threads[nextActive++] = t;
                 } else {
                     runtime.threadMap.erase(t->getId());
@@ -582,16 +583,20 @@ Sequencer::ParFlush Sequencer::flushParBatch() {
             fibers.clear();
             if (chained) {
                 for (Thread* t : batch) {
-                    // Broadcast receivers can be replaced in the thread list.
-                    // The chain bypasses jitStepThread's per-fiber liveness
-                    // check, so never chain a restartable receiver.
+                    // A preceding serial script may have replaced a receiver.
+                    // Validate identity, not hat type. Within this worker-safe
+                    // batch no script can spawn/restart/stop another thread;
+                    // serial barriers are always flushed before entering it.
                     if (!t->isCompiled || !t->jitCtx || !t->fiber ||
-                        t->fiber->finished() || t->reusableBroadcastReceiver ||
-                        (t->topBlockPtr &&
-                         t->topBlockPtr->opcode == "event_whenbroadcastreceived")) {
+                        t->fiber->finished() || t->isKilled ||
+                        !runtime.isActiveThread(t) ||
+                        (t->status != STATUS_RUNNING && t->status != STATUS_YIELD)) {
                         chained = false;
                         break;
                     }
+                    t->jitCtx->target = t->target;
+                    t->jitCtx->sampledWarpClockUs = sampledWarpClock();
+                    t->jitCtx->sampledWarpDeadlineUs = sampledWarpDeadline();
                     fibers.push_back(t->fiber);
                 }
             }
@@ -600,7 +605,8 @@ Sequencer::ParFlush Sequencer::flushParBatch() {
                 Fiber::resumeChain(fibers.data(), fibers.size());
                 for (Thread* t : batch) {
                     JitCtx* c = t->jitCtx;
-                    if (t->fiber->finished()) {
+                    if (t->fiber->finished() || t->status == STATUS_DONE ||
+                        t->isKilled || !runtime.isActiveThread(t)) {
                         t->status = STATUS_DONE;
                         t->stack.clear();
                         FiberPool::release(c->fiber);

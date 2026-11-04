@@ -198,7 +198,7 @@ Value joinStrings(Value a, Value b) {
     if (!s1 || !s1->len) return b;
     if (!s2 || !s2->len) return a;
     if (size_t(s1->len) + s2->len >= 16)
-        return Value::string(sstrCons(s1, s2));
+        return Value::string(sstrConsOrAppend(s1, s2));
     return Value::string(sstrConcat(s1->view(), s2->view()));
 }
 
@@ -221,7 +221,7 @@ Value join(Value a, Value b) {
         if (SStr* leaf = cast::smallIntString(d)) {
             if (!s1 || !s1->len) return Value::string(leaf);
             if (size_t(s1->len) + leaf->len >= 16)
-                return Value::string(sstrCons(s1, leaf));
+                return Value::string(sstrConsOrAppend(s1, leaf));
             return Value::string(sstrConcat(s1->view(), leaf->view()));
         }
         std::string ns = jsnum::toString(d);
@@ -229,7 +229,7 @@ Value join(Value a, Value b) {
         // Keep the single-allocation ASCII path for short results.
         if (s1 && s1->len && size_t(s1->len) + ns.size() >= 16) {
             SStr* leaf = sstrFromAscii(ns);
-            return Value::string(sstrCons(s1, leaf));
+            return Value::string(sstrConsOrAppend(s1, leaf));
         }
         return Value::string(sstrConcatAscii(
             s1 ? s1->view() : std::u16string_view(), ns));
@@ -254,12 +254,12 @@ Value join(Value a, Value b) {
             }
             s1 = sstrFromAscii(ns);
         }
-        if (s2->len == 1 && !s2->isCons()) {
+        if (s2->len == 1 && !s2->isComposite()) {
             const char16_t c = s2->data()[0];
             if (c < 128) s2 = letterCached(c);
         }
         if (size_t(s1->len) + s2->len >= 16)
-            return Value::string(sstrCons(s1, s2));
+            return Value::string(sstrConsOrAppend(s1, s2));
         return Value::string(sstrConcat(s1->view(), s2->view()));
     }
     // (num, num): two conversions plus one concatenation, not three objects.
@@ -267,7 +267,7 @@ Value join(Value a, Value b) {
         SStr* s1 = cast::toString(a);
         SStr* s2 = cast::toString(b);
         if (size_t(s1->len) + s2->len >= 16)
-            return Value::string(sstrCons(s1, s2));
+            return Value::string(sstrConsOrAppend(s1, s2));
         return Value::string(sstrConcat(s1->view(), s2->view()));
     }
     SStr* s1 = cast::toString(a);

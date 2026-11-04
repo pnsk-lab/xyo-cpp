@@ -309,24 +309,25 @@ void fixSporkCompatibility(
 }
 
 /// BlockJson → Block 変換（createBlock 相当）
-Block makeBlock(const BlockJson& bj) {
+Block makeBlock(BlockJson&& bj) {
     Block b;
-    b.id = bj.id;
-    b.opcode = bj.opcode;
-    if (!bj.next.empty()) b.next = bj.next;
-    if (!bj.parent.empty()) b.parent = bj.parent;
+    b.id = std::move(bj.id);
+    b.opcode = std::move(bj.opcode);
+    b.next = std::move(bj.next);
+    b.parent = std::move(bj.parent);
     b.topLevel = bj.topLevel;
     b.shadow = bj.shadow;
     b.x = bj.x;
     b.y = bj.y;
-    for (const auto& [name, bs] : bj.inputs) {
+    for (auto& [name, bs] : bj.inputs) {
         BlockInput in;
-        in.block = bs.first;
-        in.shadow = bs.second;
+        in.block = std::move(bs.first);
+        in.shadow = std::move(bs.second);
         b.inputs.set(name, std::move(in));
     }
-    for (const auto& [name, f] : bj.fields) b.fields[name] = f;
-    if (bj.mutation) b.mutation = *bj.mutation;
+    for (auto& [name, f] : bj.fields)
+        b.fields.emplace(std::move(name), std::move(f));
+    if (bj.mutation) b.mutation = std::move(*bj.mutation);
     return b;
 }
 
@@ -489,7 +490,7 @@ Target* loadTargetObject(Runtime& runtime, const JsonValue& obj,
         for (const std::string& id : order) {
             auto it = all.find(id);
             if (it == all.end()) continue;
-            Block b = makeBlock(it->second);
+            Block b = makeBlock(std::move(it->second));
             std::string ext = extensionIdForOpcode(b.opcode);
             if (!ext.empty() &&
                 std::find(extIds.begin(), extIds.end(), ext) == extIds.end())
@@ -695,9 +696,10 @@ void loadMonitor(Runtime& runtime, const JsonValue& monitorData,
 /// runtime.js の findProjectOptionsComment/parseStoredProjectOptions
 /// 相当。ターゲットやモニタのロードより先に呼ぶこと。
 void applyTwProjectOptions(Runtime& runtime,
-                           const JsonArray& targetObjs) {
+                           const std::vector<const JsonValue*>& targetObjs) {
     static constexpr std::string_view kMagic = " // _twconfig_";
-    for (const JsonValue& tobj : targetObjs) {
+    for (const JsonValue* targetObj : targetObjs) {
+        const JsonValue& tobj = *targetObj;
         for (const auto& [cid, comment] :
                  tobj.get("comments").asObject()) {
             const std::string& text = comment.get("text").asString();
@@ -774,14 +776,19 @@ Sb3LoadResult loadSb3(Runtime& runtime, const std::string& projectJson,
     runtime.origin = json.get("meta").get("origin").asString();
 
     // targets: layerOrder ソートで parse → targetPaneOrder で並び戻す
-    JsonArray targetObjs;
-    if (isSingleSprite) targetObjs.push_back(json);
-    else targetObjs = json.get("targets").asArray();
-
+    // Borrow target objects from the parsed JSON tree instead of copying
+    // them (a large project can contain millions of block entries).
+    // This also avoids duplicating JSON when importing a single sprite.
+    std::vector<const JsonValue*> targetObjs;
+    if (isSingleSprite) {
+        targetObjs.push_back(&json);
+    } else {
+        for (const JsonValue& target : json.get("targets").asArray())
+            targetObjs.push_back(&target);
+    }
     applyTwProjectOptions(runtime, targetObjs);
 
-    std::vector<const JsonValue*> sorted;
-    for (const auto& t : targetObjs) sorted.push_back(&t);
+    std::vector<const JsonValue*> sorted = targetObjs;
     // targetPaneOrder = 元順序
     std::vector<int> paneOrder(sorted.size());
     for (size_t i = 0; i < sorted.size(); ++i) paneOrder[i] = int(i);
@@ -798,7 +805,7 @@ Sb3LoadResult loadSb3(Runtime& runtime, const std::string& projectJson,
                                      result.extensionIds, listStrings);
         int po = 0;
         for (size_t i = 0; i < targetObjs.size(); ++i)
-            if (&targetObjs[i] == tobj) po = int(i);
+            if (targetObjs[i] == tobj) po = int(i);
         if (t) parsed.emplace_back(t, po);
     }
     std::stable_sort(parsed.begin(), parsed.end(),
@@ -867,7 +874,7 @@ std::vector<std::string> loadBlocksFragment(Blocks& out, const JsonValue& fragme
             bs.second = mapId(bs.second);
         }
         bj.topLevel = false;
-        Block b = makeBlock(bj);
+        Block b = makeBlock(std::move(bj));
         ids.push_back(b.id);
         out.createBlock(std::move(b));
     }

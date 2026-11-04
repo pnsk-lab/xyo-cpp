@@ -22,7 +22,7 @@ std::string Thread::getIdFromTargetAndBlock(const Target* target,
     return target->id + "&" + tb;
 }
 
-std::string Thread::getId() const {
+const std::string& Thread::getId() const {
     if (idCache_.empty()) idCache_ = getIdFromTargetAndBlock(target, topBlock);
     return idCache_;
 }

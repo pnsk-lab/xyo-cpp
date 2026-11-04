@@ -1929,10 +1929,57 @@ void test_live_vm() {
 
 } // namespace
 
+void test_random_numeric_precision() {
+    Env e;
+    CHECK(e.ok);
+
+    auto make = [&](double low, double high,
+                    bool compoundUpper = false) {
+        BB b{e.bs};
+        Block* rnd = b.add("operator_random");
+        b.lit(rnd, "FROM", low);
+        if (compoundUpper) {
+            Block* mul = b.add("operator_multiply");
+            b.lit(mul, "NUM1", high);
+            b.lit(mul, "NUM2", 1);
+            b.inp(rnd, "TO", mul);
+        } else {
+            b.lit(rnd, "TO", high);
+        }
+        Block* set = b.setVar("v", "vv");
+        b.inp(set, "VALUE", rnd);
+        return compileRepeat(b, b.chain({set}));
+    };
+
+    // Small, exact integer literals remain eligible for GPU rendering.
+    CHECK(make(0, 10).has_value());
+    CHECK(make(-100, 100).has_value());
+    CHECK(make(0, 8388607).has_value());
+
+    // Regression: Scratch pick random(0, 3e9) must produce an integer,
+    // but the f32 GPU VM uses the float branch for endpoints >= 2^31.
+    CHECK(!make(0, 3000000000.0).has_value());
+    CHECK(!make(0, 3000000000.0, true).has_value());
+    CHECK(!make(0, 8388608.0).has_value());
+    CHECK(!make(1.5, 10).has_value());
+
+    // Unknown/dynamic endpoints must not be assumed f32-exact.
+    {
+        BB b{e.bs};
+        Block* rnd = b.add("operator_random");
+        b.varInp(rnd, "FROM", "v", "vv");
+        b.lit(rnd, "TO", 10);
+        Block* set = b.setVar("v", "vv");
+        b.inp(set, "VALUE", rnd);
+        CHECK(!compileRepeat(b, b.chain({set})).has_value());
+    }
+}
+
 int test_parallel_gpu() {
     // ヘルパ内部の static 初期化より先に最小レーン閾値を下げる
     setenv("XYO_GPU_MIN", "1", 0);
     test_order();
+    test_random_numeric_precision();
     test_cfg_locals();
     test_cfg_recurrence();
     test_cfg_inner_loops();

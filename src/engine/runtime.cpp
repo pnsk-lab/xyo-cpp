@@ -72,6 +72,7 @@ Thread* Runtime::pushThread(const std::string& id, Target* target,
     t->updateMonitor = updateMonitor;
     t->blockContainer = updateMonitor ? monitorBlocks.get() : target->blocks;
     t->pushStack(id);
+    t->runtimeIndex = threads.size();
     threads.push_back(t);
     ownedThreads.push_back(std::move(thread));
     if (!t->stackClick && !t->updateMonitor) {
@@ -117,6 +118,7 @@ Thread* Runtime::restartThread(Thread* thread, const Block* topHint) {
     }
     for (size_t i = 0; i < threads.size(); ++i) {
         if (threads[i] == thread) {
+            n->runtimeIndex = i;
             threads[i] = n;
             ownedThreads.push_back(std::move(nt));
             // The replaced thread will never be scheduled again. Release
@@ -132,16 +134,30 @@ Thread* Runtime::restartThread(Thread* thread, const Block* topHint) {
             return n;
         }
     }
+    n->runtimeIndex = threads.size();
     threads.push_back(n);
     ownedThreads.push_back(std::move(nt));
     sequencer->retireThread(*thread);
     return n;
 }
 
+bool Runtime::containsThread(Thread* thread) const {
+    const size_t index = thread->runtimeIndex;
+    if (index < threads.size() && threads[index] == thread) return true;
+    // Validate the hint rather than trusting it: restart replaces an identity,
+    // stopAll detaches the list, and embedders can edit the public vector.
+    for (size_t i = 0; i < threads.size(); ++i) {
+        if (threads[i] == thread) {
+            thread->runtimeIndex = i;
+            return true;
+        }
+    }
+    return false;
+}
+
 bool Runtime::isActiveThread(Thread* thread) const {
     if (thread->stack.empty() || thread->status == STATUS_DONE) return false;
-    for (Thread* t : threads) if (t == thread) return true;
-    return false;
+    return containsThread(thread);
 }
 
 bool Runtime::isWaitingThread(Thread* thread) const {
@@ -398,25 +414,47 @@ void Runtime::greenFlag() {
 // ------------------------------------------------------------------ step --
 
 void Runtime::reclaimThreads() {
-    // 待機中の broadcast and wait が握っている生ポインタを集める。
+    // Keep handles exposed by runtime execution state, including detached
+    // scheduler passes and completed receivers held by a join. Moving the
+    // unique_ptrs never changes Thread addresses; recycling an observed identity
+    // would, however, introduce an ABA bug in broadcast-and-wait.
     std::unordered_set<const Thread*> refs;
-    for (Thread* t : threads) {
-        for (auto& f : t->stackFrames) {
-            if (!f->executionContext) continue;
-            for (Thread* s : f->executionContext->startedThreads)
-                refs.insert(s);
-        }
-        if (t->jitCtx && t->jitCtx->joinRefs) {
-            for (Thread* s : *t->jitCtx->joinRefs) refs.insert(s);
-        }
+    std::vector<Thread*> pending;
+    const auto retain = [&](Thread* t) {
+        if (t && refs.insert(t).second) pending.push_back(t);
+    };
+    for (Thread* t : threads) retain(t);
+    for (Thread* t : lastStepDoneThreads) retain(t);
+    for (const auto& entry : waitQueue) retain(entry.thread);
+    for (const auto& [id, t] : threadMap) retain(t);
+    retain(sequencer->activeThread);
+    if (sequencer->stepping)
+        for (Thread* t : *sequencer->stepping) retain(t);
+    for (const auto& list : sequencer->detachedLists)
+        for (Thread* t : *list) retain(t);
+    for (const auto& up : ownedThreads) {
+        if (up && (up->status != STATUS_DONE || up->fiber || up->jitCtx))
+            retain(up.get());
     }
-    for (auto& up : ownedThreads) {
-        Thread* t = up.get();
-        if (!t || t->status != STATUS_DONE || t->fiber || t->jitCtx) continue;
-        if (refs.count(t)) continue;
-        up.reset();
+    for (size_t i = 0; i < pending.size(); ++i) {
+        Thread* t = pending[i];
+        const auto retainFrames = [&](const auto& frames) {
+            for (const auto& f : frames) {
+                if (!f->executionContext) continue;
+                for (Thread* s : f->executionContext->startedThreads) retain(s);
+            }
+        };
+        retainFrames(t->stackFrames);
+        retainFrames(t->trashFrames);
+        for (Thread* s : t->compatibilityStackFrame.startedThreads) retain(s);
+        if (t->jitCtx && t->jitCtx->joinRefs)
+            for (Thread* s : *t->jitCtx->joinRefs) retain(s);
     }
-    // 次の回収は 25% 増えたとき（空きスロットは 8 バイトだけ残る）。
+    // Compact ownership, not just Thread payloads. Leaving null slots makes
+    // both future reclamation and GC root visits scale with historical spawns.
+    std::erase_if(ownedThreads, [&](const auto& up) {
+        return !up || !refs.contains(up.get());
+    });
     reclaimAt = ownedThreads.size() + ownedThreads.size() / 4 + 1024;
 }
 
@@ -425,7 +463,12 @@ void Runtime::step() {
     // 停止指示のあったスレッドを除去
     std::vector<Thread*> alive;
     alive.reserve(threads.size());
-    for (Thread* t : threads) if (!t->isKilled) alive.push_back(t);
+    for (Thread* t : threads) {
+        if (!t->isKilled) {
+            t->runtimeIndex = alive.size();
+            alive.push_back(t);
+        }
+    }
     threads = std::move(alive);
     // killed スレッドは ownedThreads に残す: broadcastandwait 等の
     // startedThreads が生ポインタを保持するため（解放すると ABA になる）
@@ -853,7 +896,9 @@ void Runtime::markRoots(Gc& g) {
         for (auto& [id, v] : t->edgeActivatedHatValues) g.markValue(v);
         markBlocks(g, t->blocks);
     }
-    for (auto& th : ownedThreads) markThread(g, *th);
+    // Also tolerate null slots supplied by embedders or left by an older
+    // reclamation pass; ownership compaction normally removes them now.
+    for (auto& th : ownedThreads) if (th) markThread(g, *th);
     markBlocks(g, monitorBlocks.get());
     markBlocks(g, flyoutBlocks.get());
     for (auto& [id, rec] : monitorState.records) g.markValue(rec.value);

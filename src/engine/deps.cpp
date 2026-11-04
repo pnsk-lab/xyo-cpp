@@ -185,9 +185,11 @@ const std::unordered_map<std::string, OpRule>& opRules() {
         { OpRule r; r.spawn = true; add("control_stop", r); }
         { OpRule r; r.spawn = true; add("control_create_clone_of", r); }
         { OpRule r; r.spawn = true; add("control_delete_this_clone", r); }
-        // wait/wait_until — rt_wait が waitQueue/redrawRequested に触れる
+        // Timed wait mutates waitQueue/redrawRequested. In contrast the JIT
+        // wait-until loop only evaluates CONDITION and yields its own fiber;
+        // its reporter dependencies are collected by the ordinary input walk.
         { OpRule r; r.spawn = true; add("control_wait", r); }
-        { OpRule r; r.spawn = true; add("control_wait_until", r); }
+        add("control_wait_until", OpRule{});
 
         // --- event ---
         { OpRule r; r.spawn = true; add("event_broadcast", r); }
@@ -218,7 +220,7 @@ const std::unordered_map<std::string, OpRule>& opRules() {
 }
 
 /// 制御構造 op — SUBSTACK/SUBSTACK2 を持ち、固有アクセスは無い
-/// （wait/wait_until はルール表で spawn 扱い — waitQueue を共有するため）
+/// （wait はルール表で spawn 扱い — waitQueue を共有するため）
 bool isStructOp(const std::string& op) {
     return op == "control_if" || op == "control_if_else" ||
            op == "control_repeat" || op == "control_forever" ||

@@ -3,7 +3,6 @@
 #pragma once
 
 #include <cstdint>
-#include <deque>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -130,14 +129,20 @@ public:
     /// unique_ptr 保持で StackFrame*/ExecContext& の参照を常に安定させる
     /// （pushStack/vector 再配置でダングルしない）。pop したフレームは
     /// trashFrames に移し、JS GC 相当の「ポップ済みでも読める」挙動を維持。
-    std::deque<std::unique_ptr<StackFrame>> stackFrames;
-    std::deque<std::unique_ptr<StackFrame>> trashFrames;
+    // Only back/index access is needed. Empty vectors allocate nothing, unlike
+    // deque's map and initial block. Moving unique_ptrs keeps frame addresses
+    // stable across growth and transfer into trashFrames.
+    std::vector<std::unique_ptr<StackFrame>> stackFrames;
+    std::vector<std::unique_ptr<StackFrame>> trashFrames;
     /// JIT proc フレームの再利用プール — xyo_proc_pop が reset 済みの
     /// フレームを貯め、pushStack が make_unique の代わりに再利用する。
     /// 内容は fresh StackFrame と等価（pop 時に reset 済み・GC 参照解放済み）。
     std::vector<std::unique_ptr<StackFrame>> framePool;
     int status = STATUS_RUNNING;
     bool isKilled = false;
+    // Validated against Runtime::threads before use; public vector edits may
+    // invalidate this hint, in which case membership falls back to a scan.
+    mutable size_t runtimeIndex = SIZE_MAX;
     Target* target = nullptr;
     Blocks* blockContainer = nullptr;
     bool stackClick = false;
@@ -182,7 +187,7 @@ public:
     static std::string getIdFromTargetAndBlock(const Target* target,
                                              const std::string& topBlock);
     /// target.id&topBlock — target セット後は不変なので遅延キャッシュ
-    std::string getId() const;
+    const std::string& getId() const;
 
     /// 完了したスレッドの重い状態を返す（frames / 実行コンテキスト /
     /// JIT キャッシュ）。Thread オブジェクト自体は broadcastandwait の

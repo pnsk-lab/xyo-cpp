@@ -27,6 +27,7 @@
 
 #include "../blocks/pen_api.hpp"
 #include "../core/cast.hpp"
+#include "../core/jsnum.hpp"
 #include "../core/slist.hpp"
 #include "../core/sstr.hpp"
 #include "../gpu/gpu_compile.hpp"
@@ -783,6 +784,35 @@ struct Codegen {
         curYieldCnt = s.cnt;
         curYieldWarp = s.warp;
     }
+    // Only active while lowering a proven self-append-only warp repeat.
+    // The log remains GC-rooted by the immutable prefix snapshot in var.
+    AllocaInst* activeTransient = nullptr;
+    llvm::Value* activeTransientVariable = nullptr;
+    // Additional live append logs in a simultaneous multi-variable loop.
+    // Every log is rooted via its own published variable snapshot.
+    std::vector<std::pair<AllocaInst*, llvm::Value*>> activeExtraTransients;
+    void transientBeforeHandoff() {
+        if (!activeTransient) return;
+        llvm::Value* log = b.CreateLoad(ptrt, activeTransient);
+        call2("xyo_transient_flush", voidt, log, activeTransientVariable);
+        for (const auto& extra : activeExtraTransients) {
+            llvm::Value* other = b.CreateLoad(ptrt, extra.first);
+            call2("xyo_transient_flush", voidt, other, extra.second);
+        }
+    }
+    void transientAfterHandoff() {
+        if (!activeTransient) return;
+        llvm::Value* log = b.CreateLoad(ptrt, activeTransient);
+        llvm::Value* resumed = call2(
+            "xyo_transient_resume", ptrt, log, activeTransientVariable);
+        b.CreateStore(resumed, activeTransient);
+        for (const auto& extra : activeExtraTransients) {
+            llvm::Value* other = b.CreateLoad(ptrt, extra.first);
+            llvm::Value* changed = call2(
+                "xyo_transient_resume", ptrt, other, extra.second);
+            b.CreateStore(changed, extra.first);
+        }
+    }
     void emitLoopYield() {
         // non-warp は毎反復 yield。warp は 64 回に 1 回 stuck を検査。
         BasicBlock* chkBB = BasicBlock::Create(lc, "", fn);
@@ -800,20 +830,25 @@ struct Codegen {
         BasicBlock* normalBB = BasicBlock::Create(lc, "", fn);
         b.CreateCondBr(b.CreateICmpEQ(warp, ci32(0)), normalBB, warpBB);
         b.SetInsertPoint(normalBB);
+        transientBeforeHandoff();
         spillPromoted();
         if (std::getenv("XYO_PROF"))
             call1("xyo_yield", voidt, ctxArg);
         else
             call1("xyo_yield_fast", voidt, ctxPtr(4));
         reloadPromoted();
+        transientAfterHandoff();
         b.CreateBr(done);
         b.SetInsertPoint(warpBB);
         llvm::Value* due =
             b.CreateICmpEQ(b.CreateAnd(n, ci64(63)), ci64(0));
         hotBr(due, chkBB, done, 1, 63);
         b.SetInsertPoint(chkBB);
-        if (!sharedWarpClock && promoted.empty() && promotedLists.empty()) {
+        if (!sharedWarpClock && promoted.empty() &&
+            promotedLists.empty() && !activeTransient) {
+            transientBeforeHandoff();
             call1("xyo_loop_yield", voidt, ctxArg);
+            transientAfterHandoff();
             b.CreateBr(done);
         } else {
             llvm::Value* shouldYield;
@@ -859,9 +894,11 @@ struct Codegen {
             BasicBlock* handoff = newBB("yield.handoff");
             hotBr(shouldYield, handoff, done, 1, 100000);
             b.SetInsertPoint(handoff);
+            transientBeforeHandoff();
             spillPromoted();
             call1("xyo_yield", voidt, ctxArg);
             reloadPromoted();
+            transientAfterHandoff();
             b.CreateBr(done);
         }
         b.SetInsertPoint(done);
@@ -1308,7 +1345,7 @@ struct Codegen {
         llvm::Value* f = b.CreateLoad(
             i32t, b.CreateConstGEP1_32(i8t, sp, kSStrFlagsOff));
         return b.CreateICmpNE(
-            b.CreateAnd(f, ci32(SStr::kConsFlag)), ci32(0));
+            b.CreateAnd(f, ci32(SStr::kConsFlag | SStr::kAppendFlag)), ci32(0));
     }
     static constexpr uint32_t kSStrRgbStateOff =
         uint32_t(offsetof(SStr, rgbState));
@@ -4318,6 +4355,626 @@ struct Codegen {
         if (branch) --nestedBranchDepth;
     }
 
+    // Scratch-specific escape proof for repeat-loop transient strings.
+    // Before every possible handoff, the pending prefix is materialized as
+    // an immutable GC-rooted snapshot. Only pure local variable mutations
+    // are allowed among the appends; side effects/observers are rejected.
+    struct TransientPiece {
+        std::u16string text;
+        Block* dynamic = nullptr;
+    };
+    struct TransientAction {
+        Block* statement = nullptr;  // null only for an impossible plan
+        bool isAppend = false;
+        std::vector<TransientPiece> pieces; // RHS join flattened into leaves
+    };
+    struct TransientRepeat {
+        const BlockField* variable = nullptr;
+        std::vector<TransientAction> actions;
+        std::optional<std::u16string> batchText;
+    };
+
+    Block* transientChild(Block* block, const char* name) {
+        if (!block) return nullptr;
+        const BlockInput* input = block->inputs.find(name);
+        return input
+            ? getBlock(input->block.empty() ? input->shadow : input->block)
+            : nullptr;
+    }
+
+    // Prove that evaluating a reporter neither writes Scratch-visible state
+    // nor reads the transient destination's unpublished value. Do NOT add
+    // sensing, random, procedures, lists or custom extensions here.
+    bool safeTransientReporter(Block* rhs, const std::string& destination,
+                               unsigned depth = 0) {
+        if (!rhs || depth > 12) return false;
+        const auto& op = rhs->opcode;
+        if (rhs->shadow) {
+            if (op == "text") {
+                const auto* f = findField(rhs, "TEXT");
+                return f && f->value.isString();
+            }
+            return op == "math_number" || op == "math_integer" ||
+                   op == "math_whole_number" || op == "math_positive_number" ||
+                   op == "math_angle";
+        }
+        if (op == "data_variable") {
+            const auto* field = findField(rhs, "VARIABLE");
+            return field && !field->id.empty() && field->id != destination;
+        }
+        if (op == "argument_reporter_string_number" ||
+            op == "argument_reporter_boolean")
+            return true; // immutable parameters of the containing procedure
+        if (op == "operator_add" || op == "operator_subtract" ||
+            op == "operator_multiply" || op == "operator_divide" ||
+            op == "operator_mod") {
+            return safeTransientReporter(
+                       transientChild(rhs, "NUM1"), destination, depth + 1) &&
+                   safeTransientReporter(
+                       transientChild(rhs, "NUM2"), destination, depth + 1);
+        }
+        if (op == "operator_join") {
+            return safeTransientReporter(
+                       transientChild(rhs, "STRING1"), destination, depth + 1) &&
+                   safeTransientReporter(
+                       transientChild(rhs, "STRING2"), destination, depth + 1);
+        }
+        if (op == "operator_lt" || op == "operator_gt" ||
+            op == "operator_equals" || op == "operator_and" ||
+            op == "operator_or") {
+            return safeTransientReporter(
+                       transientChild(rhs, "OPERAND1"), destination, depth + 1) &&
+                   safeTransientReporter(
+                       transientChild(rhs, "OPERAND2"), destination, depth + 1);
+        }
+        if (op == "operator_not")
+            return safeTransientReporter(
+                transientChild(rhs, "OPERAND"), destination, depth + 1);
+        if (op == "operator_round")
+            return safeTransientReporter(
+                transientChild(rhs, "NUM"), destination, depth + 1);
+        if (op == "operator_length")
+            return safeTransientReporter(
+                transientChild(rhs, "STRING"), destination, depth + 1);
+        if (op == "operator_letter_of")
+            return safeTransientReporter(
+                       transientChild(rhs, "LETTER"), destination, depth + 1) &&
+                   safeTransientReporter(
+                       transientChild(rhs, "STRING"), destination, depth + 1);
+        return false;
+    }
+
+    // Recursively decompose RHS joins. This removes intermediate SStr
+    // allocations for join(s, join("prefix", v)) and preserves evaluation
+    // order, numeric casts, UTF-16 indexing and empty-string handling.
+    bool collectTransientPieces(Block* rhs, const std::string& destination,
+                                std::vector<TransientPiece>& out,
+                                unsigned depth = 0) {
+        if (!rhs || depth > 12 || out.size() > 16) return false;
+        if (rhs->opcode == "operator_join" && !rhs->shadow) {
+            return collectTransientPieces(
+                       transientChild(rhs, "STRING1"), destination, out,
+                       depth + 1) &&
+                   collectTransientPieces(
+                       transientChild(rhs, "STRING2"), destination, out,
+                       depth + 1);
+        }
+        if (rhs->opcode == "text" && rhs->shadow) {
+            const BlockField* text = findField(rhs, "TEXT");
+            if (!text || !text->value.isString()) return false;
+            const SStr* str = text->value.asStrPtr();
+            if (str && str->len)
+                out.push_back({std::u16string(str->view()), nullptr});
+            return true;
+        }
+        // Preformat constant numeric additions: no formatter on the loop
+        // hot path, even when the expression is written as two shadows.
+        if (rhs->opcode == "operator_add" && !rhs->shadow) {
+            auto numShadow = [&](const char* input) -> std::optional<double> {
+                Block* child = transientChild(rhs, input);
+                if (!child || !child->shadow) return std::nullopt;
+                if (child->opcode != "math_number" &&
+                    child->opcode != "math_integer" &&
+                    child->opcode != "math_whole_number" &&
+                    child->opcode != "math_positive_number")
+                    return std::nullopt;
+                const BlockField* field = findField(child, "NUM");
+                return field ? std::optional(cast::toNumber(field->value))
+                             : std::nullopt;
+            };
+            auto a = numShadow("NUM1");
+            auto b = numShadow("NUM2");
+            if (a && b) {
+                out.push_back({jsnum::toString16(*a + *b), nullptr});
+                return true;
+            }
+        }
+        if (!safeTransientReporter(rhs, destination, depth))
+            return false;
+        out.push_back({{}, rhs});
+        return true;
+    }
+
+    std::optional<TransientRepeat> transientRepeatPattern(Block* loop) {
+        if (aot || !curFnWarp || activeTransient ||
+            (std::getenv("XYO_JIT_TRANSIENT_STRINGS") &&
+             std::getenv("XYO_JIT_TRANSIENT_STRINGS")[0] == '0'))
+            return std::nullopt;
+        const BlockInput* bodyIn = loop->inputs.find("SUBSTACK");
+        if (!bodyIn || bodyIn->block.empty()) return std::nullopt;
+        auto body = chainOf(bodyIn->block);
+        if (body.empty() || body.size() > 16 || !body.back()->next.empty())
+            return std::nullopt;
+
+        TransientRepeat plan;
+        size_t appendCount = 0;
+        for (Block* statement : body) {
+            const std::string& op = statement->opcode;
+            if (op != "data_setvariableto" &&
+                op != "data_changevariableby")
+                return std::nullopt;
+            const BlockField* field = findField(statement, "VARIABLE");
+            if (!field || field->id.empty()) return std::nullopt;
+
+            const BlockInput* valueIn = statement->inputs.find("VALUE");
+            Block* value = valueIn ? transientChild(statement, "VALUE") : nullptr;
+            if (!value) return std::nullopt;
+            if (op == "data_setvariableto" &&
+                value->opcode == "operator_join" && !value->shadow) {
+                Block* lhs = transientChild(value, "STRING1");
+                Block* rhs = transientChild(value, "STRING2");
+                const BlockField* read = lhs && lhs->opcode == "data_variable"
+                    ? findField(lhs, "VARIABLE") : nullptr;
+                if (read && read->id == field->id) {
+                    if (!plan.variable)
+                        plan.variable = field;
+                    if (plan.variable->id != field->id)
+                        return std::nullopt;  // distinct transient variables
+                    TransientAction action;
+                    action.statement = statement;
+                    action.isAppend = true;
+                    if (!collectTransientPieces(rhs, field->id, action.pieces))
+                        return std::nullopt;
+                    if (action.pieces.size() > 16) return std::nullopt;
+                    plan.actions.push_back(std::move(action));
+                    ++appendCount;
+                    continue;
+                }
+            }
+            // A regular variable assignment can read/update itself (e.g.
+            // change i by 1). Once the transient destination is identified
+            // below, prove that its expression never reads that destination.
+            plan.actions.push_back({statement, false, {}});
+        }
+        if (!plan.variable || !appendCount ||
+            (findPromoted(plan.variable) && findPromoted(plan.variable)->numeric))
+            return std::nullopt;
+
+        for (const auto& action : plan.actions) {
+            if (action.isAppend) continue;
+            const BlockField* field = findField(action.statement, "VARIABLE");
+            if (!field || field->id == plan.variable->id ||
+                !safeTransientReporter(
+                    transientChild(action.statement, "VALUE"),
+                    plan.variable->id))
+                return std::nullopt;
+        }
+
+        // Pure literal append chains can be collapsed into a single constant
+        // repeated for every logical iteration. Even multiple set-variable
+        // blocks can be combined because none is observable until a yield.
+        std::u16string combined;
+        bool allLiteral = true;
+        for (const auto& action : plan.actions) {
+            if (!action.isAppend) { allLiteral = false; break; }
+            for (const auto& piece : action.pieces) {
+                if (piece.dynamic || combined.size() + piece.text.size() > 4096) {
+                    allLiteral = false;
+                    break;
+                }
+                combined += piece.text;
+            }
+            if (!allLiteral) break;
+        }
+        if (allLiteral && !combined.empty())
+            plan.batchText = std::move(combined);
+        return plan;
+    }
+
+    struct TransientEmittedPiece {
+        Block* dynamic = nullptr;
+        llvm::Value* literal = nullptr;
+        uint64_t packed = 0;
+        uint32_t packedLength = 0;
+    };
+    TransientEmittedPiece makeTransientPiece(const TransientPiece& piece,
+                                            bool allowPacked) {
+        TransientEmittedPiece result;
+        result.dynamic = piece.dynamic;
+        if (piece.dynamic || piece.text.empty()) return result;
+        const bool packEnabled =
+            !std::getenv("XYO_JIT_TRANSIENT_PACKED") ||
+            std::getenv("XYO_JIT_TRANSIENT_PACKED")[0] != '0';
+        if (allowPacked && packEnabled && piece.text.size() <= 4) {
+            result.packedLength = uint32_t(piece.text.size());
+            for (size_t i = 0; i < piece.text.size(); ++i)
+                result.packed |= uint64_t(piece.text[i]) << (16 * i);
+        } else {
+            result.literal = constValue(
+                Value::string(SStr::create(piece.text)));
+        }
+        return result;
+    }
+
+    void emitTransientPiece(llvm::Value* state,
+                            const TransientEmittedPiece& piece) {
+        if (piece.dynamic) {
+            llvm::Value* value = emitInputBlock(piece.dynamic->id);
+            call2("xyo_transient_append_value", voidt, state, value);
+        } else if (piece.packedLength) {
+            call3("xyo_transient_append_packed", voidt, state,
+                  ci64(piece.packed), ci32(piece.packedLength));
+        } else if (piece.literal) {
+            call2("xyo_transient_append", voidt, state, piece.literal);
+        }
+    }
+
+    void emitTransientRepeat(Block* loop, TransientRepeat plan) {
+        if (verbose) std::fprintf(stderr,
+            "xyo-jit: transient MATCH %s actions=%zu aggregate=%zu\n",
+            loop->id.c_str(), plan.actions.size(),
+            plan.batchText ? plan.batchText->size() : 0);
+        const bool counted = loop->opcode == "control_repeat";
+        const bool foreach = loop->opcode == "control_for_each";
+        const bool until = loop->opcode == "control_repeat_until";
+        llvm::Value* count = counted
+            ? emitToNumF64(emitInputOf(loop, "TIMES")) : nullptr;
+        beginLoopYieldScope();
+        AllocaInst* remaining = counted
+            ? entryAlloca(f64t, 1, "str.rep.left") : nullptr;
+        if (counted) b.CreateStore(count, remaining);
+        AllocaInst* index = foreach
+            ? entryAlloca(f64t, 1, "str.foreach.index") : nullptr;
+        const BlockField* indexVar = foreach
+            ? findField(loop, "VARIABLE") : nullptr;
+        if (foreach) b.CreateStore(cf64(0.0), index);
+        AllocaInst* currentLog = entryAlloca(ptrt, 1, "str.transient");
+        b.CreateStore(cnull(), currentLog);
+        llvm::Value* varPtr = varValuePtr(plan.variable);
+
+        // If the entire body is one pure reporter append, its RHS is
+        // invariant between scheduling checkpoints and can also be batched.
+        // The reporter must be evaluated anew after each possible yield.
+        const bool dynamicBatch = counted && !plan.batchText &&
+            plan.actions.size() == 1 && plan.actions[0].isAppend &&
+            plan.actions[0].pieces.size() == 1 &&
+            plan.actions[0].pieces[0].dynamic != nullptr;
+        const bool batching =
+            counted && (plan.batchText || dynamicBatch) &&
+            (!std::getenv("XYO_JIT_TRANSIENT_BATCH") ||
+             std::getenv("XYO_JIT_TRANSIENT_BATCH")[0] != '0');
+        TransientEmittedPiece batchPiece;
+        if (batching) {
+            batchPiece = dynamicBatch
+                ? makeTransientPiece(plan.actions[0].pieces[0], true)
+                : makeTransientPiece(
+                    TransientPiece{*plan.batchText, nullptr}, true);
+        }
+        std::vector<std::vector<TransientEmittedPiece>> emitted;
+        if (!batching) {
+            emitted.reserve(plan.actions.size());
+            for (const auto& action : plan.actions) {
+                std::vector<TransientEmittedPiece> pieces;
+                for (const auto& piece : action.pieces)
+                    pieces.push_back(makeTransientPiece(piece, true));
+                emitted.push_back(std::move(pieces));
+            }
+        }
+
+        BasicBlock* head = newBB("str.rep.head");
+        BasicBlock* body = newBB("str.rep.body");
+        BasicBlock* start = newBB("str.rep.start");
+        BasicBlock* continuing = newBB("str.rep.cont");
+        BasicBlock* push = newBB("str.rep.push");
+        BasicBlock* done = newBB("str.rep.done");
+        BasicBlock* publish = newBB("str.rep.publish");
+        BasicBlock* leave = newBB("str.rep.leave");
+        b.CreateBr(head);
+        b.SetInsertPoint(head);
+        llvm::Value* i = counted
+            ? b.CreateLoad(f64t, remaining) : nullptr;
+        llvm::Value* indexValue = foreach
+            ? b.CreateLoad(f64t, index) : nullptr;
+        llvm::Value* go;
+        if (counted) {
+            go = b.CreateFCmpOGE(i, cf64(0.5));
+        } else if (foreach) {
+            llvm::Value* bound =
+                emitToNumF64(emitInputOf(loop, "VALUE"));
+            go = b.CreateFCmpOLT(indexValue, bound);
+        } else {
+            llvm::Value* cond =
+                emitTruthyV(emitInputOf(loop, "CONDITION"));
+            go = until ? b.CreateNot(cond) : cond;
+        }
+        b.CreateCondBr(go, body, done);
+        b.SetInsertPoint(body);
+        if (foreach) {
+            llvm::Value* nextIndex = b.CreateFAdd(indexValue, cf64(1.0));
+            emitVarSet(indexVar, emitCanon(nextIndex));
+        }
+        llvm::Value* existing = b.CreateLoad(ptrt, currentLog);
+        b.CreateCondBr(b.CreateIsNull(existing), start, continuing);
+        b.SetInsertPoint(start);
+        llvm::Value* initial = b.CreateLoad(i64t, varPtr);
+        llvm::Value* fresh = call2("xyo_transient_begin", ptrt, initial, varPtr);
+        b.CreateStore(fresh, currentLog);
+        b.CreateBr(push);
+        b.SetInsertPoint(continuing);
+        b.CreateBr(push);
+        b.SetInsertPoint(push);
+        PHINode* state = b.CreatePHI(ptrt, 2);
+        state->addIncoming(fresh, start);
+        state->addIncoming(existing, continuing);
+
+        llvm::Value* logicalCount = ci64(1);
+        if (batching) {
+            llvm::Value* poll = b.CreateLoad(i64t, curYieldCnt);
+            llvm::Value* toCheckpoint =
+                b.CreateSub(ci64(64), b.CreateAnd(poll, ci64(63)));
+            llvm::Value* enough = b.CreateFCmpOGE(
+                i, b.CreateFSub(b.CreateUIToFP(toCheckpoint, f64t), cf64(0.5)));
+            llvm::Value* safe = b.CreateAnd(
+                b.CreateFCmpOLE(i, cf64(4503599627370496.0)),
+                b.CreateICmpNE(curYieldWarp, ci32(0)));
+            logicalCount = b.CreateSelect(
+                b.CreateAnd(enough, safe), toCheckpoint, ci64(1));
+            if (batchPiece.dynamic) {
+                llvm::Value* rhs = emitInputBlock(batchPiece.dynamic->id);
+                call3("xyo_transient_append_repeat_value", voidt,
+                      state, rhs, b.CreateTrunc(logicalCount, i32t));
+            } else if (batchPiece.packedLength) {
+                llvm::Value* meta = b.CreateOr(
+                    ci64(uint64_t(batchPiece.packedLength) << 32),
+                    logicalCount);
+                call3("xyo_transient_append_repeat_packed", voidt,
+                      state, ci64(batchPiece.packed), meta);
+            } else {
+                call3("xyo_transient_append_repeat_string", voidt,
+                      state, batchPiece.literal,
+                      b.CreateTrunc(logicalCount, i32t));
+            }
+            b.CreateStore(
+                b.CreateAdd(poll, b.CreateSub(logicalCount, ci64(1))),
+                curYieldCnt);
+        } else {
+            // Preserve the exact Scratch order of every independent variable
+            // update and append. Only the destination's repeated SStr node
+            // allocations are elided.
+            for (size_t step = 0; step < plan.actions.size(); ++step) {
+                const auto& action = plan.actions[step];
+                if (action.isAppend) {
+                    for (const auto& piece : emitted[step])
+                        emitTransientPiece(state, piece);
+                } else {
+                    emitStackBlock(action.statement);
+                }
+            }
+        }
+
+        activeTransient = currentLog;
+        activeTransientVariable = varPtr;
+        emitLoopYield();
+        activeTransient = nullptr;
+        activeTransientVariable = nullptr;
+        if (counted) {
+            llvm::Value* next = b.CreateLoad(f64t, remaining);
+            b.CreateStore(b.CreateFSub(
+                next, b.CreateUIToFP(logicalCount, f64t)), remaining);
+        } else if (foreach) {
+            b.CreateStore(b.CreateFAdd(
+                b.CreateLoad(f64t, index), cf64(1.0)), index);
+        }
+        b.CreateBr(head);
+
+        b.SetInsertPoint(done);
+        llvm::Value* last = b.CreateLoad(ptrt, currentLog);
+        b.CreateCondBr(b.CreateIsNull(last), leave, publish);
+        b.SetInsertPoint(publish);
+        call2("xyo_transient_finish", voidt, last, varPtr);
+        b.CreateBr(leave);
+        b.SetInsertPoint(leave);
+        endLoopYieldScope(true);
+    }
+
+    // Multiple independent destination strings can be batched together when
+    // every instruction in the repeat body is a constant self-append. There
+    // are no intermediate observers, so each variable can have its own
+    // immutable prefix snapshot and its own copy-on-write log.
+    struct MultiTransientVar {
+        const BlockField* field = nullptr;
+        std::u16string text;
+    };
+    std::optional<std::vector<MultiTransientVar>>
+    multiTransientPattern(Block* loop) {
+        if (aot || !curFnWarp || activeTransient ||
+            (std::getenv("XYO_JIT_TRANSIENT_STRINGS") &&
+             std::getenv("XYO_JIT_TRANSIENT_STRINGS")[0] == '0') ||
+            (std::getenv("XYO_JIT_TRANSIENT_MULTI") &&
+             std::getenv("XYO_JIT_TRANSIENT_MULTI")[0] == '0'))
+            return std::nullopt;
+        const BlockInput* substack = loop->inputs.find("SUBSTACK");
+        if (!substack || substack->block.empty()) return std::nullopt;
+        auto body = chainOf(substack->block);
+        if (body.size() < 2 || body.size() > 16 || !body.back()->next.empty())
+            return std::nullopt;
+        std::vector<MultiTransientVar> vars;
+        for (Block* statement : body) {
+            if (statement->opcode != "data_setvariableto") return std::nullopt;
+            const BlockField* field = findField(statement, "VARIABLE");
+            Block* value = transientChild(statement, "VALUE");
+            if (!field || field->id.empty() || !value ||
+                value->opcode != "operator_join") return std::nullopt;
+            Block* left = transientChild(value, "STRING1");
+            Block* right = transientChild(value, "STRING2");
+            const BlockField* source =
+                left && left->opcode == "data_variable"
+                    ? findField(left, "VARIABLE") : nullptr;
+            if (!source || source->id != field->id) return std::nullopt;
+            std::vector<TransientPiece> pieces;
+            if (!collectTransientPieces(right, field->id, pieces))
+                return std::nullopt;
+            size_t index = 0;
+            while (index < vars.size() && vars[index].field->id != field->id)
+                ++index;
+            if (index == vars.size()) {
+                if (vars.size() == 4) return std::nullopt;
+                for (const auto& other : vars) {
+                    // Conservative fallback for malformed SB3s with distinct
+                    // variable IDs but identical fallback names.
+                    if (other.field->value.isString() && field->value.isString() &&
+                        other.field->value.asStrPtr() &&
+                        field->value.asStrPtr() &&
+                        other.field->value.asStrPtr()->view() ==
+                            field->value.asStrPtr()->view())
+                        return std::nullopt;
+                }
+                vars.push_back({field, {}});
+            }
+            for (const auto& piece : pieces) {
+                if (piece.dynamic ||
+                    vars[index].text.size() + piece.text.size() > 4096)
+                    return std::nullopt;
+                vars[index].text += piece.text;
+            }
+        }
+        if (vars.size() < 2) return std::nullopt;
+        for (const auto& var : vars) {
+            if (var.text.empty()) return std::nullopt;
+            if (auto* promoted = findPromoted(var.field);
+                promoted && promoted->numeric)
+                return std::nullopt;
+        }
+        return vars;
+    }
+
+    void emitTransientMultiRepeat(
+        Block* loop, const std::vector<MultiTransientVar>& vars) {
+        if (verbose)
+            std::fprintf(stderr, "xyo-jit: transient MULTI %s vars=%zu\n",
+                         loop->id.c_str(), vars.size());
+        llvm::Value* count = emitToNumF64(emitInputOf(loop, "TIMES"));
+        beginLoopYieldScope();
+        AllocaInst* remaining = entryAlloca(f64t, 1, "str.multi.left");
+        b.CreateStore(count, remaining);
+        std::vector<AllocaInst*> logs;
+        std::vector<llvm::Value*> variablePointers;
+        std::vector<TransientEmittedPiece> data;
+        logs.reserve(vars.size());
+        variablePointers.reserve(vars.size());
+        data.reserve(vars.size());
+        for (const auto& var : vars) {
+            AllocaInst* state = entryAlloca(ptrt, 1, "str.multi.log");
+            b.CreateStore(cnull(), state);
+            logs.push_back(state);
+            variablePointers.push_back(varValuePtr(var.field));
+            data.push_back(makeTransientPiece(
+                TransientPiece{var.text, nullptr}, true));
+        }
+        const bool batching =
+            !std::getenv("XYO_JIT_TRANSIENT_BATCH") ||
+            std::getenv("XYO_JIT_TRANSIENT_BATCH")[0] != '0';
+
+        BasicBlock* head = newBB("str.multi.head");
+        BasicBlock* body = newBB("str.multi.body");
+        BasicBlock* done = newBB("str.multi.done");
+        b.CreateBr(head);
+        b.SetInsertPoint(head);
+        llvm::Value* n = b.CreateLoad(f64t, remaining);
+        b.CreateCondBr(b.CreateFCmpOGE(n, cf64(0.5)), body, done);
+        b.SetInsertPoint(body);
+
+        llvm::Value* logicalCount = ci64(1);
+        if (batching) {
+            llvm::Value* poll = b.CreateLoad(i64t, curYieldCnt);
+            llvm::Value* untilPoll =
+                b.CreateSub(ci64(64), b.CreateAnd(poll, ci64(63)));
+            llvm::Value* fits = b.CreateFCmpOGE(
+                n, b.CreateFSub(
+                    b.CreateUIToFP(untilPoll, f64t), cf64(0.5)));
+            llvm::Value* safe = b.CreateAnd(
+                b.CreateFCmpOLE(n, cf64(4503599627370496.0)),
+                b.CreateICmpNE(curYieldWarp, ci32(0)));
+            logicalCount = b.CreateSelect(
+                b.CreateAnd(fits, safe), untilPoll, ci64(1));
+            b.CreateStore(
+                b.CreateAdd(poll, b.CreateSub(logicalCount, ci64(1))),
+                curYieldCnt);
+        }
+
+        for (size_t i = 0; i < vars.size(); ++i) {
+            llvm::Value* initial = b.CreateLoad(ptrt, logs[i]);
+            BasicBlock* create = newBB("str.multi.start");
+            BasicBlock* reuse = newBB("str.multi.reuse");
+            BasicBlock* ready = newBB("str.multi.ready");
+            b.CreateCondBr(b.CreateIsNull(initial), create, reuse);
+            b.SetInsertPoint(create);
+            llvm::Value* bits = b.CreateLoad(i64t, variablePointers[i]);
+            llvm::Value* log = call2("xyo_transient_begin", ptrt, bits,
+                                      variablePointers[i]);
+            b.CreateStore(log, logs[i]);
+            b.CreateBr(ready);
+            b.SetInsertPoint(reuse);
+            b.CreateBr(ready);
+            b.SetInsertPoint(ready);
+            PHINode* state = b.CreatePHI(ptrt, 2);
+            state->addIncoming(log, create);
+            state->addIncoming(initial, reuse);
+            if (batching) {
+                if (data[i].packedLength) {
+                    llvm::Value* meta = b.CreateOr(
+                        ci64(uint64_t(data[i].packedLength) << 32),
+                        logicalCount);
+                    call3("xyo_transient_append_repeat_packed", voidt,
+                          state, ci64(data[i].packed), meta);
+                } else {
+                    call3("xyo_transient_append_repeat_string", voidt,
+                          state, data[i].literal,
+                          b.CreateTrunc(logicalCount, i32t));
+                }
+            } else {
+                emitTransientPiece(state, data[i]);
+            }
+        }
+
+        activeTransient = logs[0];
+        activeTransientVariable = variablePointers[0];
+        for (size_t i = 1; i < vars.size(); ++i)
+            activeExtraTransients.push_back({logs[i], variablePointers[i]});
+        emitLoopYield();
+        activeExtraTransients.clear();
+        activeTransient = nullptr;
+        activeTransientVariable = nullptr;
+        llvm::Value* old = b.CreateLoad(f64t, remaining);
+        b.CreateStore(b.CreateFSub(
+            old, b.CreateUIToFP(logicalCount, f64t)), remaining);
+        b.CreateBr(head);
+
+        b.SetInsertPoint(done);
+        for (size_t i = 0; i < vars.size(); ++i) {
+            BasicBlock* publish = newBB("str.multi.finish");
+            BasicBlock* next = newBB("str.multi.next");
+            llvm::Value* log = b.CreateLoad(ptrt, logs[i]);
+            b.CreateCondBr(b.CreateIsNull(log), next, publish);
+            b.SetInsertPoint(publish);
+            call2("xyo_transient_finish", voidt, log,
+                  variablePointers[i]);
+            b.CreateBr(next);
+            b.SetInsertPoint(next);
+        }
+        endLoopYieldScope(true);
+    }
+
     void emitStackBlock(Block* blk) {
         const std::string& op = blk->opcode;
 
@@ -4353,6 +5010,14 @@ struct Codegen {
         }
 
         if (op == "control_repeat") {
+            if (auto plan = multiTransientPattern(blk)) {
+                emitTransientMultiRepeat(blk, *plan);
+                return;
+            }
+            if (auto plan = transientRepeatPattern(blk)) {
+                emitTransientRepeat(blk, *plan);
+                return;
+            }
             // for (i = toNum(TIMES); i >= 0.5; i--) { body; loopYield }
             // Fixed-count straight-line bodies are eligible for bounded
             // strip-mining into groups of at most 512 logical iterations.
@@ -4514,6 +5179,14 @@ struct Codegen {
         }
 
         if (op == "control_while" || op == "control_repeat_until") {
+            if (auto plan = transientRepeatPattern(blk)) {
+                if (safeTransientReporter(
+                        transientChild(blk, "CONDITION"),
+                        plan->variable->id)) {
+                    emitTransientRepeat(blk, std::move(*plan));
+                    return;
+                }
+            }
             BasicBlock* head = BasicBlock::Create(lc, "", fn);
             BasicBlock* bodyBB = BasicBlock::Create(lc, "", fn);
             BasicBlock* merge = BasicBlock::Create(lc, "", fn);
@@ -4569,6 +5242,16 @@ struct Codegen {
         }
 
         if (op == "control_for_each") {
+            if (auto plan = transientRepeatPattern(blk)) {
+                const BlockField* indexVar = findField(blk, "VARIABLE");
+                if (indexVar && !indexVar->id.empty() &&
+                    indexVar->id != plan->variable->id &&
+                    safeTransientReporter(
+                        transientChild(blk, "VALUE"), plan->variable->id)) {
+                    emitTransientRepeat(blk, std::move(*plan));
+                    return;
+                }
+            }
             // Scratch の for_each は index=0 から index < toNum(VALUE) の間
             // 回る（scratch3_control.forEach）。値が整数でない場合に
             // ceil 回になるので i=1..<=n では合わない（2.5 → 3 回）。

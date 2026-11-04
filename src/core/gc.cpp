@@ -495,6 +495,9 @@ void Gc::drainPending() {
                 };
                 markChild(s->left);
                 markChild(s->right);
+            } else if (s->isAppend()) {
+                // Prefix snapshot: its single GC-owned log holds immutable chunks.
+                markPtr(s->left);
             }
         }
     }
@@ -646,6 +649,8 @@ void Gc::collect() {
             if (h->type == GcType::List) {
                 auto* list = reinterpret_cast<SList*>(h + 1);
                 listBytes += size_t(list->cap) * sizeof(Value);
+            } else if (h->type == GcType::AppendLog) {
+                listBytes += appendLogExternalBytes(h + 1);
             }
         } else {
             destroyPayload(h);
@@ -710,7 +715,9 @@ void Gc::destroyPayload(GcHeader* h) {
     } else if (h->type == GcType::Str) {
         // cons の flatten 結果は GC オブジェクトではないので明示的に返す。
         auto* s = reinterpret_cast<SStr*>(h + 1);
-        if (s->isCons() && s->body) std::free(s->body);
+        if (s->isComposite() && s->body) std::free(s->body);
+    } else if (h->type == GcType::AppendLog) {
+        destroyAppendLog(h + 1);
     }
 }
 

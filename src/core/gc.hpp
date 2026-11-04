@@ -17,7 +17,7 @@
 
 namespace xyo {
 
-enum class GcType : uint16_t { Str = 1, List = 2 };
+enum class GcType : uint16_t { Str = 1, List = 2, AppendLog = 3 };
 
 struct GcHeader {
     GcHeader* next;    // 全オブジェクト侵入リスト
@@ -147,6 +147,10 @@ public:
     bool isObject(void* p) const;
 
     size_t bytesAllocated() const { return bytesAllocated_.load(std::memory_order_relaxed); }
+    // Append-log chunks live outside the GC allocation payload.
+    void noteExternalAllocation(size_t bytes) {
+        bytesAllocated_.fetch_add(bytes, std::memory_order_relaxed);
+    }
     /// Diagnostic counts require a quiescent collector (workers joined, no
     /// concurrent allocation/collection), as do the slab and malloc registries.
     size_t objectCount() const {

@@ -35,6 +35,7 @@ struct SStr {
     char16_t* body;
     // char16_t data[len+1] がここに続く（flat のみ）
     static constexpr uint32_t kConsFlag = 1;
+    static constexpr uint32_t kAppendFlag = 8; // append-log prefix snapshot
     /// kAsciiKnown が立っていれば kAsciiValue が ASCII 性を表す（遅延計算）。
     static constexpr uint32_t kAsciiKnown = 2;
     static constexpr uint32_t kAsciiValue = 4;
@@ -83,18 +84,23 @@ struct SStr {
     static_assert(std::atomic_ref<uint32_t>::required_alignment <= alignof(uint32_t));
 
     bool isCons() const { return flags & kConsFlag; }
+    bool isAppend() const { return flags & kAppendFlag; }
+    bool isComposite() const { return flags & (kConsFlag | kAppendFlag); }
     /// flat の本体（構造体直後）。cons では left/right がここに入る。
     char16_t* inlineBody() { return reinterpret_cast<char16_t*>(this + 1); }
     const char16_t* inlineBody() const {
         return reinterpret_cast<const char16_t*>(this + 1);
     }
     char16_t* data() {
-        return isCons() ? const_cast<char16_t*>(consBody()) : inlineBody();
+        return isCons() ? const_cast<char16_t*>(consBody()) :
+               isAppend() ? const_cast<char16_t*>(appendBody()) : inlineBody();
     }
-    const char16_t* data() const { return isCons() ? consBody() : inlineBody(); }
+    const char16_t* data() const { return isCons() ? consBody() :
+                                     isAppend() ? appendBody() : inlineBody(); }
     std::u16string_view view() const { return {data(), len}; }
     /// cons を 1 回だけ materialize して本体を返す（string_util.cpp）。
     const char16_t* consBody() const;
+    const char16_t* appendBody() const;
     /// Read one UTF-16 unit without flattening shallow cons paths. The caller
     /// must check index < len. Deep paths fall back to materialization so random
     /// access over a skewed rope cannot repeatedly walk its entire depth.
@@ -129,6 +135,10 @@ SStr* sstrConcat(std::u16string_view a, std::u16string_view b);
 /// 連結ノード（V8 の cons string 相当）: コピーせず left/right を保持し、
 /// 本文は view()/data() が初めて必要になったときに 1 回だけ作る。
 SStr* sstrCons(SStr* a, SStr* b);
+/// Optional append-log snapshots: enabled by XYO_STRING_APPEND_LOG=1.
+SStr* sstrConsOrAppend(SStr* a, SStr* b);
+void destroyAppendLog(void* ptr);
+size_t appendLogExternalBytes(void* ptr);
 /// 後段が ASCII（数値表記など）の結合 — 中間 SStr を作らない
 SStr* sstrConcatAscii(std::u16string_view a, std::string_view b);
 SStr* sstrLower(std::u16string_view sv);
