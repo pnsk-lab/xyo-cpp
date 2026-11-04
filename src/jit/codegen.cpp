@@ -3825,7 +3825,13 @@ struct Codegen {
             llvm::Value* x = emitToNumF64(emitInputOf(blk, "NUM"));
             // JS Math.round は .5 を +Infinity 方向へ丸め、-0 を保持する。
             // llvm.round + 0.0 は負の .5 と -0 で Scratch と違う。
-            llvm::Value* rounded = inlineJsRound
+            // Baseline AOT must not emit an external roundeven libcall:
+            // the intrinsic needs SSE4.1 for an inlined lowering, but that
+            // instruction set is not guaranteed on portable x86-64 targets
+            // and the roundeven symbol is absent on some Windows runtimes.
+            // Keep the portable, already-registered helper for AOT; JIT
+            // retains the fast native inline lowering.
+            llvm::Value* rounded = inlineJsRound && !aot
                 ? emitJsRound(x) : call1("xyo_round", f64t, x);
             llvm::Value* result = pureMathFacts
                 ? emitCanonKnownNonNaN(rounded) : emitCanon(rounded);

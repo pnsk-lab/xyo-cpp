@@ -42,6 +42,17 @@ jobs:
           bash tools/ci/smoke.sh play build/xyo
           bash tools/ci/smoke.sh gui build/xyo
 
+      # The host runner can execute native AVX instructions, masking a bug
+      # in portable AOT artifacts. Emulate baseline x86-64 (without SSE4.1
+      # or AVX) so a native-tuned AOT regression fails before publishing.
+      - name: AOT portability smoke（baseline x86-64）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user
+          mkdir -p build/aot-portability
+          build/xyo aot examples/play_demo.sb3 --obj build/aot-portability/play.o
+          qemu-x86_64 -cpu qemu64 build/xyo run examples/play_demo.sb3 --aot build/aot-portability/play.o --frames 30
+
       - name: パッケージ
         run: |
           mkdir -p dist/pkg

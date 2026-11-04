@@ -209,11 +209,21 @@ bool compileProject(Runtime& rt, uint64_t projectHash, BuildResult& out,
         if (why) *why = "no target: " + err;
         return false;
     }
+    // AOT objects are embedded in executables and may run on a different
+    // machine than the compiler (including GitHub Actions runners). The LLVM
+    // CPU *name* alone is not a reliable proxy for the actual virtual CPU
+    // features, and native tuning can emit instructions absent on the host.
+    // Use the architecture baseline by default. Explicitly request native
+    // tuning only for machine-local AOT builds.
+    const char* requestedCpu = std::getenv("XYO_AOT_TARGET_CPU");
+    const std::string cpu = requestedCpu && requestedCpu[0]
+        ? (std::strcmp(requestedCpu, "native") == 0
+            ? llvm::sys::getHostCPUName().str() : requestedCpu)
+        : "generic";
     llvm::TargetOptions opt;
     auto tm = std::unique_ptr<llvm::TargetMachine>(
         target->createTargetMachine(llvmc::tripleArg(triple),
-                                    llvm::sys::getHostCPUName().str(), "", opt,
-                                    llvm::Reloc::PIC_));
+                                    cpu, "", opt, llvm::Reloc::PIC_));
     if (!tm) {
         if (why) *why = "TargetMachine creation failed";
         return false;
