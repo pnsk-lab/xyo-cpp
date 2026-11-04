@@ -1,0 +1,28 @@
+---
+title: xyo-cpp
+description: Scratch プロジェクトをネイティブで動かす LLVM JIT ランタイム
+template: splash
+hero:
+  tagline: Scratch をより速く、より深く。
+  actions:
+    - text: はじめる
+      link: /xyo-cpp/getting-started/
+      icon: right-arrow
+      variant: primary
+    - text: GitHub
+      link: https://github.com/pnsk-lab/xyo-cpp
+      icon: external
+      variant: minimal
+---
+import { CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+xyo-cpp は Scratch 3 形式のプロジェクトを読み込み、インタプリタ・LLVM JIT・AOT で実行する C++20 製ランタイムです。
+
+<CardGrid>
+  <LinkCard title="クイックスタート" href="/xyo-cpp/getting-started/" description="SB3 プロジェクトをすぐに実行します。" />
+  <LinkCard title="実行モード" href="/xyo-cpp/guide/execution/" description="HotSpot、Eager JIT、インタプリタを理解します。" />
+  <LinkCard title="内部構造" href="/xyo-cpp/architecture/overview/" description="IR・ファイバ・スケジューラの構成。" />
+  <LinkCard title="パフォーマンス" href="/xyo-cpp/development/testing/" description="測定と互換性の検証方法。" />
+</CardGrid>
+
+ネイティブ実行のほか、SDL2 を使った画面表示、単体実行ファイルの書き出し、SB3 の解析・最適化、WebAssembly ビルドにも対応しています。機能と制限はプラットフォームによって異なります。

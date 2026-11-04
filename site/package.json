@@ -1,0 +1,1 @@
+{"name":"xyo-cpp-docs","private":true,"type":"module","scripts":{"dev":"node scripts/sync-docs.mjs && astro dev","build":"node scripts/sync-docs.mjs && astro build","preview":"astro preview"},"dependencies":{"astro":"^5.15.0","@astrojs/starlight":"^0.36.0"}}
