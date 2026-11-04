@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "../core/json.hpp"
+#include "graphic_effects.hpp"
 #include "blocks.hpp"
 #include "variable.hpp"
 
@@ -94,7 +95,7 @@ public:
     double videoTransparency = 50;        // stage
     std::string videoState = "on";        // stage: on/off/on-flipped
     std::string textToSpeechLanguage;     // stage
-    std::map<std::string, double> effects;
+    GraphicEffects effects;
     std::map<std::string, double> soundEffects; // Scratch.sound state.effects
     /// ペン拡張状態（pen.cpp が遅延生成。clone 時に複製）
     std::unique_ptr<PenState> penState;

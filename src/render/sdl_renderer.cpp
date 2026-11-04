@@ -877,9 +877,8 @@ bool SdlRenderer::skinPxAt(const Drawable& d, double px, double py,
     DrawXform f;
     if (!xformFor(d, *s, f)) return false;
     Rendered r;
-    const auto ghost = t->effects.find("ghost");
     // Scratch collision/mask passes ignore the ghost alpha of the tester.
-    const bool rawMask = ignoreGhost && ghost != t->effects.end() && ghost->second != 0;
+    const bool rawMask = ignoreGhost && t->effects.get("ghost") != 0;
     const Rendered* rd = rawMask ? nullptr : renderedFor(t, s, &r);
     if (rawMask) {
         r.px = s->px.data();

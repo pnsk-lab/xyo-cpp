@@ -29,12 +29,11 @@ struct FxUniforms {
     float ghost = 0;       // 1 - clamp(x,0,100)/100  （alpha 乗数）
 };
 
-double eff(const std::map<std::string, double>& e, const char* k) {
-    auto it = e.find(k);
-    return it != e.end() ? it->second : 0.0;
+double eff(const GraphicEffects& e, const char* k) {
+    return e.get(k);
 }
 
-FxUniforms toUniforms(const std::map<std::string, double>& e) {
+FxUniforms toUniforms(const GraphicEffects& e) {
     FxUniforms u;
     u.color = std::fmod(eff(e, "color") / 200.0, 1.0);
     u.fisheye = std::max(0.0, (eff(e, "fisheye") + 100.0) / 100.0);
@@ -109,13 +108,11 @@ void sampleBilinear(const uint8_t* src, int w, int h, double u, double v,
 
 } // namespace
 
-bool hasActiveEffects(const std::map<std::string, double>& effects) {
-    for (auto& [k, v] : effects)
-        if (v != 0.0) return true;
-    return false;
+bool hasActiveEffects(const GraphicEffects& effects) {
+    return effects.anyActive();
 }
 
-std::string effectKey(const std::map<std::string, double>& effects) {
+std::string effectKey(const GraphicEffects& effects) {
     char buf[160];
     std::snprintf(buf, sizeof(buf),
                   "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f",
@@ -127,7 +124,7 @@ std::string effectKey(const std::map<std::string, double>& effects) {
 }
 
 void applyEffects(const uint8_t* src, int w, int h,
-                  const std::map<std::string, double>& effects,
+                  const GraphicEffects& effects,
                   std::vector<uint8_t>& out) {
     const FxUniforms u = toUniforms(effects);
     out.resize(static_cast<size_t>(w) * h * 4);

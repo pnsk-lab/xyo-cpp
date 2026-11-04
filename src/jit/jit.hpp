@@ -221,6 +221,10 @@ struct CompiledScript {
     std::unordered_map<std::string, ScriptFn> procedures;
     /// 生成コード内に yield 点が存在するか。false なら fiber なしで同期実行可。
     bool mayYield = true;
+    // A bounded, synchronous script executes faster in scheduler order than
+    // through a dependency graph and worker dispatch. Calculated once from
+    // the script's structural scan, never from benchmark names or input.
+    bool shortSync = false;
     /// Compat/reporter fallbacks or AOT-owned GPU programs require the caller
     /// thread even when opcode-level dependency analysis looks compute-only.
     bool mainThread = false;

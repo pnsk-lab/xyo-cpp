@@ -462,6 +462,134 @@ void testBroadcastReceiverReuse() {
           "only executed receiver effects are visible after replacement");
 }
 
+void testGraphicEffectsStorage() {
+    GraphicEffects base;
+    check(base.size() == 7 && base.count("ghost") == 1 &&
+          base.count("unknown") == 0 && !base.anyActive(),
+          "fixed graphics effects provide seven zero-valued entries");
+    base["ghost"] = 45.0;
+    base["fisheye"] = -10.0;
+    base["custom_fx"] = 15.0;
+    check(base.size() == 8 && base.count("custom_fx") == 1 &&
+          base.get("custom_fx") == 15.0 && base.anyActive(),
+          "custom graphics effect keys retain legacy map insertion semantics");
+    GraphicEffects copied = base;
+    check(copied == base, "graphics effects copy preserves all values");
+    check(copied.erase("ghost") == 1 &&
+          copied.erase("ghost") == 0 &&
+          copied.count("ghost") == 0 &&
+          copied.size() == 7 &&
+          copied.get("ghost") == 0.0,
+          "erasing a standard graphics effect retains map semantics");
+    copied["ghost"] = 45.0;
+    check(copied == base && copied.size() == 8,
+          "recreating an erased graphics effect restores its value and key");
+    check(copied.erase("custom_fx") == 1 &&
+          copied.count("custom_fx") == 0,
+          "custom graphics effect erase remains supported");
+    copied["custom_fx"] = 15.0;
+    copied["ghost"] = 12.0;
+    check(base.get("ghost") == 45.0 && copied != base,
+          "copying graphic effects produces independent mutable storage");
+    copied.clearValues();
+    check(!copied.anyActive() && copied.size() == 8 &&
+          copied.count("custom_fx") == 1 &&
+          copied.get("custom_fx") == 0.0,
+          "clearing graphic effects retains known and custom keys");
+}
+
+void testBroadcastIndexInvalidation() {
+    const std::string receiver =
+        "{\"recv\":{\"opcode\":\"event_whenbroadcastreceived\","
+        "\"topLevel\":true,\"next\":\"inc\",\"inputs\":{},"
+        "\"fields\":{\"BROADCAST_OPTION\":[\"PING\",null]}},"
+        "\"inc\":" +
+        block("data_changevariableby", nullptr,
+              "{\"VALUE\":[1,[4,\"1\"]]}",
+              "{\"VARIABLE\":[\"s\",\"s\"]}") + "}";
+    const std::string json =
+        "{\"targets\":[" + target("Stage", "{}", true) + "," +
+        target("Receiver", receiver) +
+        "],\"monitors\":[],\"extensions\":[],\"meta\":{}}";
+    Runtime rt;
+    const auto loaded = loadSb3(rt, json, nullptr);
+    check(loaded.ok, "load broadcast-index fixture");
+    if (!loaded.ok) return;
+    Target* receiverTarget = rt.getSpriteTargetByName(u"Receiver");
+    Variable* shared = rt.getTargetForStage()->lookupVariableById("s");
+    if (!receiverTarget || !shared) {
+        check(false, "broadcast-index fixture has receivers and shared var");
+        return;
+    }
+
+    rt.startBroadcast(u"ping");
+    rt.runUntilDone(50);
+    check(cast::toNumber(shared->value) == 1,
+          "first case-insensitive broadcast is delivered");
+
+    Block* hat = receiverTarget->blocks->getBlock("recv");
+    if (!hat) {
+        check(false, "receiver hat exists");
+        return;
+    }
+    hat->fields["BROADCAST_OPTION"].value =
+        Value::string(SStr::create(u"PONG"));
+    receiverTarget->blocks->resetCache();
+    rt.startBroadcast(u"ping");
+    check(rt.threads.empty(), "stale broadcast subscription invalidated");
+    rt.startBroadcast(u"pOnG");
+    rt.runUntilDone(50);
+    check(cast::toNumber(shared->value) == 2,
+          "renamed broadcast subscription is available");
+
+    // The clone constructor skips temporary effect-map initialization.
+    // Verify that inherited effects (including nonzero values) are exactly
+    // equal to those of the source target.
+    check(receiverTarget->effects.size() == 7,
+          "original target initializes all visual effects");
+    receiverTarget->effects["ghost"] = 37.0;
+    receiverTarget->effects["fisheye"] = -12.0;
+    Target* clone = receiverTarget->makeClone();
+    check(clone != nullptr, "create subscriber clone");
+    if (!clone) return;
+    check(clone->effects == receiverTarget->effects &&
+          clone->effects.size() == 7,
+          "clone inherits exact source effect map without extra initialization");
+    rt.addTarget(clone);
+    clone->goBehindOther(receiverTarget);
+    rt.startBroadcast(u"pong");
+    rt.runUntilDone(50);
+    check(cast::toNumber(shared->value) == 4,
+          "new clone receives exactly one additional broadcast");
+    rt.disposeTarget(clone);
+    rt.startBroadcast(u"PONG");
+    rt.runUntilDone(50);
+    check(cast::toNumber(shared->value) == 5,
+          "disposed clone subscription is removed");
+
+    // Last-clone pop_back and non-last erase must both preserve membership.
+    Target* a = receiverTarget->makeClone();
+    Target* b = receiverTarget->makeClone();
+    if (!a || !b) {
+        check(false, "create two further clones");
+        if (a) { rt.addTarget(a); rt.disposeTarget(a); }
+        if (b) { rt.addTarget(b); rt.disposeTarget(b); }
+        return;
+    }
+    rt.addTarget(a);
+    rt.addTarget(b);
+    check(receiverTarget->sprite->clones.size() == 3,
+          "original and two clones appear in sprite list");
+    rt.disposeTarget(a);
+    check(receiverTarget->sprite->clones.size() == 2 &&
+          receiverTarget->sprite->clones.back() == b,
+          "disposing a non-last clone preserves later clone");
+    rt.disposeTarget(b);
+    check(receiverTarget->sprite->clones.size() == 1 &&
+          receiverTarget->sprite->clones.front() == receiverTarget,
+          "disposing the last clone returns to original-only list");
+}
+
 void testThreadMembership() {
     Runtime rt;
     const auto loaded = loadSb3(rt, project(false, false), nullptr);
@@ -627,6 +755,46 @@ void testThreadReclamation() {
     Gc::get().collect();
 }
 
+void testRecycledThreadStorage() {
+    if (const char* setting = std::getenv("XYO_THREAD_REUSE");
+        setting && setting[0] == '0') return;
+    Runtime rt;
+    const auto loaded = loadSb3(rt, project(false, false), nullptr);
+    check(loaded.ok, "load recycle fixture");
+    if (!loaded.ok) return;
+    Target* stage = rt.getTargetForStage();
+    Thread* held = rt.pushThread("held", stage, false, true);
+    Thread* recycled = rt.pushThread("recycled", stage, false, true);
+    held->status = recycled->status = STATUS_DONE;
+    held->stack.clear();
+    recycled->stack.clear();
+    rt.threads.clear();
+    // This pointer could be a pending UI handle or join result; it must
+    // never be recycled while the runtime advertises that ownership.
+    rt.lastStepDoneThreads.push_back(held);
+    recycled->justReported = Value::string(SStr::create(u"old value"));
+    rt.reclaimThreads();
+    check(rt.ownedThreads.size() == 1 &&
+              rt.ownedThreads.front().get() == held,
+          "live done-thread handle survives recycling");
+    check(rt.reusableThreads.size() == 1 &&
+              rt.reusableThreads.back().get() == recycled,
+          "unreferenced done-thread storage enters pool");
+    Gc::get().collect();
+    Thread* next = rt.pushThread("new-identity", stage, false, true);
+    check(next == recycled && next != held,
+          "new script reuses only unreferenced thread storage");
+    check(next->topBlock == "new-identity" &&
+              next->status == STATUS_RUNNING && next->target == stage &&
+              next->justReported.isUndefined() &&
+              next->compatibilityStackFrame.startedThreads.empty() &&
+              next->idCache_.empty(),
+          "recycled thread has fresh logical identity and state");
+    check(rt.containsThread(next), "recycled thread has current index");
+    check(held->topBlock == "held" && held->status == STATUS_DONE,
+          "held thread remains an independent completed identity");
+}
+
 void testFrameAddressStability() {
     Thread thread("frames");
     std::vector<StackFrame*> frames;
@@ -783,6 +951,7 @@ int test_scheduler_main() {
     testPool();
     testThreadMembership();
     testThreadReclamation();
+    testRecycledThreadStorage();
     testFrameAddressStability();
     testWaitUntilChain();
     testFractionalLayerMovement();
@@ -793,6 +962,8 @@ int test_scheduler_main() {
     testSharedYieldChain();
     testBroadcastYieldChain();
     testBroadcastReceiverReuse();
+    testGraphicEffectsStorage();
+    testBroadcastIndexInvalidation();
     testSelfBroadcastDoesNotRecycleActiveFiber();
     testCompatBarrier();
     std::printf("scheduler: %d checks, %d failures\n", checks, failures);

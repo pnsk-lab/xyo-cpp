@@ -161,6 +161,23 @@ public:
     std::vector<Target*> executableTargets;  // 実行対象（stage 最後）
     std::vector<std::unique_ptr<Sprite>> ownedSprites;   // sb3 ロード時の所有
     std::deque<std::unique_ptr<Thread>> ownedThreads;
+    // Only threads proven unreachable by reclaimThreads enter this pool.
+    // A pending join, detached pass or GC-visible frame always retains its
+    // original identity; pooling live Thread* would introduce ABA bugs.
+    std::vector<std::unique_ptr<Thread>> reusableThreads;
+    struct BroadcastReceiver {
+        Target* target = nullptr;
+        std::string blockId;
+        const Block* top = nullptr;
+    };
+    // Rebuilt on structural changes (clone creation/disposal, script edits).
+    // shared_ptr snapshots remain valid across reentrant broadcast callbacks.
+    std::unordered_map<std::u16string,
+        std::shared_ptr<const std::vector<BroadcastReceiver>>> broadcastIndex;
+    bool broadcastIndexDirty = true;
+    void invalidateBroadcastIndex() { broadcastIndexDirty = true; }
+    std::shared_ptr<const std::vector<BroadcastReceiver>>
+    broadcastReceivers(std::u16string_view name);
     /// 回収（ownedThreads から解放）を次に試すサイズ。回収は O(n) なので
     /// 25% 増えるたびに間引く — 償却 O(1)/スレッド。
     size_t reclaimAt = 4096;

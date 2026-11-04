@@ -45,6 +45,11 @@ void Thread::releaseFinished() {
 }
 
 void Thread::pushStack(const std::string& blockId) {
+    // A tiny native script can begin with only its root block ID. If it
+    // unexpectedly enters a procedure or compatibility frame, materialize
+    // the missing root frame before pushing the nested frame.
+    while (stackFrames.size() < stack.size())
+        stackFrames.emplace_back(std::make_unique<StackFrame>());
     stack.push_back(blockId);
     if (stack.size() > stackFrames.size()) {
         bool parentWarp = !stackFrames.empty() && stackFrames.back()->warpMode;
@@ -68,6 +73,8 @@ void Thread::reuseStackForNextBlock(const std::string& blockId) {
 }
 
 std::string Thread::popStack() {
+    while (stackFrames.size() < stack.size())
+        stackFrames.emplace_back(std::make_unique<StackFrame>());
     std::string id = stack.back();
     stack.pop_back();
     // JS GC 相当: ポップしてもオブジェクト自体は生かしておく
@@ -113,6 +120,10 @@ std::string Thread::peekStack() const {
 }
 
 StackFrame* Thread::peekStackFrame() {
+    // Lazily materialize a root frame when an otherwise synchronous native
+    // script visits interpreter compatibility or explicit frame inspection.
+    while (stackFrames.size() < stack.size())
+        stackFrames.emplace_back(std::make_unique<StackFrame>());
     return stackFrames.empty() ? nullptr : stackFrames.back().get();
 }
 

@@ -390,6 +390,7 @@ void Blocks::restoreState(std::unordered_map<std::string, Block> blocks,
 }
 
 void Blocks::resetCache() {
+    if (runtime) runtime->invalidateBroadcastIndex();
     cache_.inputs.clear();
     cache_.procedureDefinitions.clear();
     cache_.procedurePrototypes.clear();

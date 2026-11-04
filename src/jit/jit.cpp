@@ -1102,6 +1102,13 @@ const CompiledScript* JitEngine::compile(Thread& thread, Runtime& runtime,
     }
     cs->entry = reinterpret_cast<ScriptFn>(addrOr->getValue());
     cs->lazy = lazyThisScript;
+    // Compiling a script does not imply its scheduler should launch worker
+    // batches. A very small script that never suspends is best executed
+    // immediately in Scratch order. Keep long/looping code parallelizable.
+    const auto profileIt = profiles_.find(top);
+    cs->shortSync = !cs->mayYield && !cs->mainThread &&
+        profileIt != profiles_.end() && profileIt->second.hasLoop == 1 &&
+        profileIt->second.nodeCount > 0 && profileIt->second.nodeCount <= 8;
     // Looking up every procedure in lazy mode defeats on-demand function
     // materialization. Generated Scratch code calls via ORC trampolines;
     // no runtime consumer reads CompiledScript::procedures in this path.

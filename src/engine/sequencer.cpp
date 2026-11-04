@@ -156,7 +156,21 @@ std::vector<Thread*> Sequencer::stepThreads() {
             }
             if (activeThread->status == STATUS_RUNNING ||
                 activeThread->status == STATUS_YIELD) {
-                const AccessSet* access = allowParallel
+                // Tiny scripts whose generated entry cannot yield are
+                // cheaper to run in-order than to enqueue, build conflict
+                // groups and hand off to workers. Long or yielding scripts
+                // retain the original parallel scheduling policy.
+                static const bool serialShortSync = [] {
+                    const char* env = std::getenv("XYO_SHORT_SYNC_SERIAL");
+                    return !env || env[0] != '0';
+                }();
+                const auto* compiled = activeThread->isCompiled
+                    ? static_cast<const CompiledScript*>(
+                        activeThread->compiled)
+                    : nullptr;
+                const bool immediate = serialShortSync && compiled &&
+                    compiled->shortSync;
+                const AccessSet* access = allowParallel && !immediate
                     ? parallelAccessFor(*activeThread) : nullptr;
                 if (access) {
                     // 並列バッチに溜める — flush は次の serial スレッドの

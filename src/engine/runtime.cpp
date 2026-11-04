@@ -65,13 +65,28 @@ Thread* Runtime::pushThread(const std::string& id, Target* target,
     std::chrono::steady_clock::time_point t0;
     if (pp.enabled) { t0 = now(); }
 #endif
-    auto thread = std::make_unique<Thread>(id);
+    static const bool recycleEnabled = [] {
+        const char* env = std::getenv("XYO_THREAD_REUSE");
+        return !env || env[0] != '0';
+    }();
+    std::unique_ptr<Thread> thread;
+    if (recycleEnabled && !reusableThreads.empty()) {
+        thread = std::move(reusableThreads.back());
+        reusableThreads.pop_back();
+        // Reconstruct rather than partially resetting: the old target,
+        // variable slots, frame owners, profile hints, and ID cache must not
+        // leak into a new logical Scratch script.
+        std::string newId(id);
+        std::destroy_at(thread.get());
+        std::construct_at(thread.get(), std::move(newId));
+    } else {
+        thread = std::make_unique<Thread>(id);
+    }
     Thread* t = thread.get();
     t->target = target;
     t->stackClick = stackClick;
     t->updateMonitor = updateMonitor;
     t->blockContainer = updateMonitor ? monitorBlocks.get() : target->blocks;
-    t->pushStack(id);
     t->runtimeIndex = threads.size();
     threads.push_back(t);
     ownedThreads.push_back(std::move(thread));
@@ -82,6 +97,19 @@ Thread* Runtime::pushThread(const std::string& id, Target* target,
     if (pp.enabled) { pp.allocNs += std::chrono::duration<double,std::nano>(now()-t0).count(); t0 = now(); }
 #endif
     if (!updateMonitor) t->tryCompile(topHint);
+    // A short synchronous native entry never needs the interpreter's root
+    // StackFrame. Defer its heap allocation until a frame is first requested.
+    // Every fallback/non-JIT script retains the eager root frame invariant.
+    static const bool lazyRootFrame = [] {
+        const char* env = std::getenv("XYO_LAZY_ROOT_FRAME");
+        return !env || env[0] != '0';
+    }();
+    const auto* compiled = t->isCompiled
+        ? static_cast<const CompiledScript*>(t->compiled) : nullptr;
+    if (lazyRootFrame && compiled && compiled->shortSync)
+        t->stack.push_back(id);
+    else
+        t->pushStack(id);
 #if !defined(XYO_DISABLE_RT_PROF)
     if (pp.enabled) { pp.compileNs += std::chrono::duration<double,std::nano>(now()-t0).count(); ++pp.n; }
 #endif
@@ -100,7 +128,6 @@ Thread* Runtime::restartThread(Thread* thread, const Block* topHint) {
     n->stackClick = thread->stackClick;
     n->updateMonitor = thread->updateMonitor;
     n->blockContainer = thread->blockContainer;
-    n->pushStack(thread->topBlock);
     if (thread->isCompiled) {
         // A restarted script has exactly the same entry block and compiled
         // code. The CompiledScript is owned by JitEngine, not by the Thread.
@@ -113,13 +140,32 @@ Thread* Runtime::restartThread(Thread* thread, const Block* topHint) {
     } else if (thread->triedToCompile) {
         n->tryCompile(topHint);
     }
+    const auto* compiled = n->isCompiled
+        ? static_cast<const CompiledScript*>(n->compiled) : nullptr;
+    static const bool lazyRootFrame = [] {
+        const char* env = std::getenv("XYO_LAZY_ROOT_FRAME");
+        return !env || env[0] != '0';
+    }();
+    if (lazyRootFrame && compiled && compiled->shortSync)
+        n->stack.push_back(thread->topBlock);
+    else
+        n->pushStack(thread->topBlock);
     if (!n->stackClick && !n->updateMonitor) {
         threadMap[n->getId()] = n;
     }
-    for (size_t i = 0; i < threads.size(); ++i) {
-        if (threads[i] == thread) {
-            n->runtimeIndex = i;
-            threads[i] = n;
+    // A restartable broadcast may replace hundreds of receivers in a
+    // single scheduler pass. Search-by-identity costs O(receiver-count²).
+    // The stored index is a hint, not an invariant: callers can modify the
+    // public threads vector. Validate it and fall back to the exact scan.
+    size_t index = thread->runtimeIndex;
+    if (index >= threads.size() || threads[index] != thread) {
+        const auto found = std::find(threads.begin(), threads.end(), thread);
+        index = found == threads.end() ? threads.size()
+                                       : size_t(found - threads.begin());
+    }
+    if (index < threads.size()) {
+            n->runtimeIndex = index;
+            threads[index] = n;
             ownedThreads.push_back(std::move(nt));
             // The replaced thread will never be scheduled again. Release
             // suspended fibers and their 1 MiB stack mappings immediately.
@@ -132,7 +178,6 @@ Thread* Runtime::restartThread(Thread* thread, const Block* topHint) {
             if (thread != sequencer->activeThread)
                 sequencer->retireThread(*thread);
             return n;
-        }
     }
     n->runtimeIndex = threads.size();
     threads.push_back(n);
@@ -222,43 +267,56 @@ std::vector<Thread*> Runtime::startHats(
 
     const size_t startingThreadCount = threads.size();
 
-    forEachScriptByOpcode(requestedHatOpcode,
-        [&](const RuntimeScriptCache& script, Target* target) {
-            // フィールド一致（キャッシュ側は大文字化済み、JS: !== 厳密比較）
-            for (auto& [mf, want] : matchFields) {
-                auto it = script.fieldsOfInputs.find(mf);
-                if (it == script.fieldsOfInputs.end()) return;
-                const Value& fv = it->second;
-                SStr* s = fv.isString() ? fv.asStrPtr() : nullptr;
-                if (!s || s->view() != want) return;
+    const auto spawnMatched = [&](const std::string& topBlockId,
+                                  const Block* top, Target* target) {
+        if (hatMeta.restartExistingThreads) {
+            static thread_local std::string lookupKey;
+            lookupKey.assign(target->id);
+            lookupKey.push_back('&');
+            lookupKey.append(topBlockId);
+            auto it = threadMap.find(lookupKey);
+            if (it != threadMap.end()) {
+                newThreads.push_back(restartThread(it->second, top));
+                return;
             }
-            const std::string& topBlockId = script.blockId;
-            if (hatMeta.restartExistingThreads) {
-                // Broadcast can restart the same hat thousands of times per
-                // frame. Reuse key storage instead of allocating the composite
-                // target/block identity for every lookup.
-                static thread_local std::string lookupKey;
-                lookupKey.assign(target->id);
-                lookupKey.push_back('&');
-                lookupKey.append(topBlockId);
-                auto it = threadMap.find(lookupKey);
-                if (it != threadMap.end()) {
-                    newThreads.push_back(restartThread(it->second, script.block));
+        } else {
+            for (size_t j = 0; j < startingThreadCount; ++j) {
+                if (threads[j]->target == target &&
+                    threads[j]->topBlock == topBlockId &&
+                    !threads[j]->stackClick &&
+                    threads[j]->status != STATUS_DONE)
                     return;
-                }
-            } else {
-                for (size_t j = 0; j < startingThreadCount; ++j) {
-                    if (threads[j]->target == target &&
-                        threads[j]->topBlock == topBlockId &&
-                        !threads[j]->stackClick &&
-                        threads[j]->status != STATUS_DONE) {
-                        return;
-                    }
-                }
             }
-            newThreads.push_back(
-                pushThread(topBlockId, target, false, false, script.block));
-        }, optTarget);
+        }
+        newThreads.push_back(
+            pushThread(topBlockId, target, false, false, top));
+    };
+    // Broadcast-and-wait must keep its returned Thread* list (unlike the
+    // fire-and-forget path), but it can use exactly the same subscriber index.
+    // Other hats and explicit target selections retain generic matching.
+    const bool indexedBroadcast =
+        requestedHatOpcode == "event_whenbroadcastreceived" &&
+        optTarget == nullptr && matchFields.size() == 1 &&
+        matchFields.begin()->first == "BROADCAST_OPTION";
+    if (indexedBroadcast) {
+        const auto receivers = broadcastReceivers(matchFields.begin()->second);
+        if (receivers) {
+            for (const BroadcastReceiver& receiver : *receivers)
+                spawnMatched(receiver.blockId, receiver.top, receiver.target);
+        }
+    } else {
+        forEachScriptByOpcode(requestedHatOpcode,
+            [&](const RuntimeScriptCache& script, Target* target) {
+                for (const auto& [field, expected] : matchFields) {
+                    auto it = script.fieldsOfInputs.find(field);
+                    if (it == script.fieldsOfInputs.end()) return;
+                    const Value& value = it->second;
+                    SStr* str = value.isString() ? value.asStrPtr() : nullptr;
+                    if (!str || str->view() != expected) return;
+                }
+                spawnMatched(script.blockId, script.block, target);
+            }, optTarget);
+    }
 
     // Scratch 2 互換: 新スレッドのハット即時評価
     for (Thread* t : newThreads) {
@@ -272,6 +330,41 @@ std::vector<Thread*> Runtime::startHats(
     return newThreads;
 }
 
+std::shared_ptr<const std::vector<Runtime::BroadcastReceiver>>
+Runtime::broadcastReceivers(std::u16string_view name) {
+    if (broadcastIndexDirty) {
+        // Collect subscriptions once in Scratch execution order. Clones
+        // share Blocks, but retain independent Thread identities and their
+        // insertion position in executableTargets.
+        std::unordered_map<std::u16string, std::vector<BroadcastReceiver>> groups;
+        static const std::string opcode = "event_whenbroadcastreceived";
+        static const std::string fieldName = "BROADCAST_OPTION";
+        for (auto it = executableTargets.rbegin();
+             it != executableTargets.rend(); ++it) {
+            Target* target = *it;
+            for (const auto& script : target->blocks->getRuntimeScripts(opcode)) {
+                const auto field = script.fieldsOfInputs.find(fieldName);
+                if (field == script.fieldsOfInputs.end() ||
+                    !field->second.isString()) continue;
+                SStr* str = field->second.asStrPtr();
+                if (!str) continue;
+                groups[std::u16string(str->view())].push_back(
+                    {target, script.blockId, script.block});
+            }
+        }
+        broadcastIndex.clear();
+        for (auto& [key, list] : groups) {
+            broadcastIndex.emplace(
+                std::move(key),
+                std::make_shared<const std::vector<BroadcastReceiver>>(
+                    std::move(list)));
+        }
+        broadcastIndexDirty = false;
+    }
+    const auto it = broadcastIndex.find(u16ToUpper(name));
+    return it == broadcastIndex.end() ? nullptr : it->second;
+}
+
 // Only the non-waiting broadcast path uses this API. Broadcast-and-wait
 // must preserve the exact returned Thread* set for its join semantics.
 void Runtime::startBroadcast(std::u16string_view name) {
@@ -280,35 +373,14 @@ void Runtime::startBroadcast(std::u16string_view name) {
     if (hat == hats.end()) return;
     const HatMeta meta = hat->second;
 
-    // Script input fields were uppercased when the runtime script cache was
-    // built. ASCII names are the frequent case and need no temporary string.
-    const bool ascii = std::all_of(name.begin(), name.end(),
-                                   [](char16_t ch) { return ch < 128; });
-    std::u16string upper;
-    if (!ascii) upper = u16ToUpper(name);
-    const auto matching = [&](const RuntimeScriptCache& script) {
-        const auto field = script.fieldsOfInputs.find("BROADCAST_OPTION");
-        if (field == script.fieldsOfInputs.end()) return false;
-        const Value& v = field->second;
-        SStr* s = v.isString() ? v.asStrPtr() : nullptr;
-        if (!s) return false;
-        const auto expected = s->view();
-        if (!ascii) return expected == upper;
-        if (expected.size() != name.size()) return false;
-        for (size_t i = 0; i < name.size(); ++i) {
-            const char16_t ch = name[i];
-            const char16_t up = ch >= u'a' && ch <= u'z' ? ch - 32 : ch;
-            if (up != expected[i]) return false;
-        }
-        return true;
-    };
+    const auto receivers = broadcastReceivers(name);
+    if (!receivers) return;
 
     const size_t startingThreadCount = threads.size();
     std::vector<Thread*> interpreted;
-    forEachScriptByOpcode(opcode,
-        [&](const RuntimeScriptCache& script, Target* target) {
-            if (!matching(script)) return;
-            const std::string& top = script.blockId;
+    for (const BroadcastReceiver& receiver : *receivers) {
+            Target* target = receiver.target;
+            const std::string& top = receiver.blockId;
             Thread* next = nullptr;
             if (meta.restartExistingThreads) {
                 static thread_local std::string key;
@@ -337,7 +409,7 @@ void Runtime::startBroadcast(std::u16string_view name) {
                         previous->pushStack(top);
                         next = previous;
                     } else {
-                        next = restartThread(previous, script.block);
+                        next = restartThread(previous, receiver.top);
                     }
                 }
             } else {
@@ -348,10 +420,10 @@ void Runtime::startBroadcast(std::u16string_view name) {
                         threads[j]->status != STATUS_DONE) return;
                 }
             }
-            if (!next) next = pushThread(top, target, false, false, script.block);
+            if (!next) next = pushThread(top, target, false, false, receiver.top);
             next->reusableBroadcastReceiver = next->isCompiled;
             if (!next->isCompiled) interpreted.push_back(next);
-        }, nullptr);
+    }
     for (Thread* t : interpreted) {
         execute(*sequencer, *t);
         t->goToNextBlock();
@@ -369,6 +441,7 @@ void Runtime::stopForTarget(Target* target, Thread* optException) {
 }
 
 void Runtime::stopAll() {
+    invalidateBroadcastIndex();
     emitProjectStopAll();
     // クローンを廃棄（dispose が executableTargets/sprite.clones から除去）
     std::vector<Target*> keep;
@@ -450,10 +523,23 @@ void Runtime::reclaimThreads() {
         if (t->jitCtx && t->jitCtx->joinRefs)
             for (Thread* s : *t->jitCtx->joinRefs) retain(s);
     }
-    // Compact ownership, not just Thread payloads. Leaving null slots makes
-    // both future reclamation and GC root visits scale with historical spawns.
-    std::erase_if(ownedThreads, [&](const auto& up) {
-        return !up || !refs.contains(up.get());
+    // Compact ownership, not just Thread payloads. Threads no longer
+    // reachable through *any* join, runtime, frame or detached-pass reference
+    // can donate their storage. Crucially this check occurs before recycling,
+    // not opportunistically inside pushThread(), which cannot prove liveness.
+    static const bool recycleEnabled = [] {
+        const char* env = std::getenv("XYO_THREAD_REUSE");
+        return !env || env[0] != '0';
+    }();
+    constexpr size_t kMaxReusableThreads = 2048;
+    std::erase_if(ownedThreads, [&](auto& up) {
+        if (!up) return true;
+        if (refs.contains(up.get())) return false;
+        if (recycleEnabled && reusableThreads.size() < kMaxReusableThreads) {
+            up->releaseFinished();
+            reusableThreads.push_back(std::move(up));
+        }
+        return true;
     });
     reclaimAt = ownedThreads.size() + ownedThreads.size() / 4 + 1024;
 }
@@ -549,11 +635,13 @@ void Runtime::processWaitQueue() {
 // --------------------------------------------------------------- targets --
 
 void Runtime::addTarget(Target* target) {
+    invalidateBroadcastIndex();
     targets.push_back(target);
     executableTargets.push_back(target);
 }
 
 void Runtime::moveExecutable(Target* target, double delta) {
+    invalidateBroadcastIndex();
     auto it = std::find(executableTargets.begin(), executableTargets.end(), target);
     if (it == executableTargets.end()) return;
     int oldIndex = int(it - executableTargets.begin());
@@ -573,21 +661,44 @@ void Runtime::moveExecutable(Target* target, double delta) {
 }
 
 void Runtime::setExecutablePosition(Target* target, int newIndex) {
+    // Integer layer placement already knows the destination. Calling the
+    // relative move routine searches the same vector twice and converts
+    // the index through floating point. Reorder directly, preserving its
+    // clamp and stage-first rules (including out-of-range positions).
     auto it = std::find(executableTargets.begin(), executableTargets.end(), target);
     if (it == executableTargets.end()) return;
-    moveExecutable(target, newIndex - int(it - executableTargets.begin()));
+    invalidateBroadcastIndex();
+    executableTargets.erase(it);
+    int dest = std::clamp(newIndex, 0, int(executableTargets.size()));
+    if (dest == 0 && !executableTargets.empty() &&
+        executableTargets.front()->isStage)
+        dest = 1;
+    executableTargets.insert(executableTargets.begin() + dest, target);
 }
 
 void Runtime::removeExecutable(Target* target) {
-    auto it = std::find(executableTargets.begin(), executableTargets.end(), target);
+    invalidateBroadcastIndex();
+    if (!executableTargets.empty() && executableTargets.back() == target) {
+        executableTargets.pop_back();
+        return;
+    }
+    const auto it = std::find(executableTargets.begin(), executableTargets.end(), target);
     if (it != executableTargets.end()) executableTargets.erase(it);
 }
 
 void Runtime::disposeTarget(Target* target) {
-    auto it = std::find(targets.begin(), targets.end(), target);
-    if (it == targets.end()) return;
-    target->dispose();
-    targets.erase(it);
+    // Recently created Scratch clones are usually also the last target.
+    // Avoid a linear membership scan for the common case, but retain
+    // stable ordering and the exact erase semantics for other targets.
+    if (!targets.empty() && targets.back() == target) {
+        target->dispose();
+        targets.pop_back();
+    } else {
+        const auto it = std::find(targets.begin(), targets.end(), target);
+        if (it == targets.end()) return;
+        target->dispose();
+        targets.erase(it);
+    }
     // editingTarget が消えたターゲットを指すと addMonitorScript が freed
     // ターゲットへスレッドを生成する（モニタ UAF）。次のスプライトへ移す。
     if (editingTarget == target) {

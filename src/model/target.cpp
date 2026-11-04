@@ -26,17 +26,21 @@ Target* Sprite::createClone(const std::string& layerGroup) {
 }
 
 void Sprite::removeClone(Target* clone) {
-    for (auto it = clones.begin(); it != clones.end(); ++it)
-        if (*it == clone) { clones.erase(it); return; }
+    // The common clone churn pattern removes the most recently created
+    // clone. pop_back avoids scanning/moving unrelated clone pointers.
+    if (!clones.empty() && clones.back() == clone) {
+        clones.pop_back();
+        return;
+    }
+    const auto it = std::find(clones.begin(), clones.end(), clone);
+    if (it != clones.end()) clones.erase(it);
 }
 
 Target::Target(Runtime* rt, Sprite* spr)
     : runtime(rt), id(genId()), sprite(spr),
       blocks(spr ? spr->blocks.get() : new Blocks(rt)) {
-    // RenderedTarget 相当 — エフェクト7種を 0 で初期化
-    for (const char* e : {"color", "fisheye", "whirl", "pixelate",
-                          "mosaic", "brightness", "ghost"})
-        effects[e] = 0;
+    // GraphicEffects initializes its seven values without allocating map
+    // nodes. Clones copy their source's fixed-size array in makeClone().
 }
 
 // ---------------------------------------------------------------- 変数 --
@@ -267,7 +271,7 @@ void Target::setEffect(const std::string& name, double value) {
 }
 
 void Target::clearEffects() {
-    for (auto& [k, v] : effects) v = 0;
+    effects.clearValues();
     if (runtime && runtime->renderer && visible) {
         emitVisualChange();
         runtime->redrawRequested = true;
@@ -418,6 +422,7 @@ bool Target::keepInFence(double nx, double ny, double& fx, double& fy) const {
 
 std::unordered_map<std::string, Variable> Target::duplicateVariables() {
     std::unordered_map<std::string, Variable> out;
+    out.reserve(variables.size());
     for (auto& [vid, v] : variables) {
         Variable nv;
         nv.id = v.id;                 // クローンは同じ変数 id を共有
