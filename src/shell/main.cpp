@@ -71,7 +71,7 @@ static int usage() {
     std::fprintf(stderr,
         "usage:\n"
         "  xyo run <project.sb3> [--frames N] [--aot obj]"
-        " [--jit hotspot|eager|off] [--danger]\n"
+        " [--jit hotspot|eager|off] [--jit-lazy auto|on|off] [--danger]\n"
         "          [--fps N] [--print-list NAME]\n"
         "      --fps: 1 ステップを 1/N 秒に合わせる（scratch-vm の 30fps 相当。"
         "既定 0 = 最速）\n"
@@ -97,10 +97,12 @@ static int usage() {
         " 未参照アセット削除）\n"
         "      --aggressive: 未使用の変数/リスト/ブロードキャストも削除\n"
         "  xyo test <fixture.sb3|dir> [--aot obj]"
-        " [--jit hotspot|eager|off] [--danger]  （既定 eager）\n"
+        " [--jit hotspot|eager|off] [--jit-lazy auto|on|off] [--danger]  （既定 eager）\n"
         "  --jit: hotspot=インタプリタ→ホットなスクリプトだけ JIT（既定）,\n"
         "         eager=全スクリプトを spawn 時にコンパイル（テスト/ベンチ用）,"
         " off=インタプリタのみ\n"
+        "  --jit-lazy: auto=HotSpotが手続き利用量で自動選択（既定）、\n"
+        "              on=必要時に最適化・コンパイル、off=事前コンパイル\n"
         "  --danger: スレッドごとの実行時間予算（warp 500ms）を外す危険モード。\n"
         "  --list-limit N: リスト長の上限（0 = 無制限、既定 0）。Scratch と同じ\n"
         "         挙動にするなら 200000（XYO_LIST_LIMIT でも指定可）。\n"
@@ -1142,6 +1144,17 @@ int main(int argc, char** argv) {
             JitMode m;
             if (!parseJitMode(argv[++i], &m)) return usage();
             setJitMode(m);
+        }
+        else if (std::strncmp(argv[i], "--jit-lazy=", 11) == 0) {
+            JitLazyMode m;
+            if (!parseJitLazyMode(argv[i] + 11, &m)) return usage();
+            setJitLazyMode(m);
+        }
+        else if (std::strcmp(argv[i], "--jit-lazy") == 0 &&
+                 i + 1 < argc) {
+            JitLazyMode m;
+            if (!parseJitLazyMode(argv[++i], &m)) return usage();
+            setJitLazyMode(m);
         }
         else if (std::strcmp(argv[i], "--save") == 0 && i + 1 < argc) {
             g_saveAfterRun = argv[++i];

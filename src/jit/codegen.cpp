@@ -19,6 +19,7 @@
 
 #include <cstddef>
 #include <cmath>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -75,6 +76,10 @@ struct Codegen {
         return mode && mode[0] == '0';
     }();
     // Compiled-code A/B switch; never read getenv in a generated hot path.
+    const bool sharedWarpClock = [] {
+        const char* env = std::getenv("XYO_JIT_WARP_CLOCK");
+        return !env || env[0] != '0';
+    }();
     const bool safeArithCanon = [] {
         const char* mode = std::getenv("XYO_JIT_SAFE_ARITH_CANON");
         return !mode || mode[0] != '0';
@@ -90,6 +95,58 @@ struct Codegen {
         const char* mode = std::getenv("XYO_JIT_MOD_OUTLINE_WIDE");
         return !mode || mode[0] != '0';
     }();
+    // Native IEEE roundeven with correct JS half-tie adjustment removes the
+    // runtime helper call; retain a reference opt-out for differential tests.
+    const bool inlineJsRound = [] {
+        const char* mode = std::getenv("XYO_JIT_ROUND_INLINE");
+        return !mode || mode[0] != '0';
+    }();
+    const bool integralFactsEnabled = [] {
+        const char* mode = std::getenv("XYO_JIT_INTEGRAL_FACTS");
+        return !mode || mode[0] != '0';
+    }();
+    // Prove bounded induction values instead of guessing from type feedback.
+    const bool inductionRangesEnabled = [] {
+        const char* mode = std::getenv("XYO_JIT_INDUCTION_RANGES");
+        return !mode || mode[0] != '0';
+    }();
+    // Static bounded repeat counts can use an exact integral countdown.
+    // No runtime guard is needed: all nonconstant or out-of-range counts
+    // keep the existing IEEE double loop.
+    const bool repeatIntegerCounter = [] {
+        const char* mode = std::getenv("XYO_JIT_REPEAT_INT_COUNTER");
+        return !mode || mode[0] != '0';
+    }();
+    const bool foreachIntegerCounter = [] {
+        const char* mode = std::getenv("XYO_JIT_FOREACH_INT_COUNTER");
+        return !mode || mode[0] != '0';
+    }();
+    const bool pureMathFacts = [] {
+        const char* mode = std::getenv("XYO_JIT_PURE_MATH_FACTS");
+        return !mode || mode[0] != '0';
+    }();
+    // The i32 modulo fast path is guarded to (0, INT32_MAX] (or
+    // [1, INT32_MAX] for its divisor). In this domain signed and unsigned
+    // conversions have identical exact results; signed conversion lowers
+    // to native CVTTSD2SI without an unsigned-range fixup.
+    const bool modSignedI32 = [] {
+        const char* mode = std::getenv("XYO_JIT_MOD_SIGNED_I32");
+        return !mode || mode[0] != '0';
+    }();
+    // Propagate finite f64 facts from arithmetic reporters (not only
+    // literals/induction variables) into "change variable by" shadows.
+    // Facts only refer to current SSA values and never cross a yield.
+    const bool arithmeticDeltaFacts = [] {
+        const char* mode = std::getenv("XYO_JIT_FINITE_ARITH_DELTA");
+        return !mode || mode[0] != '0';
+    }();
+    // Optional interval transfer functions. Facts are attached to immutable
+    // LLVM SSA doubles, never to mutable Scratch storage or type feedback.
+    const bool arithmeticRangeFacts = [] {
+        const char* mode = std::getenv("XYO_JIT_ARITH_RANGE_FACTS");
+        return !mode || mode[0] != '0';
+    }();
+
 
     // 手続き variantKey(proccode|warp) → 宣言済み Function
     std::map<std::string, Function*> procFns;
@@ -755,19 +812,52 @@ struct Codegen {
             b.CreateICmpEQ(b.CreateAnd(n, ci64(63)), ci64(0));
         hotBr(due, chkBB, done, 1, 63);
         b.SetInsertPoint(chkBB);
-        if (promoted.empty() && promotedLists.empty()) {
+        if (!sharedWarpClock && promoted.empty() && promotedLists.empty()) {
             call1("xyo_loop_yield", voidt, ctxArg);
             b.CreateBr(done);
         } else {
-            // A warp time check reads only the scheduler clock. It cannot
-            // mutate variables or run another script. Check FIRST; spill and
-            // reload only on the actual handoff. This keeps the typed SSA
-            // values intact on the overwhelmingly common non-yield path.
-            llvm::Value* shouldYield =
-                call1("xyo_warp_yield_due", i32t, ctxArg);
+            llvm::Value* shouldYield;
+            if (sharedWarpClock) {
+                auto* clockField = b.CreateConstGEP1_32(
+                    i8t, ctxArg,
+                    uint32_t(offsetof(JitCtx, sampledWarpClockUs)));
+                auto* clockPtr = b.CreateLoad(ptrt, clockField);
+                auto* sampled = newBB("warp.sampled.clock");
+                auto* fallback = newBB("warp.clock.fallback");
+                auto* merge = newBB("warp.clock.merge");
+                hotBr(b.CreateICmpNE(clockPtr, cnull()),
+                      sampled, fallback, 1000, 1);
+
+                b.SetInsertPoint(sampled);
+                auto* timeUs = b.CreateLoad(i64t, clockPtr);
+                timeUs->setAtomic(AtomicOrdering::Monotonic);
+                auto* deadlineField = b.CreateConstGEP1_32(
+                    i8t, ctxArg,
+                    uint32_t(offsetof(JitCtx, sampledWarpDeadlineUs)));
+                auto* deadlinePtr = b.CreateLoad(ptrt, deadlineField);
+                auto* deadlineUs = b.CreateLoad(i64t, deadlinePtr);
+                deadlineUs->setAtomic(AtomicOrdering::Monotonic);
+                auto* expired = b.CreateICmpSGT(timeUs, deadlineUs);
+                b.CreateBr(merge);
+
+                b.SetInsertPoint(fallback);
+                auto* oldDue = call1("xyo_warp_yield_due", i32t, ctxArg);
+                auto* oldExpired = b.CreateICmpNE(oldDue, ci32(0));
+                b.CreateBr(merge);
+
+                b.SetInsertPoint(merge);
+                auto* joined = b.CreatePHI(b.getInt1Ty(), 2);
+                joined->addIncoming(expired, sampled);
+                joined->addIncoming(oldExpired, fallback);
+                shouldYield = joined;
+            } else {
+                shouldYield = b.CreateICmpNE(
+                    call1("xyo_warp_yield_due", i32t, ctxArg), ci32(0));
+            }
+            // Neither a sampled clock read nor the fallback synchronous
+            // check changes Scratch variables. Spill only on actual yield.
             BasicBlock* handoff = newBB("yield.handoff");
-            hotBr(b.CreateICmpNE(shouldYield, ci32(0)),
-                  handoff, done, 1, 100000);
+            hotBr(shouldYield, handoff, done, 1, 100000);
             b.SetInsertPoint(handoff);
             spillPromoted();
             call1("xyo_yield", voidt, ctxArg);
@@ -807,6 +897,64 @@ struct Codegen {
     // produce NaN when added to a non-NaN promoted accumulator.
     std::unordered_set<std::string> finiteInductionVars;
     std::unordered_set<llvm::Value*> knownFiniteDeltas;
+    struct IntInterval {
+        int64_t lo, hi;
+    };
+    // Lexically scoped index proof. Valid only between for-each's implicit
+    // index write and the end of its yield-free, index-write-free body.
+    std::unordered_map<std::string, IntInterval> activeInductionRanges;
+    // Abstract interpretation of immutable LLVM SSA doubles. Never attach
+    // ranges to a mutable variable, profile prediction, or non-SSA memory.
+    std::unordered_map<llvm::Value*, IntInterval> integerValueRanges;
+    std::optional<IntInterval> intInterval(llvm::Value* number) const {
+        if (!inductionRangesEnabled) return std::nullopt;
+        if (auto it = integerValueRanges.find(number);
+            it != integerValueRanges.end()) return it->second;
+        const auto* c = llvm::dyn_cast<llvm::ConstantFP>(number);
+        if (!c || !c->getValueAPF().isFinite()) return std::nullopt;
+        const double d = c->getValueAPF().convertToDouble();
+        if (d < -2147483647.0 || d > 2147483647.0 ||
+            std::trunc(d) != d) return std::nullopt;
+        const int64_t n = static_cast<int64_t>(d);
+        return IntInterval{n, n};
+    }
+    void recordIntInterval(llvm::Value* boxed, IntInterval range) {
+        if (!inductionRangesEnabled || range.lo < -2147483647LL ||
+            range.hi > 2147483647LL || range.lo > range.hi) return;
+        if (auto it = knownNumD.find(boxed); it != knownNumD.end()) {
+            integerValueRanges[it->second] = range;
+            integralWhenFinite.insert(it->second);
+            finiteArithmetic.insert(it->second);
+        }
+    }
+    std::optional<IntInterval> arithmeticIntInterval(
+            llvm::Value* fa, llvm::Value* fb, int operation) const {
+        auto a = intInterval(fa);
+        auto b = intInterval(fb);
+        if (!a || !b) return std::nullopt;
+        int64_t lo = 0, hi = 0;
+        switch (operation) {
+        case 0: // add
+            lo = a->lo + b->lo; hi = a->hi + b->hi; break;
+        case 1: // sub
+            lo = a->lo - b->hi; hi = a->hi - b->lo; break;
+        case 2: { // mul: signed 32-bit inputs -> product fits signed 64-bit
+            const int64_t candidates[4] = {
+                a->lo * b->lo, a->lo * b->hi,
+                a->hi * b->lo, a->hi * b->hi};
+            lo = *std::min_element(std::begin(candidates), std::end(candidates));
+            hi = *std::max_element(std::begin(candidates), std::end(candidates));
+            break;
+        }
+        case 4: // modulo: positive constant divisor, nonnegative dividend
+            if (a->lo < 0 || b->lo != b->hi || b->lo < 1)
+                return std::nullopt;
+            lo = 0; hi = b->lo - 1; break;
+        default: return std::nullopt;
+        }
+        if (lo < -2147483647LL || hi > 2147483647LL) return std::nullopt;
+        return IntInterval{lo, hi};
+    }
 
     // --- ループ内スカラー変数のレジスタ昇格 -----------------------------
     // Scratch 変数は Variable::value（メモリ）に置かれるため、ループの
@@ -890,6 +1038,51 @@ struct Codegen {
     // Scratch variable. They never survive a load or an interpreter handoff.
     // Scratch's toNumber() is non-NaN even for an invalid numeric string.
     std::unordered_set<llvm::Value*> finiteArithmetic;
+    // Absolute-value upper bounds on finite SSA values. Rounded upward so
+    // a saved double never understates the mathematical interval endpoint.
+    std::unordered_map<llvm::Value*, double> finiteUpperBounds;
+    std::optional<double> upperBound(llvm::Value* v) const {
+        if (!arithmeticRangeFacts) return std::nullopt;
+        if (auto it = finiteUpperBounds.find(v);
+            it != finiteUpperBounds.end()) return it->second;
+        auto* constant = llvm::dyn_cast<llvm::ConstantFP>(v);
+        if (!constant || !constant->getValueAPF().isFinite())
+            return std::nullopt;
+        return std::abs(constant->getValueAPF().convertToDouble());
+    }
+    void noteFiniteUpperBound(llvm::Value* boxed, double bound) {
+        if (!arithmeticRangeFacts || !std::isfinite(bound) || bound < 0)
+            return;
+        auto it = knownNumD.find(boxed);
+        if (it == knownNumD.end()) return;
+        finiteArithmetic.insert(it->second);
+        finiteUpperBounds[it->second] = bound;
+    }
+    // Exact IEEE integer *when finite*. This is a property of an SSA producer,
+    // never of mutable variables or profiling predictions. All modulo range
+    // checks remain in place; only its redundant FP->int->FP exactness test
+    // can be skipped when a preceding numeric operation proved integrality.
+    std::unordered_set<llvm::Value*> integralWhenFinite;
+    bool isIntegralF64(llvm::Value* v) const {
+        if (!integralFactsEnabled) return false;
+        if (integralWhenFinite.count(v)) return true;
+        auto* c = llvm::dyn_cast<llvm::ConstantFP>(v);
+        if (!c) return false;
+        const llvm::APFloat& ap = c->getValueAPF();
+        if (!ap.isFinite()) return false;
+        const double value = ap.convertToDouble();
+        return std::trunc(value) == value;
+    }
+    bool isUnitDivisor(llvm::Value* v) const {
+        const auto* c = llvm::dyn_cast<llvm::ConstantFP>(v);
+        return c && c->getValueAPF().isFinite() &&
+               std::abs(c->getValueAPF().convertToDouble()) == 1.0;
+    }
+    void noteIntegralBox(llvm::Value* bits) {
+        if (!integralFactsEnabled) return;
+        if (auto it = knownNumD.find(bits); it != knownNumD.end())
+            integralWhenFinite.insert(it->second);
+    }
     bool arithmeticFinite(llvm::Value* v) const {
         if (finiteArithmetic.count(v)) return true;
         const auto* c = llvm::dyn_cast<llvm::ConstantFP>(v);
@@ -1419,6 +1612,58 @@ struct Codegen {
         }
         return true;
     }
+    // The historical finiteIndexBody() recognizes many operators and merely
+    // proves a finite delta. A *typed interval* is stronger: reject opaque,
+    // extension, random, and potentially side-effecting reporters. The
+    // compiler never substitutes a profile prediction for this structural
+    // proof. It also rejects all nested control constructs and index writes.
+    bool strictInductionBody(const BlockInput* body,
+                             const BlockField* indexField) {
+        if (!indexField || !indexField->value.isString() ||
+            !indexField->value.asStrPtr()) return false;
+        const std::string& indexId = indexField->id;
+        const auto indexName = indexField->value.asStrPtr()->view();
+        if (!finiteIndexBody(body, indexId)) return false;
+        if (!body || body->block.empty()) return false;
+        static const std::unordered_set<std::string> kPure = {
+            "data_variable", "data_setvariableto", "data_changevariableby",
+            "operator_add", "operator_subtract", "operator_multiply",
+            "operator_divide", "operator_mod", "operator_round",
+            "operator_mathop", "operator_lt", "operator_gt",
+            "operator_equals", "operator_and", "operator_or",
+            "operator_not"
+        };
+        std::vector<std::string> todo{body->block};
+        std::unordered_set<std::string> visited;
+        while (!todo.empty()) {
+            std::string id = std::move(todo.back());
+            todo.pop_back();
+            if (id.empty() || !visited.insert(id).second) continue;
+            Block* node = getBlock(id);
+            if (!node) return false;
+            if (!node->shadow && !kPure.count(node->opcode)) return false;
+            if (node->opcode == "data_setvariableto" ||
+                node->opcode == "data_changevariableby") {
+                const BlockField* written = findField(node, "VARIABLE");
+                if (!written) return false;
+                // An invalid/stale ID can resolve by name to this same
+                // Scratch variable. Check both ID and name rather than
+                // trusting the textual ID alone.
+                if (written->id == indexId || !written->value.isString() ||
+                    !written->value.asStrPtr()) return false;
+                if (written->value.asStrPtr()->view() == indexName)
+                    return false;
+            }
+            if (!node->next.empty()) todo.push_back(node->next);
+            for (const auto& [name, in] : node->inputs.items) {
+                (void)name;
+                if (!in.block.empty()) todo.push_back(in.block);
+                if (!in.shadow.empty()) todo.push_back(in.shadow);
+            }
+        }
+        return true;
+    }
+
     const PromotedList* findPromotedList(const std::string& id) const {
         for (const PromotedList& pl : promotedLists)
             if (pl.field->id == id) return &pl;
@@ -1601,6 +1846,19 @@ struct Codegen {
         llvm::Value* bits = b.CreateLoad(i64t, vp);
         if (f && finiteInductionVars.count(f->id))
             knownFiniteDeltas.insert(bits);
+        if (f && inductionRangesEnabled) {
+            if (auto range = activeInductionRanges.find(f->id);
+                range != activeInductionRanges.end()) {
+                // Valid immediately after this for-each's implicit numeric
+                // write, with no yield, opaque call or index write in body.
+                llvm::Value* number = emitAsF64(bits);
+                knownNum.insert(bits);
+                knownNumD[bits] = number;
+                knownNumOk[bits] = b.getTrue();
+                recordIntInterval(bits, range->second);
+                return bits;
+            }
+        }
         if (PromotedVar* p = findPromoted(f)) {
             if (p->numeric) {
                 knownNumD[bits] = b.CreateLoad(f64t, p->dslot);
@@ -1654,6 +1912,7 @@ struct Codegen {
                 finite = !ap.isNaN() && !ap.isInfinity();
             }
             finite |= knownFiniteDeltas.count(delta) != 0;
+            if (arithmeticDeltaFacts) finite |= arithmeticFinite(fb);
             if (finite) {
                 // 影の d は決して NaN にならない（toNum の結果）ので、
                 // 有限デルタでは結果も NaN にならない = 数値比較可。
@@ -1778,6 +2037,19 @@ struct Codegen {
     }
 
     enum class AOp { Add, Sub, Mul, Div, Mod };
+    // Native round-to-even is an SSE4.1 instruction on x86-64. JavaScript
+    // Math.round differs from ties-to-even only when a half-integer rounds
+    // down: those cases need an exact +1 correction. Negative zero, infinities
+    // and already integral values remain unchanged. Sterbenz's lemma makes
+    // x - rounded exact for half-integers, even near the 2^52 boundary.
+    llvm::Value* emitJsRound(llvm::Value* x) {
+        llvm::Value* even = b.CreateUnaryIntrinsic(Intrinsic::roundeven, x);
+        llvm::Value* isHalfDown = b.CreateFCmpOEQ(
+            b.CreateFSub(x, even), cf64(0.5));
+        return b.CreateSelect(isHalfDown,
+                              b.CreateFAdd(even, cf64(1.0)), even);
+    }
+
     /// xyo_add/sub/mul/div/mod と同型 — numCanonical(toNum(a) op
     /// toNum(b)) を直接 emit（helper 呼出しなし）。
     llvm::Value* emitArithNumeric(llvm::Value* fa, llvm::Value* fb,
@@ -1806,6 +2078,22 @@ struct Codegen {
             };
             auto* div = dyn_cast<ConstantFP>(fb);
             double m = div ? div->getValueAPF().convertToDouble() : 0.0;
+            if (inductionRangesEnabled && m >= 1 && m <= 2147483647.0 &&
+                std::trunc(m) == m) {
+                if (auto range = intInterval(fa);
+                    range && range->lo > 0 && range->hi <= 2147483647LL) {
+                    // Positive, exact signed-i32 dividend is statically
+                    // proven. Remove all modulo range/integer/NaN branches.
+                    llvm::Value* n = b.CreateFPToSI(fa, i32t);
+                    llvm::Value* rem = b.CreateSRem(
+                        n, b.getInt32(static_cast<uint32_t>(m)));
+                    llvm::Value* number = b.CreateSIToFP(rem, f64t);
+                    llvm::Value* boxed = emitCanonKnownNonNaN(number);
+                    recordIntInterval(boxed,
+                        IntInterval{0, static_cast<int64_t>(m) - 1});
+                    return boxed;
+                }
+            }
             if (m >= 1 && m <= 2147483647.0 && std::trunc(m) == m) {
                 // For an exact positive i32 dividend, a u32 remainder by a
                 // compile-time constant is much cheaper than a 64-bit signed
@@ -1820,9 +2108,12 @@ struct Codegen {
                     b.CreateFCmpOLE(fa, cf64(2147483647.0)));
                 b.CreateCondBr(smallRange, smallCheck, widePath);
                 b.SetInsertPoint(smallCheck);
-                llvm::Value* smallN = b.CreateFPToUI(fa, i32t);
-                llvm::Value* exact32 = b.CreateFCmpOEQ(
-                    b.CreateUIToFP(smallN, f64t), fa);
+                llvm::Value* smallN = modSignedI32
+                    ? b.CreateFPToSI(fa, i32t)
+                    : b.CreateFPToUI(fa, i32t);
+                llvm::Value* exact32 = isIntegralF64(fa)
+                    ? b.getInt1(true)
+                    : b.CreateFCmpOEQ(b.CreateUIToFP(smallN, f64t), fa);
                 b.CreateCondBr(exact32, smallFast, widePath);
                 b.SetInsertPoint(smallFast);
                 llvm::Value* rem32 = b.CreateURem(
@@ -1843,8 +2134,9 @@ struct Codegen {
                 b.CreateCondBr(inRange, checkInt, slow);
                 b.SetInsertPoint(checkInt);
                 llvm::Value* n = b.CreateFPToSI(fa, i64t);
-                llvm::Value* exact = b.CreateFCmpOEQ(
-                    b.CreateSIToFP(n, f64t), fa);
+                llvm::Value* exact = isIntegralF64(fa)
+                    ? b.getInt1(true)
+                    : b.CreateFCmpOEQ(b.CreateSIToFP(n, f64t), fa);
                 b.CreateCondBr(exact, fast, slow);
                 b.SetInsertPoint(fast);
                 llvm::Value* rem = b.CreateSRem(n, ci64(uint64_t(m)));
@@ -1901,11 +2193,17 @@ struct Codegen {
                                 b.CreateFCmpOLE(fb, cf64(2147483647.0))));
                 b.CreateCondBr(inSmallRange, smallExact, wide);
                 b.SetInsertPoint(smallExact);
-                llvm::Value* smallN = b.CreateFPToUI(fa, i32t);
-                llvm::Value* smallD = b.CreateFPToUI(fb, i32t);
+                llvm::Value* smallN = modSignedI32
+                    ? b.CreateFPToSI(fa, i32t)
+                    : b.CreateFPToUI(fa, i32t);
+                llvm::Value* smallD = modSignedI32
+                    ? b.CreateFPToSI(fb, i32t)
+                    : b.CreateFPToUI(fb, i32t);
                 llvm::Value* smallIntegers = b.CreateAnd(
-                    b.CreateFCmpOEQ(b.CreateUIToFP(smallN, f64t), fa),
-                    b.CreateFCmpOEQ(b.CreateUIToFP(smallD, f64t), fb));
+                    isIntegralF64(fa) ? b.getInt1(true)
+                        : b.CreateFCmpOEQ(b.CreateUIToFP(smallN, f64t), fa),
+                    isIntegralF64(fb) ? b.getInt1(true)
+                        : b.CreateFCmpOEQ(b.CreateUIToFP(smallD, f64t), fb));
                 b.CreateCondBr(smallIntegers, smallFast, wide);
                 b.SetInsertPoint(smallFast);
                 llvm::Value* smallResult = b.CreateUIToFP(
@@ -1953,8 +2251,10 @@ struct Codegen {
                 llvm::Value* ni = b.CreateFPToSI(fa, i64t);
                 llvm::Value* di = b.CreateFPToSI(fb, i64t);
                 llvm::Value* ints = b.CreateAnd(
-                    b.CreateFCmpOEQ(b.CreateSIToFP(ni, f64t), fa),
-                    b.CreateFCmpOEQ(b.CreateSIToFP(di, f64t), fb));
+                    isIntegralF64(fa) ? b.getInt1(true)
+                        : b.CreateFCmpOEQ(b.CreateSIToFP(ni, f64t), fa),
+                    isIntegralF64(fb) ? b.getInt1(true)
+                        : b.CreateFCmpOEQ(b.CreateSIToFP(di, f64t), fb));
                 b.CreateCondBr(ints, fast, slow);
                 b.SetInsertPoint(fast);
                 llvm::Value* rem = b.CreateSRem(ni, di);
@@ -2004,12 +2304,53 @@ struct Codegen {
             break;
         }
         }
+        // Range transfer functions for a bounded expression, including a
+        // modulo whose dividend may be infinity/NaN. Canonicalization repairs
+        // an invalid remainder to zero; a finite modulus bounds any other
+        // result by abs(modulus), even after Scratch's sign adjustment.
+        std::optional<double> finiteBound;
+        if (arithmeticRangeFacts) {
+            const auto boundA = upperBound(fa);
+            const auto boundB = upperBound(fb);
+            long double bound = -1.0L;
+            if (aop == AOp::Mod && boundB) {
+                bound = *boundB;
+            } else if (boundA && boundB) {
+                switch (aop) {
+                case AOp::Add: case AOp::Sub:
+                    bound = static_cast<long double>(*boundA) + *boundB;
+                    break;
+                case AOp::Mul:
+                    bound = static_cast<long double>(*boundA) * *boundB;
+                    break;
+                case AOp::Div:
+                    if (auto* divisor = dyn_cast<ConstantFP>(fb)) {
+                        const double d = divisor->getValueAPF().convertToDouble();
+                        if (std::isfinite(d) && d != 0.0)
+                            bound = static_cast<long double>(*boundA) / std::abs(d);
+                    }
+                    break;
+                case AOp::Mod: break;
+                }
+            }
+            // Avoid claims near the overflow boundary. nextafter rounds any
+            // converted long-double bound up to the next representable double.
+            if (bound >= 0.0L &&
+                bound < static_cast<long double>(
+                            std::numeric_limits<double>::max()) / 4.0L) {
+                finiteBound = std::nextafter(static_cast<double>(bound),
+                                             std::numeric_limits<double>::infinity());
+            }
+        }
         // Both operands arrived through emitToNumF64(), so neither is NaN.
         // IEEE-754 add/sub with one finite operand cannot produce NaN;
         // multiply/divide with a finite nonzero factor/divisor cannot either.
         // Do not use fast-math: infinity, signed zero and overflow stay exact.
         // The general modulo path still needs canonicalization (fmod(inf,m)
         // is NaN), but its numeric coercion is always finite after repair.
+        const auto integerRange = inductionRangesEnabled
+            ? arithmeticIntInterval(fa, fb, static_cast<int>(aop))
+            : std::nullopt;
         if (modNan) {
             // The integer paths have a constant false flag. Only the floating
             // fallback computes isNaN, while preserving NaN-box canonical form
@@ -2021,8 +2362,18 @@ struct Codegen {
             knownNumD[boxed] = number;
             knownNumOk[boxed] = b.CreateNot(modNan);
             finiteArithmetic.insert(number);
+            if (finiteBound) noteFiniteUpperBound(boxed, *finiteBound);
+            if (integerRange) recordIntInterval(boxed, *integerRange);
+            if (isIntegralF64(fa) && isIntegralF64(fb))
+                noteIntegralBox(boxed);
             return boxed;
         }
+        const bool integralResult =
+            (aop == AOp::Add || aop == AOp::Sub ||
+             aop == AOp::Mul || aop == AOp::Mod)
+                ? isIntegralF64(fa) && isIntegralF64(fb)
+                : (aop == AOp::Div && isIntegralF64(fa) &&
+                   isUnitDivisor(fb));
         const bool finiteA = arithmeticFinite(fa);
         const bool finiteB = arithmeticFinite(fb);
         const bool noNaN =
@@ -2032,9 +2383,17 @@ struct Codegen {
                                  arithmeticFiniteNonzero(fb) :
             aop == AOp::Div ? arithmeticFiniteNonzero(fb) :
             false;
-        if (noNaN && safeArithCanon)
-            return emitCanonKnownNonNaN(r);
+        if (noNaN && safeArithCanon) {
+            llvm::Value* result = emitCanonKnownNonNaN(r);
+            if (finiteBound) noteFiniteUpperBound(result, *finiteBound);
+            if (integralResult) noteIntegralBox(result);
+            if (integerRange) recordIntInterval(result, *integerRange);
+            return result;
+        }
         llvm::Value* result = emitCanon(r);
+        if (finiteBound) noteFiniteUpperBound(result, *finiteBound);
+        if (integralResult) noteIntegralBox(result);
+        if (integerRange) recordIntInterval(result, *integerRange);
         if (aop == AOp::Mod)
             finiteArithmetic.insert(knownNumD[result]);
         return result;
@@ -3466,7 +3825,14 @@ struct Codegen {
             llvm::Value* x = emitToNumF64(emitInputOf(blk, "NUM"));
             // JS Math.round は .5 を +Infinity 方向へ丸め、-0 を保持する。
             // llvm.round + 0.0 は負の .5 と -0 で Scratch と違う。
-            return emitCanon(call1("xyo_round", f64t, x));
+            llvm::Value* rounded = inlineJsRound
+                ? emitJsRound(x) : call1("xyo_round", f64t, x);
+            llvm::Value* result = pureMathFacts
+                ? emitCanonKnownNonNaN(rounded) : emitCanon(rounded);
+            // Math.round always produces an exact integral double or +/-inf;
+            // canonical NaN repair also produces an exact integer zero.
+            noteIntegralBox(result);
+            return result;
         }
         if (op == "operator_mathop") {
             static const std::map<std::string, int32_t> ops = {
@@ -3497,7 +3863,18 @@ struct Codegen {
             // xyo_num is exactly Value::numCanonical. Keep its NaN/Inf/±0
             // semantics inline, and expose the numeric result to consumers so
             // immediate arithmetic need not re-test bool/string tags.
-            return genericMathBox ? call1("xyo_num", i64t, r) : emitCanon(r);
+            // These functions cannot produce NaN from a non-NaN number.
+            // Scratch's emitToNumF64 already repairs all NaN inputs.
+            // sqrt/log/sin/cos and domain-restricted inverse trig are excluded.
+            const bool nonNanFn = fn == 0 || fn == 1 || fn == 2 ||
+                                  fn == 9 || fn == 12 || fn == 13;
+            llvm::Value* result = genericMathBox
+                ? call1("xyo_num", i64t, r)
+                : pureMathFacts && nonNanFn
+                    ? emitCanonKnownNonNaN(r) : emitCanon(r);
+            if (!genericMathBox && (fn == 1 || fn == 2))
+                noteIntegralBox(result); // floor and ceiling
+            return result;
         }
 
         // --- sensing 軽量 ---
@@ -4017,8 +4394,36 @@ struct Codegen {
             // 失敗時のみ従来の CPU ループへ進む分岐を emit する。
             const gpu::Program* gp =
                 promotedLoop ? nullptr : tryGpuLoop(blk);
-            AllocaInst* iv = entryAlloca(f64t, 1, "rep_i");
-            b.CreateStore(n, iv);
+            // With a compile-time fixed nonnegative count <= INT32_MAX, the
+            // existing IEEE test i >= 0.5 followed by i -= 1 performs exactly
+            // round-to-nearest with half ties upward. Replacing the private
+            // (never Scratch-visible) counter with an i32 countdown removes
+            // the floating loop carry and compare. At any yield, the local
+            // alloca remains live; variable spill/reload semantics are shared.
+            std::optional<uint32_t> exactTrips;
+            if (repeatIntegerCounter) {
+                if (auto* c = llvm::dyn_cast<llvm::ConstantFP>(n)) {
+                    const double value = c->getValueAPF().convertToDouble();
+                    if (std::isfinite(value) && value >= 0.0 &&
+                        value <= 2147483647.0) {
+                        const double integer = std::floor(value);
+                        const double fractional = value - integer;
+                        const uint64_t trips =
+                            static_cast<uint64_t>(integer) +
+                            static_cast<unsigned>(fractional >= 0.5);
+                        if (trips <= uint64_t(INT32_MAX))
+                            exactTrips = static_cast<uint32_t>(trips);
+                    }
+                }
+            }
+            AllocaInst* iv = exactTrips ? nullptr
+                : entryAlloca(f64t, 1, "rep_i");
+            AllocaInst* intIv = exactTrips
+                ? entryAlloca(i32t, 1, "rep_i32") : nullptr;
+            if (intIv)
+                b.CreateStore(ci32(*exactTrips), intIv);
+            else
+                b.CreateStore(n, iv);
             // 本体先頭の不変 pen setter をループ外へ（本体が 0 回なら実行しない）
             emitHoistedSetters(hoistableSetters(blk),
                                b.CreateFCmpOGE(n, cf64(0.5)));
@@ -4043,8 +4448,14 @@ struct Codegen {
                 b.SetInsertPoint(head);
             }
             b.SetInsertPoint(head);
-            llvm::Value* i = b.CreateLoad(f64t, iv);
-            llvm::Value* go = b.CreateFCmpOGE(i, cf64(0.5));
+            llvm::Value* go;
+            if (intIv) {
+                llvm::Value* count = b.CreateLoad(i32t, intIv);
+                go = b.CreateICmpNE(count, ci32(0));
+            } else {
+                llvm::Value* i = b.CreateLoad(f64t, iv);
+                go = b.CreateFCmpOGE(i, cf64(0.5));
+            }
             b.CreateCondBr(go, bodyBB, merge);
             b.SetInsertPoint(bodyBB);
             {
@@ -4053,8 +4464,13 @@ struct Codegen {
             }
             if (!bbDone(b.GetInsertBlock())) {
                 emitLoopYield();
-                llvm::Value* i2 = b.CreateLoad(f64t, iv);
-                b.CreateStore(b.CreateFSub(i2, cf64(1.0)), iv);
+                if (intIv) {
+                    llvm::Value* remaining = b.CreateLoad(i32t, intIv);
+                    b.CreateStore(b.CreateSub(remaining, ci32(1)), intIv);
+                } else {
+                    llvm::Value* i2 = b.CreateLoad(f64t, iv);
+                    b.CreateStore(b.CreateFSub(i2, cf64(1.0)), iv);
+                }
                 b.CreateBr(head);
             }
             b.SetInsertPoint(merge);
@@ -4156,8 +4572,40 @@ struct Codegen {
             const bool promotedLoop = beginLoopPromotion(blk, false);
             const gpu::Program* gp =
                 promotedLoop ? nullptr : tryGpuLoop(blk);
-            AllocaInst* iv = entryAlloca(f64t, 1, "fe_i");
-            b.CreateStore(cf64(0.0), iv);
+            // A literal for-each upper bound is immutable. Unlike a dynamic
+            // reporter it cannot change across iterations or yield. The
+            // private zero-based induction counter then fits u32, and
+            // ceil(bound) is the exact number of iterations even for a
+            // fractional bound such as 2.5. Other bounds retain the original
+            // double counter and re-evaluation at each header.
+            std::optional<uint32_t> intTripCount;
+            if (foreachIntegerCounter) {
+                const BlockInput* limit = blk->inputs.find("VALUE");
+                if (limit) {
+                    const std::string& source =
+                        limit->block.empty() ? limit->shadow : limit->block;
+                    Block* literal = getBlock(source);
+                    if (literal && literal->shadow && literal->fields.size() == 1 &&
+                        (literal->opcode == "math_number" ||
+                         literal->opcode == "math_integer" ||
+                         literal->opcode == "math_whole_number" ||
+                         literal->opcode == "math_positive_number")) {
+                        const double n = cast::toNumber(
+                            literal->fields.begin()->second.value);
+                        if (std::isfinite(n) && n >= 0.0 &&
+                            n <= 2147483647.0)
+                            intTripCount = static_cast<uint32_t>(std::ceil(n));
+                    }
+                }
+            }
+            AllocaInst* iv = intTripCount ? nullptr
+                : entryAlloca(f64t, 1, "fe_i");
+            AllocaInst* iv32 = intTripCount
+                ? entryAlloca(i32t, 1, "fe_i32") : nullptr;
+            if (iv32)
+                b.CreateStore(ci32(0), iv32);
+            else
+                b.CreateStore(cf64(0.0), iv);
             BasicBlock* head = BasicBlock::Create(lc, "", fn);
             BasicBlock* bodyBB = BasicBlock::Create(lc, "", fn);
             BasicBlock* merge = BasicBlock::Create(lc, "", fn);
@@ -4172,16 +4620,28 @@ struct Codegen {
                 b.CreateBr(head);
             }
             b.SetInsertPoint(head);
-            llvm::Value* i = b.CreateLoad(f64t, iv);
+            llvm::Value* integralIndex = iv32
+                ? b.CreateLoad(i32t, iv32) : nullptr;
+            llvm::Value* i = iv32
+                ? b.CreateUIToFP(integralIndex, f64t)
+                : b.CreateLoad(f64t, iv);
+            // Still emit VALUE in its original location. Only pure literal
+            // bounds can use the faster i32 comparison.
             llvm::Value* bound = emitToNumF64(emitInputOf(blk, "VALUE"));
-            llvm::Value* go = b.CreateFCmpOLT(i, bound);
+            llvm::Value* go = iv32
+                ? b.CreateICmpULT(integralIndex, ci32(*intTripCount))
+                : b.CreateFCmpOLT(i, bound);
             b.CreateCondBr(go, bodyBB, merge);
             b.SetInsertPoint(bodyBB);
             {
                 const BlockField* f = findField(blk, "VARIABLE");
                 if (f) {
-                    llvm::Value* next = b.CreateFAdd(i, cf64(1.0));
-                    llvm::Value* vv = emitCanon(next);
+                    llvm::Value* next = iv32
+                        ? b.CreateUIToFP(
+                            b.CreateAdd(integralIndex, ci32(1)), f64t)
+                        : b.CreateFAdd(i, cf64(1.0));
+                    llvm::Value* vv = iv32
+                        ? emitCanonKnownNonNaN(next) : emitCanon(next);
                     if (PromotedVar* p = findPromoted(f); p && p->numeric)
                         storeNumericPair(*p, vv, next, b.getInt1(true));
                     else
@@ -4193,13 +4653,38 @@ struct Codegen {
                 bool inserted = false;
                 if (finiteIndex)
                     inserted = finiteInductionVars.insert(f->id).second;
+                bool boundedIndex = false;
+                if (finiteIndex && inductionRangesEnabled &&
+                    strictInductionBody(in, f)) {
+                    if (auto* c = llvm::dyn_cast<llvm::ConstantFP>(bound)) {
+                        if (c->getValueAPF().isFinite()) {
+                            const double limit = c->getValueAPF().convertToDouble();
+                            // The index in the body is i+1. Because i < bound,
+                            // the last visible value is ceil(bound), even for
+                            // fractional bounds. A signed-i32 cap also proves
+                            // that every increment is exactly representable.
+                            if (limit > 0.0 && limit <= 2147483647.0) {
+                                activeInductionRanges.emplace(
+                                    f->id, IntInterval{
+                                        1, static_cast<int64_t>(std::ceil(limit))});
+                                boundedIndex = true;
+                            }
+                        }
+                    }
+                }
                 if (in) emitChainBlocks(chainOf(in->block), true);
+                if (boundedIndex) activeInductionRanges.erase(f->id);
                 if (inserted) finiteInductionVars.erase(f->id);
             }
             if (!bbDone(b.GetInsertBlock())) {
                 emitLoopYield();
-                llvm::Value* i2 = b.CreateLoad(f64t, iv);
-                b.CreateStore(b.CreateFAdd(i2, cf64(1.0)), iv);
+                if (iv32) {
+                    llvm::Value* i2 = b.CreateLoad(i32t, iv32);
+                    b.CreateStore(b.CreateAdd(i2, ci32(1)), iv32);
+                } else {
+                    llvm::Value* i2 = b.CreateLoad(f64t, iv);
+                    b.CreateStore(b.CreateFAdd(i2, cf64(1.0)), iv);
+                }
                 b.CreateBr(head);
             }
             b.SetInsertPoint(merge);

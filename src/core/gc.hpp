@@ -181,6 +181,10 @@ private:
         uint32_t capacity;
         uint32_t live;
         uint32_t firstFreeWord;
+        // While a thread owns the slab, [nextFreeCell, freeRunEnd) contains
+        // exclusively unallocated cells. GC invalidates every run.
+        uint32_t nextFreeCell;
+        uint32_t freeRunEnd;
         uint64_t allocated[16];
     };
     static constexpr size_t kSlabDataOffset = (sizeof(SmallSlab) + 15) & ~size_t(15);
@@ -196,6 +200,13 @@ private:
     void markHeader(uintptr_t address);
     bool validHeader(uintptr_t address) const;
     bool poolEnabled_ = true;
+    // Contiguous free-run allocation is enabled by default. The environment
+    // can restore the original bitmap-per-cell allocator for diagnostics.
+    bool poolRunAlloc_ = true;
+    // Rope children are produced by the runtime, not discovered by the
+    // conservative stack scanner. Avoid revalidating their slab cell bits
+    // while retaining safe fallback for malloc / foreign collector strings.
+    bool fastConsChildMark_ = true;
     std::vector<SmallSlab*> poolSlabs_;
     PtrSet slabBases_;
     SmallSlab* availableSlabs_[2][3] = {};

@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <functional>
 #include <memory>
+#include <limits>
 #include <string>
 #include <thread>
 
@@ -28,6 +29,7 @@
 #include "engine/runtime.hpp"
 #include "engine/sequencer.hpp"
 #include "engine/thread.hpp"
+#include "engine/warp_clock.hpp"
 #include "jit/jit.hpp"
 #include "load/sb3.hpp"
 #include "model/target.hpp"
@@ -300,8 +302,49 @@ void testWarpWaits(JitMode mode) {
 } // namespace
 
 /// テストランナ（tests/unit/test_cast.cpp の main）から呼ばれる。
+void testSampledWarpClock() {
+    WarpClockWatchdog clock;
+    clock.arm(Timer::stdNow() + 1000.0, false);
+    const int64_t first = clock.sampledUs.load(std::memory_order_relaxed);
+    int64_t next = first;
+    for (int attempt = 0; attempt < 100 && next <= first; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        next = clock.sampledUs.load(std::memory_order_relaxed);
+    }
+    check(next > first, "sampled warp clock advances asynchronously");
+    check(next < clock.deadlineUs.load(std::memory_order_relaxed),
+          "sampled warp clock not yet past deadline");
+
+    clock.arm(Timer::stdNow() + 3.0, false);
+    bool expired = false;
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        if (clock.sampledUs.load(std::memory_order_relaxed) >
+            clock.deadlineUs.load(std::memory_order_relaxed)) {
+            expired = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    check(expired, "shared clock crosses expired warp deadline");
+
+    // A previous tick's deadline must not continue to preempt the next.
+    clock.arm(Timer::stdNow() + 1000.0, false);
+    std::this_thread::sleep_for(std::chrono::milliseconds(8));
+    check(clock.sampledUs.load(std::memory_order_relaxed) <
+          clock.deadlineUs.load(std::memory_order_relaxed),
+          "rearming invalidates previous warp deadline");
+
+    clock.arm(Timer::stdNow() - 100.0, true);
+    check(clock.deadlineUs.load(std::memory_order_relaxed) ==
+              std::numeric_limits<int64_t>::max(),
+          "danger mode never reaches the sampled warp deadline");
+    clock.disarm();
+    check(!clock.armed(), "watchdog disarmed after tick");
+}
+
 int test_danger_main() {
     GpuEnvGuard gpuDisabled;
+    testSampledWarpClock();
     const JitMode modes[] = {JitMode::Off, JitMode::Eager};
     for (JitMode mode : modes) {
         testWarpYieldReload(mode);

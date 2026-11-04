@@ -5,7 +5,8 @@ import sys
 import zipfile
 from pathlib import Path
 
-def make_project(count: int, body_steps: int, gate: int) -> dict:
+def make_project(count: int, body_steps: int, gate: int,
+                 hot_calls: int = 1) -> dict:
     blocks = {}
 
     def add(uid, opcode, next_id=None, inputs=None, fields=None, mutation=None, top=False, shadow=False):
@@ -53,7 +54,7 @@ def make_project(count: int, body_steps: int, gate: int) -> dict:
                 fields={"VARIABLE": ["value", "value"]})
 
     add("hat", "event_whenflagclicked", "branch", top=True)
-    add("branch", "control_if", "hot_call",
+    add("branch", "control_if", "hot_call0",
         {"CONDITION": [2, "gate_read"],
          "SUBSTACK": [2, "cold_call0"]})
     add("gate_read", "data_variable",
@@ -63,7 +64,9 @@ def make_project(count: int, body_steps: int, gate: int) -> dict:
              f"cold_call{i+1}" if i+1 < count else None)
         define(f"cold{i}", body_steps)
     define("hot", 1)
-    call("hot_call", "hot", "output")
+    for i in range(hot_calls):
+        call(f"hot_call{i}", "hot",
+             f"hot_call{i+1}" if i+1 < hot_calls else "output")
     add("output", "data_addtolist", None,
         {"ITEM": [2, "value_read"]}, {"LIST": ["output", "out"]})
     add("value_read", "data_variable",

@@ -30,6 +30,47 @@ add_test(NAME xyo-interpreter-parity-regressions
 set_tests_properties(xyo-interpreter-parity-regressions PROPERTIES
   ENVIRONMENT "XYO_JIT_MODE=off")
 
+# Production HotSpot chooses per script whether to compile procedures
+# on first use. Verify the CLI policy, selected tier and Scratch output.
+if(TARGET xyo-cli)
+  find_package(Python3 QUIET COMPONENTS Interpreter)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME xyo-jit-lazy-integration
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_lazy_integration.py"
+              "$<TARGET_FILE:xyo-cli>")
+    set_tests_properties(xyo-jit-lazy-integration PROPERTIES TIMEOUT 180)
+
+    # Preserve Scratch semantics with dynamic limits, fractional bounds, or
+    # index mutation when optional static induction analysis is enabled.
+    add_test(NAME xyo-jit-induction-ranges
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_induction_ranges.py"
+              --binary "$<TARGET_FILE:xyo-cli>"
+              --out "${CMAKE_CURRENT_BINARY_DIR}/jit-induction-range-fixtures"
+              --quick)
+    set_tests_properties(xyo-jit-induction-ranges PROPERTIES TIMEOUT 180)
+
+    # Both optimizations are independent compile-time switches. Exercise
+    # the combined for-each integer-counter / value-range lowering.
+    add_test(NAME xyo-jit-foreach-i32
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_induction_ranges.py"
+              --binary "$<TARGET_FILE:xyo-cli>"
+              --out "${CMAKE_CURRENT_BINARY_DIR}/jit-foreach-i32-fixtures"
+              --foreach-i32 --quick)
+    set_tests_properties(xyo-jit-foreach-i32 PROPERTIES TIMEOUT 180)
+
+    # Exact half-tie semantics, dynamic counts, nested repeats and fallback.
+    add_test(NAME xyo-jit-repeat-i32
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_repeat_integer_counter.py"
+              --binary "$<TARGET_FILE:xyo-cli>"
+              --out "${CMAKE_CURRENT_BINARY_DIR}/jit-repeat-i32-fixtures")
+    set_tests_properties(xyo-jit-repeat-i32 PROPERTIES TIMEOUT 180)
+  endif()
+endif()
+
 file(GLOB RENDER_TEST_SOURCES CONFIGURE_DEPENDS render/*.cpp)
 if(RENDER_TEST_SOURCES AND SDL2_FOUND)
   add_executable(xyo-render-tests ${RENDER_TEST_SOURCES})

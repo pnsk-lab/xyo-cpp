@@ -26,6 +26,7 @@ Linux 版は 2 種類あります。どちらも **LLVM は静的リンク**な�
   JIT コンパイルします。`eager` は全スクリプトを即コンパイル（従来動作）、
   `off` はインタプリタのみ。AOT は `xyo aot` / `--aot <obj>` を明示した
   ときだけ使われます。
+
 - `--danger`（環境変数 `XYO_DANGER=1`）は **スレッドごとの実行時間予算
   （warp 500ms）を外す危険モード**です。既定では warp スクリプトは 500ms
   走ると他のスレッド/描画へ譲りますが、`--danger` では 1 ティックで終わらない
@@ -88,6 +89,39 @@ xyo.exe minify <project.sb3>           # sb3 を小さくする
   GPU ペン層（OpenGL FBO/シェーダ）も Windows では無効で、CPU ラスタで描画します。
 - Vulkan（`vulkan-1.dll`）があれば GPU 並列ループが有効になります。
 - UTF-8 のパス・コンソール出力に対応（日本語ファイル名の sb3 も可）。
+
+## HotSpot JITと遅延手続きコンパイル
+
+ネイティブ版では **HotSpotと遅延JITが統合されている**。既定の
+`--jit=hotspot --jit-lazy=auto` では、まずHotSpotがスクリプト単位の
+コンパイル対象を選ぶ。その後、LLVMの関数数と、スクリプト本体にある
+直接の手続き呼び出し数を見て、手続きごとの遅延最適化・機械語生成を
+自動選択する。
+
+- `--jit-lazy=auto`（既定）: HotSpotでのみ自動選択。32個以上のLLVM
+  関数を含み、本体の直接呼び出し箇所が関数数の1/4以下なら遅延を選ぶ。
+  それ以外、またEager JITでは通常の一括O3コンパイルになる。
+- `--jit-lazy=on`: HotSpot/Eagerのいずれでも、複数関数を含むスクリプトの
+  手続きを初回呼び出し時にLLVM O3最適化・機械語生成する。
+- `--jit-lazy=off`: 従来の一括O3コンパイルを使用する。
+
+```sh
+./xyo run project.sb3 --jit=hotspot                   # 自動選択
+./xyo run project.sb3 --jit=hotspot --jit-lazy=on     # 遅延を明示
+./xyo run project.sb3 --jit=hotspot --jit-lazy=off    # 従来の一括コンパイル
+XYO_HOT_STATS=1 ./xyo run project.sb3                 # スクリプトごとのjit/lazy統計
+XYO_JIT_TIMING=1 ./xyo run project.sb3                # compile段階とtier=eager/lazy
+```
+
+環境変数は `XYO_JIT_LAZY_MODE=auto|on|off`。旧設定
+`XYO_JIT_LAZY_PROCEDURES=0|1`も互換入力として使えるが、
+新しい設定またはCLIが優先される。
+
+**遅延JITは初回起動時間を短縮するための機能**であり、コンパイル作業を
+後から発生させる。ほとんどの手続きを実行するプロジェクトでは、むしろ
+全体の終了が遅くなる場合がある。`auto`は静的な推定であり、全ての条件分岐の
+実際の実行結果を予測するものではない。実行時間重視なら`off`で比較できる。
+AOTは別のコンパイル方式のため、この設定の対象外。
 
 ## WASM / WebAssembly（Emscripten）
 

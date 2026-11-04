@@ -3,6 +3,7 @@
 // yield は xyo_yield による fiber switch（任意の呼び出し深さから可能）。
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -45,6 +46,42 @@ class Fiber;
 // （IR emit が支配的）、C1→C2 の二重 emit が数秒の追加コストになる
 // ため採用していない。
 enum class JitMode { Off, HotSpot, Eager };
+
+/// How to compile procedures within scripts selected for JIT.
+enum class JitLazyMode { Auto, On, Off };
+
+inline bool parseJitLazyMode(const char* s, JitLazyMode* out) {
+    if (!s || !out) return false;
+    if (!std::strcmp(s, "auto")) *out = JitLazyMode::Auto;
+    else if (!std::strcmp(s, "on") || !std::strcmp(s, "yes") ||
+             !std::strcmp(s, "1")) *out = JitLazyMode::On;
+    else if (!std::strcmp(s, "off") || !std::strcmp(s, "no") ||
+             !std::strcmp(s, "0")) *out = JitLazyMode::Off;
+    else return false;
+    return true;
+}
+
+namespace detail {
+struct JitLazyState {
+    JitLazyMode mode = [] {
+        JitLazyMode parsed;
+        // Old preview flag remains accepted for existing users.
+        const char* value = std::getenv("XYO_JIT_LAZY_MODE");
+        if (!value) value = std::getenv("XYO_JIT_LAZY_PROCEDURES");
+        if (value && parseJitLazyMode(value, &parsed)) return parsed;
+        return JitLazyMode::Auto;
+    }();
+};
+inline JitLazyState& jitLazyState() {
+    static JitLazyState state;
+    return state;
+}
+} // namespace detail
+
+inline JitLazyMode jitLazyMode() { return detail::jitLazyState().mode; }
+inline void setJitLazyMode(JitLazyMode mode) {
+    detail::jitLazyState().mode = mode;
+}
 
 /// "off" | "interp" | "hotspot" | "eager" を解析する。
 inline bool parseJitMode(const char* s, JitMode* out) {
@@ -151,6 +188,12 @@ struct JitCtx {
     /// 非 null）。完了スレッドの回収（Runtime::reclaimThreads）が生ポインタ
     /// 参照を辿るために公開する — 生成コードは触らない。
     std::vector<Thread*>* joinRefs;
+
+    /// Monotonic time sampled asynchronously by the Sequencer watchdog.
+    /// Null outside stepThreads() or when using a custom clock; those paths
+    /// retain the existing synchronous xyo_warp_yield_due check.
+    std::atomic<int64_t>* sampledWarpClockUs;
+    std::atomic<int64_t>* sampledWarpDeadlineUs;
 };
 
 static_assert(std::is_trivially_copyable_v<JitCtx>);
@@ -172,6 +215,8 @@ extern "C" void xyo_varslot_init(JitCtx* c, uint64_t idx, const char* id,
 /// コンパイル済みスクリプト（target->blocks 共有 — クローン間で共有可）
 struct CompiledScript {
     ScriptFn entry = nullptr;
+    /// True when this script's procedures are compiled on first use.
+    bool lazy = false;
     /// variantKey(proccode+warp) → 手続き関数
     std::unordered_map<std::string, ScriptFn> procedures;
     /// 生成コード内に yield 点が存在するか。false なら fiber なしで同期実行可。
@@ -214,6 +259,7 @@ public:
         uint64_t invocations = 0;
         uint64_t interpBlocks = 0;
         bool compiled = false;
+        bool lazy = false;
         bool aot = false;
         bool hasLoop = false;
     };
@@ -243,6 +289,9 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+
+    /// Create the secondary on-demand ORC engine only if a script uses it.
+    bool ensureLazyJit();
 
     /// トップ Block* ごとのコンパイル結果。ティアごとに保持し、実行中
     /// スレッドが参照中の旧ティアのコードを破棄しない（JIT コードは

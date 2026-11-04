@@ -473,6 +473,7 @@ const std::vector<std::pair<const char*, void*>>& hostLibcallSymbols() {
 struct JitEngine::Impl {
     llvm::orc::ThreadSafeContext tsc;
     std::unique_ptr<llvm::orc::LLJIT> jit;
+    std::unique_ptr<llvm::orc::LLLazyJIT> lazyJit;
     bool lazyProcedures = false;
     JitPinned pinned;
     /// AOT: 文字列 c_str の安定置き場（deque は push_back で
@@ -498,6 +499,123 @@ static llvm::OptimizationLevel jitIrOptimizationLevel() {
     return std::getenv("XYO_JIT_O2")
         ? llvm::OptimizationLevel::O2
         : llvm::OptimizationLevel::O3;
+}
+
+// A conservative static estimate of likely procedure calls. Follow only
+// the script's main sequence, not conditional substack inputs. Count call
+// sites rather than unique callees: a long test/dispatch sequence is likely
+// to use a large fraction of its procedures even if names repeat.
+static size_t countDirectProcedureCalls(const Blocks* blocks,
+                                        const Block* top) {
+    size_t calls = 0;
+    std::unordered_set<const Block*> seen;
+    while (top && seen.insert(top).second && seen.size() <= 200000) {
+        calls += top->opcode == "procedures_call";
+        top = top->next.empty() ? nullptr : blocks->getBlock(top->next);
+    }
+    return calls;
+}
+
+// On-demand materialization pays a trampoline and first-call compile cost.
+// Use it automatically only for scripts with substantial cold-procedure
+// potential. A script with many direct call sites is treated as eager.
+// "on" is an explicit choice, independent of the HotSpot heuristic.
+static bool chooseLazyCompile(JitLazyMode policy, JitMode mode,
+                              size_t functions, size_t directCallSites) {
+    if (policy == JitLazyMode::Off || mode == JitMode::Off)
+        return false;
+    if (policy == JitLazyMode::On)
+        return functions >= 2;
+    return mode == JitMode::HotSpot && functions >= 32 &&
+           directCallSites * 4 <= functions;
+}
+
+// The eager and on-demand engines use the same host calls and diagnostics.
+static void configureLazyIR(llvm::orc::LLJIT& jit) {
+    jit.getIRTransformLayer().setTransform(
+        [](llvm::orc::ThreadSafeModule tsm,
+           llvm::orc::MaterializationResponsibility&)
+            -> llvm::Expected<llvm::orc::ThreadSafeModule> {
+            tsm.withModuleDo([](llvm::Module& module) {
+                if (!module.getModuleFlag("xyo.lazy.optimize"))
+                    return;
+                const auto began = std::chrono::steady_clock::now();
+                llvm::PassBuilder pb;
+                llvm::LoopAnalysisManager lam;
+                llvm::FunctionAnalysisManager fam;
+                llvm::CGSCCAnalysisManager cgam;
+                llvm::ModuleAnalysisManager mam;
+                pb.registerModuleAnalyses(mam);
+                pb.registerCGSCCAnalyses(cgam);
+                pb.registerFunctionAnalyses(fam);
+                pb.registerLoopAnalyses(lam);
+                pb.crossRegisterProxies(lam, fam, cgam, mam);
+                auto mpm = pb.buildPerModuleDefaultPipeline(
+                    jitIrOptimizationLevel());
+                mpm.run(module, mam);
+                if (std::getenv("XYO_JIT_TIMING")) {
+                    const double elapsed =
+                        std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - began)
+                            .count();
+                    std::fprintf(stderr, "[jit-lazy-ir] %.3fms\n",
+                                 elapsed);
+                }
+            });
+            return std::move(tsm);
+        });
+}
+
+static void configureObjectDump(llvm::orc::LLJIT& jit) {
+    // Inspect the exact JIT machine code, not an AOT approximation. Disabled
+    // by default; prefix-N.o files contain the objects before linking.
+    if (const char* p = std::getenv("XYO_JIT_DUMP_OBJECT")) {
+        if (p[0]) jit.getObjTransformLayer().setTransform(
+            [prefix = std::string(p)](std::unique_ptr<llvm::MemoryBuffer> object)
+                -> llvm::Expected<std::unique_ptr<llvm::MemoryBuffer>> {
+                static std::atomic<uint64_t> serial{0};
+                const std::string path = prefix + "-" +
+                    std::to_string(serial.fetch_add(1, std::memory_order_relaxed)) + ".o";
+                if (FILE* out = std::fopen(path.c_str(), "wb")) {
+                    const auto bytes = object->getBuffer();
+                    const size_t written = std::fwrite(bytes.data(), 1, bytes.size(), out);
+                    const int closed = std::fclose(out);
+                    if (written != bytes.size() || closed != 0)
+                        std::fprintf(stderr, "xyo-jit: incomplete object dump %s\n", path.c_str());
+                } else {
+                    std::fprintf(stderr, "xyo-jit: cannot dump object %s\n", path.c_str());
+                }
+                return std::move(object);
+            });
+    }
+
+}
+
+static void registerRuntimeSymbols(llvm::orc::LLJIT& jit) {
+    auto& es = jit.getExecutionSession();
+    llvm::orc::SymbolMap symbols;
+    for (auto& [name, addr] : kRtSymbols) {
+        symbols[es.intern(name)] = llvm::orc::ExecutorSymbolDef(
+            llvm::orc::ExecutorAddr::fromPtr(addr),
+            llvm::JITSymbolFlags::Exported);
+    }
+    // バックエンドの libcall（fmod/log/bcmp 等）— 静的リンクでも解決できる
+    for (auto& [name, addr] : hostLibcallSymbols()) {
+        symbols[es.intern(name)] = llvm::orc::ExecutorSymbolDef(
+            llvm::orc::ExecutorAddr::fromPtr(addr),
+            llvm::JITSymbolFlags::Exported);
+    }
+    auto& jd = jit.getMainJITDylib();
+    if (auto err =
+            jd.define(llvm::orc::absoluteSymbols(std::move(symbols)))) {
+        std::fprintf(stderr, "xyo-jit: symbol define failed\n");
+        llvm::consumeError(std::move(err));
+    }
+    if (auto gen =
+            llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+                jit.getDataLayout().getGlobalPrefix())) {
+        jd.addGenerator(std::move(*gen));
+    }
 }
 
 JitEngine::JitEngine() {
@@ -529,120 +647,23 @@ JitEngine::JitEngine() {
             llvm::consumeError(host.takeError());
         }
     }
-    const char* lazySetting = std::getenv("XYO_JIT_LAZY_PROCEDURES");
-    impl_->lazyProcedures = lazySetting && lazySetting[0] &&
-                             lazySetting[0] != '0';
-    std::unique_ptr<llvm::orc::LLJIT> jit;
-    if (impl_->lazyProcedures) {
-        llvm::orc::LLLazyJITBuilder lazyBuilder;
-        if (builder.getJITTargetMachineBuilder())
-            lazyBuilder.setJITTargetMachineBuilder(
-                std::move(*builder.getJITTargetMachineBuilder()));
-        // Runtime worker threads can trigger lazy resolution concurrently.
-        // A shared single-threaded IRCompiler/TargetMachine is unsafe here.
-        lazyBuilder.setNumCompileThreads(2);
-        auto result = lazyBuilder.create();
-        if (!result) {
-            std::fprintf(stderr, "xyo-jit: LLLazyJIT init failed\n");
-            llvm::consumeError(result.takeError());
-            impl_.reset();
-            return;
-        }
-        jit = std::move(*result);
-    } else {
-        auto result = builder.create();
-        if (!result) {
-            std::fprintf(stderr, "xyo-jit: LLJIT init failed\n");
-            llvm::consumeError(result.takeError());
-            impl_.reset();
-            return;
-        }
-        jit = std::move(*result);
+    // HotSpot automatically selects an eager or on-demand compilation tier
+    // per script. Eager tests remain fully precompiled unless requested.
+    impl_->lazyProcedures =
+        jitMode() != JitMode::Off &&
+        (jitLazyMode() == JitLazyMode::On ||
+         (jitLazyMode() == JitLazyMode::Auto &&
+          jitMode() == JitMode::HotSpot));
+    auto result = builder.create();
+    if (!result) {
+        std::fprintf(stderr, "xyo-jit: LLJIT init failed\n");
+        llvm::consumeError(result.takeError());
+        impl_.reset();
+        return;
     }
-    // Optional experiment: optimize only partitions actually materialized
-    // by LLLazyJIT. A module flag survives ORC's function partitioning and
-    // distinguishes these from the small scripts already optimized at emit.
-    if (impl_->lazyProcedures &&
-        std::getenv("XYO_JIT_LAZY_IR_OPT")) {
-        jit->getIRTransformLayer().setTransform(
-            [](llvm::orc::ThreadSafeModule tsm,
-               llvm::orc::MaterializationResponsibility&)
-                -> llvm::Expected<llvm::orc::ThreadSafeModule> {
-                tsm.withModuleDo([](llvm::Module& module) {
-                    if (!module.getModuleFlag("xyo.lazy.optimize"))
-                        return;
-                    const auto began = std::chrono::steady_clock::now();
-                    llvm::PassBuilder pb;
-                    llvm::LoopAnalysisManager lam;
-                    llvm::FunctionAnalysisManager fam;
-                    llvm::CGSCCAnalysisManager cgam;
-                    llvm::ModuleAnalysisManager mam;
-                    pb.registerModuleAnalyses(mam);
-                    pb.registerCGSCCAnalyses(cgam);
-                    pb.registerFunctionAnalyses(fam);
-                    pb.registerLoopAnalyses(lam);
-                    pb.crossRegisterProxies(lam, fam, cgam, mam);
-                    auto mpm = pb.buildPerModuleDefaultPipeline(
-                        jitIrOptimizationLevel());
-                    mpm.run(module, mam);
-                    if (std::getenv("XYO_JIT_TIMING")) {
-                        const double elapsed =
-                            std::chrono::duration<double, std::milli>(
-                                std::chrono::steady_clock::now() - began)
-                                .count();
-                        std::fprintf(stderr, "[jit-lazy-ir] %.3fms\n",
-                                     elapsed);
-                    }
-                });
-                return std::move(tsm);
-            });
-    }
-    // Inspect the exact JIT machine code, not an AOT approximation. Disabled
-    // by default; prefix-N.o files contain the objects before linking.
-    if (const char* p = std::getenv("XYO_JIT_DUMP_OBJECT")) {
-        if (p[0]) jit->getObjTransformLayer().setTransform(
-            [prefix = std::string(p)](std::unique_ptr<llvm::MemoryBuffer> object)
-                -> llvm::Expected<std::unique_ptr<llvm::MemoryBuffer>> {
-                static std::atomic<uint64_t> serial{0};
-                const std::string path = prefix + "-" +
-                    std::to_string(serial.fetch_add(1, std::memory_order_relaxed)) + ".o";
-                if (FILE* out = std::fopen(path.c_str(), "wb")) {
-                    const auto bytes = object->getBuffer();
-                    const size_t written = std::fwrite(bytes.data(), 1, bytes.size(), out);
-                    const int closed = std::fclose(out);
-                    if (written != bytes.size() || closed != 0)
-                        std::fprintf(stderr, "xyo-jit: incomplete object dump %s\n", path.c_str());
-                } else {
-                    std::fprintf(stderr, "xyo-jit: cannot dump object %s\n", path.c_str());
-                }
-                return std::move(object);
-            });
-    }
-
-    auto& es = jit->getExecutionSession();
-    llvm::orc::SymbolMap symbols;
-    for (auto& [name, addr] : kRtSymbols) {
-        symbols[es.intern(name)] = llvm::orc::ExecutorSymbolDef(
-            llvm::orc::ExecutorAddr::fromPtr(addr),
-            llvm::JITSymbolFlags::Exported);
-    }
-    // バックエンドの libcall（fmod/log/bcmp 等）— 静的リンクでも解決できる
-    for (auto& [name, addr] : hostLibcallSymbols()) {
-        symbols[es.intern(name)] = llvm::orc::ExecutorSymbolDef(
-            llvm::orc::ExecutorAddr::fromPtr(addr),
-            llvm::JITSymbolFlags::Exported);
-    }
-    auto& jd = jit->getMainJITDylib();
-    if (auto err =
-            jd.define(llvm::orc::absoluteSymbols(std::move(symbols)))) {
-        std::fprintf(stderr, "xyo-jit: symbol define failed\n");
-        llvm::consumeError(std::move(err));
-    }
-    if (auto gen =
-            llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
-                jit->getDataLayout().getGlobalPrefix())) {
-        jd.addGenerator(std::move(*gen));
-    }
+    auto jit = std::move(*result);
+    configureObjectDump(*jit);
+    registerRuntimeSymbols(*jit);
     impl_->jit = std::move(jit);
 
     // pinned 文字列を GC ルート化（JitEngine 単位でプロバイダ登録）
@@ -650,6 +671,42 @@ JitEngine::JitEngine() {
         if (impl_)
             for (SStr* s : impl_->pinned.strings) g.markPtr(s);
     });
+}
+
+bool JitEngine::ensureLazyJit() {
+    if (!impl_ || !impl_->lazyProcedures) return false;
+    if (impl_->lazyJit) return true;
+
+    llvm::orc::LLLazyJITBuilder builder;
+    if (const char* level = std::getenv("XYO_JIT_CODEGEN_OPT")) {
+        llvm::CodeGenOptLevel opt = llvm::CodeGenOptLevel::Default;
+        if (std::strcmp(level, "less") == 0)
+            opt = llvm::CodeGenOptLevel::Less;
+        else if (std::strcmp(level, "none") == 0)
+            opt = llvm::CodeGenOptLevel::None;
+        if (auto host = llvm::orc::JITTargetMachineBuilder::detectHost()) {
+            host->setCodeGenOptLevel(opt);
+            builder.setJITTargetMachineBuilder(std::move(*host));
+        } else {
+            std::fprintf(stderr, "xyo-jit: cannot configure lazy codegen level\n");
+            llvm::consumeError(host.takeError());
+        }
+    }
+    // Lazy resolution may happen on different scheduler workers.
+    // Separate code-generation contexts are required for concurrent LLVM.
+    builder.setNumCompileThreads(2);
+    auto result = builder.create();
+    if (!result) {
+        std::fprintf(stderr, "xyo-jit: lazy engine unavailable; using eager\n");
+        llvm::consumeError(result.takeError());
+        return false;
+    }
+    auto lazy = std::move(*result);
+    configureLazyIR(*lazy);
+    configureObjectDump(*lazy);
+    registerRuntimeSymbols(*lazy);
+    impl_->lazyJit = std::move(lazy);
+    return true;
 }
 
 namespace {
@@ -690,7 +747,7 @@ JitEngine::~JitEngine() {
         struct Row {
             uint64_t inv, blocks;
             const std::string* id;
-            bool jit, aot, loop;
+            bool jit, lazy, aot, loop;
         };
         std::vector<Row> rows;
         rows.reserve(profiles_.size());
@@ -702,22 +759,24 @@ JitEngine::~JitEngine() {
                 aot = cit->second.aot;
                 jit = cit->second.code != nullptr;
             }
-            rows.push_back({p.invocations, p.interpBlocks, &p.id, jit, aot,
-                            p.hasLoop == 2});
+            const bool lazy = jit && cit->second.code->lazy;
+            rows.push_back({p.invocations, p.interpBlocks, &p.id,
+                            jit, lazy, aot, p.hasLoop == 2});
         }
         std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) {
             return a.inv > b.inv ||
                    (a.inv == b.inv && a.blocks > b.blocks);
         });
         std::fprintf(stderr,
-                     "[hot] %-32s %8s %10s %5s %4s %s\n", "script", "inv",
-                     "interp", "jit", "aot", "loop");
+                     "[hot] %-32s %8s %10s %5s %5s %4s %s\n",
+                     "script", "inv", "interp", "jit", "lazy", "aot", "loop");
         for (const Row& r : rows)
-            std::fprintf(stderr, "[hot] %-32s %8llu %10llu %5s %4d %d\n",
+            std::fprintf(stderr, "[hot] %-32s %8llu %10llu %5s %5s %4d %d\n",
                          r.id ? r.id->c_str() : "?",
                          (unsigned long long)r.inv,
                          (unsigned long long)r.blocks,
-                         r.jit ? "yes" : "-", int(r.aot), int(r.loop));
+                         r.jit ? "yes" : "-", r.lazy ? "yes" : "-",
+                         int(r.aot), int(r.loop));
     }
     Gc::get().removeRootProvider(this);
     if (impl_) Gc::get().removeRootProvider(impl_.get());
@@ -824,6 +883,7 @@ bool JitEngine::scriptStats(const void* top, ScriptStats* out) const {
     if (cit != cache_.end()) {
         out->aot = cit->second.aot;
         out->compiled = cit->second.code != nullptr;
+        out->lazy = cit->second.code && cit->second.code->lazy;
     }
     return true;
 }
@@ -935,10 +995,16 @@ const CompiledScript* JitEngine::compile(Thread& thread, Runtime& runtime,
             llvm::ModulePassManager mpm =
                 pb.buildPerModuleDefaultPipeline(jitIrOptimizationLevel());
             const auto tOptimize = Clock::now();
+            // JIT modes can be changed by API clients after construction.
+            // The requested tier still needs a matching ORC engine.
+            const bool deferredCandidate = impl_->lazyProcedures &&
+                chooseLazyCompile(
+                    jitLazyMode(), jitMode(), irFunctions,
+                    countDirectProcedureCalls(blocks, top));
+            // Failure to initialize the secondary ORC engine must not
+            // prevent Scratch from running: fall back to normal O3.
             const bool deferIR =
-                impl_->lazyProcedures &&
-                std::getenv("XYO_JIT_LAZY_IR_OPT") &&
-                irFunctions >= 16;
+                deferredCandidate && ensureLazyJit();
             if (deferIR) {
                 mod->addModuleFlag(llvm::Module::Warning,
                                    "xyo.lazy.optimize", 1);
@@ -958,13 +1024,10 @@ const CompiledScript* JitEngine::compile(Thread& thread, Runtime& runtime,
             // Lazy compilation is worthwhile only when a top-level script
             // has substantial distinct procedure bodies. Small scripts use
             // the normal ORC layer and avoid call-through trampoline cost.
-            constexpr size_t kLazyMinFunctions = 16;
-            lazyThisScript = impl_->lazyProcedures &&
-                             irFunctions >= kLazyMinFunctions;
+            lazyThisScript = deferIR;
             llvm::orc::ThreadSafeModule tsm(std::move(mod), impl_->tsc);
             llvm::Error err = lazyThisScript
-                ? static_cast<llvm::orc::LLLazyJIT*>(
-                      impl_->jit.get())->addLazyIRModule(std::move(tsm))
+                ? impl_->lazyJit->addLazyIRModule(std::move(tsm))
                 : impl_->jit->addIRModule(std::move(tsm));
             if (err) {
                 llvm::consumeError(std::move(err));
@@ -982,13 +1045,17 @@ const CompiledScript* JitEngine::compile(Thread& thread, Runtime& runtime,
     }
 
     const auto tLookup = Clock::now();
-    auto addrOr = impl_->jit->lookup(entryName);
+    auto& owningJit = lazyThisScript
+        ? static_cast<llvm::orc::LLJIT&>(*impl_->lazyJit)
+        : *impl_->jit;
+    auto addrOr = owningJit.lookup(entryName);
     if (!addrOr) {
         llvm::consumeError(addrOr.takeError());
         failed_.insert(top);
         return nullptr;
     }
     cs->entry = reinterpret_cast<ScriptFn>(addrOr->getValue());
+    cs->lazy = lazyThisScript;
     // Looking up every procedure in lazy mode defeats on-demand function
     // materialization. Generated Scratch code calls via ORC trampolines;
     // no runtime consumer reads CompiledScript::procedures in this path.
@@ -1006,10 +1073,11 @@ const CompiledScript* JitEngine::compile(Thread& thread, Runtime& runtime,
         const auto tDone = Clock::now();
         std::fprintf(stderr,
             "[jit-timing] %s emit=%.3fms opt=%.3fms submit=%.3fms "
-            "lookup=%.3fms total=%.3fms funcs=%zu ir=%zu\n",
+            "lookup=%.3fms total=%.3fms funcs=%zu ir=%zu tier=%s\n",
             topId.c_str(), emitMs, optMs, submitMs,
             msBetween(tLookup, tDone), msBetween(tStart, tDone),
-            irFunctions, irInstructions);
+            irFunctions, irInstructions,
+            lazyThisScript ? "lazy" : "eager");
     }
     if (verbose) {
         const double ms = std::chrono::duration<double, std::milli>(

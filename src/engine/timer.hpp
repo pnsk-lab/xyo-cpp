@@ -20,6 +20,8 @@ public:
     void start() { startTime_ = now(); }
     double timeElapsed() const { return now() - startTime_; }
     double startTime() const { return startTime_; }
+    /// A custom clock cannot use the scheduler's steady-clock snapshot.
+    bool usesSteadyClock() const { return !nowFn_; }
     /// Clock::resume 用（JS は startTime += dt）
     void setStartTime(double t) { startTime_ = t; }
 

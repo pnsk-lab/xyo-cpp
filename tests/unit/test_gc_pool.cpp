@@ -163,6 +163,36 @@ void rootedGraphAndReentrantAllocation() {
     gc.removeRootProvider(&list);
 }
 
+// Fragmented slabs must reuse only unallocated cells. Exercise all size
+// classes across repeated collection/reallocation, including surviving ropes.
+void fragmentedRunsPreserveSurvivors() {
+    Gc gc;
+    gc.setDeferred(true);
+    struct Root { SStr* str; char16_t value; };
+    std::vector<Root> roots;
+    roots.reserve(5000);
+    gc.addRootProvider(&roots, [&](Gc& g) {
+        for (const Root& r : roots) g.markPtr(r.str);
+    });
+    constexpr uint32_t cycleCount = 3;
+    for (uint32_t cycle = 0; cycle < cycleCount; ++cycle) {
+        for (uint32_t i = 0; i < 2400; ++i) {
+            const uint32_t len = i % 3 == 0 ? 1 : (i % 3 == 1 ? 8 : 20);
+            const char16_t value = char16_t(u'A' + (cycle * 7 + i) % 26);
+            SStr* current = flat(gc, len, value);
+            if (i % 5 == 0) roots.push_back({current, value});
+        }
+        gc.collect();
+        for (const Root& r : roots) {
+            check(gc.isObject(header(r.str)),
+                  "fragmented slab retained exact rooted allocation");
+            check(r.str->inlineBody()[0] == r.value,
+                  "fragmented allocation did not overwrite survivor");
+        }
+    }
+    gc.removeRootProvider(&roots);
+}
+
 void workerAllocationAndReclamation() {
     Gc gc;
     gc.setDeferred(true);
@@ -251,6 +281,7 @@ int test_gc_pool_main() {
     boundariesAndCandidates();
     rootedGraphAndReentrantAllocation();
     workerAllocationAndReclamation();
+    fragmentedRunsPreserveSurvivors();
     std::printf("GC pool: %d checks, %d failures\n", checks, failures);
     return failures;
 }

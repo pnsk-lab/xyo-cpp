@@ -70,6 +70,10 @@ std::atomic<uint64_t> g_poolGenCounter{0};
 Gc::Gc() {
     const char* enabled = std::getenv("XYO_GC_POOL");
     poolEnabled_ = !enabled || enabled[0] != '0';
+    const char* runAlloc = std::getenv("XYO_GC_RUN_ALLOC");
+    poolRunAlloc_ = !runAlloc || runAlloc[0] != '0';
+    const char* fastChild = std::getenv("XYO_GC_FAST_CONS_MARK");
+    fastConsChildMark_ = !fastChild || fastChild[0] != '0';
     if (const char* mb = std::getenv("XYO_GC_THRESHOLD")) {
         const long v = std::atol(mb);
         if (v > 0) minThreshold_ = size_t(v) << 20;
@@ -134,6 +138,7 @@ Gc::SmallSlab* Gc::acquireSlabLocked(unsigned cls, PoolKind pool) {
         availableSlabs_[kind][cls] = slab->availableNext;
         slab->availableNext = nullptr;
         slab->firstFreeWord = 0;
+        slab->nextFreeCell = slab->freeRunEnd = 0;
         return slab;
     }
     slab = static_cast<SmallSlab*>(::operator new(kSlabBytes, std::align_val_t{kSlabBytes}));
@@ -143,6 +148,8 @@ Gc::SmallSlab* Gc::acquireSlabLocked(unsigned cls, PoolKind pool) {
     slab->capacity = uint32_t((kSlabBytes - kSlabDataOffset) / kCellBytes[cls]);
     slab->live = 0;
     slab->firstFreeWord = 0;
+    slab->nextFreeCell = 0;
+    slab->freeRunEnd = slab->capacity; // new slabs are entirely empty
     for (unsigned word = 0; word < 16; ++word) {
         const unsigned start = word * 64;
         const unsigned free = start < slab->capacity
@@ -174,19 +181,56 @@ GcHeader* Gc::allocSmallTls(size_t total, PoolKind pool) {
             slab = acquireSlabLocked(cls, pool);
             tls.slab[kind][cls] = slab;
         }
-        unsigned word = slab->firstFreeWord;
-        while (word * 64 < slab->capacity && slab->allocated[word] == ~uint64_t(0))
-            ++word;
-        if (word * 64 >= slab->capacity) {
-            tls.slab[kind][cls] = nullptr;   // full; it stays registered for sweep
-            continue;
+        unsigned index;
+        if (poolRunAlloc_) {
+            if (slab->nextFreeCell >= slab->freeRunEnd) {
+                // This branch runs only when a contiguous run has been used
+                // up. Newly created slabs start with one full-capacity run.
+                unsigned word = slab->nextFreeCell / 64;
+                uint64_t free = 0;
+                while (word * 64 < slab->capacity) {
+                    free = ~slab->allocated[word];
+                    // Discard any cells before the previous run's end.
+                    const unsigned bit = slab->nextFreeCell % 64;
+                    if (word == slab->nextFreeCell / 64)
+                        free &= ~uint64_t(0) << bit;
+                    if (free) break;
+                    ++word;
+                }
+                if (word * 64 >= slab->capacity) {
+                    tls.slab[kind][cls] = nullptr;
+                    continue;
+                }
+                const unsigned start = word * 64 + std::countr_zero(free);
+                // Find the end of the free run once. All cells in this
+                // interval can be allocated with a simple cursor advance.
+                unsigned end = start + 1;
+                while (end < slab->capacity &&
+                       !(slab->allocated[end / 64] &
+                         (uint64_t(1) << (end % 64))))
+                    ++end;
+                slab->nextFreeCell = start;
+                slab->freeRunEnd = end;
+            }
+            index = slab->nextFreeCell++;
+            slab->allocated[index / 64] |= uint64_t(1) << (index % 64);
+        } else {
+            unsigned word = slab->firstFreeWord;
+            while (word * 64 < slab->capacity &&
+                   slab->allocated[word] == ~uint64_t(0))
+                ++word;
+            if (word * 64 >= slab->capacity) {
+                tls.slab[kind][cls] = nullptr;
+                continue;
+            }
+            const unsigned bit = std::countr_zero(~slab->allocated[word]);
+            slab->allocated[word] |= uint64_t(1) << bit;
+            slab->firstFreeWord = word;
+            index = word * 64 + bit;
         }
-        const unsigned bit = std::countr_zero(~slab->allocated[word]);
-        slab->allocated[word] |= uint64_t(1) << bit;
-        slab->firstFreeWord = word;
         ++slab->live;
         auto* h = reinterpret_cast<GcHeader*>(reinterpret_cast<char*>(slab) +
-            kSlabDataOffset + size_t(word * 64 + bit) * kCellBytes[cls]);
+            kSlabDataOffset + size_t(index) * kCellBytes[cls]);
         GC_UNPOISON(h, total);
         return h;
     }
@@ -218,6 +262,7 @@ void Gc::sweepSmallSlabs(size_t& live) {
             }
         }
         slab->firstFreeWord = 0;
+        slab->nextFreeCell = slab->freeRunEnd = 0;
     }
 }
 
@@ -428,8 +473,28 @@ void Gc::drainPending() {
         } else if (h->type == GcType::Str) {
             auto* s = reinterpret_cast<SStr*>(h + 1);
             if (s->isCons()) {
-                markPtr(s->left);
-                markPtr(s->right);
+                auto markChild = [&](SStr* child) {
+                    if (!child) return;
+                    if (fastConsChildMark_) {
+                        // Known cons edges always reference exact SStr payloads.
+                        // Within our slab, bypass expensive candidate/membership
+                        // validation done for arbitrary conservative roots.
+                        // Other collectors / malloc-backed cells use the
+                        // original, exact membership-checked path.
+                        uintptr_t address = uintptr_t(child) - sizeof(GcHeader);
+                        if (slabBases_.count(uintptr_t(slabBase(address)))) {
+                            auto* header = reinterpret_cast<GcHeader*>(address);
+                            if (!header->mark) {
+                                header->mark = 1;
+                                pending_.push_back(header);
+                            }
+                            return;
+                        }
+                    }
+                    markPtr(child);
+                };
+                markChild(s->left);
+                markChild(s->right);
             }
         }
     }

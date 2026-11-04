@@ -13,8 +13,23 @@
 #include "fiber.hpp"
 #include "pool.hpp"
 #include "runtime.hpp"
+#include "warp_clock.hpp"
 
 namespace xyo {
+
+Sequencer::Sequencer(Runtime& rt) : runtime(rt) {}
+Sequencer::~Sequencer() = default;
+
+std::atomic<int64_t>* Sequencer::sampledWarpClock() const {
+    return warpWatchdog_ && warpWatchdog_->armed()
+        ? &warpWatchdog_->sampledUs : nullptr;
+}
+
+std::atomic<int64_t>* Sequencer::sampledWarpDeadline() const {
+    return warpWatchdog_ && warpWatchdog_->armed()
+        ? &warpWatchdog_->deadlineUs : nullptr;
+}
+
 
 namespace {
 
@@ -105,6 +120,18 @@ std::vector<Thread*> Sequencer::stepThreads() {
     const double WORK_TIME = 0.75 * runtime.currentStepTime;
     runtime.updateCurrentMSecs();
     timer.start();
+    // Default JIT path: a shared, ~1ms sampled clock instead of calling
+    // steady_clock from each warp polling checkpoint. Custom clocks remain
+    // on the synchronous helper path.
+    static const bool sharedClockEnabled = [] {
+        const char* env = std::getenv("XYO_JIT_WARP_CLOCK");
+        return !env || env[0] != '0';
+    }();
+    if (sharedClockEnabled && jitEnabled() && timer.usesSteadyClock()) {
+        if (!warpWatchdog_) warpWatchdog_ = std::make_unique<WarpClockWatchdog>();
+        warpWatchdog_->arm(timer.startTime() + runtime.warpTimeMs,
+                           runtime.dangerMode);
+    }
     size_t numActiveThreads = SIZE_MAX;
     bool ranFirstTick = false;
     const bool allowParallel = parallelEnabled();
@@ -185,6 +212,7 @@ std::vector<Thread*> Sequencer::stepThreads() {
     this->activeThread = nullptr;
     stepping = nullptr;
     detachedLists.clear();
+    if (warpWatchdog_) warpWatchdog_->disarm();
     return doneThreads;
 }
 
@@ -377,6 +405,8 @@ void Sequencer::jitStepThread(Thread& thread) {
         c->fiber = thread.fiber;
     }
     c->target = thread.target;
+    c->sampledWarpClockUs = sampledWarpClock();
+    c->sampledWarpDeadlineUs = sampledWarpDeadline();
 #if !defined(XYO_DISABLE_RT_PROF)
     std::optional<ProfScope> ps;
     if (prof().enabled) { ps.emplace(&prof().fiberNs); ++prof().nFiber; }

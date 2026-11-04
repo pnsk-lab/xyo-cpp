@@ -1,6 +1,7 @@
 // xyo-cpp: engine/sequencer.js 相当。
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <vector>
 
@@ -14,10 +15,16 @@ struct Runtime;
 struct DepGraph;
 struct AccessSet;
 class Fiber;
+class WarpClockWatchdog;
 
 class Sequencer {
 public:
-    explicit Sequencer(Runtime& rt) : runtime(rt) {}
+    explicit Sequencer(Runtime& rt);
+    ~Sequencer();
+
+    /// Available only while stepThreads() is executing with a steady clock.
+    std::atomic<int64_t>* sampledWarpClock() const;
+    std::atomic<int64_t>* sampledWarpDeadline() const;
 
     Runtime& runtime;
     Timer timer;
@@ -72,6 +79,7 @@ public:
     const ParallelStats& parallelStats() const { return parStats_; }
 
 private:
+    std::unique_ptr<WarpClockWatchdog> warpWatchdog_;
     const AccessSet* parallelAccessFor(Thread& t) const;
     std::unique_ptr<WorkerPool> parPool_;
     std::vector<Thread*> parBatch_;
