@@ -51,9 +51,16 @@ static std::string quoteJson(const std::string& input) {
     }
     return out + '"';
 }
+static std::string targetTripleString(const llvm::Module& module) {
+#if LLVM_VERSION_MAJOR >= 20
+    return module.getTargetTriple().str();
+#else
+    return module.getTargetTriple();
+#endif
+}
 // This partial diagnostic fingerprint is NOT an ABI-compatibility proof or authentication.
 static std::string descriptor(const llvm::Module& module) {
-    std::string s = "xyo-browser-ir-abi-v2;llvm=" LLVM_VERSION_STRING ";triple=" + module.getTargetTriple().str() +
+    std::string s = "xyo-browser-ir-abi-v2;llvm=" LLVM_VERSION_STRING ";triple=" + targetTripleString(module) +
         ";layout=" + module.getDataLayoutStr();
     auto add = [&](const char* key, size_t value) { s += ';'; s += key; s += '='; s += std::to_string(value); };
     add("ptr_size", sizeof(void*)); add("ptr_align", alignof(void*));
@@ -94,7 +101,7 @@ static std::string fnv64(const std::string& input) {
 static std::string buildMetadata(const llvm::Module& module, const xyo::AotEmit& aot) {
     const auto abi = descriptor(module);
     std::string out = "{\"version\":1,\"targetIndex\":" + std::to_string(aot.targetIndex) +
-        ",\"targetTriple\":" + quoteJson(module.getTargetTriple().str()) +
+        ",\"targetTriple\":" + quoteJson(targetTripleString(module)) +
         ",\"dataLayout\":" + quoteJson(module.getDataLayoutStr()) +
         ",\"abiDescriptor\":" + quoteJson(abi) + ",\"abiFingerprintFNV1a64\":" + quoteJson(fnv64(abi)) +
         ",\"slots\":[";

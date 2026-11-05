@@ -4,4 +4,5 @@ public/llvm-assets/*
 !public/llvm-assets/.gitkeep
 tests/.xyo-sb3-llvm-*/
 native/build/
+native/.llvm-work/
 tests/.unified-tool-*/

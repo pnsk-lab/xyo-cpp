@@ -260,12 +260,12 @@ TurboWarp は `blocks` を JS オブジェクトとして**挿入順**にイテ�
 - `xyo gui` / `xyo edit` はブラウザシェル未対応（`play` のみ）。
 - WASM のスタックは既定 64KiB → 本ビルドは `-sSTACK_SIZE=5242880`（5MiB）。
 
-## ブラウザ内 LLVM と統合xyoランタイム（2026-11 実験的）
+## ブラウザ内 LLVM JIT（2026-11-05）
 
-[web/llvm-jit](../web/llvm-jit/README.md) に xyo-editor のコンパイラ・動的リンクホストを移植した。現在のxyo-cppをEmscriptenの `MAIN_MODULE=2` でビルドし、生成コードを同じxyo::Runtimeのメモリ・変数へ接続する実行経路を持つ。
+[web/llvm-jit](../web/llvm-jit/README.md) に xyo-editor の LLVM WebAssembly コンパイル基盤と実ランタイム統合ホストを移植した。現行 xyo-cpp の C++ `jitEmitScript` を wasm32 LLVM 19.1.7 に対してビルドし、ブラウザ内の wasm32 LLVM `llc` → wasm32 LLD → Emscripten `MAIN_MODULE=2` の `dlopen` で、インタプリタと同じ `xyo::Runtime` の変数を更新する。
 
-**確認済み:** 現行ランタイムWASMのビルド・Node実行、緑旗のインタプリタによる変数更新、SB3から生成したLLVM IRのPIC side moduleの動的ロードと同じ変数の更新、LLVMに非対応なプロジェクトのインタプリタフォールバック。Native LLVM llc/wasm-ldを用いたテストが通過している。統合モジュールはブラウザ専用Worker内でロードする設計。
+**検証済み:** Emscripten 6.0.12、LLVM 19.1.7 でコンパイラ・リンカ・ホストをビルド。Bun/Node の全WASM統合テストと、ヘッドレスGoogle ChromeでのVite+Worker+SB3読み込み+LLVM実行テストに成功（値 `42`）。ABI比較とAOTスロットの束縛、非対応スクリプトのインタプリタフォールバックも動作する。
 
-**未確認:** 実ブラウザにおけるLLVM in WasmのE2E実行（LLVM llc/LLDのWasmバイナリが別途必要）。現在SB3からIRを生成する実行用TypeScript経路は、単一緑旗の数値代入・加算だけを対象とした限定的なもの。xyo本体の `jitEmitScript` を利用する C++ API は移植・ネイティブでのIR生成検証済みだが、wasm32版LLVMライブラリとともにEmscriptenでビルドして統合する作業が残っている。ネイティブ版のIRには64-bitホストの構造体オフセットが入るためWASM32への流用を禁止する。レンダラ・音声・入力などのブラウザホストAPIも今後の統合対象。
+**制限:** LLVMは単一緑旗スクリプトの直線的な数値変数代入・加算のみ。ループ／yield／並列スケジューラ／クローン等はLLVM化しない。ブラウザのレンダラ・音声・ペン・ユーザー入力ブリッジは未接続。実行する動的モジュールはホストとメモリ共有し、サンドボックスではない。
 
-既存のネイティブLLVM ORC JITおよび自前WASMエンコーダの経路には変更を加えていない。
+再現手順と `bun run test:browser` は上記READMEを参照。ビルド生成物はGit管理しない。ネイティブ ORC JIT と従来の自前WASMエンコーダは変更しない。

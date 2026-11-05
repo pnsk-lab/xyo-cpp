@@ -10,7 +10,12 @@ export interface RunRequest {
   validateWasm?: string[];
 }
 export interface RunResult { files: InputFile[]; stdout: string; stderr: string }
-export interface WorkerRequest { id: number; request: RunRequest }
+export interface WorkerRequest {
+  id: number;
+  request: RunRequest;
+  /** Trusted same-origin factory URL configuration for Vite's immutable Worker URL. */
+  toolUrls?: { llc: string; 'wasm-ld': string };
+}
 export type WorkerResponse =
   | { id: number; ok: true; result: RunResult }
   | { id: number; ok: false; error: { message: string; stdout: string; stderr: string } };

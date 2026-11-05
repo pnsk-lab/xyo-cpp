@@ -8,3 +8,4 @@ export * from './sb3';
 export * from './runtime-ir';
 export * from './unified-runtime';
 export * from './compiler-metadata';
+export * from './browser-ir-compiler';

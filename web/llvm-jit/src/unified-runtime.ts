@@ -1,6 +1,7 @@
 import { zipSync, strToU8, unzipSync } from 'fflate';
 import { splitProjectForLlvm } from './split';
 import { emitRuntimeIR, type RuntimeIR } from './runtime-ir';
+import type { BrowserIrCompiler } from './browser-ir-compiler';
 import type { LLVMPipeline } from './pipeline';
 
 export interface XyoUnifiedModule {
@@ -37,15 +38,20 @@ export class UnifiedSB3Executor {
   private entry = 0;
   private disposed = false;
   private compiled = false;
+  private frontend: RuntimeIR['source'] | undefined;
+  private fallbackDiagnostic: string | undefined;
   private readonly encoder = new TextEncoder();
   private readonly decoder = new TextDecoder();
 
-  constructor(private readonly m: XyoUnifiedModule, private readonly compiler: LLVMPipeline) {
+  constructor(private readonly m: XyoUnifiedModule, private readonly compiler: LLVMPipeline,
+              private readonly cppCompiler?: BrowserIrCompiler) {
     this.handle = m._xyo_browser_create();
     if (!this.handle) throw Error('xyo browser create failed');
   }
 
   get mode(): 'llvm' | 'interpreter' { return this.compiled ? 'llvm' : 'interpreter'; }
+  get compilerBackend(): RuntimeIR['source'] | undefined { return this.frontend; }
+  get compileDiagnostic(): string | undefined { return this.fallbackDiagnostic; }
 
   private ensureActive() { if (this.disposed) throw Error('unified executor already disposed'); }
   private withBytes<T>(bytes: Uint8Array, f: (ptr: number) => T): T {
@@ -84,19 +90,28 @@ export class UnifiedSB3Executor {
     this.m._xyo_llvm_release(this.handle);
     this.entry = 0;
     this.compiled = false;
+    this.frontend = undefined;
+    this.fallbackDiagnostic = undefined;
     // No filtering of the project unless compilation and linking succeed.
     let ir: RuntimeIR | undefined;
     let side: Uint8Array | undefined;
     try {
       this.checkAbi();
+      // The restricted admission check is intentionally the same regardless
+      // of frontend. Never run general C++ output without the yield/ABI gate.
       ir = emitRuntimeIR(sb3);
+      if (this.cppCompiler) {
+        const native = this.cppCompiler.compile(sb3, this.readCString(this.m._xyo_browser_abi_descriptor()), ir.target);
+        ir = { ...native, hat: ir.hat };
+      }
       const result = await this.compiler.compile({
         ir: ir.ir,
         exports: ['xyo_browser_script', ...ir.slots.map(s => s.global)],
         sideModule: true,
       });
       side = result.binary;
-    } catch {
+    } catch (error) {
+      this.fallbackDiagnostic = error instanceof Error ? error.message : String(error);
       this.loadBytes(sb3);
       return;
     }
@@ -143,6 +158,7 @@ export class UnifiedSB3Executor {
       this.entry = sym('xyo_browser_script');
       if (!this.entry) throw Error('missing side module entry');
       this.compiled = true;
+      this.frontend = ir.source;
       success = true;
     } finally {
       if (!success) {

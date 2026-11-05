@@ -48,7 +48,7 @@ button.addEventListener('click', () => {
     button.disabled = false;
   }, 120_000);
   const finish = () => { clearTimeout(timeout); worker.terminate(); if (id === generation) button.disabled = false; };
-  worker.onmessage = (event: MessageEvent<{ id: number; ok: boolean; mode?: string; snapshot?: unknown; error?: string }>) => {
+  worker.onmessage = (event: MessageEvent<{ id: number; ok: boolean; mode?: string; backend?: string; diagnostic?: string; snapshot?: unknown; error?: string }>) => {
     if (event.data.id !== id) return;
     finish();
     if (!event.data.ok) {
@@ -57,12 +57,12 @@ button.addEventListener('click', () => {
     }
     result.textContent = JSON.stringify(event.data.snapshot, null, 2);
     status.textContent = event.data.mode === 'llvm'
-      ? 'xyo-cpp統合ランタイム内でLLVM生成コードを実行しました。'
-      : 'LLVM非対応のため、xyo-cppインタプリタで実行しました。';
+      ? 'xyo-cpp統合ランタイム内でLLVM生成コードを実行しました（' + (event.data.backend === 'cpp-jit-emit' ? 'C++ jitEmitScript' : '限定TypeScript生成器') + '）。'
+      : 'LLVM非対応のため、xyo-cppインタプリタで実行しました。' + (event.data.diagnostic ? ' 原因: ' + event.data.diagnostic : '');
   };
   worker.onerror = event => {
     finish();
     if (id === generation) status.textContent = 'Workerエラー: ' + event.message;
   };
-  worker.postMessage({ id, bytes: source, steps: 20 });
+  worker.postMessage({ id, bytes: source, steps: 20, origin: location.origin });
 });

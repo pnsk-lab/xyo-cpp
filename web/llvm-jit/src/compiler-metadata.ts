@@ -1,6 +1,8 @@
 import type { RuntimeSlot } from './runtime-ir';
 
 export interface BrowserCompilerMetadata {
+  version: number;
+  dataLayout: string;
   targetIndex: number;
   targetTriple: string;
   abiDescriptor: string;
@@ -29,11 +31,14 @@ export function verifyBrowserCompilerMetadata(
   hostDescriptor: string,
   expectedTarget: number,
 ): void {
+  if (metadata.version !== 1) throw Error('unsupported compiler metadata schema');
+  if (typeof metadata.dataLayout !== 'string' || !metadata.dataLayout.includes('p:32:32')) throw Error('invalid wasm32 data layout');
   if (metadata.targetTriple !== 'wasm32-unknown-emscripten') throw Error('wrong LLVM triple');
   if (metadata.targetIndex !== expectedTarget) throw Error('target index mismatch');
   if (!Array.isArray(metadata.slots) || metadata.slots.length === 0 || metadata.slots.length > 64) throw Error('invalid slot count');
   const host = parseDescriptor(hostDescriptor);
   const compiler = parseDescriptor(metadata.abiDescriptor);
+  if (compiler.get('layout') !== metadata.dataLayout || compiler.get('triple') !== metadata.targetTriple) throw Error('compiler layout metadata inconsistent');
   if (host.get('ptr_size') !== '4' || compiler.get('ptr_size') !== '4') throw Error('not wasm32 pointer ABI');
   for (const [key, value] of host) {
     if (compiler.get(key) !== value) throw Error('LLVM runtime ABI mismatch at ' + key);

@@ -24,7 +24,7 @@ export interface RuntimeIR {
   hat: string;
   target: number;
   /** This is a limited compatibility lowering, not xyo's C++ jitEmitScript. */
-  source: 'typescript-restricted';
+  source: 'typescript-restricted' | 'cpp-jit-emit';
 }
 
 /** Emit PIC LLVM IR that invokes the *real xyo* variable runtime helpers.

@@ -19,7 +19,8 @@
 namespace xyo::llvmc {
 
 /// lookupTarget / createTargetMachine / setTargetTriple へ渡す三つ組引数。
-#if LLVM_VERSION_MAJOR >= 19
+/// LLVM 19までは文字列。LLVM 20以降は Triple を受け取る。
+#if LLVM_VERSION_MAJOR >= 20
 using TripleArg = const llvm::Triple&;
 inline const llvm::Triple& tripleArg(const llvm::Triple& t) { return t; }
 #else
@@ -28,10 +29,10 @@ inline llvm::StringRef tripleArg(const llvm::Triple& t) { return t.str(); }
 #endif
 
 /// ThreadSafeContext のロックを取って LLVMContext を渡す。
-/// LLVM 19+ は withContextDo、18 は getLock()+getContext() を使う。
+/// LLVM 20+ は withContextDo、19 以下は getLock()+getContext() を使う。
 template <typename Fn>
 inline void withContext(llvm::orc::ThreadSafeContext& tsc, Fn&& fn) {
-#if LLVM_VERSION_MAJOR >= 19
+#if LLVM_VERSION_MAJOR >= 20
     tsc.withContextDo([&](llvm::LLVMContext* lc) { fn(lc); });
 #else
     auto lock = tsc.getLock();
