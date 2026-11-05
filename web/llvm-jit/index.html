@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="ja">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>xyo-cpp Browser LLVM JIT</title></head>
+<body><main>
+  <p class="eyebrow">xyo-cpp / experimental</p>
+  <h1>Scratch SB3 → LLVM → WebAssembly</h1>
+  <p class="description">ブラウザ内のLLVMでSB3をコンパイルして実行します。現在は単一の緑旗スクリプト内の数値変数の代入・加算に限定されます。</p>
+  <section class="panel">
+    <label for="project">SB3ファイル</label>
+    <input id="project" type="file" accept=".sb3,application/zip">
+    <button id="run" disabled>LLVMで実行</button>
+    <p id="status" role="status">SB3ファイルを選択してください。</p>
+  </section>
+  <section class="panel">
+    <h2>出力</h2>
+    <pre id="result">実行結果はここに表示されます。</pre>
+    <details><summary>生成されたLLVM IR</summary><pre id="ir"></pre></details>
+  </section>
+  <p class="footnote">LLVMのブラウザ用バイナリは <code>public/llvm-assets/</code> に別途配置する必要があります。対応しない命令は実行せず拒否します。現段階では完全なxyo-cppランタイムへの統合は未実装です。</p>
+</main><script type="module" src="/src/main.ts"></script></body>
+</html>

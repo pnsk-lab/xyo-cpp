@@ -32,6 +32,13 @@ describe('fake IR-to-module pipeline (not real LLVM)', () => {
     expect(output.diagnostics.llc?.stderr).toBe('output.o stderr');
     expect(output.diagnostics.linker?.stdout).toBe('output.wasm stdout');
   });
+  test('standalone browser modules export memory and reserve stack', async () => {
+    const fake = new FakeClient();
+    await new LLVMPipeline(fake).compile({ ir: '', exports: ['xyo_script'], exportMemory: true });
+    expect(fake.calls[1]!.args).toContain('--export-memory');
+    expect(fake.calls[1]!.args).toContain('--stack-first');
+    expect(fake.calls[1]!.args).toContain('--initial-memory=131072');
+  });
   test('side modules use PIC/shared flags', async () => {
     const fake = new FakeClient();
     fake.run = async r => { fake.calls.push(r); return r.tool === 'llc' ? result('output.o', new Uint8Array([1])) : result('output.wasm', wasm); };

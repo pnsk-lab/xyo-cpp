@@ -1,41 +1,52 @@
-# Browser LLVM JIT pipeline (experimental)
+# Browser LLVM execution for Scratch SB3 (experimental)
 
-Ported from [pnsk-lab/xyo-editor/packages/llvm-wasm](https://github.com/pnsk-lab/xyo-editor/tree/main/packages/llvm-wasm), MIT licensed.
+This directory contains the browser LLVM toolchain transport ported from [xyo-editor/packages/llvm-wasm](https://github.com/pnsk-lab/xyo-editor/tree/main/packages/llvm-wasm), plus an **independent, restricted SB3 frontend**.
 
-This provides the **browser-side LLVM IR → relocatable wasm object → linked wasm module** pipeline using **Emscripten-built LLVM llc and wasm-ld**, each in an isolated Web Worker invocation. It does not implement xyo's Scratch-to-LLVM IR generation or dynamically link generated code to the xyo runtime yet.
+## What works
 
-## Browser usage
+For a project containing **exactly one green-flag script**, with up to eight straight-line `data_setvariableto` / `data_changevariableby` blocks and numeric-shadow constants, the frontend:
 
-Prebuild `llc.mjs/.wasm` and `wasm-ld.mjs/.wasm` for the browser using the build and relink scripts from `xyo-editor/packages/llvm-wasm`. Serve these immutable artifacts over HTTP(S). The worker only imports *trusted* compiler URLs.
+1. Extracts `project.json` from the SB3 ZIP with bounded input size.
+2. Verifies the green-flag script and its initial numeric variables, rejecting unsupported input before execution.
+3. Emits wasm32 LLVM IR using double values in a flat variable array.
+4. Compiles IR to an object in a browser Worker using **LLVM llc compiled to WebAssembly**.
+5. Links it using **wasm-ld compiled to WebAssembly**, then instantiates the resulting module via the native browser WebAssembly API.
+6. Seeds the module's memory from the SB3 variables, invokes its compiled function and displays the resulting values.
 
-```ts
-import { createLLVMWorkerClient, LLVMPipeline } from './src/index';
-const client = createLLVMWorkerClient(
-  new URL('./src/worker.ts', import.meta.url),
-  '/llvm/llc.mjs',
-  '/llvm/wasm-ld.mjs',
-);
-const compiler = new LLVMPipeline(client);
-try {
-  const { binary, diagnostics } = await compiler.compile({
-    ir: 'define i32 @answer() { ret i32 42 }',
-    exports: ['answer'],
-  });
-  const { instance } = await WebAssembly.instantiate(binary);
-  console.log((instance.exports.answer as () => number)(), diagnostics);
-} finally {
-  compiler.stop();
-}
+The same end-to-end code was tested with **native LLVM llc + wasm-ld**, not with browser tool binaries. The 16 total unit/integration tests pass, including two actual ZIP→LLVM→Wasm executions.
+
+## Run locally
+
+This is a separate experimental viewer, not the main xyo CLI or full Scratch editor.
+
+```sh
+cd web/llvm-jit
+bun install
+# Build the browser llc and LLD artifacts in xyo-editor first, following
+# packages/llvm-wasm/README.md there. Then:
+bun run copy:artifacts -- /path/to/xyo-editor
+bun run dev
 ```
 
-Use an application bundler that compiles the TypeScript Worker (for example Vite). A valid `llc` and `wasm-ld` pair is mandatory; the project does not download or bundle their multi-megabyte .wasm images. The compiler instances run in their own isolated memories and do **not** automatically share xyo runtime memory or table.
+Open the printed Vite URL, select an SB3 file and choose **LLVMで実行**. The copy script expects these four artifact files from the xyo-editor build:
 
-## Current limitations
+- `llc-browser.mjs` and `llc-browser.wasm`
+- `lld-browser.mjs` and `lld-browser.wasm`
 
-- This pipeline accepts LLVM **IR**, not `.sb3` files. xyo's `src/jit/codegen.cpp` requires a wasm32-aware, ORC-free adapter before its IR can be fed into this pipeline. Do not pass host-ABI IR directly.
-- `sideModule: true` requests PIC/wasm32-unknown-emscripten and a shared link, but actual Emscripten side-module loading, helper resolution, GC roots, scheduler, ABI layout and return values still require integration and validation.
-- No code is placed in executable native linear memory; `WebAssembly.validate` is only format validation, not runtime/ABI or semantic parity proof.
-- Compiling untrusted code should be separated from execution and terminated at Worker level on cancellation.
-- The existing direct binary encoder in `src/wasm` and native LLVM ORC JIT remain unchanged.
+The compiler toolchain's Wasm binary assets are deliberately **not committed**. Opening the page without them is possible, but pressing run will fail. In particular, building this repository alone does not build or download LLVM in WebAssembly format.
 
-Run the isolated fake-tool tests with `cd web/llvm-jit && bun test`. These verify protocol and lifecycle, **not** actual LLVM tool binaries. See [docs/wasm.md](../../docs/wasm.md) for the existing xyo runtime and JIT architecture.
+```sh
+bun run check
+bun test
+bun run build
+```
+
+The native integration tests require `llc` and `wasm-ld` on PATH.
+
+## Scope and limitations
+
+**This does not yet execute arbitrary SB3 programs through xyo-cpp's full native `src/jit/codegen.cpp` on the browser.** It is a genuine LLVM→WebAssembly execution path, but the subset frontend generates its own IR and runs a separate memory instance. It does not run alongside xyo::Runtime or update a live Scratch stage. Unsupported projects are **refused** with an interpreter-required message; they are not silently dropped or incorrectly reported as compiled. The `split.ts` port is reserved for future integrated scheduling.
+
+General integration still needs the upstream xyo codegen's wasm32 ABI, real Emscripten runtime hosting, dynamic side-module loading, helper/slot binding, GC roots, scheduler integration and a proper interpreter fallback. xyo-editor's `unified` prototype provides a more complete experimental model, but relies on a pinned, patched old xyo-cpp revision and cannot be copied blindly into the current v1.0.2 runtime.
+
+This is not a sandbox for untrusted machine code, and LLVM compiling in a Worker is not equivalent to runtime parity validation.

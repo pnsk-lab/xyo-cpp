@@ -5,6 +5,18 @@
   "license": "MIT",
   "scripts": {
     "test": "bun test tests",
-    "check": "tsc -p tsconfig.json"
+    "check": "tsc -p tsconfig.json",
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "copy:artifacts": "node scripts/copy-editor-artifacts.mjs"
+  },
+  "dependencies": {
+    "fflate": "^0.8.3",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.6"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.4"
   }
 }

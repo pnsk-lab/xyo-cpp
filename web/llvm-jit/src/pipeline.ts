@@ -10,7 +10,7 @@ export interface StageDiagnostics { stdout: string; stderr: string }
 export interface PipelineDiagnostics { llc?: StageDiagnostics; linker?: StageDiagnostics }
 /** `sideModule` links a shared object with `--allow-undefined` instead of an
  * executable; imports are resolved by whatever loads it. */
-export interface CompileOptions { ir: string; exports: string[]; sideModule?: true }
+export interface CompileOptions { ir: string; exports: string[]; sideModule?: true; exportMemory?: true }
 export interface CompileResult { binary: Uint8Array; diagnostics: PipelineDiagnostics }
 export class PipelineError extends Error {
   constructor(message: string, public readonly stage: 'llc' | 'linker' | 'validation' | 'cancelled', public readonly diagnostics: PipelineDiagnostics) {
@@ -54,6 +54,9 @@ export class LLVMPipeline {
       throw new PipelineError('Invalid IR or export names', 'llc', diagnostics);
     }
     const side = options.sideModule === true;
+    if (options.exportMemory !== undefined && options.exportMemory !== true) {
+      throw new PipelineError('Invalid exportMemory flag', 'validation', diagnostics);
+    }
     if (options.sideModule !== undefined && options.sideModule !== true) {
       throw new PipelineError('Invalid side-module flag', 'validation', diagnostics);
     }
@@ -77,7 +80,7 @@ export class LLVMPipeline {
     const objectBytes = object.files.find(file => file.path === 'output.o')?.data;
     if (!(objectBytes instanceof Uint8Array)) throw new PipelineError('llc did not produce output.o', 'llc', diagnostics);
     checkCurrent();
-    const linked = await run('linker', { tool: 'wasm-ld', args: ['-flavor', 'wasm', ...(side ? ['--shared', '--allow-undefined'] : ['--no-entry']), ...exports.map(name => `--export=${name}`), 'input.o', '-o', 'output.wasm'], inputs: [{ path: 'input.o', data: objectBytes }], outputs: ['output.wasm'] });
+    const linked = await run('linker', { tool: 'wasm-ld', args: ['-flavor', 'wasm', ...(side ? ['--shared', '--allow-undefined'] : ['--no-entry', '--stack-first', '-z', 'stack-size=65536', '--initial-memory=131072']), ...(options.exportMemory ? ['--export-memory'] : []), ...exports.map(name => `--export=${name}`), 'input.o', '-o', 'output.wasm'], inputs: [{ path: 'input.o', data: objectBytes }], outputs: ['output.wasm'] });
     const linkedBytes = linked.files.find(file => file.path === 'output.wasm')?.data;
     // Copy into a fresh ArrayBuffer-backed view: some DOM lib typings only
     // accept ArrayBuffer-backed BufferSource for validate/compile.

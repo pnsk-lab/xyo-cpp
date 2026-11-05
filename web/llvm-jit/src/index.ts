@@ -2,3 +2,6 @@ export * from './protocol';
 export * from './client';
 export * from './pipeline';
 export type { ToolFactory, ToolFactories, ToolModule } from './runtime';
+export * from './admission';
+export * from './split';
+export * from './sb3';
