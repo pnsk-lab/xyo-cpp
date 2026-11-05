@@ -3263,6 +3263,67 @@ struct Codegen {
                          const char* helper, CmpInst::Predicate pred) {
         llvm::Value* a = emitInputOf(blk, in1);
         llvm::Value* bv = emitInputOf(blk, in2);
+        // For two dynamic Scratch values, the hot case is two plain IEEE
+        // numbers (finite values or infinities). Check their absolute bit
+        // patterns against +Infinity. Unlike signed-bits < kNan, this ALSO
+        // excludes every noncanonical negative NaN payload. All Scratch
+        // NaN-boxed tags and either sign of NaN take the full helper path.
+        // A list item changing type never invalidates this guard.
+        const char* plainCmp = std::getenv("XYO_JIT_PLAIN_NUMBER_CMP");
+        // List-item comparisons dominate many Scratch algorithms. Only this
+        // structurally identifiable shape uses the speculation by default;
+        // global speculative comparison adds overhead to string/other cases.
+        // 0 disables it; 1 opts every dynamic/dynamic comparison into it.
+        auto isListItemInput = [&](const char* name) {
+            const BlockInput* input = blk->inputs.find(name);
+            if (!input) return false;
+            const std::string& id = input->block.empty()
+                ? input->shadow : input->block;
+            Block* source = id.empty() ? nullptr : getBlock(id);
+            return source && source->opcode == "data_itemoflist";
+        };
+        const bool listPair = isListItemInput(in1) && isListItemInput(in2);
+        const bool fastCmp = plainCmp ? plainCmp[0] == '1' : listPair;
+        if (fastCmp && !isNumericOperand(a) && !isNumericOperand(bv)) {
+            BasicBlock* numberBB = newBB("cmp.plain.number");
+            BasicBlock* fallbackBB = newBB("cmp.plain.scratch");
+            BasicBlock* doneBB = newBB("cmp.plain.done");
+            constexpr uint64_t kMagnitudeMask = 0x7fff'ffff'ffff'ffffull;
+            constexpr uint64_t kInfinityBits = 0x7ff0'0000'0000'0000ull;
+            auto plainNumber = [&](llvm::Value* value) {
+                return b.CreateICmpULE(
+                    b.CreateAnd(value, ci64(kMagnitudeMask)),
+                    ci64(kInfinityBits));
+            };
+            llvm::Value* fa = emitAsF64(a);
+            llvm::Value* fb = emitAsF64(bv);
+            // A NaN-boxed non-number is always a NaN when interpreted as
+            // IEEE double. Use an ordered floating-point comparison as an
+            // alternative to two integer type guards; an unordered input
+            // must still use Scratch's string/numeric fallback semantics.
+            const char* orderedEnv = std::getenv("XYO_JIT_FP_ORDERED_CMP");
+            // The default ordered comparison can reuse the same floating
+            // point operands and flags as the actual < or > comparison.
+            // The older integer tag guard is available for controlled A/B
+            // testing; both reject every NaN-boxed non-number.
+            const bool useOrdered = !orderedEnv || orderedEnv[0] != '0';
+            llvm::Value* bothNumber = useOrdered
+                ? b.CreateFCmpORD(fa, fb)
+                : b.CreateAnd(plainNumber(a), plainNumber(bv));
+            hotBr(bothNumber, numberBB, fallbackBB, 1000, 1);
+            b.SetInsertPoint(numberBB);
+            llvm::Value* direct = b.CreateZExt(
+                b.CreateFCmp(pred, fa, fb), i32t);
+            b.CreateBr(doneBB);
+            b.SetInsertPoint(fallbackBB);
+            llvm::Value* scratch = call2(helper, i32t, a, bv);
+            b.CreateBr(doneBB);
+            b.SetInsertPoint(doneBB);
+            llvm::PHINode* result = b.CreatePHI(i32t, 2);
+            result->addIncoming(direct, numberBB);
+            result->addIncoming(scratch, fallbackBB);
+            return result;
+        }
         // 相手が数値と分かっていれば、リテラル側を数値へ畳める。
         const bool aNum = isNumericOperand(a);
         const bool bNum = isNumericOperand(bv);
@@ -5122,6 +5183,776 @@ struct Codegen {
         endLoopYieldScope(true);
     }
 
+    // Aggregate affine, effect-free scalar updates up to the next warp
+    // deadline sample. Never change the behavior of non-warp loops or of
+    // fractional, nonnumeric, potentially inexact or unproven inputs.
+    struct WarpInductionUpdate {
+        const BlockField* field;
+        int64_t delta;
+    };
+    struct WarpInductionPlan {
+        const BlockField* index = nullptr;
+        const BlockField* boundVariable = nullptr;
+        int64_t boundLiteral = 0;
+        int64_t stride = 0;
+        int direction = 0;
+        bool inclusive = false;
+        std::vector<WarpInductionUpdate> updates;
+    };
+
+    // Literal number shadows only. Expressions and strings can have different
+    // Scratch coercion or evaluation semantics and cannot be hoisted blindly.
+    std::optional<double> literalNumber(Block* parent, const char* input) {
+        const BlockInput* in = parent ? parent->inputs.find(input) : nullptr;
+        if (!in) return std::nullopt;
+        const auto& id = in->block.empty() ? in->shadow : in->block;
+        Block* value = getBlock(id);
+        if (!value || !value->shadow || value->fields.size() != 1)
+            return std::nullopt;
+        static const std::unordered_set<std::string_view> kNumeric = {
+            "math_number", "math_integer", "math_whole_number",
+            "math_positive_number", "math_angle"
+        };
+        if (!kNumeric.contains(value->opcode)) return std::nullopt;
+        const Value literal = value->fields.begin()->second.value;
+        if (cast::isWhiteSpace(literal)) return std::nullopt;
+        const double number = cast::toNumberOrNaN(literal);
+        if (!std::isfinite(number)) return std::nullopt;
+        return number;
+    }
+
+    const BlockField* directVariableInput(Block* node, const char* input) {
+        const BlockInput* in = node ? node->inputs.find(input) : nullptr;
+        if (!in) return nullptr;
+        Block* child = getBlock(in->block.empty() ? in->shadow : in->block);
+        return child && child->opcode == "data_variable"
+            ? findField(child, "VARIABLE") : nullptr;
+    }
+
+    // Resolve-by-name fallback can alias two different Scratch IDs. Rather
+    // than assuming they are distinct, reject ambiguous equal-name fields.
+    static bool sameNamedField(const BlockField* a, const BlockField* c) {
+        if (!a || !c || !a->value.isString() || !c->value.isString() ||
+            !a->value.asStrPtr() || !c->value.asStrPtr()) return false;
+        return a->value.asStrPtr()->view() == c->value.asStrPtr()->view();
+    }
+
+    std::optional<WarpInductionPlan> warpInductionPlan(Block* loop) {
+        if (promotingLoop || !promoted.empty()) return std::nullopt;
+        const char* enabled = std::getenv("XYO_JIT_WARP_INDUCTION");
+        if (enabled && enabled[0] == '0') return std::nullopt;
+        const BlockInput* condition = loop->inputs.find("CONDITION");
+        const BlockInput* bodyInput = loop->inputs.find("SUBSTACK");
+        if (!condition || !bodyInput || bodyInput->block.empty())
+            return std::nullopt;
+
+        WarpInductionPlan plan;
+        // All statements must be independent constant integer increments,
+        // either `change x by N` or `set x to x +/- N`. Allow several distinct
+        // variables but not repeated writes to one (intermediate conversions).
+        Block* body = getBlock(bodyInput->block);
+        for (unsigned count = 0; body; ++count) {
+            if (count == 8 ||
+                (body->opcode != "data_changevariableby" &&
+                 body->opcode != "data_setvariableto")) return std::nullopt;
+            const BlockField* written = findField(body, "VARIABLE");
+            if (!written || written->id.empty()) return std::nullopt;
+            std::optional<double> delta;
+            if (body->opcode == "data_changevariableby") {
+                delta = literalNumber(body, "VALUE");
+            } else {
+                const BlockInput* in = body->inputs.find("VALUE");
+                Block* arithmetic = in
+                    ? getBlock(in->block.empty() ? in->shadow : in->block)
+                    : nullptr;
+                if (!arithmetic ||
+                    (arithmetic->opcode != "operator_add" &&
+                     arithmetic->opcode != "operator_subtract"))
+                    return std::nullopt;
+                const BlockField* lhs = directVariableInput(arithmetic, "NUM1");
+                const BlockField* rhs = directVariableInput(arithmetic, "NUM2");
+                auto isSelf = [&](const BlockField* f) {
+                    return f && f->id == written->id &&
+                           sameNamedField(f, written);
+                };
+                if (isSelf(lhs)) {
+                    delta = literalNumber(arithmetic, "NUM2");
+                    if (delta && arithmetic->opcode == "operator_subtract")
+                        *delta = -*delta;
+                } else if (arithmetic->opcode == "operator_add" &&
+                           isSelf(rhs)) {
+                    delta = literalNumber(arithmetic, "NUM1");
+                }
+            }
+            if (!delta ||
+                std::trunc(*delta) != *delta || std::abs(*delta) > 65536.0)
+                return std::nullopt;
+            for (const auto& previous : plan.updates) {
+                if (previous.field->id == written->id ||
+                    sameNamedField(previous.field, written))
+                    return std::nullopt;
+            }
+            plan.updates.push_back({written, static_cast<int64_t>(*delta)});
+            if (body->next.empty()) break;
+            body = getBlock(body->next);
+            if (!body) return std::nullopt;
+        }
+        if (plan.updates.empty()) return std::nullopt;
+
+        const std::string& conditionId = condition->block.empty()
+            ? condition->shadow : condition->block;
+        Block* test = getBlock(conditionId);
+        bool negated = loop->opcode == "control_repeat_until";
+        for (unsigned i = 0; test && test->opcode == "operator_not" && i < 4; ++i) {
+            const BlockInput* child = test->inputs.find("OPERAND");
+            if (!child) return std::nullopt;
+            test = getBlock(child->block.empty() ? child->shadow : child->block);
+            negated = !negated;
+        }
+        if (!test || (test->opcode != "operator_lt" &&
+                      test->opcode != "operator_gt")) return std::nullopt;
+        const BlockField* left = directVariableInput(test, "OPERAND1");
+        const BlockField* right = directVariableInput(test, "OPERAND2");
+        auto isUpdated = [&](const BlockField* field) {
+            return field && std::any_of(
+                plan.updates.begin(), plan.updates.end(),
+                [&](const WarpInductionUpdate& entry) {
+                    return entry.field->id == field->id ||
+                           sameNamedField(entry.field, field);
+                });
+        };
+        const bool lhsIsIndex = isUpdated(left);
+        const bool rhsIsIndex = isUpdated(right);
+        if (lhsIsIndex == rhsIsIndex) return std::nullopt;
+        const BlockField* index = lhsIsIndex ? left : right;
+        const BlockField* other = lhsIsIndex ? right : left;
+        if (!index || index->id.empty()) return std::nullopt;
+        const auto it = std::find_if(
+            plan.updates.begin(), plan.updates.end(),
+            [&](const WarpInductionUpdate& entry) {
+                return entry.field->id == index->id &&
+                       sameNamedField(entry.field, index);
+            });
+        if (it == plan.updates.end() || it->delta == 0)
+            return std::nullopt;
+        // If the same name has an unresolved/different ID, it may alias
+        // another variable at runtime; do not use the aggregate path.
+        for (const auto& entry : plan.updates)
+            if (entry.field->id != index->id &&
+                sameNamedField(entry.field, index)) return std::nullopt;
+
+        const char* boundInput = lhsIsIndex ? "OPERAND2" : "OPERAND1";
+        auto literal = literalNumber(test, boundInput);
+        constexpr double kExact = 281474976710656.0; // 2^48
+        if (literal && std::trunc(*literal) == *literal &&
+            std::abs(*literal) <= kExact) {
+            plan.boundLiteral = static_cast<int64_t>(*literal);
+        } else if (other && !other->id.empty() && !isUpdated(other)) {
+            for (const auto& entry : plan.updates)
+                if (sameNamedField(entry.field, other)) return std::nullopt;
+            plan.boundVariable = other;
+        } else return std::nullopt;
+
+        // Rewrite an RHS induction variable into the normal LHS orientation.
+        const bool less = (test->opcode == "operator_lt") == lhsIsIndex;
+        plan.direction = (less != negated) ? 1 : -1;
+        plan.inclusive = negated;
+        if ((it->delta > 0 ? 1 : -1) != plan.direction)
+            return std::nullopt;
+        plan.index = it->field;
+        plan.stride = std::abs(it->delta);
+        return plan;
+    }
+
+    // The acceleration writes nothing until all runtime guards pass. Each
+    // chunk ends at exactly the next original 64-iteration warp poll; after
+    // yielding, we reread BOTH index and dynamic bound/accumulator variables.
+    void emitWarpInduction(const WarpInductionPlan& plan,
+                           BasicBlock* fallback, BasicBlock* fastDone) {
+        BasicBlock* prepare = newBB("induction.prepare");
+        BasicBlock* head = newBB("induction.head");
+        BasicBlock* valid = newBB("induction.valid");
+        BasicBlock* update = newBB("induction.update");
+        BasicBlock* perform = newBB("induction.perform");
+        BasicBlock* abandon = newBB("induction.abandon");
+        BasicBlock* finish = newBB("induction.finish");
+        b.CreateCondBr(b.CreateICmpNE(loadIsWarp(), ci32(0)), prepare, fallback);
+        b.SetInsertPoint(prepare);
+        beginLoopYieldScope();
+        llvm::Value* real = realVarValuePtr(plan.index);
+        llvm::Value* boundPtr = plan.boundVariable
+            ? realVarValuePtr(plan.boundVariable) : nullptr;
+        b.CreateBr(head);
+        b.SetInsertPoint(head);
+        llvm::Value* indexBits = b.CreateLoad(i64t, real);
+        llvm::Value* indexOk = nullptr;
+        llvm::Value* indexNumber = emitCmpNumF64(indexBits, &indexOk, true);
+        llvm::Value* boundOk = b.getTrue();
+        llvm::Value* boundNumber = cf64(static_cast<double>(plan.boundLiteral));
+        if (boundPtr) {
+            llvm::Value* boundBits = b.CreateLoad(i64t, boundPtr);
+            boundNumber = emitCmpNumF64(boundBits, &boundOk, true);
+        }
+        constexpr double kExact = 281474976710656.0;
+        auto safeIntegral = [&](llvm::Value* v) {
+            return b.CreateAnd(
+                b.CreateAnd(b.CreateFCmpOGE(v, cf64(-kExact)),
+                            b.CreateFCmpOLE(v, cf64(kExact))),
+                b.CreateFCmpOEQ(v, b.CreateUnaryIntrinsic(Intrinsic::trunc, v)));
+        };
+        llvm::Value* accepted = b.CreateAnd(
+            b.CreateAnd(indexOk, boundOk),
+            b.CreateAnd(safeIntegral(indexNumber), safeIntegral(boundNumber)));
+        llvm::Value* index = b.CreateFPToSI(
+            b.CreateSelect(accepted, indexNumber, cf64(0.0)), i64t);
+        llvm::Value* bound = b.CreateFPToSI(
+            b.CreateSelect(accepted, boundNumber, cf64(0.0)), i64t);
+        b.CreateCondBr(accepted, valid, abandon);
+        b.SetInsertPoint(valid);
+        llvm::Value* distance = plan.direction > 0
+            ? b.CreateSub(bound, index) : b.CreateSub(index, bound);
+        llvm::Value* go = plan.inclusive
+            ? b.CreateICmpSGE(distance, ci64(0))
+            : b.CreateICmpSGT(distance, ci64(0));
+        llvm::Value* safeDistance = b.CreateSelect(go, distance, ci64(0));
+        llvm::Value* remaining = plan.inclusive
+            ? b.CreateAdd(b.CreateUDiv(safeDistance, ci64(plan.stride)), ci64(1))
+            : b.CreateUDiv(b.CreateAdd(safeDistance, ci64(plan.stride - 1)),
+                           ci64(plan.stride));
+        b.CreateCondBr(go, update, finish);
+        b.SetInsertPoint(update);
+        llvm::Value* ticks = b.CreateLoad(i64t, curYieldCnt);
+        llvm::Value* toPoll = b.CreateSub(
+            ci64(64), b.CreateAnd(ticks, ci64(63)));
+        llvm::Value* chunk = b.CreateSelect(
+            b.CreateICmpULT(remaining, toPoll), remaining, toPoll);
+
+        // Validate secondary scalars BEFORE any store. Exact integral
+        // arithmetic is associative in this bounded domain, so a batch
+        // produces the same bits as one Scratch change-variable-by at a time.
+        std::vector<std::pair<llvm::Value*, llvm::Value*>> finalValues;
+        std::vector<llvm::Value*> initialValues;
+        llvm::Value* allOk = b.getTrue();
+        for (const auto& entry : plan.updates) {
+            llvm::Value* ptr = entry.field->id == plan.index->id
+                ? real : realVarValuePtr(entry.field);
+            llvm::Value* current;
+            if (entry.field->id == plan.index->id) {
+                current = index;
+            } else {
+                llvm::Value* bits = b.CreateLoad(i64t, ptr);
+                llvm::Value* isNumeric = nullptr;
+                llvm::Value* value = emitCmpNumF64(bits, &isNumeric, true);
+                allOk = b.CreateAnd(allOk, b.CreateAnd(isNumeric,
+                                                        safeIntegral(value)));
+                current = b.CreateFPToSI(
+                    b.CreateSelect(safeIntegral(value), value, cf64(0.0)),
+                    i64t);
+            }
+            llvm::Value* next = b.CreateAdd(
+                current, b.CreateMul(chunk, ci64(entry.delta)));
+            finalValues.emplace_back(ptr, next);
+            initialValues.push_back(current);
+        }
+        b.CreateCondBr(allOk, perform, abandon);
+        b.SetInsertPoint(perform);
+        const char* scevMode = std::getenv("XYO_JIT_WARP_SCEV");
+        const bool emitScevLoop = !scevMode || scevMode[0] != '0';
+        if (emitScevLoop) {
+            // LLVM receives a standard single-block SSA induction loop.
+            // LLVM's normal O2/O3 loop passes analyze the AddRec and fold
+            // the bounded microloop. Scratch's guards and warp poll remain.
+            BasicBlock* preheader = b.GetInsertBlock();
+            BasicBlock* nativeHead = newBB("xyo.affine.header");
+            BasicBlock* nativeExit = newBB("xyo.affine.exit");
+            b.CreateBr(nativeHead);
+            b.SetInsertPoint(nativeHead);
+            auto* iter = b.CreatePHI(i64t, 2, "xyo.affine.iter");
+            iter->addIncoming(ci64(0), preheader);
+            std::vector<llvm::PHINode*> states;
+            states.reserve(initialValues.size());
+            for (size_t i = 0; i < initialValues.size(); ++i) {
+                auto* phi = b.CreatePHI(i64t, 2, "xyo.affine.value");
+                phi->addIncoming(initialValues[i], preheader);
+                states.push_back(phi);
+            }
+            std::vector<llvm::Value*> stepped;
+            for (size_t i = 0; i < states.size(); ++i) {
+                // Runtime proof bounds values to ±2^48 and 64*65536
+                // extra, well within the exact integer range of IEEE f64.
+                llvm::Value* next = b.CreateNSWAdd(
+                    states[i], ci64(plan.updates[i].delta));
+                stepped.push_back(next);
+                states[i]->addIncoming(next, nativeHead);
+            }
+            llvm::Value* nextIter = b.CreateAdd(iter, ci64(1),
+                                               "xyo.affine.next", true, true);
+            iter->addIncoming(nextIter, nativeHead);
+            b.CreateCondBr(
+                b.CreateICmpULT(nextIter, chunk), nativeHead, nativeExit);
+            b.SetInsertPoint(nativeExit);
+            // LLVM requires all PHI instructions at the top of their block.
+            // Keeping them contiguous also lets SCEV collect every affine
+            // result before CFG rewriting, not just the first accumulator.
+            std::vector<llvm::PHINode*> exitValues;
+            for (llvm::Value* next : stepped) {
+                auto* exitPhi = b.CreatePHI(i64t, 1, "xyo.affine.result");
+                exitPhi->addIncoming(next, nativeHead);
+                exitValues.push_back(exitPhi);
+            }
+            for (size_t i = 0; i < exitValues.size(); ++i) {
+                llvm::Value* nextNumber = b.CreateSIToFP(exitValues[i], f64t);
+                b.CreateStore(b.CreateBitCast(nextNumber, i64t),
+                              finalValues[i].first);
+            }
+        } else {
+            // Pre-SCEV implementation for isolated A/B measurements.
+            for (const auto& [ptr, value] : finalValues) {
+                llvm::Value* nextNumber = b.CreateSIToFP(value, f64t);
+                b.CreateStore(b.CreateBitCast(nextNumber, i64t), ptr);
+            }
+        }
+        b.CreateStore(b.CreateAdd(ticks, b.CreateSub(chunk, ci64(1))),
+                      curYieldCnt);
+        emitLoopYield();
+        b.CreateBr(head);
+        BasicBlock* leave = newBB("induction.leave");
+        b.SetInsertPoint(abandon);
+        b.CreateBr(leave);
+        b.SetInsertPoint(finish);
+        b.CreateBr(leave);
+        b.SetInsertPoint(leave);
+        auto* completed = b.CreatePHI(b.getInt1Ty(), 2);
+        completed->addIncoming(b.getFalse(), abandon);
+        completed->addIncoming(b.getTrue(), finish);
+        endLoopYieldScope(true);
+        b.CreateCondBr(completed, fastDone, fallback);
+        b.SetInsertPoint(fallback);
+    }
+
+    struct RepeatCopyOp {
+        unsigned dst;
+        std::optional<unsigned> src; // nullopt => constant numeric increment
+        int64_t delta = 0;
+    };
+    struct RepeatCopyPlan {
+        struct Variable {
+            const BlockField* field;
+            bool written = false;
+        };
+        std::vector<Variable> vars;
+        std::vector<RepeatCopyOp> ops;
+    };
+
+    // Recognize a straight-line, pure sequence of scalar assignments and
+    // constant increments (not a particular benchmark's variable names).
+    // No intermediate value is visible to Scratch without a yield. The
+    // runtime proof below requires all values to be plain, integral doubles.
+    std::optional<RepeatCopyPlan> repeatCopyPlan(Block* loop) {
+        const char* flag = std::getenv("XYO_JIT_REPEAT_COPY_SSA");
+        if (flag && flag[0] == '0') return std::nullopt;
+        const BlockInput* input = loop->inputs.find("SUBSTACK");
+        if (!input || input->block.empty()) return std::nullopt;
+        RepeatCopyPlan plan;
+        auto resolve = [&](const BlockField* f) -> std::optional<unsigned> {
+            if (!f || f->id.empty() || !f->value.isString() ||
+                !f->value.asStrPtr()) return std::nullopt;
+            for (unsigned i = 0; i < plan.vars.size(); ++i) {
+                const auto* existing = plan.vars[i].field;
+                if (existing->id == f->id) {
+                    if (!sameNamedField(existing, f)) return std::nullopt;
+                    return i;
+                }
+                if (sameNamedField(existing, f)) return std::nullopt;
+            }
+            if (plan.vars.size() == 8) return std::nullopt;
+            plan.vars.push_back({f, false});
+            return unsigned(plan.vars.size() - 1);
+        };
+        Block* statement = getBlock(input->block);
+        for (unsigned count = 0; statement && count < 12; ++count) {
+            const bool assign = statement->opcode == "data_setvariableto";
+            if (!assign && statement->opcode != "data_changevariableby")
+                return std::nullopt;
+            const auto dst = resolve(findField(statement, "VARIABLE"));
+            if (!dst) return std::nullopt;
+            if (assign) {
+                Block* rhs = transientChild(statement, "VALUE");
+                if (!rhs || rhs->opcode != "data_variable")
+                    return std::nullopt;
+                const auto src = resolve(findField(rhs, "VARIABLE"));
+                if (!src) return std::nullopt;
+                plan.ops.push_back({*dst, *src, 0});
+            } else {
+                const auto amount = literalNumber(statement, "VALUE");
+                if (!amount || !std::isfinite(*amount) ||
+                    *amount != std::trunc(*amount) ||
+                    std::abs(*amount) > 65536.0) return std::nullopt;
+                plan.ops.push_back({*dst, std::nullopt, int64_t(*amount)});
+            }
+            plan.vars[*dst].written = true;
+            if (statement->next.empty()) break;
+            statement = getBlock(statement->next);
+            if (!statement) return std::nullopt;
+        }
+        if (statement && !statement->next.empty()) return std::nullopt;
+        if (plan.ops.size() < 2 || plan.ops.size() > 12) return std::nullopt;
+        return plan;
+    }
+
+    void emitRepeatCopyChunk(const RepeatCopyPlan& plan,
+                             llvm::Value* remaining32, AllocaInst* countdown,
+                             BasicBlock* loopHead) {
+        BasicBlock* fast = newBB("rep.copy.fast");
+        BasicBlock* slow = newBB("rep.copy.slow");
+        constexpr double kLimit = 281474976710656.0; // 2^48
+        llvm::Value* valid = b.CreateICmpNE(loadIsWarp(), ci32(0));
+        std::vector<llvm::Value*> starts;
+        for (const auto& var : plan.vars) {
+            llvm::Value* bits = emitVarGet(var.field);
+            // A numeric string must retain its original boxed type if a
+            // copy happens before the next addition. Do not speculate on it.
+            llvm::Value* plain = b.CreateICmpSLT(bits, ci64(val::kNan));
+            llvm::Value* value = b.CreateBitCast(
+                b.CreateSelect(plain, bits, ci64(0)), f64t);
+            llvm::Value* inRange = b.CreateAnd(
+                b.CreateFCmpOGE(value, cf64(-kLimit)),
+                b.CreateFCmpOLE(value, cf64(kLimit)));
+            llvm::Value* integral = b.CreateFCmpOEQ(
+                value, b.CreateUnaryIntrinsic(Intrinsic::trunc, value));
+            // Copying -0 through an integer recurrence would turn it into
+            // +0. Scratch's set-variable preserves the exact sign bit.
+            llvm::Value* notNegativeZero = b.CreateICmpNE(
+                bits, ci64(0x8000000000000000ULL));
+            valid = b.CreateAnd(valid, b.CreateAnd(
+                plain, b.CreateAnd(inRange,
+                    b.CreateAnd(integral, notNegativeZero))));
+            // fptosi on infinity/out-of-range doubles is LLVM poison.
+            // Guard before converting, even though the fast CFG is cold.
+            starts.push_back(b.CreateFPToSI(
+                b.CreateSelect(inRange, value, cf64(0.0)), i64t));
+        }
+        b.CreateCondBr(valid, fast, slow);
+        b.SetInsertPoint(fast);
+        llvm::Value* ticks = b.CreateLoad(i64t, curYieldCnt);
+        llvm::Value* toPoll = b.CreateSub(
+            ci64(64), b.CreateAnd(ticks, ci64(63)));
+        llvm::Value* available = b.CreateZExt(remaining32, i64t);
+        llvm::Value* chunk = b.CreateSelect(
+            b.CreateICmpULT(available, toPoll), available, toPoll);
+        BasicBlock* preheader = b.GetInsertBlock();
+        BasicBlock* ssaHead = newBB("rep.copy.header");
+        BasicBlock* ssaExit = newBB("rep.copy.exit");
+        b.CreateBr(ssaHead);
+        b.SetInsertPoint(ssaHead);
+        auto* iter = b.CreatePHI(i64t, 2, "rep.copy.iter");
+        iter->addIncoming(ci64(0), preheader);
+        std::vector<llvm::PHINode*> carries;
+        std::vector<llvm::Value*> state;
+        for (unsigned i = 0; i < starts.size(); ++i) {
+            auto* phi = b.CreatePHI(i64t, 2, "rep.copy.var");
+            phi->addIncoming(starts[i], preheader);
+            carries.push_back(phi);
+            state.push_back(phi);
+        }
+        for (const auto& op : plan.ops) {
+            if (op.src) state[op.dst] = state[*op.src];
+            else state[op.dst] = b.CreateNSWAdd(state[op.dst], ci64(op.delta));
+        }
+        llvm::Value* nextIter = b.CreateAdd(iter, ci64(1));
+        iter->addIncoming(nextIter, ssaHead);
+        for (unsigned i = 0; i < carries.size(); ++i)
+            carries[i]->addIncoming(state[i], ssaHead);
+        b.CreateCondBr(b.CreateICmpULT(nextIter, chunk), ssaHead, ssaExit);
+        b.SetInsertPoint(ssaExit);
+        // LLVM IR PHIs must be contiguous at the beginning of their block.
+        std::vector<llvm::PHINode*> results;
+        for (unsigned i = 0; i < carries.size(); ++i) {
+            auto* phi = b.CreatePHI(i64t, 1, "rep.copy.result");
+            phi->addIncoming(state[i], ssaHead);
+            results.push_back(phi);
+        }
+        for (unsigned i = 0; i < results.size(); ++i) {
+            if (!plan.vars[i].written) continue;
+            llvm::Value* numeric = b.CreateSIToFP(results[i], f64t);
+            llvm::Value* boxed = emitCanonKnownNonNaN(numeric);
+            const auto* field = plan.vars[i].field;
+            if (PromotedVar* pv = findPromoted(field); pv && pv->numeric)
+                storeNumericPair(*pv, boxed, numeric, b.getInt1(true));
+            else emitVarSet(field, boxed);
+        }
+        b.CreateStore(b.CreateSub(remaining32, b.CreateTrunc(chunk, i32t)),
+                      countdown);
+        b.CreateStore(b.CreateAdd(ticks, b.CreateSub(chunk, ci64(1))),
+                      curYieldCnt);
+        emitLoopYield();
+        b.CreateBr(loopHead);
+        b.SetInsertPoint(slow);
+    }
+
+    struct RepeatAffinePlan {
+        const BlockField* accumulator;
+        int64_t delta;
+    };
+
+    // Single pure constant-increment body. The private repeat counter is
+    // immutable to Scratch and already has an exact i32 trip count. If the
+    // accumulator stops being a bounded integer after a warp yield, the
+    // next chunk falls back to the ordinary per-iteration Scratch path.
+    std::optional<RepeatAffinePlan> repeatAffinePlan(Block* loop) {
+        const char* flag = std::getenv("XYO_JIT_REPEAT_SSA");
+        if (flag && flag[0] == '0') return std::nullopt;
+        const BlockInput* body = loop->inputs.find("SUBSTACK");
+        if (!body || body->block.empty()) return std::nullopt;
+        Block* statement = getBlock(body->block);
+        if (!statement || !statement->next.empty() ||
+            (statement->opcode != "data_changevariableby" &&
+             statement->opcode != "data_setvariableto"))
+            return std::nullopt;
+        const BlockField* accumulator = findField(statement, "VARIABLE");
+        if (!accumulator || accumulator->id.empty()) return std::nullopt;
+        std::optional<double> constant;
+        if (statement->opcode == "data_changevariableby") {
+            constant = literalNumber(statement, "VALUE");
+        } else {
+            // `set acc to acc + constant` and `set acc to acc - constant`
+            // are just as affine as the Scratch change-variable block.
+            Block* expression = transientChild(statement, "VALUE");
+            if (!expression || (expression->opcode != "operator_add" &&
+                                expression->opcode != "operator_subtract"))
+                return std::nullopt;
+            const BlockField* lhs = directVariableInput(expression, "NUM1");
+            const BlockField* rhs = directVariableInput(expression, "NUM2");
+            auto isSelf = [&](const BlockField* f) {
+                return f && f->id == accumulator->id &&
+                       sameNamedField(f, accumulator);
+            };
+            if (isSelf(lhs)) {
+                constant = literalNumber(expression, "NUM2");
+                if (constant && expression->opcode == "operator_subtract")
+                    *constant = -*constant;
+            } else if (expression->opcode == "operator_add" && isSelf(rhs)) {
+                constant = literalNumber(expression, "NUM1");
+            }
+        }
+        if (!constant ||
+            std::trunc(*constant) != *constant ||
+            std::abs(*constant) > 65536.0 || *constant == 0.0)
+            return std::nullopt;
+        return RepeatAffinePlan{accumulator, static_cast<int64_t>(*constant)};
+    }
+
+    void emitRepeatAffineChunk(const RepeatAffinePlan& plan,
+                               llvm::Value* remaining32,
+                               AllocaInst* countdown,
+                               BasicBlock* loopHead) {
+        BasicBlock* fast = newBB("rep.ssa.fast");
+        BasicBlock* slow = newBB("rep.ssa.slow");
+        llvm::Value* bits = emitVarGet(plan.accumulator);
+        llvm::Value* numericOk = nullptr;
+        llvm::Value* current = emitCmpNumF64(bits, &numericOk, true);
+        constexpr double kExactLimit = 281474976710656.0;
+        llvm::Value* inRange = b.CreateAnd(
+            b.CreateFCmpOGE(current, cf64(-kExactLimit)),
+            b.CreateFCmpOLE(current, cf64(kExactLimit)));
+        llvm::Value* isIntegral = b.CreateFCmpOEQ(
+            current, b.CreateUnaryIntrinsic(Intrinsic::trunc, current));
+        llvm::Value* valid = b.CreateAnd(
+            b.CreateICmpNE(loadIsWarp(), ci32(0)),
+            b.CreateAnd(numericOk, b.CreateAnd(inRange, isIntegral)));
+        b.CreateCondBr(valid, fast, slow);
+        b.SetInsertPoint(fast);
+        llvm::Value* ticks = b.CreateLoad(i64t, curYieldCnt);
+        llvm::Value* toPoll = b.CreateSub(
+            ci64(64), b.CreateAnd(ticks, ci64(63)));
+        llvm::Value* remaining = b.CreateZExt(remaining32, i64t);
+        llvm::Value* chunk = b.CreateSelect(
+            b.CreateICmpULT(remaining, toPoll), remaining, toPoll);
+        llvm::Value* initial = b.CreateFPToSI(
+            b.CreateSelect(valid, current, cf64(0.0)), i64t);
+        BasicBlock* preheader = b.GetInsertBlock();
+        BasicBlock* ssaHead = newBB("rep.ssa.header");
+        BasicBlock* ssaExit = newBB("rep.ssa.exit");
+        b.CreateBr(ssaHead);
+        b.SetInsertPoint(ssaHead);
+        auto* iteration = b.CreatePHI(i64t, 2, "rep.ssa.iter");
+        auto* accumulator = b.CreatePHI(i64t, 2, "rep.ssa.value");
+        iteration->addIncoming(ci64(0), preheader);
+        accumulator->addIncoming(initial, preheader);
+        llvm::Value* next = b.CreateNSWAdd(accumulator, ci64(plan.delta));
+        llvm::Value* nextIteration = b.CreateAdd(iteration, ci64(1));
+        iteration->addIncoming(nextIteration, ssaHead);
+        accumulator->addIncoming(next, ssaHead);
+        b.CreateCondBr(b.CreateICmpULT(nextIteration, chunk), ssaHead, ssaExit);
+        b.SetInsertPoint(ssaExit);
+        auto* finalValue = b.CreatePHI(i64t, 1, "rep.ssa.result");
+        finalValue->addIncoming(next, ssaHead);
+        llvm::Value* result = b.CreateSIToFP(finalValue, f64t);
+        llvm::Value* resultBits = emitCanonKnownNonNaN(result);
+        if (PromotedVar* pv = findPromoted(plan.accumulator); pv && pv->numeric)
+            storeNumericPair(*pv, resultBits, result, b.getInt1(true));
+        else
+            emitVarSet(plan.accumulator, resultBits);
+        b.CreateStore(b.CreateSub(remaining32, b.CreateTrunc(chunk, i32t)),
+                      countdown);
+        b.CreateStore(b.CreateAdd(ticks, b.CreateSub(chunk, ci64(1))),
+                      curYieldCnt);
+        emitLoopYield();
+        b.CreateBr(loopHead);
+        b.SetInsertPoint(slow);
+    }
+
+    struct ForEachSumPlan {
+        const BlockField* index;
+        const BlockField* accumulator;
+        int64_t scale;
+    };
+
+    // A for-each body consisting of a single linear reduction is safe to
+    // lower to a typed SSA loop, provided the induction index is not written
+    // by the body and the accumulator is an independent scalar. The loop's
+    // private iteration count and Scratch-visible index are kept distinct.
+    std::optional<ForEachSumPlan> forEachSumPlan(Block* loop) {
+        const char* enabled = std::getenv("XYO_JIT_FOREACH_SSA");
+        if (enabled && enabled[0] == '0') return std::nullopt;
+        const BlockField* index = findField(loop, "VARIABLE");
+        if (!index || index->id.empty()) return std::nullopt;
+        const BlockInput* input = loop->inputs.find("SUBSTACK");
+        if (!input || input->block.empty()) return std::nullopt;
+        Block* stmt = getBlock(input->block);
+        if (!stmt || !stmt->next.empty() ||
+            (stmt->opcode != "data_changevariableby" &&
+             stmt->opcode != "data_setvariableto"))
+            return std::nullopt;
+        const BlockField* acc = findField(stmt, "VARIABLE");
+        if (!acc || acc->id.empty() || acc->id == index->id ||
+            sameNamedField(acc, index)) return std::nullopt;
+        Block* delta = transientChild(stmt, "VALUE");
+        if (!delta) return std::nullopt;
+        if (stmt->opcode == "data_setvariableto") {
+            // `set acc to acc + index` is equivalent to an accumulator
+            // increment under the same numeric-range guard. Its reporters
+            // must be direct variables, with no unknown side effects.
+            if (delta->opcode != "operator_add") return std::nullopt;
+            const BlockField* lhs = directVariableInput(delta, "NUM1");
+            const BlockField* rhs = directVariableInput(delta, "NUM2");
+            auto isAcc = [&](const BlockField* f) {
+                return f && f->id == acc->id && sameNamedField(f, acc);
+            };
+            if (isAcc(lhs))
+                delta = transientChild(delta, "NUM2");
+            else if (isAcc(rhs))
+                delta = transientChild(delta, "NUM1");
+            else
+                return std::nullopt;
+            if (!delta) return std::nullopt;
+        }
+        const BlockField* source = nullptr;
+        int64_t scale = 1;
+        if (delta->opcode == "data_variable") {
+            source = findField(delta, "VARIABLE");
+        } else if (delta->opcode == "operator_multiply") {
+            const BlockField* lhs = directVariableInput(delta, "NUM1");
+            const BlockField* rhs = directVariableInput(delta, "NUM2");
+            std::optional<double> factor;
+            if (lhs && lhs->id == index->id && sameNamedField(lhs, index)) {
+                source = lhs;
+                factor = literalNumber(delta, "NUM2");
+            } else if (rhs && rhs->id == index->id &&
+                       sameNamedField(rhs, index)) {
+                source = rhs;
+                factor = literalNumber(delta, "NUM1");
+            }
+            if (!factor || !std::isfinite(*factor) ||
+                std::trunc(*factor) != *factor ||
+                std::abs(*factor) > 1024.0) return std::nullopt;
+            scale = static_cast<int64_t>(*factor);
+        }
+        if (!source || source->id != index->id ||
+            !sameNamedField(source, index) || scale == 0)
+            return std::nullopt;
+        return ForEachSumPlan{index, acc, scale};
+    }
+
+    // Called from the regular control_for_each body. The slow branch starts
+    // exactly at the same private counter, so deoptimization *after* a yield
+    // cannot restart already executed iterations. A batch always ends at the
+    // original 64-iteration clock poll, including an early final iteration.
+    void emitForEachSumChunk(const ForEachSumPlan& plan,
+                             llvm::Value* zeroIndex,
+                             uint32_t tripCount, AllocaInst* counter,
+                             BasicBlock* loopHead) {
+        BasicBlock* fast = newBB("fe.ssa.fast");
+        BasicBlock* slow = newBB("fe.ssa.slow");
+        llvm::Value* initialBits = emitVarGet(plan.accumulator);
+        llvm::Value* numericOk = nullptr;
+        llvm::Value* current = emitCmpNumF64(initialBits, &numericOk, true);
+        constexpr double kExactLimit = 281474976710656.0; // 2^48
+        llvm::Value* inRange = b.CreateAnd(
+            b.CreateFCmpOGE(current, cf64(-kExactLimit)),
+            b.CreateFCmpOLE(current, cf64(kExactLimit)));
+        llvm::Value* integral = b.CreateFCmpOEQ(
+            current, b.CreateUnaryIntrinsic(Intrinsic::trunc, current));
+        llvm::Value* valid = b.CreateAnd(
+            b.CreateICmpNE(loadIsWarp(), ci32(0)),
+            b.CreateAnd(numericOk, b.CreateAnd(inRange, integral)));
+        b.CreateCondBr(valid, fast, slow);
+        b.SetInsertPoint(fast);
+        llvm::Value* ticks = b.CreateLoad(i64t, curYieldCnt);
+        llvm::Value* untilPoll = b.CreateSub(
+            ci64(64), b.CreateAnd(ticks, ci64(63)));
+        llvm::Value* left = b.CreateZExt(
+            b.CreateSub(ci32(tripCount), zeroIndex), i64t);
+        llvm::Value* chunk = b.CreateSelect(
+            b.CreateICmpULT(left, untilPoll), left, untilPoll);
+        llvm::Value* firstIndex = b.CreateAdd(
+            b.CreateZExt(zeroIndex, i64t), ci64(1));
+        llvm::Value* safeCurrent = b.CreateSelect(valid, current, cf64(0.0));
+        llvm::Value* startAcc = b.CreateFPToSI(safeCurrent, i64t);
+
+        BasicBlock* preheader = b.GetInsertBlock();
+        BasicBlock* ssaHead = newBB("fe.ssa.header");
+        BasicBlock* ssaExit = newBB("fe.ssa.exit");
+        b.CreateBr(ssaHead);
+        b.SetInsertPoint(ssaHead);
+        auto* step = b.CreatePHI(i64t, 2, "fe.ssa.step");
+        step->addIncoming(ci64(0), preheader);
+        auto* acc = b.CreatePHI(i64t, 2, "fe.ssa.acc");
+        acc->addIncoming(startAcc, preheader);
+        llvm::Value* nthIndex = b.CreateAdd(firstIndex, step);
+        llvm::Value* delta = b.CreateMul(nthIndex, ci64(plan.scale));
+        llvm::Value* nextAcc = b.CreateNSWAdd(acc, delta);
+        llvm::Value* nextStep = b.CreateAdd(step, ci64(1), "fe.ssa.next");
+        step->addIncoming(nextStep, ssaHead);
+        acc->addIncoming(nextAcc, ssaHead);
+        b.CreateCondBr(b.CreateICmpULT(nextStep, chunk), ssaHead, ssaExit);
+        b.SetInsertPoint(ssaExit);
+        auto* result = b.CreatePHI(i64t, 1, "fe.ssa.result");
+        result->addIncoming(nextAcc, ssaHead);
+        llvm::Value* finalAcc = b.CreateSIToFP(result, f64t);
+        llvm::Value* lastIndex = b.CreateAdd(
+            b.CreateZExt(zeroIndex, i64t), chunk);
+        llvm::Value* finalIndex = b.CreateUIToFP(lastIndex, f64t);
+        llvm::Value* accBits = emitCanonKnownNonNaN(finalAcc);
+        llvm::Value* indexBits = emitCanonKnownNonNaN(finalIndex);
+        if (PromotedVar* p = findPromoted(plan.accumulator); p && p->numeric)
+            storeNumericPair(*p, accBits, finalAcc, b.getInt1(true));
+        else
+            emitVarSet(plan.accumulator, accBits);
+        if (PromotedVar* p = findPromoted(plan.index); p && p->numeric)
+            storeNumericPair(*p, indexBits, finalIndex, b.getInt1(true));
+        else
+            emitVarSet(plan.index, indexBits);
+        b.CreateStore(b.CreateTrunc(lastIndex, i32t), counter);
+        // Account for chunk-1 completed iterations; emitLoopYield handles
+        // the final iteration, preserving the exact warp deadline phase.
+        b.CreateStore(b.CreateAdd(ticks, b.CreateSub(chunk, ci64(1))),
+                      curYieldCnt);
+        emitLoopYield();
+        b.CreateBr(loopHead);
+        b.SetInsertPoint(slow);
+    }
+
     void emitStackBlock(Block* blk) {
         const std::string& op = blk->opcode;
 
@@ -5157,6 +5988,14 @@ struct Codegen {
         }
 
         if (op == "control_repeat") {
+            const auto repeatCopies = repeatCopyPlan(blk);
+            if (verbose && repeatCopies)
+                std::fprintf(stderr, "xyo-jit: repeat SSA copies %s\n",
+                             blk->id.c_str());
+            const auto repeatAffine = repeatAffinePlan(blk);
+            if (verbose && repeatAffine)
+                std::fprintf(stderr, "xyo-jit: repeat SSA affine %s\n",
+                             blk->id.c_str());
             if (auto plan = multiTransientPattern(blk)) {
                 emitTransientMultiRepeat(blk, *plan);
                 return;
@@ -5276,6 +6115,12 @@ struct Codegen {
             }
             b.CreateCondBr(go, bodyBB, merge);
             b.SetInsertPoint(bodyBB);
+            if (repeatCopies && intIv)
+                emitRepeatCopyChunk(*repeatCopies,
+                    b.CreateLoad(i32t, intIv), intIv, head);
+            if (repeatAffine && intIv)
+                emitRepeatAffineChunk(*repeatAffine,
+                    b.CreateLoad(i32t, intIv), intIv, head);
             {
                 const BlockInput* in = blk->inputs.find("SUBSTACK");
                 if (in) emitChainBlocks(chainOf(in->block), true);
@@ -5326,6 +6171,15 @@ struct Codegen {
         }
 
         if (op == "control_while" || op == "control_repeat_until") {
+            BasicBlock* inductionDone = nullptr;
+            if (auto plan = warpInductionPlan(blk)) {
+                BasicBlock* fallback = newBB("induction.fallback");
+                inductionDone = newBB("induction.done");
+                emitWarpInduction(*plan, fallback, inductionDone);
+                if (verbose)
+                    std::fprintf(stderr,
+                        "xyo-jit: guarded warp induction %s\n", blk->id.c_str());
+            }
             if (auto plan = transientRepeatPattern(blk)) {
                 if (safeTransientReporter(
                         transientChild(blk, "CONDITION"),
@@ -5385,6 +6239,10 @@ struct Codegen {
             b.SetInsertPoint(merge);
             endLoopYieldScope(true);
             endLoopPromotion(promotedLoop);
+            if (inductionDone) {
+                b.CreateBr(inductionDone);
+                b.SetInsertPoint(inductionDone);
+            }
             return;
         }
 
@@ -5399,6 +6257,10 @@ struct Codegen {
                     return;
                 }
             }
+            const auto ssaSum = forEachSumPlan(blk);
+            if (verbose && ssaSum)
+                std::fprintf(stderr, "xyo-jit: foreach SSA sum %s\n",
+                             blk->id.c_str());
             // Scratch の for_each は index=0 から index < toNum(VALUE) の間
             // 回る（scratch3_control.forEach）。値が整数でない場合に
             // ceil 回になるので i=1..<=n では合わない（2.5 → 3 回）。
@@ -5469,6 +6331,9 @@ struct Codegen {
                 : b.CreateFCmpOLT(i, bound);
             b.CreateCondBr(go, bodyBB, merge);
             b.SetInsertPoint(bodyBB);
+            if (ssaSum && intTripCount && iv32)
+                emitForEachSumChunk(*ssaSum, integralIndex, *intTripCount,
+                                    iv32, head);
             {
                 const BlockField* f = findField(blk, "VARIABLE");
                 if (f) {

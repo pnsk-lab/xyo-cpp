@@ -94,6 +94,43 @@ if(TARGET xyo-cli)
               "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_ascii_fastpaths.py"
               "$<TARGET_FILE:xyo-cli>")
     set_tests_properties(xyo-jit-ascii-fastpaths PROPERTIES TIMEOUT 180)
+
+    # Guarded, type-safe LLVM SSA loop reductions and dynamic comparisons.
+    add_test(NAME xyo-jit-repeat-ssa
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_repeat_ssa.py"
+              "$<TARGET_FILE:xyo-cli>")
+    set_tests_properties(xyo-jit-repeat-ssa PROPERTIES TIMEOUT 240)
+
+    add_test(NAME xyo-jit-foreach-ssa
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_foreach_ssa.py"
+              "$<TARGET_FILE:xyo-cli>")
+    set_tests_properties(xyo-jit-foreach-ssa PROPERTIES TIMEOUT 240)
+
+    add_test(NAME xyo-jit-repeat-copy-ssa
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_repeat_copy_ssa.py"
+              "$<TARGET_FILE:xyo-cli>")
+    set_tests_properties(xyo-jit-repeat-copy-ssa PROPERTIES TIMEOUT 240)
+
+    add_test(NAME xyo-jit-warp-induction
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_warp_induction.py"
+              "$<TARGET_FILE:xyo-cli>")
+    set_tests_properties(xyo-jit-warp-induction PROPERTIES TIMEOUT 240)
+
+    add_test(NAME xyo-jit-plain-list-compare
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/differential/plain_numeric_cmp.py"
+              "$<TARGET_FILE:xyo-cli>")
+    set_tests_properties(xyo-jit-plain-list-compare PROPERTIES TIMEOUT 240)
+
+    add_test(NAME xyo-jit-plain-list-sort
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/differential/plain_numeric_sort_algos.py"
+              "$<TARGET_FILE:xyo-cli>")
+    set_tests_properties(xyo-jit-plain-list-sort PROPERTIES TIMEOUT 240)
   endif()
 endif()
 
