@@ -41,8 +41,20 @@ StrDebug& strDebug() { static StrDebug d; return d; }
 // when the vector grows, and preserve UTF-16 code-unit indexing.
 struct AppendLog {
     static constexpr uint32_t kChunk = 256;
+
+    // Raw chunks and packed repeated literals share one ordered sequence.
+    // A repeated literal is kept as (pattern, length) instead of allocating
+    // 512 bytes for every 256 UTF-16 units produced by a JIT batch.
+    struct Segment {
+        uint32_t end = 0;      // exclusive end in the logical UTF-16 string
+        uint32_t size = 0;
+        uint64_t packed = 0;   // up to four UTF-16 code units
+        uint8_t period = 0;    // 0 = raw chunk; otherwise repeated literal
+        std::unique_ptr<char16_t[]> raw;
+    };
+
     std::mutex mutex;
-    std::vector<std::unique_ptr<char16_t[]>> chunks;
+    std::vector<Segment> segments;
     uint32_t length = 0;
     bool ascii = true;
 
@@ -50,59 +62,129 @@ struct AppendLog {
         size_t pos = 0;
         while (pos < text.size()) {
             if (length == UINT32_MAX) std::abort();
-            const uint32_t offset = length % kChunk;
-            if (offset == 0) {
-                chunks.push_back(std::make_unique<char16_t[]>(kChunk));
+            if (segments.empty() || segments.back().period ||
+                segments.back().size == kChunk) {
+                Segment segment;
+                segment.raw = std::make_unique<char16_t[]>(kChunk);
+                segments.push_back(std::move(segment));
                 Gc::get().noteExternalAllocation(kChunk * sizeof(char16_t));
             }
+            Segment& segment = segments.back();
             const size_t n = std::min<size_t>(
-                {size_t(kChunk - offset), text.size() - pos,
+                {size_t(kChunk - segment.size), text.size() - pos,
                  size_t(UINT32_MAX - length)});
-            if (n == 0) std::abort();
+            if (!n) std::abort();
             const char16_t* src = text.data() + pos;
-            std::memcpy(chunks[length / kChunk].get() + offset,
-                        src, n * sizeof(char16_t));
+            std::memcpy(segment.raw.get() + segment.size, src,
+                        n * sizeof(char16_t));
             if (ascii)
                 for (size_t i = 0; i < n; ++i)
                     if (src[i] >= 128) { ascii = false; break; }
+            segment.size += static_cast<uint32_t>(n);
             length += static_cast<uint32_t>(n);
+            segment.end = length;
             pos += n;
         }
     }
+
     void appendAscii(std::string_view text) { // lock must be held
         size_t pos = 0;
         while (pos < text.size()) {
             if (length == UINT32_MAX) std::abort();
-            const uint32_t offset = length % kChunk;
-            if (offset == 0) {
-                chunks.push_back(std::make_unique<char16_t[]>(kChunk));
+            if (segments.empty() || segments.back().period ||
+                segments.back().size == kChunk) {
+                Segment segment;
+                segment.raw = std::make_unique<char16_t[]>(kChunk);
+                segments.push_back(std::move(segment));
                 Gc::get().noteExternalAllocation(kChunk * sizeof(char16_t));
             }
+            Segment& segment = segments.back();
             const size_t n = std::min<size_t>(
-                {kChunk - offset, text.size() - pos, UINT32_MAX - length});
-            if (n == 0) std::abort();
-            char16_t* target = chunks[length / kChunk].get() + offset;
-            for (size_t i = 0; i < n; ++i) {
-                // jsnum::toString emits only 7-bit ASCII.
-                target[i] = static_cast<unsigned char>(text[pos + i]);
-            }
+                {size_t(kChunk - segment.size), text.size() - pos,
+                 size_t(UINT32_MAX - length)});
+            if (!n) std::abort();
+            for (size_t i = 0; i < n; ++i)
+                segment.raw[segment.size + i] =
+                    static_cast<unsigned char>(text[pos + i]);
+            segment.size += static_cast<uint32_t>(n);
             length += static_cast<uint32_t>(n);
+            segment.end = length;
             pos += n;
         }
     }
+
+    void appendPackedRepeat(uint64_t packed, uint32_t period,
+                            uint32_t repeats) { // lock must be held
+        if (!period || period > 4 || !repeats || repeats > 64)
+            std::abort();
+        const uint64_t units = uint64_t(period) * repeats;
+        if (units > UINT32_MAX - length) std::abort();
+        if (ascii)
+            for (uint32_t i = 0; i < period; ++i)
+                if (((packed >> (16 * i)) & 0xffffu) >= 128) {
+                    ascii = false;
+                    break;
+                }
+        // Adjacent batches of the same literal coalesce to a single segment.
+        // Existing prefix snapshots stay immutable: only bytes beyond their
+        // length are logically appended.
+        if (!segments.empty() && segments.back().period == period &&
+            segments.back().packed == packed) {
+            Segment& tail = segments.back();
+            tail.size += uint32_t(units);
+            length += uint32_t(units);
+            tail.end = length;
+            return;
+        }
+        Segment segment;
+        segment.period = static_cast<uint8_t>(period);
+        segment.packed = packed;
+        segment.size = static_cast<uint32_t>(units);
+        length += segment.size;
+        segment.end = length;
+        segments.push_back(std::move(segment));
+        Gc::get().noteExternalAllocation(sizeof(Segment));
+    }
+
     void copy(char16_t* out, uint32_t n) const { // lock must be held
-        uint32_t at = 0;
-        while (at < n) {
-            const uint32_t take = std::min(kChunk, n - at);
-            std::memcpy(out + at, chunks[at / kChunk].get(), take * sizeof(char16_t));
-            at += take;
+        uint32_t pos = 0;
+        for (const Segment& segment : segments) {
+            if (pos >= n) break;
+            const uint32_t take = std::min(segment.size, n - pos);
+            if (!segment.period) {
+                std::memcpy(out + pos, segment.raw.get(),
+                            size_t(take) * sizeof(char16_t));
+            } else {
+                for (uint32_t i = 0; i < take; ++i)
+                    out[pos + i] = static_cast<char16_t>(
+                        (segment.packed >> (16 * (i % segment.period))) & 0xffffu);
+            }
+            pos += take;
         }
     }
+
     char16_t unitAt(uint32_t i) const { // lock must be held
-        return chunks[i / kChunk][i % kChunk];
+        const auto it = std::lower_bound(
+            segments.begin(), segments.end(), i,
+            [](const Segment& segment, uint32_t pos) {
+                return segment.end <= pos;
+            });
+        if (it == segments.end()) std::abort();
+        const uint32_t start = it->end - it->size;
+        const uint32_t offset = i - start;
+        if (it->period)
+            return static_cast<char16_t>(
+                (it->packed >> (16 * (offset % it->period))) & 0xffffu);
+        return it->raw[offset];
+    }
+
+    size_t externalBytes() const {
+        size_t bytes = segments.capacity() * sizeof(Segment);
+        for (const Segment& segment : segments)
+            if (!segment.period) bytes += kChunk * sizeof(char16_t);
+        return bytes;
     }
 };
-
 void destroyAppendLog(void* ptr) {
     static_cast<AppendLog*>(ptr)->~AppendLog();
 }
@@ -110,7 +192,7 @@ size_t appendLogExternalBytes(void* ptr) {
     auto* log = static_cast<AppendLog*>(ptr);
     // GC may read accounting while another worker is appending chunks.
     std::lock_guard lock(log->mutex);
-    return log->chunks.size() * AppendLog::kChunk * sizeof(char16_t);
+    return log->externalBytes();
 }
 
 const char16_t* SStr::appendBody() const {
@@ -273,17 +355,11 @@ void xyo_transient_append_packed(void* pointer, uint64_t packed, uint32_t length
 // 64-iteration yield checkpoints; it advances the same logical poll counter.
 void xyo_transient_append_repeat_packed(void* pointer, uint64_t packed,
                                         uint64_t metadata) {
-    const uint32_t length = uint32_t(metadata >> 32);
+    const uint32_t period = uint32_t(metadata >> 32);
     const uint32_t repeats = uint32_t(metadata);
-    if (length == 0 || length > 4 || repeats == 0 || repeats > 64)
-        std::abort();
-    char16_t buffer[256];
-    for (uint32_t r = 0; r < repeats; ++r)
-        for (uint32_t c = 0; c < length; ++c)
-            buffer[r * length + c] = char16_t((packed >> (16 * c)) & 0xffff);
     auto* log = static_cast<AppendLog*>(pointer);
     std::lock_guard lock(log->mutex);
-    log->append(std::u16string_view(buffer, size_t(repeats) * length));
+    log->appendPackedRepeat(packed, period, repeats);
 }
 
 // Batch arbitrary constant UTF-16 text without paying for a lock or SStr
