@@ -87,6 +87,13 @@ if(TARGET xyo-cli)
               "${CMAKE_CURRENT_SOURCE_DIR}/differential/event_scheduler.py"
               "$<TARGET_FILE:xyo-cli>")
     set_tests_properties(xyo-event-driven-scheduler PROPERTIES TIMEOUT 180)
+
+    # Punctuation equality, immutable digit-set contains and warp recursion.
+    add_test(NAME xyo-jit-ascii-fastpaths
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_ascii_fastpaths.py"
+              "$<TARGET_FILE:xyo-cli>")
+    set_tests_properties(xyo-jit-ascii-fastpaths PROPERTIES TIMEOUT 180)
   endif()
 endif()
 

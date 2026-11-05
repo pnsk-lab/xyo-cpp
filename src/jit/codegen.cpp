@@ -2762,7 +2762,12 @@ struct Codegen {
         std::u16string word(text);
         for (char16_t& c : word) {
             if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
-            if (c < 'a' || c > 'z') return std::nullopt;
+            // The old fast path accepted only letters. Brainfuck's hot
+            // operators are ASCII punctuation ('+', '-', '<', '>', '[', ']').
+            // Reject non-printable/Unicode literals, which may case-fold to
+            // different lengths; numeric-looking literals remain excluded by
+            // the toNumberOrNaN test below.
+            if (c < 0x21 || c > 0x7e) return std::nullopt;
         }
         // Test the ORIGINAL spelling: "Infinity" is numeric but "infinity"
         // is not. Numeric literals must retain Scratch's numeric comparison
@@ -2771,8 +2776,9 @@ struct Codegen {
         return word;
     }
 
-    /// Equality with a nonnumeric ASCII word of 1..8 letters (3D2 uses "n"
-    /// and "none"). A different first ASCII unit cannot lowercase to the word:
+    /// Equality with a nonnumeric, printable ASCII literal of 1..8 chars
+    /// (including Brainfuck operators and 3D2's "n"/"none"). A different
+    /// first ASCII unit cannot lowercase to the literal:
     /// lowercasing never removes that ASCII prefix. Otherwise inline comparison
     /// requires equal length and ALL ASCII units. Unicode anywhere, or unequal
     /// length after a matching prefix, falls back without assuming anything
@@ -2780,7 +2786,8 @@ struct Codegen {
     /// Only SINGLE letters can reject non-heap Values: numeric cast of the
     /// literal is NaN, forcing string comparison; finite numbers contain digits,
     /// NaN/Infinity/true/false/undefined/r,g,b have multiple characters, and the
-    /// inline empty string has none. Words retain the helper because e.g. bool
+    /// inline empty string has none. Punctuation and longer words retain the
+    /// helper for non-string values because e.g. bool
     /// true == "true" and numeric NaN == "NaN" must still succeed.
     llvm::Value* emitEqAsciiWord(llvm::Value* a, llvm::Value* bv,
                                llvm::Value* dynamic, std::u16string_view word) {
@@ -2797,7 +2804,12 @@ struct Codegen {
         BasicBlock* merge = newBB("eq.lit.merge");
         llvm::Value* isStr = b.CreateICmpEQ(
             b.CreateLShr(dynamic, ci64(48)), ci64(val::kTagStr >> 48));
-        b.CreateCondBr(isStr, strBB, word.size() == 1 ? ret0BB : helperBB);
+        // For a one-letter literal no non-string Scratch Value can compare
+        // equal. With punctuation, retain xyo_eq for non-string values
+        // (including extensions/undefined) rather than assuming their cast.
+        const bool singleLetter = word.size() == 1 &&
+            word[0] >= 'a' && word[0] <= 'z';
+        b.CreateCondBr(isStr, strBB, singleLetter ? ret0BB : helperBB);
         b.SetInsertPoint(strBB);
         llvm::Value* sp = b.CreateIntToPtr(
             b.CreateAnd(dynamic, ci64(val::kPtrMask)), ptrt);
@@ -4104,6 +4116,62 @@ struct Codegen {
         // --- 直接ヘルパ（レポータ）---
         if (op == "operator_letter_of") return emitLetterOf(blk);
         if (op == "operator_length") return emitLength(blk);
+        if (op == "operator_contains") {
+            // An immutable digits literal is common in Scratch lexers.
+            // Only bypass case-insensitive Unicode substring matching when
+            // the needle is proven to be exactly one ASCII code unit.
+            // All other values (including empty/non-string/cons/Unicode) go
+            // through the full Scratch coercion and comparison helper.
+            const BlockInput* input = blk->inputs.find("STRING1");
+            const std::string literalId = input
+                ? (input->block.empty() ? input->shadow : input->block) : "";
+            Block* literal = literalId.empty() ? nullptr : getBlock(literalId);
+            const BlockField* field = literal && literal->shadow &&
+                literal->opcode == "text" ? findField(literal, "TEXT") : nullptr;
+            const char* setting = std::getenv("XYO_JIT_DIGIT_CONTAINS");
+            if (field && field->value.isString() && field->value.asStrPtr() &&
+                field->value.asStrPtr()->view() == u"0123456789" &&
+                (!setting || setting[0] != '0')) {
+                llvm::Value* hay = emitInputOf(blk, "STRING1");
+                llvm::Value* needle = emitInputOf(blk, "STRING2");
+                BasicBlock* taggedBB = newBB("digits.tagged");
+                BasicBlock* flatBB = newBB("digits.flat");
+                BasicBlock* asciiBB = newBB("digits.ascii");
+                BasicBlock* fastBB = newBB("digits.fast");
+                BasicBlock* slowBB = newBB("digits.slow");
+                BasicBlock* doneBB = newBB("digits.done");
+                llvm::Value* isStr = b.CreateICmpEQ(
+                    b.CreateLShr(needle, ci64(48)),
+                    ci64(val::kTagStr >> 48));
+                b.CreateCondBr(isStr, taggedBB, slowBB);
+                b.SetInsertPoint(taggedBB);
+                llvm::Value* str = b.CreateIntToPtr(
+                    b.CreateAnd(needle, ci64(val::kPtrMask)), ptrt);
+                b.CreateCondBr(emitIsConsStr(str), slowBB, flatBB);
+                b.SetInsertPoint(flatBB);
+                llvm::Value* len = b.CreateLoad(i32t, fld(str, kSStrLenOff));
+                b.CreateCondBr(b.CreateICmpEQ(len, ci32(1)), asciiBB, slowBB);
+                b.SetInsertPoint(asciiBB);
+                llvm::Value* code = b.CreateLoad(i16t, fld(str, kSStrDataOff));
+                b.CreateCondBr(b.CreateICmpULT(code, b.getInt16(128)),
+                               fastBB, slowBB);
+                b.SetInsertPoint(fastBB);
+                llvm::Value* digit = b.CreateAnd(
+                    b.CreateICmpUGE(code, b.getInt16('0')),
+                    b.CreateICmpULE(code, b.getInt16('9')));
+                llvm::Value* fastResult = boolBits(digit);
+                b.CreateBr(doneBB);
+                b.SetInsertPoint(slowBB);
+                llvm::Value* slowResult = call2("xyo_strcontains", i64t,
+                                               hay, needle);
+                b.CreateBr(doneBB);
+                b.SetInsertPoint(doneBB);
+                auto* result = b.CreatePHI(i64t, 2);
+                result->addIncoming(fastResult, fastBB);
+                result->addIncoming(slowResult, slowBB);
+                return result;
+            }
+        }
         {
             auto it = directInputs().find(op);
             if (it != directInputs().end()) {
@@ -5739,11 +5807,12 @@ struct Codegen {
     };
     std::vector<ProcCallSite> procCallSites;
 
-    /// Stack frames are invisible within a small, purely scalar warp
-    /// procedure graph that never yields. Recursive calls in such a graph
-    /// must not pay for Scratch's interpreter stack on every native call.
-    /// All reachable definitions must be warp; non-warp recursion needs its
-    /// frames for Scratch's bounded isRecursiveCall check.
+    /// A fully lowered warp-only procedure graph can run on the native fiber
+    /// without materializing interpreter stack frames. Its implicit warp-loop
+    /// timer may suspend the native fiber; the register arguments and native
+    /// call stack survive that suspension. Explicit waits/compat/other
+    /// stack-observing operations are excluded by the allowlist below.
+    /// Non-warp recursion still needs frames for isRecursiveCall handling.
     bool canElideWarpRecursiveFrames(Function* start) {
         static const std::unordered_set<std::string_view> kStackInvisible = {
             "data_variable", "data_setvariableto", "data_changevariableby",
@@ -5753,13 +5822,24 @@ struct Codegen {
             "operator_and", "operator_or", "operator_not",
             "argument_reporter_string_number", "argument_reporter_boolean",
             "argument_reporter", "control_if", "control_if_else",
+            // Only fully native, stack-transparent list/string operations.
+            // These do not yield, use interpreter frames, or mutate warpMode.
+            "data_addtolist", "data_deletealloflist", "data_itemoflist",
+            "data_lengthoflist", "data_replaceitemoflist",
+            "operator_letter_of", "operator_length", "operator_contains",
+            // A warp loop may trigger the stuck-thread timer, but that
+            // suspends the native fiber rather than entering the interpreter.
+            "control_repeat_until", "control_repeat",
             "procedures_call",
         };
+        const char* setting = std::getenv("XYO_JIT_RECURSIVE_FRAME_ELIDE");
+        if (setting && setting[0] == '0') return false;
         std::unordered_set<Function*> seenProcs;
         std::function<bool(Function*)> check = [&](Function* f) -> bool {
             if (!seenProcs.insert(f).second) return true;
-            auto direct = fnDirect.find(f);
-            if (direct != fnDirect.end() && direct->second) return false;
+            // fnDirect also includes implicit warp-loop timer polls. Those
+            // do not need interpreter frames. The strict opcode allowlist
+            // below rejects all explicit yields and compatibility execution.
 
             // Only actual warp definitions are permitted. Looking up the
             // definition again avoids trusting the caller's warp state.
