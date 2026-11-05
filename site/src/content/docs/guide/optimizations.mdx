@@ -106,6 +106,63 @@ xyo-cpp に実装されている主な最適化と、試験中の最適化をま
 | [Warpループの三角関数キャッシュ](/xyo-cpp/research/jit-loop-invariant-trig-2026-11-05/) | 対象マイクロベンチの所要時間 **約24%減** | 試験機能のON/OFF |
 | [スケジューラ最適化](/xyo-cpp/research/scheduler-performance/) | `sched_threads` **2.63倍**、`sched_waituntil` **1.77倍** | CPU固定、同一条件の単独ベンチ |
 
+## ソースコード監査で追加確認した最適化
+
+以下は主要な機能一覧で省略されていた実装です。コードの環境変数を照合しており、個別ベンチマークでの改善が確定しているとは限りません。既定値はコード中の設定判定に基づきます。
+
+### JIT・ループ・コード生成
+
+| 最適化 | 説明 | 適用・切替 |
+| --- | --- | --- |
+| 整数Repeatカウンタ | 反復回数が定数・整数として証明できるとき、浮動小数点カウントダウンを整数化 | 既定ON / `XYO_JIT_REPEAT_INT_COUNTER=0` |
+| 整数For Eachカウンタ | 変数の整数値を守れる範囲で反復カウンタを整数化 | 既定ON / `XYO_JIT_FOREACH_INT_COUNTER=0` |
+| Warp誘導変数 | 定数整数増分と終了条件が解析できるWarpループの整数カウンタ処理 | 既定ON / `XYO_JIT_WARP_INDUCTION=0` |
+| 固定反復ループ展開 | 小規模な直線的ループ本体を部分展開。論理反復ごとのyield検査は維持 | **明示ON** / `XYO_REPEAT_UNROLL=1` |
+| 整数値域の帰納解析 | ループ変数の上下界と増分を証明し、範囲内演算を特殊化 | 既定ON / `XYO_JIT_INDUCTION_RANGES=0` |
+| 整数性・算術事実 | SSA値が有限整数である事実や純粋な数式の性質を伝播 | 既定ON / `XYO_JIT_INTEGRAL_FACTS=0`、`XYO_JIT_PURE_MATH_FACTS=0` |
+| 浮動小数点の値域事実 | 不変のSSA演算結果に対する有限性・区間の解析 | 既定ON / `XYO_JIT_ARITH_RANGE_FACTS=0`、`XYO_JIT_FINITE_ARITH_DELTA=0` |
+| リテラル数値の直接処理 | 一般のScratch数値変換ヘルパへの呼び出しを抑制 | 通常経路 / `XYO_JIT_LITERAL_NUM_GENERIC` で汎用化 |
+| 数値演算のBoxing削減 | 数値の一時的なValue化を避けてネイティブ数値表現で計算 | 通常経路 / `XYO_JIT_MATH_BOX_GENERIC` で汎用化 |
+| 比較・演算の各種コード生成 | 演算に応じた汎用経路へのフォールバックや符号・NaNの扱いを切替 | 診断用の`XYO_JIT_MOD_NAN_SPLIT`、`XYO_JIT_FP_ORDERED_CMP`など |
+| JIT最適化レベル | LLVMの最適化段階を選択しコンパイルコストと生成コードを比較 | 既定O3 / `XYO_JIT_OPT_LEVEL=1/2/3`（`XYO_JIT_O2`は旧切替） |
+
+詳細: [整数カウンタ](/xyo-cpp/research/scratchbench-warp-induction-2026-11-05/)、[数値SSA](/xyo-cpp/research/jit-ssa-arithmetic-2026-11-04/)、[LLVMパス](/xyo-cpp/research/jit-llvm-pass-research-2026-11-03/)。
+
+### 文字列・リスト・ロード
+
+| 最適化 | 説明 | 適用・切替 |
+| --- | --- | --- |
+| Transientの64回バッチ | スケジューラのチェックポイント間で短い追記をまとめる | 通常有効 / `XYO_JIT_TRANSIENT_BATCH=0` |
+| Transient複数変数 | 複数の独立した自己連結文字列を同じループで管理 | 通常有効 / `XYO_JIT_TRANSIENT_MULTI=0` |
+| Packed短文字列追記 | 最大4 UTF-16コード単位を整数に詰めて追記ヘルパへ渡す | 通常有効 / `XYO_JIT_TRANSIENT_PACKED=0` |
+| SB3リスト文字列の共有 | プロジェクト読み込み時、重複する初期文字列を上限付きで共有 | 既定ON / `XYO_SB3_LIST_INTERN=0` |
+| Cons String確保プール | 小さな文字列オブジェクトの割当てを専用経路で処理 | **ビルド時構成** / `XYO_STRING_CONS_POOL` |
+| 文字列連結経路の選択 | 汎用連結との比較や連結候補の特殊化 | `XYO_STRING_JOIN_SPECIALIZED`、`XYO_STRING_APPEND_LOG=1` など。後者は任意設定 |
+| リスト操作の並列化 | 安全と判定したリスト追加系ループをワーカーに分配 | 条件付き / `XYO_PARFOR=0` |
+| GC/メモリの設定 | オブジェクトプールやGCの回収閾値を調節 | 構成・診断用 / `XYO_GC_POOL`、`XYO_GC_THRESHOLD` |
+
+### スケジューラ・GPU・描画
+
+| 最適化 | 説明 | 適用・切替 |
+| --- | --- | --- |
+| Thread再利用 | 終了したスクリプトのThreadオブジェクトを安全に再初期化して再利用 | 既定ON / `XYO_THREAD_REUSE=0` |
+| 短い同期スクリプトの直列実行 | ワーカーキューに載せる固定費より逐次実行が安い小処理を直列化 | 既定ON / `XYO_SHORT_SYNC_SERIAL=0` |
+| Fiberの直接連鎖 | 条件の合う複数Fiberを直接切り替えてスケジューラの往復を減らす | 既定ON / `XYO_FIBER_CHAIN=0` |
+| 遅延ルートフレーム確保 | 実際に必要になるまでInterpreterのフレーム確保を遅らせる | `XYO_LAZY_ROOT_FRAME` |
+| daysSince2000の共有時刻 | 時刻取得を共有時計経由にするJIT経路 | `XYO_JIT_DAYS_SHARED_CLOCK` |
+| GPUによる並列ループ | 対象となる演算をGPU側の並列処理へ移す | 条件付き / `XYO_GPU`、`XYO_GPU_MIN`など |
+| GPU生成コードの局所変数特化 | GPUループ内の局所変数やスタック表現を選択 | **明示ON・研究用** / `XYO_GPU_INLINE_LOCALS=1`、`XYO_GPU_SHARED_STACK` |
+| ペン操作のループ外移動 | ペン状態が不変と証明できる操作をホットループ外へ移す | `XYO_PENHOIST` |
+| ペン色キャッシュ | 同じ色の再計算・反映を省略 | 通常有効 / `XYO_PEN_NOCACHE=1` |
+| 色変換の特化 | HSV等の色演算の高速処理と汎用経路を比較 | `XYO_HSV_FLOOR_GENERIC` |
+| GPU描画のバッチ・チャンク分割 | まとめてレコードを送信し、GPU呼び出しの固定費を削減 | `XYO_GPU_GL_BATCH`、`XYO_GPU_GL_CHUNK_LANES` |
+
+参照: [並列スケジューラ](/xyo-cpp/research/parallel-performance/)、[ペン最適化](/xyo-cpp/research/pen-point-performance/)、[GPU描画・ループ](/xyo-cpp/research/3d2-hot-loop-performance/)。
+
+### このページで数えていないもの
+
+`XYO_DEBUG`、`XYO_PROF`、`XYO_JIT_VERBOSE`、`XYO_JIT_DUMP_OBJECT`などの**診断用オプション**、画面操作・ファイル入出力・プラットフォーム機能フラグは、最適化としては数えません。また、上表はソースから見つかった主要な実装経路を整理したものであり、LLVM内部パスや環境変数なしで有効化される全ての局所的なコード変形を1対1で列挙した「完全なパス台帳」ではありません。
+
 ## 最適化の確認と比較
 
 ```bash
