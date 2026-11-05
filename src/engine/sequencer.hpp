@@ -29,6 +29,12 @@ public:
 
     Runtime& runtime;
     Timer timer;
+    // Incremented at every tick and after actual Scratch thread progress.
+    // This avoids per-variable write barriers, and intentionally over-wakes
+    // waiters when an unrelated script runs.
+    std::atomic<uint64_t> eventProgressEpoch{0};
+    bool eventSchedulerEnabled() const;
+    void armEventWait(Thread& thread, uintptr_t site);
     Thread* activeThread = nullptr;
 
     /// JS: `const threads = this.runtime.threads` — パス中に掴んだ配列。
@@ -88,6 +94,8 @@ private:
     std::vector<Fiber*> parFibers_;
     ParallelStats parStats_;
     int depGraphSeq_ = 0;
+    uint64_t eventSkippedPasses_ = 0;
+    uint64_t eventWakeups_ = 0;
 };
 
 } // namespace xyo

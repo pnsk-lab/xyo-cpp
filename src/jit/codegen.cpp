@@ -622,7 +622,7 @@ struct Codegen {
     static bool helperMayYield(const char* n) {
         static const std::unordered_set<std::string_view> k = {
             "xyo_yield", "xyo_yield_fast", "xyo_loop_yield",
-            "xyo_wait_yield", "xyo_rt_wait", "xyo_stop_all",
+            "xyo_wait_yield", "xyo_wait_event_yield", "xyo_rt_wait", "xyo_stop_all",
             "xyo_stop_script", "xyo_broadcast_wait_v", "xyo_rt_compat",
             "xyo_rt_reporter", "xyo_mot_glidexy", "xyo_mot_glideto",
             "xyo_looks_saysecs", "xyo_looks_thinksecs",
@@ -5442,9 +5442,18 @@ struct Codegen {
             // 待機系の yield — danger モードでも他スレッドが進まないと
             // 条件が変わらないため、通常のループ yield ではなく
             // 「待機なら譲る」専用ヘルパを使う。
-            call1("xyo_wait_yield", voidt, ctxArg);
+            const char* eventEnv = std::getenv("XYO_EVENT_SCHED");
+            const bool eventPureWait = eventEnv && eventEnv[0] == '1' &&
+                                       blocks->isPureWaitCondition(blk);
+            if (eventPureWait)
+                call2("xyo_wait_event_yield", voidt, ctxArg,
+                      ci64(reinterpret_cast<uintptr_t>(blk)));
+            else
+                call1("xyo_wait_yield", voidt, ctxArg);
             b.CreateBr(head);
             b.SetInsertPoint(done);
+            if (eventPureWait)
+                call1("xyo_wait_event_done", voidt, ctxArg);
             return;
         }
 

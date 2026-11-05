@@ -85,6 +85,43 @@ const Block* Blocks::getBlock(const std::string& id) const {
     return it == blocks_.end() ? nullptr : &it->second;
 }
 
+bool Blocks::isPureWaitCondition(const Block* wait) const {
+    if (!wait || wait->opcode != "control_wait_until") return false;
+    const BlockInput* condition = wait->inputs.find("CONDITION");
+    if (!condition) return false;
+    const std::string& root = condition->block.empty()
+        ? condition->shadow : condition->block;
+    // An inlined literal boolean is immutable, as are explicitly connected
+    // Scratch primitive literals. Reject arbitrary reporters by default.
+    if (root.empty()) return true;
+    static const std::unordered_set<std::string> pure = {
+        "data_variable", "math_number", "math_integer",
+        "math_whole_number", "math_positive_number",
+        "math_angle", "math_boolean", "text", "colour_picker",
+        "operator_equals", "operator_lt", "operator_gt",
+        "operator_and", "operator_or", "operator_not",
+        "operator_add", "operator_subtract", "operator_multiply",
+        "operator_divide", "operator_mod", "operator_round",
+        "operator_mathop", "operator_join", "operator_letter_of",
+        "operator_length", "operator_contains",
+    };
+    std::vector<std::string> stack{root};
+    std::unordered_set<std::string> seen;
+    while (!stack.empty()) {
+        std::string id = std::move(stack.back());
+        stack.pop_back();
+        if (!seen.insert(id).second) return false;
+        if (seen.size() > 64) return false;
+        const Block* b = getBlock(id);
+        if (!b || !pure.count(b->opcode) || !b->next.empty()) return false;
+        for (const auto& [_, in] : b->inputs.items) {
+            if (!in.block.empty()) stack.push_back(in.block);
+            else if (!in.shadow.empty()) stack.push_back(in.shadow);
+        }
+    }
+    return true;
+}
+
 std::string Blocks::getNextBlock(const std::string& id) const {
     const Block* b = getBlock(id);
     return b ? b->next : std::string{};
@@ -269,6 +306,8 @@ BlockCached* Blocks::getCachedExecute(const std::string& blockId) {
     auto flow = runtime->getFlowing(self->opcode);
     self->isConditional = flow.conditional;
     self->isLoop = flow.loop;
+    if (self->opcode == "control_wait_until")
+        self->eventWaitPure = isPureWaitCondition(block);
 
     self->isShadowBlock = !self->definedBlockFunction &&
         self->fields.size() == 1 && self->inputs.empty();

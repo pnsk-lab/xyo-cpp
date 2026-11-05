@@ -18,7 +18,30 @@
 namespace xyo {
 
 Sequencer::Sequencer(Runtime& rt) : runtime(rt) {}
-Sequencer::~Sequencer() = default;
+Sequencer::~Sequencer() {
+    if (std::getenv("XYO_EVENT_SCHED_STATS")) {
+        std::fprintf(stderr,
+                     "[event-sched] skipped=%llu woken=%llu\n",
+                     static_cast<unsigned long long>(eventSkippedPasses_),
+                     static_cast<unsigned long long>(eventWakeups_));
+    }
+}
+
+bool Sequencer::eventSchedulerEnabled() const {
+    static const bool enabled = [] {
+        const char* env = std::getenv("XYO_EVENT_SCHED");
+        return env && env[0] == '1';
+    }();
+    return enabled;
+}
+
+void Sequencer::armEventWait(Thread& thread, uintptr_t site) {
+    if (!eventSchedulerEnabled()) return;
+    thread.eventWaitEpoch = eventProgressEpoch.load(std::memory_order_relaxed);
+    thread.eventWaitSite = site;
+    thread.eventWaitArmed = true;
+}
+
 
 std::atomic<int64_t>* Sequencer::sampledWarpClock() const {
     return warpWatchdog_ && warpWatchdog_->armed()
@@ -126,6 +149,10 @@ std::vector<Thread*> Sequencer::stepThreads() {
     const double WORK_TIME = 0.75 * runtime.currentStepTime;
     runtime.updateCurrentMSecs();
     timer.start();
+    const bool eventDriven = eventSchedulerEnabled();
+    // Process external changes/IO once per tick even for pure conditions.
+    if (eventDriven)
+        eventProgressEpoch.fetch_add(1, std::memory_order_relaxed);
     // Default JIT path: a shared, ~1ms sampled clock instead of calling
     // steady_clock from each warp polling checkpoint. Custom clocks remain
     // on the synchronous helper path.
@@ -167,6 +194,21 @@ std::vector<Thread*> Sequencer::stepThreads() {
             }
             if (activeThread->status == STATUS_RUNNING ||
                 activeThread->status == STATUS_YIELD) {
+                const bool wasEventWait = eventDriven && activeThread->eventWaitArmed;
+                const uintptr_t oldWaitSite = activeThread->eventWaitSite;
+                const uint64_t oldWaitExit = activeThread->eventWaitExitCount;
+                if (wasEventWait &&
+                    activeThread->eventWaitEpoch ==
+                        eventProgressEpoch.load(std::memory_order_relaxed)) {
+                    // Pure wait-until, no other script has advanced since the
+                    // last evaluation. Nothing to re-run in this scheduler pass.
+                    ++eventSkippedPasses_;
+                    continue;
+                }
+                if (wasEventWait) {
+                    ++eventWakeups_;
+                    activeThread->eventWaitArmed = false;
+                }
                 // Tiny scripts whose generated entry cannot yield are
                 // cheaper to run in-order than to enqueue, build conflict
                 // groups and hand off to workers. Long or yielding scripts
@@ -181,7 +223,9 @@ std::vector<Thread*> Sequencer::stepThreads() {
                     : nullptr;
                 const bool immediate = serialShortSync && compiled &&
                     compiled->shortSync;
-                const AccessSet* access = allowParallel && !immediate
+                // Resumed event waiters run in-order: one extra evaluation
+                // cannot silently overtake a writer in a parallel batch.
+                const AccessSet* access = allowParallel && !immediate && !wasEventWait
                     ? parallelAccessFor(*activeThread) : nullptr;
                 if (access) {
                     // 並列バッチに溜める — flush は次の serial スレッドの
@@ -196,6 +240,15 @@ std::vector<Thread*> Sequencer::stepThreads() {
                     stoppedThread |= fr.stopped;
                     numActiveThreads += fr.active;
                     stepThread(*activeThread);
+                    if (eventDriven && !(wasEventWait &&
+                        activeThread->eventWaitArmed &&
+                        activeThread->eventWaitSite == oldWaitSite &&
+                        activeThread->eventWaitExitCount == oldWaitExit)) {
+                        // Same condition, false again = no script-side
+                        // progress. A different wait or completed script may
+                        // have modified observable Scratch state.
+                        eventProgressEpoch.fetch_add(1, std::memory_order_relaxed);
+                    }
                     // Self-rebroadcast can replace the active thread in the
                     // list while its current block continues to completion.
                     // Its next scheduling turn is now unreachable.
@@ -551,6 +604,10 @@ Sequencer::ParFlush Sequencer::flushParBatch() {
     auto& sets = parSets_;
 
     auto finish = [&]() -> ParFlush {
+        // Parallel batches only contain newly entered event waits; resumed
+        // waiters are forced onto the serial path by stepThreads().
+        if (eventSchedulerEnabled())
+            eventProgressEpoch.fetch_add(1, std::memory_order_relaxed);
         for (Thread* t : batch) {
             if (t->status == STATUS_RUNNING) ++r.active;
             if (t->stack.empty() || t->status == STATUS_DONE)

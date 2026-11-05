@@ -158,6 +158,9 @@ public:
 
     Block* getBlock(const std::string& id);
     const Block* getBlock(const std::string& id) const;
+    /// Repeating CONDITION is safe to skip while no other script progresses.
+    /// Conservative whitelist; does not evaluate the expression.
+    bool isPureWaitCondition(const Block* wait) const;
     std::string getNextBlock(const std::string& id) const;
     /// Cブロックの分岐先（SUBSTACK / SUBSTACK2...）
     std::string getBranch(const std::string& id, int branchNum) const;
@@ -245,6 +248,9 @@ struct BlockCached {
     bool isConditional = false;   // _flowing.conditional（拡張用）
     bool isLoop = false;
     bool isShadowBlock = false;
+    // True only for a side-effect-free wait-until CONDITION. False for
+    // timers, sensors, random, procedure calls and unknown extension blocks.
+    bool eventWaitPure = false;
     Value shadowValue = Value::undefined();
 
     ArgValues argValues;

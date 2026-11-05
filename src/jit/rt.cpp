@@ -132,6 +132,21 @@ void xyo_wait_yield(JitCtx* c) {
     if (waitShouldYield(c)) xyo_yield(c);
 }
 
+void xyo_wait_event_yield(JitCtx* c, uint64_t site) {
+    XYO_RT_PROF(kLoopY);
+    if (waitShouldYield(c)) {
+        c->sequencer->armEventWait(*c->thread, static_cast<uintptr_t>(site));
+        xyo_yield(c);
+    }
+}
+
+// A wait may become true and return to the *same* site within a warp
+// loop. An unchanged site ID alone cannot prove no Scratch work occurred.
+void xyo_wait_event_done(JitCtx* c) {
+    ++c->thread->eventWaitExitCount;
+    c->thread->eventWaitArmed = false;
+}
+
 void xyo_loop_yield(JitCtx* c);
 
 // An empty warp repeat has no observable body work. Preserve the exact

@@ -55,6 +55,8 @@ void xyo_yield_fast(xyo::Fiber*);
 int32_t xyo_is_stuck(JitCtx*);
 int32_t xyo_wait_should_yield(JitCtx*);
 void xyo_wait_yield(JitCtx*);
+void xyo_wait_event_yield(JitCtx*, uint64_t);
+void xyo_wait_event_done(JitCtx*);
 void xyo_loop_yield(JitCtx*);
 int32_t xyo_warp_yield_due(JitCtx*);
 void xyo_empty_repeat_warp(JitCtx*, double);
@@ -237,6 +239,8 @@ const std::pair<const char*, void*> kRtSymbols[] = {
     {"xyo_is_stuck", (void*)&xyo_is_stuck},
     {"xyo_wait_should_yield", (void*)&xyo_wait_should_yield},
     {"xyo_wait_yield", (void*)&xyo_wait_yield},
+    {"xyo_wait_event_yield", (void*)&xyo_wait_event_yield},
+    {"xyo_wait_event_done", (void*)&xyo_wait_event_done},
     {"xyo_loop_yield", (void*)&xyo_loop_yield},
     {"xyo_warp_yield_due", (void*)&xyo_warp_yield_due},
     {"xyo_empty_repeat_warp", (void*)&xyo_empty_repeat_warp},

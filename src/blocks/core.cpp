@@ -400,7 +400,18 @@ Value ctlForever(const ArgValues&, BlockUtility& u) {
     return Value::undefined();
 }
 Value ctlWaitUntil(const ArgValues& a, BlockUtility& u) {
-    if (!truth(a, "CONDITION")) u.yield();
+    if (!truth(a, "CONDITION")) {
+        const BlockCached* current = u.thread->peekStackFrame()->currentBlock;
+        if (current && current->eventWaitPure &&
+            u.sequencer->eventSchedulerEnabled())
+            u.sequencer->armEventWait(*u.thread,
+                                     reinterpret_cast<uintptr_t>(current));
+        u.yield();
+    } else {
+        if (u.sequencer->eventSchedulerEnabled())
+            ++u.thread->eventWaitExitCount;
+        u.thread->eventWaitArmed = false;
+    }
     return Value::undefined();
 }
 Value ctlWait(const ArgValues& a, BlockUtility& u) {

@@ -140,6 +140,14 @@ public:
     std::vector<std::unique_ptr<StackFrame>> framePool;
     int status = STATUS_RUNNING;
     bool isKilled = false;
+    // The wait-until CONDITION can be skipped in unchanged scheduler passes.
+    // The site is opaque: never dereference it (AOT embeds build-time IDs).
+    bool eventWaitArmed = false;
+    uintptr_t eventWaitSite = 0;
+    uint64_t eventWaitEpoch = 0;
+    // Distinguish "condition stayed false" from "left this wait and
+    // returned to the very same wait site" within one scheduler slice.
+    uint64_t eventWaitExitCount = 0;
     // Validated against Runtime::threads before use; public vector edits may
     // invalidate this hint, in which case membership falls back to a scan.
     mutable size_t runtimeIndex = SIZE_MAX;

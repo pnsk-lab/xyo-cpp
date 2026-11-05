@@ -28,6 +28,7 @@ const std::string& Thread::getId() const {
 }
 
 void Thread::releaseFinished() {
+    eventWaitArmed = false;
     stack.clear();
     stackFrames.clear();
     trashFrames.clear();

@@ -79,6 +79,14 @@ if(TARGET xyo-cli)
               --out "${CMAKE_CURRENT_BINARY_DIR}/jit-transient-fixtures"
               --n 257)
     set_tests_properties(xyo-jit-transient-strings PROPERTIES TIMEOUT 180)
+
+    # Event-driven pure wait-until: interpreter, eager, HotSpot, parallel,
+    # time-dependent/impure fallback, and multiple waiters with a writer.
+    add_test(NAME xyo-event-driven-scheduler
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/differential/event_scheduler.py"
+              "$<TARGET_FILE:xyo-cli>")
+    set_tests_properties(xyo-event-driven-scheduler PROPERTIES TIMEOUT 180)
   endif()
 endif()
 
