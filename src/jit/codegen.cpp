@@ -81,6 +81,12 @@ struct Codegen {
         const char* env = std::getenv("XYO_JIT_WARP_CLOCK");
         return !env || env[0] != '0';
     }();
+    // Inline Scratch daysSince2000 using the scheduler's 1ms wall clock.
+    // Keep the synchronous helper for direct execution and A/B comparison.
+    const bool sharedDaysClock = [] {
+        const char* env = std::getenv("XYO_JIT_DAYS_SHARED_CLOCK");
+        return env && env[0] != '0' && !std::getenv("XYO_PROF");
+    }();
     const bool safeArithCanon = [] {
         const char* mode = std::getenv("XYO_JIT_SAFE_ARITH_CANON");
         return !mode || mode[0] != '0';
@@ -3924,6 +3930,33 @@ struct Codegen {
         if (op == "sensing_timer") {
             llvm::Value* d = call1("xyo_timer", f64t, ctxArg);
             return call1("xyo_num", i64t, d);
+        }
+        if (op == "sensing_dayssince2000" && sharedDaysClock) {
+            auto* slot = b.CreateConstGEP1_32(
+                i8t, ctxArg, uint32_t(offsetof(JitCtx, sampledUnixMs)));
+            auto* clock = b.CreateLoad(ptrt, slot);
+            BasicBlock* sampled = newBB("days.sampled");
+            BasicBlock* fallback = newBB("days.fallback");
+            BasicBlock* merge = newBB("days.merge");
+            hotBr(b.CreateICmpNE(clock, cnull()), sampled, fallback, 1000, 1);
+            b.SetInsertPoint(sampled);
+            auto* millis = b.CreateLoad(i64t, clock);
+            millis->setAtomic(AtomicOrdering::Monotonic);
+            // Match rt::daysSince2000's operation order and Date.now's
+            // integer-ms precision, including an OS wall-clock adjustment.
+            auto* delta = b.CreateFSub(
+                b.CreateSIToFP(millis, f64t), cf64(946684800000.0));
+            auto* days = b.CreateFDiv(delta, cf64(86400000.0));
+            auto* cachedBits = emitCanonKnownNonNaN(days);
+            b.CreateBr(merge);
+            b.SetInsertPoint(fallback);
+            auto* freshBits = call1("xyo_sns_dayssince2000", i64t, ctxArg);
+            b.CreateBr(merge);
+            b.SetInsertPoint(merge);
+            auto* result = b.CreatePHI(i64t, 2);
+            result->addIncoming(cachedBits, sampled);
+            result->addIncoming(freshBits, fallback);
+            return result;
         }
         if (op == "sensing_userid")
             return ci64(Value::undefined().bits);   // interp も noop=undefined

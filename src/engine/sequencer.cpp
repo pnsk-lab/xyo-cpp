@@ -30,6 +30,12 @@ std::atomic<int64_t>* Sequencer::sampledWarpDeadline() const {
         ? &warpWatchdog_->deadlineUs : nullptr;
 }
 
+std::atomic<int64_t>* Sequencer::sampledUnixClock() const {
+    return warpWatchdog_ && warpWatchdog_->armed() &&
+           warpWatchdog_->samplesWallClock()
+        ? &warpWatchdog_->sampledUnixMs : nullptr;
+}
+
 
 namespace {
 
@@ -127,8 +133,13 @@ std::vector<Thread*> Sequencer::stepThreads() {
         const char* env = std::getenv("XYO_JIT_WARP_CLOCK");
         return !env || env[0] != '0';
     }();
+    static const bool sharedDaysClockEnabled = [] {
+        const char* env = std::getenv("XYO_JIT_DAYS_SHARED_CLOCK");
+        return env && env[0] != '0' && !std::getenv("XYO_PROF");
+    }();
     if (sharedClockEnabled && jitEnabled() && timer.usesSteadyClock()) {
-        if (!warpWatchdog_) warpWatchdog_ = std::make_unique<WarpClockWatchdog>();
+        if (!warpWatchdog_)
+            warpWatchdog_ = std::make_unique<WarpClockWatchdog>(sharedDaysClockEnabled);
         warpWatchdog_->arm(timer.startTime() + runtime.warpTimeMs,
                            runtime.dangerMode);
     }
@@ -422,6 +433,7 @@ void Sequencer::jitStepThread(Thread& thread) {
     c->target = thread.target;
     c->sampledWarpClockUs = sampledWarpClock();
     c->sampledWarpDeadlineUs = sampledWarpDeadline();
+    c->sampledUnixMs = sampledUnixClock();
 #if !defined(XYO_DISABLE_RT_PROF)
     std::optional<ProfScope> ps;
     if (prof().enabled) { ps.emplace(&prof().fiberNs); ++prof().nFiber; }
@@ -611,6 +623,7 @@ Sequencer::ParFlush Sequencer::flushParBatch() {
                     t->jitCtx->target = t->target;
                     t->jitCtx->sampledWarpClockUs = sampledWarpClock();
                     t->jitCtx->sampledWarpDeadlineUs = sampledWarpDeadline();
+                    t->jitCtx->sampledUnixMs = sampledUnixClock();
                     fibers.push_back(t->fiber);
                 }
             }

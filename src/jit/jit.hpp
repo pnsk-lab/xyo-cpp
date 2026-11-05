@@ -194,6 +194,9 @@ struct JitCtx {
     /// retain the existing synchronous xyo_warp_yield_due check.
     std::atomic<int64_t>* sampledWarpClockUs;
     std::atomic<int64_t>* sampledWarpDeadlineUs;
+    // Non-null only while the Sequencer watchdog is armed.
+    // Unix milliseconds sampled every ~1ms; use the direct clock otherwise.
+    std::atomic<int64_t>* sampledUnixMs;
 };
 
 static_assert(std::is_trivially_copyable_v<JitCtx>);

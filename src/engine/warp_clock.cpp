@@ -3,9 +3,17 @@
 #include <algorithm>
 #include <limits>
 
+namespace {
+int64_t unixMilliseconds() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+} // namespace
+
 namespace xyo {
 
-WarpClockWatchdog::WarpClockWatchdog() : worker_([this] { run(); }) {}
+WarpClockWatchdog::WarpClockWatchdog(bool sampleWallClock)
+    : sampleWallClock_(sampleWallClock), worker_([this] { run(); }) {}
 
 WarpClockWatchdog::~WarpClockWatchdog() {
     {
@@ -34,6 +42,8 @@ void WarpClockWatchdog::arm(double deadlineMs, bool unlimited) {
                   : toMicroseconds(deadline_),
         std::memory_order_release);
     sampledUs.store(toMicroseconds(Clock::now()), std::memory_order_relaxed);
+    if (sampleWallClock_)
+        sampledUnixMs.store(unixMilliseconds(), std::memory_order_relaxed);
     active_ = true;
     armed_.store(true, std::memory_order_release);
     ++generation_;
@@ -57,17 +67,19 @@ void WarpClockWatchdog::run() {
         }
 
         const uint64_t generation = generation_;
-        // Danger mode does not need periodic time samples: the JIT deadline
-        // is +infinity and cannot expire.
-        if (unlimited_) {
+        // No extra wakeups in danger mode unless a wall-clock sample is used.
+        if (unlimited_ && !sampleWallClock_) {
             cv_.wait(lock, [&] {
                 return stopped_ || !active_ || generation_ != generation;
             });
             continue;
         }
 
-        const auto wakeAt = std::min(
-            deadline_, Clock::now() + std::chrono::milliseconds(1));
+        // With wall-clock reporting enabled, continue sampling after the
+        // deadline expires. Otherwise retain the original watchdog behavior.
+        const auto nextSample = Clock::now() + std::chrono::milliseconds(1);
+        const auto wakeAt = (sampleWallClock_ && (unlimited_ || deadline_ <= Clock::now()))
+            ? nextSample : std::min(deadline_, nextSample);
         const bool interrupted = cv_.wait_until(lock, wakeAt, [&] {
             return stopped_ || !active_ || generation_ != generation;
         });
@@ -76,10 +88,9 @@ void WarpClockWatchdog::run() {
 
         const auto now = Clock::now();
         sampledUs.store(toMicroseconds(now), std::memory_order_relaxed);
-
-        // Once expired, keep the timestamp updated no longer; the JIT's
-        // monotonic comparison stays true until the next arm().
-        if (now >= deadline_) {
+        if (sampleWallClock_) {
+            sampledUnixMs.store(unixMilliseconds(), std::memory_order_relaxed);
+        } else if (now >= deadline_) {
             cv_.wait(lock, [&] {
                 return stopped_ || !active_ || generation_ != generation;
             });

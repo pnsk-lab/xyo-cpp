@@ -603,7 +603,7 @@ void testWarpWaits(JitMode mode) {
 
 /// テストランナ（tests/unit/test_cast.cpp の main）から呼ばれる。
 void testSampledWarpClock() {
-    WarpClockWatchdog clock;
+    WarpClockWatchdog clock(true);
     clock.arm(Timer::stdNow() + 1000.0, false);
     const int64_t first = clock.sampledUs.load(std::memory_order_relaxed);
     int64_t next = first;
@@ -612,6 +612,14 @@ void testSampledWarpClock() {
         next = clock.sampledUs.load(std::memory_order_relaxed);
     }
     check(next > first, "sampled warp clock advances asynchronously");
+    const auto unixNow = [] {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    };
+    const int64_t sampledWall = clock.sampledUnixMs.load(std::memory_order_relaxed);
+    check(std::llabs(sampledWall - unixNow()) < 200,
+          "sampled wall clock agrees with system clock");
+
     check(next < clock.deadlineUs.load(std::memory_order_relaxed),
           "sampled warp clock not yet past deadline");
 
@@ -626,6 +634,17 @@ void testSampledWarpClock() {
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
     check(expired, "shared clock crosses expired warp deadline");
+    // Deadline expiry must not freeze a Scratch-visible wall-clock reporter.
+    const int64_t afterDeadline = clock.sampledUnixMs.load(std::memory_order_relaxed);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    check(clock.sampledUnixMs.load(std::memory_order_relaxed) > afterDeadline,
+          "sampled wall clock advances after warp deadline");
+    clock.arm(Timer::stdNow() + 1000.0, true);
+    const int64_t inDanger = clock.sampledUnixMs.load(std::memory_order_relaxed);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    check(clock.sampledUnixMs.load(std::memory_order_relaxed) > inDanger,
+          "sampled wall clock advances in danger mode");
+
 
     // A previous tick's deadline must not continue to preempt the next.
     clock.arm(Timer::stdNow() + 1000.0, false);

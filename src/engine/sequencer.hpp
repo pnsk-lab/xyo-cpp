@@ -25,6 +25,7 @@ public:
     /// Available only while stepThreads() is executing with a steady clock.
     std::atomic<int64_t>* sampledWarpClock() const;
     std::atomic<int64_t>* sampledWarpDeadline() const;
+    std::atomic<int64_t>* sampledUnixClock() const;
 
     Runtime& runtime;
     Timer timer;

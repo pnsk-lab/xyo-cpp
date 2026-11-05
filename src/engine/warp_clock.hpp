@@ -18,8 +18,11 @@ public:
     // invalidate the read-mostly deadline cache line.
     alignas(64) std::atomic<int64_t> sampledUs{0};
     alignas(64) std::atomic<int64_t> deadlineUs{0};
+    // system_clock Unix milliseconds for Scratch's days since 2000.
+    // Separate cache line to avoid invalidating the warp polling clock.
+    alignas(64) std::atomic<int64_t> sampledUnixMs{0};
 
-    WarpClockWatchdog();
+    explicit WarpClockWatchdog(bool sampleWallClock = false);
     ~WarpClockWatchdog();
 
     WarpClockWatchdog(const WarpClockWatchdog&) = delete;
@@ -30,6 +33,7 @@ public:
     void arm(double deadlineMs, bool unlimited);
     void disarm();
     bool armed() const { return armed_.load(std::memory_order_acquire); }
+    bool samplesWallClock() const { return sampleWallClock_; }
 
 private:
     using Clock = std::chrono::steady_clock;
@@ -37,6 +41,7 @@ private:
     static int64_t toMicroseconds(Clock::time_point time);
     void run();
 
+    const bool sampleWallClock_;
     std::mutex mutex_;
     std::condition_variable cv_;
     std::thread worker_;
