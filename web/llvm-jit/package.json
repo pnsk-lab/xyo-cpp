@@ -9,7 +9,9 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "copy:artifacts": "node scripts/copy-editor-artifacts.mjs"
+    "copy:artifacts": "node scripts/copy-editor-artifacts.mjs",
+    "copy:host": "node scripts/copy-host.mjs",
+    "test:unified": "bun test tests/unified-runtime.test.ts"
   },
   "dependencies": {
     "fflate": "^0.8.3",

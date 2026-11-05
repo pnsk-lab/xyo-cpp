@@ -260,14 +260,12 @@ TurboWarp は `blocks` を JS オブジェクトとして**挿入順**にイテ�
 - `xyo gui` / `xyo edit` はブラウザシェル未対応（`play` のみ）。
 - WASM のスタックは既定 64KiB → 本ビルドは `-sSTACK_SIZE=5242880`（5MiB）。
 
-## ブラウザ内 LLVM ツールチェーン（実験的）
+## ブラウザ内 LLVM と統合xyoランタイム（2026-11 実験的）
 
-[web/llvm-jit](../web/llvm-jit/README.md) に xyo-editor の LLVM Wasm Worker コンパイル基盤を移植した。ブラウザ上の llc と wasm-ld を分離起動し、LLVM IR から Wasm バイナリを生成できる API である。既存の自前 Wasm エンコーダとネイティブ ORC JIT は変更しない。
+[web/llvm-jit](../web/llvm-jit/README.md) に xyo-editor のコンパイラ・動的リンクホストを移植した。現在のxyo-cppをEmscriptenの `MAIN_MODULE=2` でビルドし、生成コードを同じxyo::Runtimeのメモリ・変数へ接続する実行経路を持つ。
 
-**現状の実装範囲**: IR→object→module のパイプライン、Worker ライフサイクル、キャンセルとエラー報告、バイナリ検証。Scratch SB3→LLVM IR、Emscripten side module の xyo ランタイムへのロード、GC/スケジューラ接続は未実装。13 件のモック単体テストは通過しているが、LLVM の実ビルド・ブラウザでの実行テストではない。
+**確認済み:** 現行ランタイムWASMのビルド・Node実行、緑旗のインタプリタによる変数更新、SB3から生成したLLVM IRのPIC side moduleの動的ロードと同じ変数の更新、LLVMに非対応なプロジェクトのインタプリタフォールバック。Native LLVM llc/wasm-ldを用いたテストが通過している。統合モジュールはブラウザ専用Worker内でロードする設計。
 
-また `src/jit/codegen.cpp` の `ctxPtr` をターゲットのポインタ幅に依存する GEP に変更した。これだけでは他の ABI/offset 互換性は保証できない。
+**未確認:** 実ブラウザにおけるLLVM in WasmのE2E実行（LLVM llc/LLDのWasmバイナリが別途必要）。現在SB3からIRを生成する実行用TypeScript経路は、単一緑旗の数値代入・加算だけを対象とした限定的なもの。xyo本体の `jitEmitScript` を利用する C++ API は移植・ネイティブでのIR生成検証済みだが、wasm32版LLVMライブラリとともにEmscriptenでビルドして統合する作業が残っている。ネイティブ版のIRには64-bitホストの構造体オフセットが入るためWASM32への流用を禁止する。レンダラ・音声・入力などのブラウザホストAPIも今後の統合対象。
 
-### 独立したブラウザLLVM SB3実行実験（2026-11）
-
-`web/llvm-jit` にSB3 ZIP→数値演算のLLVM IR→ブラウザ用llc→wasm-ld→Wasm instantiateの独立実験を追加。対応するのは単一緑旗の短い数値変数代入・加算チェーンのみ。ソースのJITをそのまま移植するものではなく、ライブの`xyo::Runtime`とはメモリを共有しない。xyo-editorでビルドしたLLVMブラウザ資産を`bun run copy:artifacts -- /path/to/xyo-editor`で配置して`bun run dev`する。ネイティブLLVMを利用したSB3実行テストは通過、ブラウザでのLLVM資産を使ったE2E実行は未検証。非対応プロジェクトは実行拒否する。
+既存のネイティブLLVM ORC JITおよび自前WASMエンコーダの経路には変更を加えていない。

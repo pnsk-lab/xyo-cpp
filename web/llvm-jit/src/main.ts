@@ -1,7 +1,5 @@
-import { createLLVMWorkerClient } from './client';
-import { LLVMPipeline } from './pipeline';
-import { admitSb3, executeSb3 } from './sb3';
-import workerUrl from './worker.ts?worker&url';
+import { admitSb3 } from './sb3';
+import workerUrl from './unified-worker.ts?worker&url';
 import './style.css';
 
 const file = document.querySelector<HTMLInputElement>('#project')!;
@@ -10,10 +8,10 @@ const status = document.querySelector<HTMLElement>('#status')!;
 const result = document.querySelector<HTMLElement>('#result')!;
 const ir = document.querySelector<HTMLElement>('#ir')!;
 let bytes: Uint8Array | undefined;
-let current = 0;
+let generation = 0;
 
 file.addEventListener('change', async () => {
-  const ticket = ++current;
+  const id = ++generation;
   const uploaded = file.files?.[0];
   bytes = undefined;
   button.disabled = true;
@@ -22,43 +20,49 @@ file.addEventListener('change', async () => {
   if (!uploaded) { status.textContent = 'SB3ファイルを選択してください。'; return; }
   if (uploaded.size > 16 * 1024 * 1024) { status.textContent = '16MiBを超えるSB3は使用できません。'; return; }
   try {
-    const loaded = new Uint8Array(await uploaded.arrayBuffer());
-    if (ticket !== current) return;
-    const admitted = admitSb3(loaded);
-    if (!admitted.ok) {
-      status.textContent = 'LLVM非対応（インタプリタが必要）: ' + admitted.reason;
-      return;
-    }
-    ir.textContent = admitted.compilation.ir;
-    bytes = loaded;
+    const source = new Uint8Array(await uploaded.arrayBuffer());
+    if (id !== generation) return;
+    // Admission here is only a hint. The Worker always validates again.
+    const admitted = admitSb3(source);
+    status.textContent = admitted.ok
+      ? '統合LLVM候補です。生成コードとインタプリタが同じxyoランタイムを使用します。'
+      : 'LLVM非対応: xyoインタプリタで実行します。';
+    ir.textContent = admitted.ok ? admitted.compilation.ir : '(インタプリタへのフォールバック)';
+    bytes = source;
     button.disabled = false;
-    status.textContent = 'コンパイル準備完了（LLVM対象）';
   } catch (error) { status.textContent = String(error); }
 });
 
-button.addEventListener('click', async () => {
+button.addEventListener('click', () => {
   if (!bytes) return;
-  const ticket = ++current;
+  const id = ++generation;
   const source = bytes;
+  const worker = new Worker(workerUrl, { type: 'module' });
   button.disabled = true;
-  status.textContent = 'LLVMコンパイル中…';
+  status.textContent = 'SB3をコンパイル／実行中…';
   result.textContent = '';
-  const client = createLLVMWorkerClient(
-    workerUrl,
-    new URL('/llvm-assets/llc-browser.mjs', location.href),
-    new URL('/llvm-assets/lld-browser.mjs', location.href),
-  );
-  const compiler = new LLVMPipeline(client);
-  try {
-    const execution = await executeSb3(source, compiler);
-    if (ticket !== current) return;
-    result.textContent = JSON.stringify(execution.variables, null, 2);
-    status.textContent = 'LLVMで生成したWebAssemblyを実行しました。';
-  } catch (error) {
-    if (ticket !== current) return;
-    status.textContent = '実行失敗: ' + (error instanceof Error ? error.message : String(error));
-  } finally {
-    compiler.stop();
-    if (ticket === current) button.disabled = false;
-  }
+  const timeout = setTimeout(() => {
+    worker.terminate();
+    if (id !== generation) return;
+    status.textContent = '実行タイムアウト。Workerを停止しました。';
+    button.disabled = false;
+  }, 120_000);
+  const finish = () => { clearTimeout(timeout); worker.terminate(); if (id === generation) button.disabled = false; };
+  worker.onmessage = (event: MessageEvent<{ id: number; ok: boolean; mode?: string; snapshot?: unknown; error?: string }>) => {
+    if (event.data.id !== id) return;
+    finish();
+    if (!event.data.ok) {
+      status.textContent = '実行失敗: ' + (event.data.error ?? 'unknown error');
+      return;
+    }
+    result.textContent = JSON.stringify(event.data.snapshot, null, 2);
+    status.textContent = event.data.mode === 'llvm'
+      ? 'xyo-cpp統合ランタイム内でLLVM生成コードを実行しました。'
+      : 'LLVM非対応のため、xyo-cppインタプリタで実行しました。';
+  };
+  worker.onerror = event => {
+    finish();
+    if (id === generation) status.textContent = 'Workerエラー: ' + event.message;
+  };
+  worker.postMessage({ id, bytes: source, steps: 20 });
 });

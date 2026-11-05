@@ -4,18 +4,18 @@
 <body><main>
   <p class="eyebrow">xyo-cpp / experimental</p>
   <h1>Scratch SB3 → LLVM → WebAssembly</h1>
-  <p class="description">ブラウザ内のLLVMでSB3をコンパイルして実行します。現在は単一の緑旗スクリプト内の数値変数の代入・加算に限定されます。</p>
+  <p class="description">xyo-cppのWASMランタイムとブラウザ内LLVM生成コードを統合して実行します。LLVM対象は単一の緑旗スクリプト内の数値変数の代入・加算に限定され、非対応ブロックはインタプリタで実行します。</p>
   <section class="panel">
     <label for="project">SB3ファイル</label>
     <input id="project" type="file" accept=".sb3,application/zip">
-    <button id="run" disabled>LLVMで実行</button>
+    <button id="run" disabled>統合WASMで実行</button>
     <p id="status" role="status">SB3ファイルを選択してください。</p>
   </section>
   <section class="panel">
-    <h2>出力</h2>
+    <h2>xyo-cpp実行結果</h2>
     <pre id="result">実行結果はここに表示されます。</pre>
-    <details><summary>生成されたLLVM IR</summary><pre id="ir"></pre></details>
+    <details><summary>参考: LLVM IR生成対象の概要</summary><pre id="ir"></pre></details>
   </section>
-  <p class="footnote">LLVMのブラウザ用バイナリは <code>public/llvm-assets/</code> に別途配置する必要があります。対応しない命令は実行せず拒否します。現段階では完全なxyo-cppランタイムへの統合は未実装です。</p>
+  <p class="footnote">ブラウザ用のLLVMとxyo-cppランタイムは <code>public/llvm-assets/</code> に別途配置する必要があります。非対応スクリプトはxyoインタプリタへフォールバックします。レンダラ、音声、全Scratch機能のブラウザ互換性は未検証です。</p>
 </main><script type="module" src="/src/main.ts"></script></body>
 </html>

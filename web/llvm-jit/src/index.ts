@@ -5,3 +5,6 @@ export type { ToolFactory, ToolFactories, ToolModule } from './runtime';
 export * from './admission';
 export * from './split';
 export * from './sb3';
+export * from './runtime-ir';
+export * from './unified-runtime';
+export * from './compiler-metadata';
