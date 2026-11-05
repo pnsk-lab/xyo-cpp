@@ -197,6 +197,37 @@ int test_sstr_cons_main() {
         CHECK(Value{slot}.asStrPtr()->view() == expected);
     }
 
+    // Compressed packed batches must preserve UTF-16 indexing, immutable
+    // snapshots, and materialization without allocating per logical chunk.
+    {
+        uint64_t slot = ns("head").bits;
+        void* log = xyo_transient_begin(slot, &slot);
+        const uint64_t packed = uint64_t(u'A') | (uint64_t(u'B') << 16);
+        const uint64_t metadata = (uint64_t(2) << 32) | 64u;
+        xyo_transient_append_repeat_packed(log, packed, metadata);
+        xyo_transient_flush(log, &slot);
+        Value prefix{slot};
+        for (int i = 0; i < 4096; ++i)
+            xyo_transient_append_repeat_packed(log, packed, metadata);
+        // The repeated section is stored as a small descriptor, not as
+        // 524KiB of 256-code-unit allocation chunks.
+        CHECK(appendLogExternalBytes(log) < 64 * 1024);
+        xyo_transient_finish(log, &slot);
+        SStr* result = Value{slot}.asStrPtr();
+        const uint32_t expectedLen = 4 + (4097u * 64u * 2u);
+        CHECK(result->len == expectedLen);
+        CHECK(prefix.asStrPtr()->len == 4 + 128);
+        CHECK(prefix.asStrPtr()->unitAt(4) == u'A');
+        CHECK(prefix.asStrPtr()->unitAt(5) == u'B');
+        CHECK(prefix.asStrPtr()->unitAt(131) == u'B');
+        CHECK(result->unitAt(4 + 128) == u'A');
+        CHECK(result->unitAt(expectedLen - 1) == u'B');
+        std::u16string expected = u"head";
+        for (int i = 0; i < 4097 * 64; ++i) expected += u"AB";
+        CHECK(result->view() == expected);
+        CHECK(prefix.asStrPtr()->view() == expected.substr(0, 132));
+    }
+
     // 64-way batches: long Unicode literal and dynamic reporter value.
     {
         uint64_t slot = ns("s:").bits;
