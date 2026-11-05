@@ -4,7 +4,7 @@
 
 - `src/jit/codegen.cpp` `eqAsciiWord` / `emitEqAsciiWord`：非数値の短いASCII文字列リテラルに記号を許す。従来 `a..z` に限定されていたためBrainfuckの `+ - < > [ ]` はすべて汎用 `xyo_eq` に落ちていた。文字列の1文字比較はUTF-16長・ASCIIコード・大小文字をJITで直接検査し、非文字列、非ASCII、連結文字列などは従来ヘルパに戻す。
 - `canElideWarpRecursiveFrames`：完全にLLVMへloweringでき、全てwarpで、明示的なyield/compatやインタプリタスタック観測を含まない再帰手続きグラフに対し、リスト操作・文字列操作・warpループもフレーム不要と証明する。warpループに挿入される500msタイマーはネイティブfiber自体を中断・再開するため、インタプリタ用手続きフレームを要求しない。`XYO_JIT_RECURSIVE_FRAME_ELIDE=0`で新しい判定のみ無効化できる。
-- `operator_contains`：第1引数が固定文字列 `"0123456789"` のとき、第2引数が単一ASCII UTF-16文字であることを実行時ガードして数字範囲判定を行う。それ以外は `xyo_strcontains` へ戻す。`XYO_JIT_DIGIT_CONTAINS=0`で無効化できる。
+- operator_contains: 旧版の定数 0123456789 完全一致による専用処理は撤廃した。現在は任意の1〜32 UTF-16コードユニットのASCII定数文字列を範囲比較または128ビット集合判定へ変換し、実行時に針がASCIIの1文字である場合だけ適用する。Unicode、連結文字列、非文字列、複数字の針は既存のScratchヘルパへ戻す。XYO_JIT_ASCII_SET_CONTAINS=0で無効化できる。
 
 ## 実測（i7-12700、Release、JIT、30fps、4回の交互実行の中央値）
 
@@ -23,7 +23,21 @@ ASTの分離実験（後半の同一測定系列）では、フレーム省略�
 ## 検証
 
 - `tests/differential/jit_ascii_fastpaths.py`：記号/英字/Unicode/空文字/数字型との等値比較、数字集合contains、リストとwarpループを伴う121段の再帰。インタプリタ、eager JIT、HotSpot、各フォールバックを照合。
-- 既存CTest：`xyo-tests`、`xyo-interpreter-parity-regressions`、`xyo-jit-lazy-integration`、`xyo-jit-transient-strings`、`xyo-jit-ascii-fastpaths` が成功（追加のUnicode文字列高速化は別の未コミット作業であり、このリリースには含めない）。
+- 既存CTest：`xyo-tests`、`xyo-interpreter-parity-regressions`、`xyo-jit-lazy-integration`、`xyo-jit-transient-strings`、`xyo-string-unicode-fast` および `xyo-jit-ascii-fastpaths` がすべて成功。
 - 独立測定ログ `build/diagnose-brainfuck-ast/paired-benchmark.json`、`digits-ab.json`、プロファイラ出力 `final-*.err`。
 
 ベンチの計測期間中に並行したユーザー作業が存在しうるため、さらに厳密なスコア比較にはCPU固定・実行順乱択・複数セッションを推奨する。機能の一般的な速度保証ではない。
+
+
+## v1.1.0 ベンチマーク特化監査・一般化の追加検証
+
+定数 0123456789 の完全一致を条件とする専用処理は削除した。変更後のコードにベンチマーク名やこの文字列の一致で分岐する条件はない。
+
+- 同一バイナリでCPU12固定、Eager JIT、OFF/ONランダム順10ペア。
+- app_ast: 27,791 → 36,690 ops/ms、ペア中央値 1.3206倍、checksum 403。
+- app_brainfuck: 133,571 → 133,270 ops/ms、ペア中央値 1.000倍、checksum 931125。集合検索最適化はBrainfuckの性能に寄与していない。
+- 差分テスト: 数字、母音、記号、飛び飛びの集合、大文字、単一文字、空集合、Unicode、長い集合、独立乱択した5集合についてインタプリタ、Eager JIT、HotSpot、OFFを照合。
+- AOTでも検証SB3の実行結果が一致。
+- 生データ: build/benchmaxxxing-audit/ascii-set-ab.json（ビルド成果物のためGit管理外）。
+
+旧資料のBrainfuck 4.04倍は複数の独立最適化の合算であり、このASCII文字集合最適化単独の効果ではない。汎用のASCII文字リテラル比較やwarp再帰フレーム省略には、今後もベンチマーク外の多様なケースで検証が必要。

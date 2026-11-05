@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare punctuation equality and ASCII digit-set contains across JIT paths.
+"""Compare punctuation equality and generic ASCII-set contains across JIT paths.
 
 Run: python3 tests/differential/jit_ascii_fastpaths.py [path/to/xyo]
 The test intentionally exercises heap strings, non-strings, empty strings,
@@ -7,6 +7,7 @@ Unicode folds and the specialized constant-ASCII-literal paths.
 """
 import json
 import os
+import random
 from pathlib import Path
 import subprocess
 import sys
@@ -21,10 +22,31 @@ from gen_algo_bench import (
 
 
 def build_fixture(out):
-    g = Gen(["candidate", "eq_forward", "eq_reverse", "digits", "iterations"], [])
+    sets = {
+        "digits": "0123456789",
+        "vowels": "aeiou",
+        "operators": "+-<>[]",
+        "alternating": "02468",
+        "uppercase": "ABCD",
+        "punctuation": "!?@#",
+        "single": "z",
+        "empty_set": "",
+        "unicode_set": "日本語",
+        "large_set": "0123456789abcdefghijklmnopqrstuvwx",
+    }
+    # Holdout alphabets deliberately unrelated to benchmark literals. The
+    # generated sets vary in cardinality, ordering, and upper/lowercase.
+    rng = random.Random(20261105)
+    alphabet = "".join(chr(i) for i in range(33, 127))
+    for i, size in enumerate((2, 5, 9, 20, 32)):
+        sets[f"holdout_{i}"] = "".join(rng.sample(alphabet, size))
+    g = Gen(["candidate", "eq_forward", "eq_reverse", "iterations",
+             *sets.keys()], [])
     cases = [
         *(text(c) for c in ["+", "-", "<", ">", "[", "]", "a", "A", "N", "none",
-                             "0", "5", "", " ", "++", "01", "＋", "K", "İ", "🍣"]),
+                             "0", "5", "", " ", "++", "01", "＋", "K", "İ", "🍣",
+                             "i", "I", "o", "O", "z", "Z", "@", "#", "8",
+                             "b", "D", "日", "日本", "á", "ß"]),
         num(5), num(0), num(-1), num(1000),
     ]
     body = []
@@ -37,19 +59,21 @@ def build_fixture(out):
                 S_if(eq(text(literal), var("candidate")),
                      [S_change("eq_reverse", num(1))]),
             ])
-        body.append(S_if(op("operator_contains", STRING1=text("0123456789"),
-                            STRING2=var("candidate")),
-                         [S_change("digits", num(1))]))
+        for key, hay in sets.items():
+            body.append(S_if(op("operator_contains", STRING1=text(hay),
+                                STRING2=var("candidate")),
+                             [S_change(key, num(1))]))
         body.append(S_change("iterations", num(1)))
     g.define("scan", [], body, warp=True)
     g.script([
         S_set("eq_forward", num(0)),
         S_set("eq_reverse", num(0)),
-        S_set("digits", num(0)),
+        *(S_set(key, num(0)) for key in sets),
         S_set("iterations", num(0)),
         S_call("scan"),
     ])
     write_sb3(out, make_project(g.vars.keys(), g.lists.keys(), g))
+    return len(cases), list(sets)
 
 
 def build_recursive_fixture(out):
@@ -88,7 +112,10 @@ def run(binary, sb3, jit, env_vars, keys=None):
     payload = p.stdout[p.stdout.index("{"):p.stdout.rindex("}") + 1]
     d = json.loads(payload)["Bench"]
     if keys is None:
-        keys = ["eq_forward", "eq_reverse", "digits", "iterations"]
+        keys = ["eq_forward", "eq_reverse", "digits", "vowels",
+                "operators", "alternating", "uppercase", "punctuation",
+                "single", "empty_set", "unicode_set", "large_set",
+                "iterations"]
     return {k: d[k] for k in keys}
 
 
@@ -97,21 +124,23 @@ def main():
     outdir = ROOT / "build/diagnose-brainfuck-ast"
     outdir.mkdir(parents=True, exist_ok=True)
     sb3 = outdir / "ascii-fastpaths.sb3"
-    build_fixture(sb3)
+    count, set_names = build_fixture(sb3)
+    all_keys = ["eq_forward", "eq_reverse", *set_names, "iterations"]
     configurations = [
         ("interpreter", "off", {}),
         ("eager default", "eager", {}),
         ("hotspot default", "hotspot", {}),
         ("eager generic equality", "eager", {"XYO_JIT_EQ_GENERIC": "1"}),
-        ("eager generic contains", "eager", {"XYO_JIT_DIGIT_CONTAINS": "0"}),
+        ("eager generic contains", "eager",
+         {"XYO_JIT_ASCII_SET_CONTAINS": "0"}),
     ]
     expected = None
     for label, jit, config in configurations:
-        result = run(binary, sb3, jit, config)
+        result = run(binary, sb3, jit, config, keys=all_keys)
         if expected is None:
             expected = result
         assert result == expected, (label, expected, result)
-        assert result["iterations"] == "24", result
+        assert result["iterations"] == str(count), result
         print("PASS", label, result, flush=True)
 
     recursion = outdir / "recursive-warp-lists.sb3"

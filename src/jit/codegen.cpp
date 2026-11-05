@@ -17,6 +17,7 @@
 #include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/Utils/Local.h>
 
+#include <bit>
 #include <cstddef>
 #include <cmath>
 #include <limits>
@@ -4117,29 +4118,49 @@ struct Codegen {
         if (op == "operator_letter_of") return emitLetterOf(blk);
         if (op == "operator_length") return emitLength(blk);
         if (op == "operator_contains") {
-            // An immutable digits literal is common in Scratch lexers.
-            // Only bypass case-insensitive Unicode substring matching when
-            // the needle is proven to be exactly one ASCII code unit.
-            // All other values (including empty/non-string/cons/Unicode) go
-            // through the full Scratch coercion and comparison helper.
+            // A literal ASCII haystack with a short alphabet can be lowered
+            // into a compile-time character set (contiguous interval or
+            // bitset), provided the needle is a flat one-unit ASCII string.
+            // This works equally for digits, operators, vowels, etc.; never
+            // match a project-specific literal or identify a benchmark.
+            // Other values retain the full Scratch substring semantics.
             const BlockInput* input = blk->inputs.find("STRING1");
             const std::string literalId = input
                 ? (input->block.empty() ? input->shadow : input->block) : "";
             Block* literal = literalId.empty() ? nullptr : getBlock(literalId);
             const BlockField* field = literal && literal->shadow &&
                 literal->opcode == "text" ? findField(literal, "TEXT") : nullptr;
-            const char* setting = std::getenv("XYO_JIT_DIGIT_CONTAINS");
-            if (field && field->value.isString() && field->value.asStrPtr() &&
-                field->value.asStrPtr()->view() == u"0123456789" &&
-                (!setting || setting[0] != '0')) {
+            uint64_t asciiLo = 0;
+            uint64_t asciiHi = 0;
+            bool asciiSet = false;
+            uint16_t rangeMin = 127, rangeMax = 0;
+            const char* setting = std::getenv("XYO_JIT_ASCII_SET_CONTAINS");
+            if ((!setting || setting[0] != '0') && field &&
+                field->value.isString() && field->value.asStrPtr()) {
+                const auto chars = field->value.asStrPtr()->view();
+                if (!chars.empty() && chars.size() <= 32) {
+                    asciiSet = true;
+                    for (char16_t c : chars) {
+                        if (c >= 128) { asciiSet = false; break; }
+                        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+                        rangeMin = std::min<uint16_t>(rangeMin, c);
+                        rangeMax = std::max<uint16_t>(rangeMax, c);
+                        if (c < 64)
+                            asciiLo |= uint64_t(1) << c;
+                        else
+                            asciiHi |= uint64_t(1) << (c - 64);
+                    }
+                }
+            }
+            if (asciiSet) {
                 llvm::Value* hay = emitInputOf(blk, "STRING1");
                 llvm::Value* needle = emitInputOf(blk, "STRING2");
-                BasicBlock* taggedBB = newBB("digits.tagged");
-                BasicBlock* flatBB = newBB("digits.flat");
-                BasicBlock* asciiBB = newBB("digits.ascii");
-                BasicBlock* fastBB = newBB("digits.fast");
-                BasicBlock* slowBB = newBB("digits.slow");
-                BasicBlock* doneBB = newBB("digits.done");
+                BasicBlock* taggedBB = newBB("ascii.set.tagged");
+                BasicBlock* flatBB = newBB("ascii.set.flat");
+                BasicBlock* asciiBB = newBB("ascii.set.ascii");
+                BasicBlock* fastBB = newBB("ascii.set.fast");
+                BasicBlock* slowBB = newBB("ascii.set.slow");
+                BasicBlock* doneBB = newBB("ascii.set.done");
                 llvm::Value* isStr = b.CreateICmpEQ(
                     b.CreateLShr(needle, ci64(48)),
                     ci64(val::kTagStr >> 48));
@@ -4156,10 +4177,34 @@ struct Codegen {
                 b.CreateCondBr(b.CreateICmpULT(code, b.getInt16(128)),
                                fastBB, slowBB);
                 b.SetInsertPoint(fastBB);
-                llvm::Value* digit = b.CreateAnd(
-                    b.CreateICmpUGE(code, b.getInt16('0')),
-                    b.CreateICmpULE(code, b.getInt16('9')));
-                llvm::Value* fastResult = boolBits(digit);
+                llvm::Value* uppercase = b.CreateAnd(
+                    b.CreateICmpUGE(code, b.getInt16('A')),
+                    b.CreateICmpULE(code, b.getInt16('Z')));
+                llvm::Value* folded = b.CreateSelect(
+                    uppercase,
+                    b.CreateAdd(code, b.getInt16('a' - 'A')), code);
+                llvm::Value* member;
+                const unsigned numMembers =
+                    std::popcount(asciiLo) + std::popcount(asciiHi);
+                if (numMembers == rangeMax - rangeMin + 1) {
+                    // General interval detection: digit classes and any
+                    // other contiguous ASCII alphabet compile to two bounds.
+                    member = b.CreateAnd(
+                        b.CreateICmpUGE(folded, b.getInt16(rangeMin)),
+                        b.CreateICmpULE(folded, b.getInt16(rangeMax)));
+                } else {
+                    // A 128-bit constant character class represented by
+                    // two 64-bit masks. No loop or heap allocation at runtime.
+                    llvm::Value* bit = b.CreateShl(
+                        ci64(1), b.CreateAnd(b.CreateZExt(folded, i64t),
+                                            ci64(63)));
+                    llvm::Value* mask = b.CreateSelect(
+                        b.CreateICmpULT(folded, b.getInt16(64)),
+                        ci64(asciiLo), ci64(asciiHi));
+                    member = b.CreateICmpNE(
+                        b.CreateAnd(mask, bit), ci64(0));
+                }
+                llvm::Value* fastResult = boolBits(member);
                 b.CreateBr(doneBB);
                 b.SetInsertPoint(slowBB);
                 llvm::Value* slowResult = call2("xyo_strcontains", i64t,
