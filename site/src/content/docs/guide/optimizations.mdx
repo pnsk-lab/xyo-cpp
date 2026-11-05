@@ -1,0 +1,131 @@
+---
+title: 最適化一覧
+description: xyo-cpp の Interpreter・LLVM JIT・文字列・リスト・GC・スケジューラ・描画の最適化カタログ
+sidebar:
+  order: 1
+---
+
+import { Card, CardGrid, LinkCard, Aside } from '@astrojs/starlight/components';
+
+xyo-cpp に実装されている主な最適化と、試験中の最適化をまとめています。Scratch の動的型、文字列処理、スレッド間の実行順序、Warp の時間制限を維持しながら、高速な経路を選択する設計です。
+
+<Aside type="note" title="掲載範囲と性能値について">
+  このページは **2026年11月5日時点の実装・研究記録**に基づきます。GitHub の安定版だけでなく、作業ツリーで検証された試験機能も含みます。「試験的」はリリース版での有効化を保証しません。性能値は記載された個別ベンチマークに限る結果であり、全プロジェクトの高速化率ではありません。
+</Aside>
+
+<CardGrid>
+  <Card title="LLVM JIT・数値演算" icon="rocket">型ガード、整数の値域証明、ループ最適化、手続きのネイティブ実行。</Card>
+  <Card title="文字列・リスト" icon="document">UTF-16、文字列連結、リスト参照・比較、変換結果の再利用。</Card>
+  <Card title="スケジューラ・GC" icon="setting">Warpのポーリング、並列実行の依存解析、メモリ確保・回収。</Card>
+  <Card title="描画・コンパイル" icon="open-book">ペンのGPU描画、遅延コンパイル、AOTと解析ツール。</Card>
+</CardGrid>
+
+## ステータスの読み方
+
+- **既定有効**: 通常の対象経路で適用される最適化。適用できない入力では従来の処理へ戻ります。
+- **条件付き**: JITモード、証明できる値域、読み取り専用ループなど、特定の条件下だけで適用されます。
+- **試験的・明示有効**: 環境変数などで明示的に有効化する機能。計測・互換性検証のための段階です。
+
+環境変数は、特記がなければ **JITコード生成前**に指定してください。無効化スイッチはA/B比較用であり、一般に最速設定とは限りません。
+
+## LLVM JIT・数値演算
+
+| 最適化 | 適用範囲・方法 | 状態 / 切替 |
+| --- | --- | --- |
+| [型フィードバック](/xyo-cpp/research/jit-type-feedback/) | HotSpotが観測した数値型を利用。実行時にタグを検査して安全な数値経路へ進む | 条件付き / `XYO_JIT_TYPE_PROFILE` |
+| [数値SSA・整数性伝播](/xyo-cpp/research/jit-v1-numeric-optimizer-2026-11-04/) | 有限時の整数性をLLVM SSA値で追跡し、不要な変換や検査を省く | 既定有効、演算により個別スイッチ |
+| [整数剰余の符号付き変換](/xyo-cpp/research/jit-ssa-arithmetic-2026-11-04/) | 値域をガードできる剰余計算を32bit整数演算へ変換 | 既定有効 / `XYO_JIT_MOD_SIGNED_I32=0` |
+| [丸め演算のインライン化](/xyo-cpp/research/jit-v1-numeric-optimizer-2026-11-04/) | `roundeven` と0.5境界補正によりScratchの丸め規則を維持 | 既定有効 / `XYO_JIT_ROUND_INLINE=0` |
+| [ループ内変数のレジスタ昇格](/xyo-cpp/research/jit-ssa-arithmetic-2026-11-04/) | ホットループで変数・数値シャドウを保持。中断時には必要な値を同期 | 条件付き |
+| [Epoch-Guarded Loop](/xyo-cpp/research/epoch-guarded-loop-2026-11-05/) | 読み取り専用変数の無用な書き戻しを削除。GC世代と値を照合する数値シャドウ再利用も試験 | 前半は既定有効 / 追加ガードは `XYO_JIT_EPOCH_GUARD=1` |
+| [ループ不変の三角関数](/xyo-cpp/research/jit-loop-invariant-trig-2026-11-05/) | 読み取り専用の角度に対するsin/cosをループ前に計算し、スケジューラ復帰時に更新 | **試験的** / `XYO_JIT_TRIG_HOIST=1` |
+| [JITの比較高速経路](/xyo-cpp/research/jit-symmetric-equality-2026-11-03/) | 数値・文字列などの種類と等値性に応じて比較を特殊化。例外型は通常経路 | 条件付き |
+| [ASCIIリテラル比較](/xyo-cpp/research/scratchbench-brainfuck-ast-2026-11-05/) | 記号を含む短いASCIIリテラルとの等値比較を直接判定 | 条件付き |
+| [数字集合の包含判定](/xyo-cpp/research/scratchbench-brainfuck-ast-2026-11-05/) | `0123456789` に1文字が含まれるかを型・長さガード付きで判定 | 既定有効 / `XYO_JIT_DIGIT_CONTAINS=0` |
+
+## 手続き・コンパイル
+
+| 最適化 | 適用範囲・方法 | 状態 / 切替 |
+| --- | --- | --- |
+| [HotSpot・遅延JIT](/xyo-cpp/research/jit-lazy-procedures-2026-11-03/) | 実行頻度に応じたネイティブコード生成と、手続き単位の遅延解決 | JITモード依存 |
+| [再帰手続きフレーム省略](/xyo-cpp/research/scratchbench-brainfuck-ast-2026-11-05/) | ネイティブ化できるWarp再帰グラフの不要なInterpreterフレームを省略 | 条件付き / `XYO_JIT_RECURSIVE_FRAME_ELIDE=0` |
+| [LLVMパス・コンパイル費用の調整](/xyo-cpp/research/jit-llvm-pass-research-2026-11-03/) | コンパイル時間と実行性能を分けて計測し、生成コードを検証 | 研究・診断 |
+| [AOTコンパイル](/xyo-cpp/guide/aot/) | LLVMを用いた事前コンパイルで実行時JITを不要にする | 実行モード依存 |
+
+## 文字列・Unicode
+
+| 最適化 | 適用範囲・方法 | 状態 / 切替 |
+| --- | --- | --- |
+| [Cons String](/xyo-cpp/research/string-performance/) | 連結時の全体コピーを遅らせ、必要になった段階で平坦化 | 条件付き |
+| [Transient String](/xyo-cpp/research/string-transient/) | 自己連結Warpループを1つの追記ログで処理し、中間文字列の確保を削減 | 条件付き / `XYO_JIT_TRANSIENT_STRINGS=0` |
+| [繰り返し文字列の圧縮格納](/xyo-cpp/research/memory-performance-rle-fix-2026-11-05/) | 短いUTF-16リテラルの連続追記を、実配列ではなくパターンと回数で保持 | **v1.0.4** / 通常のTransient経路で適用 |
+| [Unicode文字列検索の特殊化](/xyo-cpp/research/string-unicode-fastpath-2026-11-05/) | 小文字化で変化しない文字列やASCII部分だけ折りたためる文字列を判定して検索・比較 | 既定有効 / `XYO_STRING_UNICODE_FAST=0` |
+| [文字列への型変換・走査の短縮](/xyo-cpp/research/string-cast-optimizations-2026-11-05/) | よく使う文字列の共有、走査中のデータポインタの再取得を削減 | 実装済み（作業ツリーの検証記録を含む） |
+| [短い固定文字列・数値の特殊化](/xyo-cpp/research/jit-nonnumeric-string-equality-2026-11-03/) | JITから汎用の変換・等値判定ヘルパを呼ぶ回数を削減 | 条件付き |
+
+## リスト・メモリ管理
+
+| 最適化 | 適用範囲・方法 | 状態 / 切替 |
+| --- | --- | --- |
+| [リスト参照時の変換メモ](/xyo-cpp/research/list-performance/) | 読み取り専用ループで同じ値の数値変換結果を再利用 | 条件付き / `XYO_LIST_READ_MEMO=0` |
+| [リスト要素同士の数値比較](/xyo-cpp/research/jit-plain-list-compare-2026-11-05/) | 個々の要素が通常数値なら直接浮動小数点比較、それ以外は従来処理 | 既定有効 / `XYO_JIT_PLAIN_NUMBER_CMP=0` |
+| [数値専用リストの特化](/xyo-cpp/research/jit-numeric-list-2026-11-05/) | 数値以外の書き込み履歴を保持し、ガード可能な読み取りを数値へ直接展開 | **試験的** / `XYO_JIT_NUMERIC_LIST=1` |
+| [GCの連続空き領域確保](/xyo-cpp/research/v1-optimization-program-2026-11-04/) | 小オブジェクトの確保に連続領域の走査結果を利用 | 既定有効 / `XYO_GC_RUN_ALLOC=0` |
+| [GCの内部参照マーク高速化](/xyo-cpp/research/v1-optimization-program-2026-11-04/) | 正規のCons String子参照に限り高速なマーク経路を使う | 既定有効 / `XYO_GC_FAST_CONS_MARK=0` |
+| [GCの補助テーブル縮小](/xyo-cpp/research/gc-registry-memory-2026-11-05/) | 大量の一時オブジェクト回収後に集合・ページ索引の容量を縮小 | 実装済み（作業ツリーの検証記録を含む） |
+| [SB3ローダーのメモリ削減](/xyo-cpp/research/memory-footprint-2026-11-04/) | 読み込み・一時領域の保持量を削減し、起動時のRSSを抑制 | 実装・測定記録あり |
+
+## スケジューラ・並列実行
+
+| 最適化 | 適用範囲・方法 | 状態 / 切替 |
+| --- | --- | --- |
+| [Warp共有時刻ポーリング](/xyo-cpp/research/jit-warp-shared-clock-2026-11-04/) | 64反復ごとの時計関数呼び出しを共有Atomic時刻の読み取りへ置換 | 既定有効 / `XYO_JIT_WARP_CLOCK=0` |
+| [スレッド検索・Fiber切替の削減](/xyo-cpp/research/scheduler-performance/) | 同時実行スレッドの状態探索、再利用、スケジューラの固定費を削減 | 条件付き |
+| [依存関係に基づく並列実行](/xyo-cpp/research/parallel-performance/) | 安全なスクリプトをグループ化し、描画・副作用のある処理は逐次バリアへ | 条件付き / `XYO_PAR=0` |
+| [イベント駆動型wait-until](/xyo-cpp/research/event-driven-scheduler-2026-11-05/) | 同一tick内に進行がない場合、純粋な待機条件の再評価を省略 | **試験的** / `XYO_EVENT_SCHED=1` |
+
+## 描画・ペン
+
+| 最適化 | 適用範囲・方法 | 状態 / 切替 |
+| --- | --- | --- |
+| [点ペンの専用GPU経路](/xyo-cpp/research/pen-point-performance/) | 画素点を線分計算に通さずGPUのインスタンスレコードへ直接追加 | 条件付き / `XYO_PEN_POINT_GENERIC=1` で従来経路 |
+| [描画キャッシュ・チャンク化](/xyo-cpp/research/pen-cache-followup/) | 描画データの再利用と一括送信でCPU・GPUの固定費を低減 | 条件付き |
+| [3D2ホットループ最適化](/xyo-cpp/research/3d2-hot-loop-performance/) | 3D描画プロジェクトでのJIT計算・描画経路をプロファイルして改善 | 個別の研究記録 |
+
+## 実測値の例
+
+代表的な単独実験です。測定環境・ベースラインが異なるため、**複数行の改善率を足したり掛けたりして総合性能と解釈しないでください**。
+
+| 対象 | 結果 | 条件 |
+| --- | --- | --- |
+| [Transient Stringのメモリ修正](/xyo-cpp/research/memory-performance-rle-fix-2026-11-05/) | HotSpotのピークRSSが **1GiB超（強制停止）→ 247MiB（正常完走）** | `performance.sb3`、同じ実行モード。修正前は未完走 |
+| [ASCII比較](/xyo-cpp/research/scratchbench-brainfuck-ast-2026-11-05/) | `app_brainfuck` で **4.04倍** | 対象最適化の前後、単独ScratchBench |
+| [再帰フレーム＋文字包含判定](/xyo-cpp/research/scratchbench-brainfuck-ast-2026-11-05/) | `app_ast` で **4.33倍** | 複数最適化の合算効果、単独ScratchBench |
+| [リスト要素間の数値比較](/xyo-cpp/research/jit-plain-list-compare-2026-11-05/) | `algo_sort` で **約1.067倍** | 16組のON/OFF測定、チェックサム一致 |
+| [数値演算round](/xyo-cpp/research/jit-v1-numeric-optimizer-2026-11-04/) | `math_round` で **約1.365倍** | 8組のON/OFF測定 |
+| [Warpループの三角関数キャッシュ](/xyo-cpp/research/jit-loop-invariant-trig-2026-11-05/) | 対象マイクロベンチの所要時間 **約24%減** | 試験機能のON/OFF |
+| [スケジューラ最適化](/xyo-cpp/research/scheduler-performance/) | `sched_threads` **2.63倍**、`sched_waituntil` **1.77倍** | CPU固定、同一条件の単独ベンチ |
+
+## 最適化の確認と比較
+
+```bash
+# 通常のHotSpot JIT
+build/xyo run project.sb3 --jit hotspot
+
+# 例: 文字列のTransient最適化を無効化して差分を測定
+XYO_JIT_TRANSIENT_STRINGS=0 build/xyo run project.sb3 --jit hotspot
+
+# 例: 試験中の数値専用リスト最適化を有効化
+XYO_JIT_NUMERIC_LIST=1 build/xyo run project.sb3 --jit eager
+
+# 対応する回帰テスト
+ctest --test-dir build --output-on-failure
+```
+
+最適化の評価では、実行時間だけでなく、初回コンパイル時間・ピークRSS・出力チェックサム・タイマーおよびWarpの意味論を分けて確認してください。詳細は[ベンチマークとテスト](/xyo-cpp/development/testing/)および[Scratch Bench](/xyo-cpp/reference/scratch-bench/)を参照してください。
+
+<CardGrid>
+  <LinkCard title="実行モード" href="/xyo-cpp/guide/execution/" description="Interpreter / HotSpot / Eager JIT の使い分け" />
+  <LinkCard title="プロジェクトの最適化" href="/xyo-cpp/guide/optimization/" description="analyze・rewrite・minifyでSB3自体を解析・書き換え" />
+  <LinkCard title="研究・実験記録" href="/xyo-cpp/research/v1-optimization-program-2026-11-04/" description="実験条件、ベンチマーク、採用・撤回した案" />
+</CardGrid>
