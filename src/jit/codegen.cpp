@@ -517,7 +517,8 @@ struct Codegen {
     /// ctx の idx 番目ポインタフィールド（JitCtx は先頭が
     /// thread/target/runtime/sequencer/fiber のポインタ列）
     llvm::Value* ctxPtr(int idx) {
-        return b.CreateLoad(ptrt, b.CreateConstGEP1_32(i64t, ctxArg, idx));
+        // JitCtx begins with a pointer array. Use the target pointer size, not i64.
+        return b.CreateLoad(ptrt, b.CreateConstGEP1_32(ptrt, ctxArg, idx));
     }
     llvm::Value* fld(llvm::Value* base, uint32_t off) {
         return b.CreateConstGEP1_32(i8t, base, off);

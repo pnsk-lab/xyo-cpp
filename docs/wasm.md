@@ -259,3 +259,11 @@ TurboWarp は `blocks` を JS オブジェクトとして**挿入順**にイテ�
   `parallelEnabled()` は JIT 前提で false になる）。
 - `xyo gui` / `xyo edit` はブラウザシェル未対応（`play` のみ）。
 - WASM のスタックは既定 64KiB → 本ビルドは `-sSTACK_SIZE=5242880`（5MiB）。
+
+## ブラウザ内 LLVM ツールチェーン（実験的）
+
+[web/llvm-jit](../web/llvm-jit/README.md) に xyo-editor の LLVM Wasm Worker コンパイル基盤を移植した。ブラウザ上の llc と wasm-ld を分離起動し、LLVM IR から Wasm バイナリを生成できる API である。既存の自前 Wasm エンコーダとネイティブ ORC JIT は変更しない。
+
+**現状の実装範囲**: IR→object→module のパイプライン、Worker ライフサイクル、キャンセルとエラー報告、バイナリ検証。Scratch SB3→LLVM IR、Emscripten side module の xyo ランタイムへのロード、GC/スケジューラ接続は未実装。13 件のモック単体テストは通過しているが、LLVM の実ビルド・ブラウザでの実行テストではない。
+
+また `src/jit/codegen.cpp` の `ctxPtr` をターゲットのポインタ幅に依存する GEP に変更した。これだけでは他の ABI/offset 互換性は保証できない。
