@@ -623,9 +623,9 @@ void Gc::collect() {
                 uintptr_t lo = reinterpret_cast<uintptr_t>(__builtin_alloca(0));
                 if (xyo::currentFiber()) {
 #if defined(__aarch64__)
-                    lo = reinterpret_cast<uintptr_t>(xyo::detail::gSchedulerRegs.sp);
+                    lo = static_cast<uintptr_t>(xyo::detail::gSchedulerRegs.sp);
 #else
-                    lo = reinterpret_cast<uintptr_t>(xyo::detail::gSchedulerRegs.rsp);
+                    lo = static_cast<uintptr_t>(xyo::detail::gSchedulerRegs.rsp);
 #endif
                 }
                 if (lo < base) lo = base;

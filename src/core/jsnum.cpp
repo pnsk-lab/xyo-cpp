@@ -11,6 +11,9 @@
 #include <cstring>
 #include <clocale>
 #include <locale.h>
+#if defined(__APPLE__)
+#include <xlocale.h>  // Darwin declares strtod_l/newlocale here.
+#endif
 
 namespace xyo::jsnum {
 
