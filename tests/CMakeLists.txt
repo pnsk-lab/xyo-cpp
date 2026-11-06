@@ -153,6 +153,13 @@ if(TARGET xyo-cli)
               "$<TARGET_FILE:xyo-cli>")
     set_tests_properties(xyo-jit-repeat-ssa PROPERTIES TIMEOUT 180)
 
+    # General lazy numeric type guards on SSA-promoted Scratch values.
+    add_test(NAME xyo-jit-lazy-typed-ssa
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_lazy_typed_ssa.py"
+              "$<TARGET_FILE:xyo-cli>")
+    set_tests_properties(xyo-jit-lazy-typed-ssa PROPERTIES TIMEOUT 180)
+
     # LLVM-IR scheduler polling for empty warp repeats.
     add_test(NAME xyo-jit-inline-empty-scheduler
       COMMAND "${Python3_EXECUTABLE}"

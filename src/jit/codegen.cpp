@@ -1090,6 +1090,7 @@ struct Codegen {
         bool numeric = false;
         bool written = false;  // a read-only variable needs no spill
         bool guarded = false;  // speculative string shadow revalidation
+        AllocaInst* lazyValid = nullptr; // type-guarded f64 cache
     };
     /// ループ内で item/replace/length だけを受けるリストは、SList の
     /// len/items を preheader と yield 再開時にロードして SSA 化する
@@ -1102,6 +1103,11 @@ struct Codegen {
     };
     std::vector<PromotedVar> promoted;
     std::vector<PromotedList> promotedLists;
+    std::unordered_map<llvm::Value*, const BlockField*> lazyNumericLoads;
+    const bool lazyTypedSSA = [] {
+        const char* mode = std::getenv("XYO_JIT_LAZY_TYPED_SSA");
+        return mode && mode[0] == '1';
+    }();
     /// 昇格した数値変数の「boxed bits → f64」対応。emitToNumF64 が
     /// タグ検査・NaN 正規化・GP↔XMM 移動なしで値を返せるようにする。
     std::unordered_map<llvm::Value*, llvm::Value*> knownNumD;
@@ -1295,6 +1301,47 @@ struct Codegen {
             if (it != literalNums.end()) return cf64(it->second);
         }
         if (knownNum.count(bits)) return emitNotNaN(emitAsF64(bits));
+        // Generic mixed-type SSA: perform Scratch coercion only for numeric
+        // consumers. Cache the resulting number and its comparison validity
+        // until the next write or scheduler handoff. All state is function-
+        // local alloca storage, so LLVM can construct PHIs via mem2reg.
+        if (auto it = lazyNumericLoads.find(bits);
+            it != lazyNumericLoads.end()) {
+            const BlockField* field = it->second;
+            lazyNumericLoads.erase(it); // prevent redispatch
+            PromotedVar* p = findPromoted(field);
+            if (p && p->lazyValid) {
+                BasicBlock* cached = newBB("typed.ssa.cached");
+                BasicBlock* cold = newBB("typed.ssa.convert");
+                BasicBlock* merge = newBB("typed.ssa.merge");
+                hotBr(b.CreateLoad(b.getInt1Ty(), p->lazyValid),
+                      cached, cold, 50, 1);
+                b.SetInsertPoint(cached);
+                llvm::Value* cachedNumber = b.CreateLoad(f64t, p->dslot);
+                llvm::Value* cachedOk =
+                    b.CreateLoad(b.getInt1Ty(), p->okslot);
+                b.CreateBr(merge);
+                b.SetInsertPoint(cold);
+                llvm::Value* number = emitToNumF64(bits);
+                llvm::Value* numericOk = numericCmpOk(bits, number, true);
+                b.CreateStore(number, p->dslot);
+                b.CreateStore(numericOk, p->okslot);
+                b.CreateStore(b.getTrue(), p->lazyValid);
+                BasicBlock* coldEnd = b.GetInsertBlock();
+                b.CreateBr(merge);
+                b.SetInsertPoint(merge);
+                auto* result = b.CreatePHI(f64t, 2, "typed.ssa.number");
+                result->addIncoming(cachedNumber, cached);
+                result->addIncoming(number, coldEnd);
+                auto* compareOk =
+                    b.CreatePHI(b.getInt1Ty(), 2, "typed.ssa.cmp");
+                compareOk->addIncoming(cachedOk, cached);
+                compareOk->addIncoming(numericOk, coldEnd);
+                knownNumD[bits] = result;
+                knownNumOk[bits] = compareOk;
+                return result;
+            }
+        }
         if (const auto iter = numericListReadGuards.find(bits);
             iter != numericListReadGuards.end() &&
             std::getenv("XYO_JIT_NUMERIC_LIST") &&
@@ -1719,6 +1766,14 @@ struct Codegen {
             AllocaInst* ds = nullptr;
             AllocaInst* oks = nullptr;
             const bool numeric = !nonNumericVars.count(f->id);
+            // Mixed-type writes keep boxed SSA; numeric conversion is lazy.
+            AllocaInst* lazyValid = nullptr;
+            if (!numeric && lazyTypedSSA) {
+                ds = entryAlloca(f64t, 1, "pv.lazy.number");
+                oks = entryAlloca(b.getInt1Ty(), 1, "pv.lazy.cmp");
+                lazyValid = entryAlloca(b.getInt1Ty(), 1, "pv.lazy.valid");
+                b.CreateStore(b.getFalse(), lazyValid);
+            }
             if (numeric) {
                 ds = entryAlloca(f64t, 1, "pvd");
                 // 不変条件: d == toNum(bits)。初期値は文字列でもよい
@@ -1736,7 +1791,7 @@ struct Codegen {
                 ? target->lookupVariableById(f->id) : nullptr;
             const bool guarded = epochGuardEnabled && numeric && !written &&
                 known && known->value.isString();
-            promoted.push_back({f, slot, ds, oks, numeric, written, guarded});
+            promoted.push_back({f, slot, ds, oks, numeric, written, guarded, lazyValid});
         }
         // リストヘッダ (len/items) を preheader へ。リストは slot init で
         // lookupOrCreateList 済みなので通常は非 null だが、null 経路でも
@@ -1888,6 +1943,7 @@ struct Codegen {
                               realVarValuePtr(p.field));
         }
         promoted.clear();
+        lazyNumericLoads.clear();
         promotedLists.clear();
         promotedGcEpoch = nullptr;
         trigHoists.clear();
@@ -1902,6 +1958,7 @@ struct Codegen {
     void clearLoopPromotion(bool owner) {
         if (!owner) return;
         promoted.clear();
+        lazyNumericLoads.clear();
         promotedLists.clear();
         promotedGcEpoch = nullptr;
         trigHoists.clear();
@@ -1966,6 +2023,10 @@ struct Codegen {
                 b.SetInsertPoint(done);
             } else {
                 b.CreateStore(ld, p.slot);
+                if (p.lazyValid) {
+                    // A yield can change the variable's value and type.
+                    b.CreateStore(b.getFalse(), p.lazyValid);
+                }
                 if (p.numeric) {
                     llvm::Value* d = emitToNumF64(ld);
                     b.CreateStore(d, p.dslot);
@@ -2139,6 +2200,8 @@ struct Codegen {
             if (p->numeric) {
                 knownNumD[bits] = b.CreateLoad(f64t, p->dslot);
                 knownNumOk[bits] = b.CreateLoad(b.getInt1Ty(), p->okslot);
+            } else if (p->lazyValid) {
+                lazyNumericLoads[bits] = f;
             }
         } else if (profiledNumber(f)) {
             likelyNumLoads.insert(bits);
@@ -2155,6 +2218,21 @@ struct Codegen {
             }
         }
         b.CreateStore(val, varValuePtr(f));
+        if (PromotedVar* p = findPromoted(f); p && p->lazyValid) {
+            // Generic producer-to-consumer forwarding: when the producer
+            // already carries a proven numeric SSA value and comparison
+            // eligibility, reuse them without another Scratch cast.
+            if (auto d = knownNumD.find(val); d != knownNumD.end()) {
+                b.CreateStore(d->second, p->dslot);
+                auto ok = knownNumOk.find(val);
+                b.CreateStore(ok != knownNumOk.end()
+                                  ? ok->second : numericCmpOk(val, d->second),
+                              p->okslot);
+                b.CreateStore(b.getTrue(), p->lazyValid);
+            } else {
+                b.CreateStore(b.getFalse(), p->lazyValid);
+            }
+        }
     }
     void emitVarChange(const BlockField* f, llvm::Value* delta) {
         llvm::Value* vp = varValuePtr(f);
@@ -2166,6 +2244,7 @@ struct Codegen {
         // produce NaN here (inf + finite = +-inf) and canon collapses.
         llvm::Value* fb = emitToNumF64(delta);
         PromotedVar* pv = findPromoted(f);
+        if (pv && pv->lazyValid) lazyNumericLoads[cur] = f;
         if (pv && pv->numeric) {
             // 影は f64。有限定数デルタなら結果は NaN になり得ない
             // （影の不変条件: d は NaN でない）ので正規化を省く。
@@ -2240,10 +2319,17 @@ struct Codegen {
             const llvm::APFloat& ap = cf->getValueAPF();
             finiteDelta = !ap.isNaN() && !ap.isInfinity();
         }
-        if (finiteDelta)
+        if (pv && pv->lazyValid) {
+            // change-variable-by always writes a numeric Scratch Value.
+            // Forward its canonical SSA representation into the guarded
+            // cache, regardless of the variable's previous type.
+            emitVarSet(f, finiteDelta ? emitCanonKnownNonNaN(s)
+                                     : emitCanon(s));
+        } else if (finiteDelta) {
             b.CreateStore(b.CreateBitCast(s, i64t), vp);
-        else
+        } else {
             b.CreateStore(emitCanon(s), vp);
+        }
     }
 
     // --- 算術・比較の fast path -------------------------------------------
