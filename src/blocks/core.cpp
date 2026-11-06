@@ -662,7 +662,8 @@ Value dtReplaceItemOfList(const ArgValues& a, BlockUtility& u) {
     SList* list = listOf(var);
     double i = cast::toListIndexD(v(a, "INDEX"), list->len, false);
     if (i == cast::LIST_INVALID || i < 1) return Value::undefined();
-    list->items[static_cast<uint32_t>(i - 1)] = v(a, "ITEM");
+    Value item = v(a, "ITEM");
+    list->replace0(static_cast<uint32_t>(i - 1), item);
     list->monitorDirty = true;
     return Value::undefined();
 }

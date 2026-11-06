@@ -52,7 +52,7 @@ def compare_images(off, on, mask_fps=True):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--binary', type=Path, default=Path('build/tests/xyo-pen-bench'))
-    ap.add_argument('--project', type=Path, default=Path('3D2.sb3'))
+    ap.add_argument('--project', type=Path, default=Path('debug/projects/3D2.sb3'))
     ap.add_argument('--output', type=Path, required=True)
     ap.add_argument('--backend', choices=['gl', 'cpu'], default='gl')
     ap.add_argument('--comparison', choices=['list-intern', 'math-box'], default='list-intern')

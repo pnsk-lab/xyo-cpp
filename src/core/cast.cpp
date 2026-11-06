@@ -11,8 +11,9 @@ namespace xyo::cast {
 
 static bool strIsNotActuallyZero(const SStr* s) {
     if (!s) return true;                    // 空文字列
+    const char16_t* data = s->data();
     for (uint32_t i = 0; i < s->len; ++i) {
-        char16_t c = s->data()[i];
+        char16_t c = data[i];
         if ((c >= u'0' && c <= u'9') || c == 9) return false;
     }
     return true;
@@ -85,8 +86,9 @@ bool toBoolean(Value v) {
         // 'false'（大文字小文字無視）
         if (s->len == 5) {
             static const char16_t kFalse[] = u"false";
+            const char16_t* data = s->data();
             for (int i = 0; i < 5; ++i) {
-                char16_t c = s->data()[i];
+                char16_t c = data[i];
                 if (c >= u'A' && c <= u'Z') c += 32;
                 if (c != kFalse[i]) return true;
             }
@@ -101,6 +103,29 @@ bool toBoolean(Value v) {
     if (v.isColor()) return true;           // JS: オブジェクトは truthy
     return false;
 }
+
+// Immutable SStr values commonly produced by string conversion. Return a
+// rooted singleton instead of allocating on each interpreter/JIT call.
+// The root provider is installed before any of these objects are allocated.
+namespace {
+enum class CommonString : uint8_t { Empty, True, False, Undefined };
+SStr* g_commonStrings[4] = {};
+
+SStr* commonString(CommonString value) {
+    static const bool initialized = [] {
+        Gc::get().addRootProvider(g_commonStrings, [](Gc& gc) {
+            for (SStr* str : g_commonStrings) gc.markPtr(str);
+        });
+        g_commonStrings[0] = sstrFromAscii("");
+        g_commonStrings[1] = sstrFromAscii("true");
+        g_commonStrings[2] = sstrFromAscii("false");
+        g_commonStrings[3] = sstrFromAscii("undefined");
+        return true;
+    }();
+    (void)initialized;
+    return g_commonStrings[static_cast<unsigned>(value)];
+}
+} // namespace
 
 // Small integers repeat constantly in Scratch (`i ++ ""`, `join(i, ...)`).
 // V8 keeps a number-string cache; return the same immutable SStr instead of
@@ -149,10 +174,12 @@ SStr* toString(Value v) {
     if (v.isString()) {
         SStr* s = v.asStrPtr();
         if (s) return s;
-        return SStr::create(std::u16string_view{});
+        return commonString(CommonString::Empty);
     }
     if (v.isNumber()) return numberToString(v.asNumberUnchecked());
-    if (v.isBool()) return sstrFromAscii(v.asBool() ? "true" : "false");
+    if (v.isBool())
+        return commonString(v.asBool() ? CommonString::True
+                                      : CommonString::False);
     if (v.isColor()) {
         char buf[24];
         uint64_t b = v.bits & 0xFFFFFF;
@@ -160,14 +187,16 @@ SStr* toString(Value v) {
                                 int((b >> 16) & 0xFF), int((b >> 8) & 0xFF), int(b & 0xFF));
         return sstrFromAscii({buf, static_cast<size_t>(len)});
     }
-    if (v.isUndefined()) return sstrFromAscii("undefined");
-    return sstrFromAscii("");
+    if (v.isUndefined()) return commonString(CommonString::Undefined);
+    return commonString(CommonString::Empty);
 }
 
 Value toStringValue(Value v) {
     if (v.isString()) return v;
     if (v.isNumber()) return Value::string(numberToString(v.asNumberUnchecked()));
-    if (v.isBool()) return Value::string(sstrFromAscii(v.asBool() ? "true" : "false"));
+    if (v.isBool())
+        return Value::string(commonString(v.asBool() ? CommonString::True
+                                                      : CommonString::False));
     if (v.isColor()) {
         char buf[24];
         uint64_t b = v.bits & 0xFFFFFF;
@@ -175,7 +204,8 @@ Value toStringValue(Value v) {
                                 int((b >> 16) & 0xFF), int((b >> 8) & 0xFF), int(b & 0xFF));
         return Value::string(sstrFromAscii({buf, static_cast<size_t>(len)}));
     }
-    if (v.isUndefined()) return Value::string(sstrFromAscii("undefined"));
+    if (v.isUndefined())
+        return Value::string(commonString(CommonString::Undefined));
     return Value::emptyStr();
 }
 
@@ -212,8 +242,9 @@ bool isInt(Value v) {
     if (v.isString()) {
         SStr* s = v.asStrPtr();
         if (!s) return true;
+        const char16_t* data = s->data();
         for (uint32_t i = 0; i < s->len; ++i)
-            if (s->data()[i] == u'.') return false;
+            if (data[i] == u'.') return false;
         return true;
     }
     return false;
@@ -225,8 +256,9 @@ bool isWhiteSpace(Value v) {
     if (!v.isString()) return false;
     SStr* s = v.asStrPtr();
     if (!s) return true;
+    const char16_t* data = s->data();
     for (uint32_t i = 0; i < s->len; ++i)
-        if (!jsnum::isStrWhiteSpace(s->data()[i])) return false;
+        if (!jsnum::isStrWhiteSpace(data[i])) return false;
     return true;
 }
 

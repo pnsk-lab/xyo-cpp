@@ -123,6 +123,40 @@ static void test_toString() {
     CHECK_EQ(ts(Value::emptyStr()), "");
 }
 
+static void test_common_string_cache() {
+    const Value inputs[] = {
+        Value::emptyStr(), Value::boolean(true),
+        Value::boolean(false), Value::undefined()
+    };
+    const std::u16string_view expected[] = {
+        u"", u"true", u"false", u"undefined"
+    };
+    SStr* shared[4];
+    for (size_t i = 0; i < 4; ++i) {
+        shared[i] = cast::toString(inputs[i]);
+        CHECK(shared[i] != nullptr);
+        CHECK(shared[i]->view() == expected[i]);
+        for (int j = 0; j < 100; ++j)
+            CHECK(cast::toString(inputs[i]) == shared[i]);
+        if (i > 0) {
+            auto stringValue = cast::toStringValue(inputs[i]);
+            CHECK(stringValue.isString());
+            CHECK(stringValue.asStrPtr() == shared[i]);
+        }
+    }
+
+    // A process-wide singleton must remain valid after collecting, even
+    // when there are no other Scratch references to the string.
+    Gc::get().collect();
+    for (size_t i = 0; i < 4; ++i) {
+        CHECK(cast::toString(inputs[i]) == shared[i]);
+        CHECK(shared[i]->view() == expected[i]);
+    }
+    // The compact Value::emptyStr tag stays the same; only its cast result
+    // is backed by a shared (rooted) SStr.
+    CHECK(cast::toStringValue(Value::emptyStr()) == Value::emptyStr());
+}
+
 static void test_compare() {
     auto cmp = [](Value a, Value b) { return cast::compare(a, b); };
     CHECK_EQ(cmp(n(0), n(0)), 0);
@@ -171,6 +205,25 @@ static void test_isInt() {
     CHECK_EQ(cast::isInt(s("3.14")), false);
     CHECK_EQ(cast::isInt(b(true)), true);
     CHECK_EQ(cast::isInt(b(false)), true);
+}
+
+static void test_composite_string_scans() {
+    Gc::DeferCollect defer;
+    SStr* digits = sstrCons(SStr::create(u"1234"), SStr::create(u"5678"));
+    SStr* fractional = sstrCons(digits, SStr::create(u".9"));
+    SStr* spaces = sstrCons(SStr::create(u"  "), SStr::create(u"  "));
+    SStr* falseWord = sstrCons(SStr::create(u"Fa"), SStr::create(u"LsE"));
+    const Value i = Value::string(digits);
+    const Value f = Value::string(fractional);
+    const Value w = Value::string(spaces);
+    CHECK(cast::isInt(i));
+    CHECK(!cast::isInt(f));
+    CHECK(!cast::isWhiteSpace(i));
+    CHECK(cast::isWhiteSpace(w));
+    CHECK(cast::isNotActuallyZero(w));
+    CHECK(!cast::isNotActuallyZero(i));
+    CHECK(!cast::toBoolean(Value::string(falseWord)));
+    CHECK(cast::toBoolean(i));
 }
 
 static void test_toListIndex() {
@@ -395,8 +448,10 @@ int main() {
     test_toNumber();
     test_toBoolean();
     test_toString();
+    test_common_string_cache();
     test_compare();
     test_isInt();
+    test_composite_string_scans();
     test_toListIndex();
     test_rt_math();
     test_rt_compare();

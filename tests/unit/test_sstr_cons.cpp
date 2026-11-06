@@ -492,6 +492,66 @@ int test_sstr_cons_main() {
         CHECK(wide->isAscii() == false);
     }
 
+    // Cached lowercase-identity proof: fast Unicode comparison/search must
+    // be identical to Scratch's full Unicode toLowerCase semantics.
+    {
+        Gc::DeferCollect defer; // Keep cross-product operands alive during tests.
+        const std::u16string samples[] = {
+            u"", u"hello", u"HELLO", u"Tokyo",
+            u"東京と日本語とひらがな", u"漢字ABCかな", u"漢字abcかな",
+            u"안녕하세요", u"😀🍣", u"\U00010400", u"\U00010428",
+            u"İ", u"i\u0307", u"K", u"k", u"ΟΣ", u"ος", u"οσ",
+            u"Σ", u"ς", u"straße", u"STRASSE", std::u16string(1, char16_t(0xD800)),
+            std::u16string(1, char16_t(0xDC00))
+        };
+        for (const auto& sample : samples) {
+            SStr* str = SStr::create(sample);
+            CHECK(!(str->flags & SStr::kLowerStableKnown));
+            const bool expected = u16ToLower(sample) == sample;
+            CHECK(str->isLowercaseStable() == expected);
+            CHECK(str->flags & SStr::kLowerStableKnown);
+            CHECK(str->isLowercaseStable() == expected);
+            std::u16string asciiLower = sample;
+            for (char16_t& unit : asciiLower)
+                if (unit >= u'A' && unit <= u'Z') unit += 32;
+            const bool foldCompatible = u16ToLower(sample) == asciiLower;
+            CHECK(str->isAsciiFoldCompatible() == foldCompatible);
+            CHECK(str->flags & SStr::kAsciiFoldKnown);
+        }
+        for (const auto& hay : samples) {
+            SStr* a = SStr::create(hay);
+            for (const auto& needle : samples) {
+                SStr* b = SStr::create(needle);
+                const auto loweredHay = u16ToLower(hay);
+                const auto loweredNeedle = u16ToLower(needle);
+                const bool found = loweredHay.find(loweredNeedle) !=
+                                   std::u16string::npos;
+                CHECK(sstrContains(a, b) == found);
+                CHECK(sstrContains(a->view(), b->view()) == found);
+                const int expectedCmp =
+                    compareStrings(loweredHay, loweredNeedle);
+                const int actualCmp = compareStringsCaseInsensitive(a, b);
+                CHECK((expectedCmp < 0) == (actualCmp < 0));
+                CHECK((expectedCmp == 0) == (actualCmp == 0));
+            }
+        }
+        SStr* mixed = SStr::create(u"東京HELLO");
+        SStr* lowerNeedle = SStr::create(u"hello");
+        CHECK(!mixed->isLowercaseStable());
+        CHECK(mixed->isAsciiFoldCompatible());
+        CHECK(sstrContains(mixed, lowerNeedle));
+        CHECK(sstrContains(mixed->view(), lowerNeedle->view()));
+        CHECK(compareStringsCaseInsensitive(mixed,
+            SStr::create(u"東京hello")) == 0);
+        SStr* rope = sstrCons(SStr::create(u"日本語"),
+                              SStr::create(u"ひらがな"));
+        SStr* needle = SStr::create(u"語ひら");
+        CHECK(rope->isLowercaseStable());
+        CHECK(sstrContains(rope, needle));
+        CHECK(compareStringsCaseInsensitive(rope,
+            SStr::create(u"日本語ひらがな")) == 0);
+    }
+
     std::printf("%d checks, %d failures (sstr cons)\n", checks, failures);
     return failures ? 1 : 0;
 }

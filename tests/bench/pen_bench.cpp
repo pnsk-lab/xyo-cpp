@@ -12,7 +12,7 @@
 //   xyo-pen-bench --vmloop N [--vmcolor 0|1] [--palette M] [--vmreal]
 //       # ペンブロック経路（setColor→setXY→hook→penLine）を VM 抜きで。
 //       # --vmreal は実 SdlRenderer（描画バックエンド込み）で測る。
-//   xyo-pen-bench --project 3D2.sb3 [--frames 30] [--scale 2] [--shot out.ppm]
+//   xyo-pen-bench --project debug/projects/3D2.sb3 [--frames 30] [--scale 2] [--shot out.ppm]
 //       # Startup clicks + 10 active warmup frames, then unpaced active frames.
 //       # Linux x86_64 only: XYO_BENCH_SAMPLE=/tmp/pen [XYO_BENCH_SAMPLE_US=2000]
 //       # writes .pcs/.maps/.json for main-thread CPU PCs, timed loop only.

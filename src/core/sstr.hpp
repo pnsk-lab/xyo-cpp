@@ -39,10 +39,21 @@ struct SStr {
     /// kAsciiKnown が立っていれば kAsciiValue が ASCII 性を表す（遅延計算）。
     static constexpr uint32_t kAsciiKnown = 2;
     static constexpr uint32_t kAsciiValue = 4;
+    static constexpr uint32_t kLowerStableKnown = 16;
+    static constexpr uint32_t kLowerStableValue = 32;
+    static constexpr uint32_t kAsciiFoldKnown = 64;
+    static constexpr uint32_t kAsciiFoldValue = 128;
     /// 全コードユニットが 0x80 未満か。比較・検索の大小文字折り畳みや
     /// u16ToLower のコピーを省く判定に使う。一度だけ計算して flags に
     /// キャッシュする（cons は子の結果を合成する）。
     bool isAscii() const;
+    /// True when JavaScript/Scratch Unicode toLowerCase would leave every
+    /// UTF-16 code unit unchanged. Cached because contains() repeats on the
+    /// same immutable strings, especially Japanese/CJK text.
+    bool isLowercaseStable() const;
+    /// True if lowercasing only changes ASCII A-Z and leaves all other
+    /// code points untouched; enables allocation-free mixed-script matching.
+    bool isAsciiFoldCompatible() const;
 
     // Keep the plain-field ABI used by JIT/AOT offsets, but access published
     // caches atomically: independent scripts can share the same immutable SStr.

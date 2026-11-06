@@ -21,6 +21,10 @@ struct SList {
     uint32_t len;
     uint32_t cap;
     bool monitorDirty;   // _monitorUpToDate=!dirty 相当（モニタ更新用）
+    // Monotonic negative type feedback. true guarantees every live item is
+    // numeric; a non-number write permanently deoptimizes the list.
+    // Never resets on clear/erase, so writers do not need to rescan contents.
+    bool numericOnly;
     Value* items;
 
     static SList* create(uint32_t initialCap = 4) {
@@ -29,6 +33,7 @@ struct SList {
         l->len = 0;
         l->cap = initialCap;
         l->monitorDirty = false;
+        l->numericOnly = true;
         l->items = static_cast<Value*>(std::malloc(initialCap * sizeof(Value)));
         return l;
     }
@@ -41,6 +46,7 @@ struct SList {
     void push(Value v) {
         if (xyo_list_limit && len >= xyo_list_limit) return;
         ensure(len + 1);
+        numericOnly &= v.isNumber();
         items[len++] = v;
     }
     /// 0-based インデックスで挿入
@@ -48,10 +54,18 @@ struct SList {
         if (i > len) return;              // defensive: callers pass 1-based-1
         ensure(len + 1);
         std::memmove(items + i + 1, items + i, (len - i) * sizeof(Value));
+        numericOnly &= v.isNumber();
         items[i] = v;
         ++len;
         // 上限を超えたら末尾を落とす（scratch の list limit と同じ挙動）
         if (xyo_list_limit && len > xyo_list_limit) --len;
+    }
+    // Use for all runtime and host item writes while JIT numeric-list
+    // specialization is enabled. Direct items[] mutation is untracked.
+    void replace0(uint32_t i, Value v) {
+        if (i >= len) return;
+        numericOnly &= v.isNumber();
+        items[i] = v;
     }
     void erase0(uint32_t i) {
         if (i >= len) return;             // defensive: never memmove past len
@@ -64,6 +78,7 @@ struct SList {
         c->len = len;
         std::memcpy(c->items, items, len * sizeof(Value));
         c->monitorDirty = monitorDirty;
+        c->numericOnly = numericOnly;
         return c;
     }
 };

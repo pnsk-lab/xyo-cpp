@@ -80,6 +80,13 @@ if(TARGET xyo-cli)
               --n 257)
     set_tests_properties(xyo-jit-transient-strings PROPERTIES TIMEOUT 180)
 
+    # Guarded resumption of promoted variables, including writes by another script.
+    add_test(NAME xyo-jit-epoch-guard
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/differential/epoch_guard.py"
+              "$<TARGET_FILE:xyo-cli>")
+    set_tests_properties(xyo-jit-epoch-guard PROPERTIES TIMEOUT 180)
+
     # Event-driven pure wait-until: interpreter, eager, HotSpot, parallel,
     # time-dependent/impure fallback, and multiple waiters with a writer.
     add_test(NAME xyo-event-driven-scheduler
@@ -88,49 +95,103 @@ if(TARGET xyo-cli)
               "$<TARGET_FILE:xyo-cli>")
     set_tests_properties(xyo-event-driven-scheduler PROPERTIES TIMEOUT 180)
 
-    # Punctuation equality, immutable digit-set contains and warp recursion.
+
+    # Real Scratch SB3 Unicode contains/equals parity with optimized and
+    # legacy case-fold paths across interpreter, eager JIT and HotSpot.
+    add_test(NAME xyo-string-unicode-fast
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/differential/string_unicode_fast.py"
+              "$<TARGET_FILE:xyo-cli>")
+    set_tests_properties(xyo-string-unicode-fast PROPERTIES TIMEOUT 180)
+
+    # Dynamic list comparisons, mixed types and changing list contents.
+    add_test(NAME xyo-jit-plain-list-compare
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/differential/plain_numeric_cmp.py"
+              "$<TARGET_FILE:xyo-cli>")
+    set_tests_properties(xyo-jit-plain-list-compare PROPERTIES TIMEOUT 120)
+
+
+    # Independently generated bubble/quick/merge sort SB3 output parity.
+    add_test(NAME xyo-jit-plain-list-sort
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/differential/plain_numeric_sort_algos.py"
+              "$<TARGET_FILE:xyo-cli>")
+    set_tests_properties(xyo-jit-plain-list-sort PROPERTIES TIMEOUT 180)
+
+    # Punctuation equality, immutable digit-set contains and warp-only
+    # recursive list procedures: JIT/interpreter parity and fallback guards.
     add_test(NAME xyo-jit-ascii-fastpaths
       COMMAND "${Python3_EXECUTABLE}"
               "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_ascii_fastpaths.py"
               "$<TARGET_FILE:xyo-cli>")
     set_tests_properties(xyo-jit-ascii-fastpaths PROPERTIES TIMEOUT 180)
 
-    # Guarded, type-safe LLVM SSA loop reductions and dynamic comparisons.
+    # Preserve exact loop semantics across interpreter/JIT, warp/non-warp,
+    # numeric strings, negatives, fractional values and precision fallback.
+    add_test(NAME xyo-jit-warp-induction
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_warp_induction.py"
+              "$<TARGET_FILE:xyo-cli>")
+    set_tests_properties(xyo-jit-warp-induction PROPERTIES TIMEOUT 180)
+
+
+    # LLVM SSA arithmetic reductions in counted repeat and for-each. Check
+    # Scratch parity across warp polls, fallback after type changes, numeric
+    # strings, fractional bounds and both LLVM O2/O3 modes.
     add_test(NAME xyo-jit-repeat-ssa
       COMMAND "${Python3_EXECUTABLE}"
               "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_repeat_ssa.py"
               "$<TARGET_FILE:xyo-cli>")
-    set_tests_properties(xyo-jit-repeat-ssa PROPERTIES TIMEOUT 240)
+    set_tests_properties(xyo-jit-repeat-ssa PROPERTIES TIMEOUT 180)
+
+    # LLVM-IR scheduler polling for empty warp repeats.
+    add_test(NAME xyo-jit-inline-empty-scheduler
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_empty_inline_scheduler.py"
+              "$<TARGET_FILE:xyo-cli>")
+    set_tests_properties(xyo-jit-inline-empty-scheduler PROPERTIES TIMEOUT 180)
+
+    # Guarded SSA chunks share an LLVM-IR deadline poll after publishing
+    # the exact Scratch yield counter phase; independently test ON/OFF.
+    add_test(NAME xyo-jit-ssa-scheduler
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_ssa_scheduler.py"
+              "$<TARGET_FILE:xyo-cli>")
+    set_tests_properties(xyo-jit-ssa-scheduler PROPERTIES TIMEOUT 180)
 
     add_test(NAME xyo-jit-foreach-ssa
       COMMAND "${Python3_EXECUTABLE}"
               "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_foreach_ssa.py"
               "$<TARGET_FILE:xyo-cli>")
-    set_tests_properties(xyo-jit-foreach-ssa PROPERTIES TIMEOUT 240)
+    set_tests_properties(xyo-jit-foreach-ssa PROPERTIES TIMEOUT 180)
 
+
+    # Pure scalar copy-chain + constant-change loops: LLVM integer SSA,
+    # canonical NaN/number guards, warp timeout phase, non-warp fallback.
     add_test(NAME xyo-jit-repeat-copy-ssa
       COMMAND "${Python3_EXECUTABLE}"
               "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_repeat_copy_ssa.py"
               "$<TARGET_FILE:xyo-cli>")
-    set_tests_properties(xyo-jit-repeat-copy-ssa PROPERTIES TIMEOUT 240)
+    set_tests_properties(xyo-jit-repeat-copy-ssa PROPERTIES TIMEOUT 180)
 
-    add_test(NAME xyo-jit-warp-induction
-      COMMAND "${Python3_EXECUTABLE}"
-              "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_warp_induction.py"
-              "$<TARGET_FILE:xyo-cli>")
-    set_tests_properties(xyo-jit-warp-induction PROPERTIES TIMEOUT 240)
 
-    add_test(NAME xyo-jit-plain-list-compare
+    # Runtime SStr numeric cache reuse in literal equality, preserving
+    # Scratch string identity, lexical fallback and warp shadow reloads.
+    add_test(NAME xyo-jit-eq-numeric-cache
       COMMAND "${Python3_EXECUTABLE}"
-              "${CMAKE_CURRENT_SOURCE_DIR}/differential/plain_numeric_cmp.py"
+              "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_eq_numeric_cache.py"
               "$<TARGET_FILE:xyo-cli>")
-    set_tests_properties(xyo-jit-plain-list-compare PROPERTIES TIMEOUT 240)
+    set_tests_properties(xyo-jit-eq-numeric-cache PROPERTIES TIMEOUT 180)
 
-    add_test(NAME xyo-jit-plain-list-sort
+
+    # Dynamic string/string =/< />: inline previously parsed numbers and
+    # short ASCII case-insensitive lexical order, preserving Unicode fallback.
+    add_test(NAME xyo-jit-string-pair-compare
       COMMAND "${Python3_EXECUTABLE}"
-              "${CMAKE_CURRENT_SOURCE_DIR}/differential/plain_numeric_sort_algos.py"
+              "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_numeric_string_pair_cmp.py"
               "$<TARGET_FILE:xyo-cli>")
-    set_tests_properties(xyo-jit-plain-list-sort PROPERTIES TIMEOUT 240)
+    set_tests_properties(xyo-jit-string-pair-compare PROPERTIES TIMEOUT 180)
   endif()
 endif()
 

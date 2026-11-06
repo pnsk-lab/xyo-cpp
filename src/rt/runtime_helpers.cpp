@@ -348,7 +348,7 @@ Value listGet(SList* list, Value idx) {
 void listReplace(SList* list, Value idx, Value v) {
     int32_t i = cast::listIndex(idx, list->len);
     if (i < 0) return;
-    list->items[i] = v;
+    list->replace0(uint32_t(i), v);
     list->monitorDirty = true;
 }
 

@@ -633,6 +633,7 @@ void Gc::collect() {
     GcHeader** prev = &allObjects_;
     size_t live = 0;
     size_t listBytes = 0;
+    size_t liveObjects = 0;
     for (GcHeader* h = allObjects_; h; ) {
         GcHeader* next = h->next;
         if (h->mark) {
@@ -640,6 +641,7 @@ void Gc::collect() {
             *prev = h;
             prev = &h->next;
             live += sizeof(GcHeader) + h->size;
+            ++liveObjects;
             // SList の items バッファは Gc::alloc を通らず malloc で
             // 管理している。これを live に数えないと、巨大リストを
             // 持つプロジェクトで「文字列を少し確保するたびに全リストを
@@ -665,20 +667,18 @@ void Gc::collect() {
     rebuildSmallSlabs();
     // sweep で pageSet を生存オブジェクトから再構築（解放済みの
     // ページは malloc 再利用で偽陽性が増えるため残さない）
-    pageSet_.clear();
+    pageSet_.resetForRebuild(liveObjects * 2);
     lastPage_ = ~uintptr_t(0);
-    // objSet_ も生存分で作り直す（フラット集合は削除を持たない）。
-    objSet_.clear();
-    std::vector<uintptr_t> pages;
-    pages.reserve(objSet_.size() ? 0 : 1024);
+    // Reclaim high-water metadata as well as dead payloads. Insert pages
+    // directly: a temporary per-object page vector duplicates the registry.
+    objSet_.resetForRebuild(liveObjects);
     for (GcHeader* h = allObjects_; h; h = h->next) {
         objSet_.insert(reinterpret_cast<uintptr_t>(h));
-        pages.push_back(reinterpret_cast<uintptr_t>(h) >> 12);
-        uintptr_t p2 = reinterpret_cast<uintptr_t>(h + 1) >> 12;
-        if (p2 != pages.back()) pages.push_back(p2);
+        const uintptr_t p1 = reinterpret_cast<uintptr_t>(h) >> 12;
+        const uintptr_t p2 = reinterpret_cast<uintptr_t>(h + 1) >> 12;
+        if (p1 != lastPage_) { pageSet_.insert(p1); lastPage_ = p1; }
+        if (p2 != lastPage_) { pageSet_.insert(p2); lastPage_ = p2; }
     }
-    for (uintptr_t pg : pages)
-        if (pg != lastPage_) { pageSet_.insert(pg); lastPage_ = pg; }
     bytesAllocated_.store(live + listBytes, std::memory_order_relaxed);
     if (gcDebug) {
         static uint64_t ncoll = 0;

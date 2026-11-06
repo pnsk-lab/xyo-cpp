@@ -59,6 +59,20 @@ public:
         if (size_) std::fill(slots_.begin(), slots_.end(), kEmpty);
         size_ = 0;
     }
+    // Rebuilding after sweep must not retain the largest historical table.
+    // Shrink only after a 4x drop to avoid allocation churn near a boundary.
+    void resetForRebuild(size_t expected) {
+        size_t want = 1024;
+        while (want * 7 / 10 < expected) want *= 2;
+        if (slots_.size() > want && slots_.size() / want >= 4) {
+            std::vector<uintptr_t> fresh(want, kEmpty);
+            slots_.swap(fresh);
+            size_ = 0;
+        } else {
+            clear();
+        }
+    }
+    size_t capacity() const { return slots_.size(); }
     void reserve(size_t n) {
         size_t want = 1024;
         while (want * 7 / 10 < n) want *= 2;

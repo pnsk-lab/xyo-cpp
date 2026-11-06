@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "../core/cast.hpp"
+#include "../core/gc.hpp"
 #include "../core/slist.hpp"
 #include "../core/sstr.hpp"
 #include "../core/v8math.hpp"
@@ -103,6 +104,13 @@ std::unordered_map<std::string, uint64_t>& compatOps() {
 } // namespace
 
 extern "C" {
+
+// GC is stop-the-world; the collection counter is read only while a
+// generated fiber is running. Never use a cached string pointer when a GC
+// collection occurred during a yield, even if the boxed bits match (ABA).
+uint64_t xyo_gc_epoch() {
+    return static_cast<uint64_t>(Gc::get().collectCount());
+}
 
 // --- 基本 -------------------------------------------------------------
 

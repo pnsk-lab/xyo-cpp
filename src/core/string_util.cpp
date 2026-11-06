@@ -808,9 +808,70 @@ bool SStr::isAscii() const {
     return (loadFlags(this) & kAsciiValue) != 0;
 }
 
+// Probe both lowercase properties in one pass. The full JavaScript
+// conversion has one context-sensitive mapping, capital sigma, whose
+// lowerCp result is already different. Astral characters are examined as
+// code points; unpaired surrogates are left unchanged.
+struct LowerProperties {
+    bool stable = true;
+    bool asciiFoldCompatible = true;
+};
+static LowerProperties lowercaseProperties(std::u16string_view s) {
+    LowerProperties p;
+    for (size_t i = 0; i < s.size();) {
+        uint32_t cp = s[i++];
+        if (cp < 0x80) {
+            if (cp >= u'A' && cp <= u'Z') p.stable = false;
+            continue;
+        }
+        if (cp >= 0xD800 && cp <= 0xDBFF && i < s.size() &&
+            s[i] >= 0xDC00 && s[i] <= 0xDFFF) {
+            cp = 0x10000u + ((cp - 0xD800) << 10) +
+                 (s[i++] - 0xDC00);
+        }
+        char16_t extra = 0;
+        if (lowerCp(cp, &extra) != cp || extra != 0)
+            return {false, false};
+    }
+    return p;
+}
+
+bool SStr::isLowercaseStable() const {
+    auto f = std::atomic_ref<uint32_t>(const_cast<SStr*>(this)->flags);
+    const uint32_t flags = f.load(std::memory_order_acquire);
+    if (flags & kLowerStableKnown)
+        return (flags & kLowerStableValue) != 0;
+    const LowerProperties p = lowercaseProperties(view());
+    const uint32_t update = kLowerStableKnown | kAsciiFoldKnown |
+        (p.stable ? kLowerStableValue : 0) |
+        (p.asciiFoldCompatible ? kAsciiFoldValue : 0);
+    f.fetch_or(update, std::memory_order_release);
+    return p.stable;
+}
+
+bool SStr::isAsciiFoldCompatible() const {
+    auto f = std::atomic_ref<uint32_t>(const_cast<SStr*>(this)->flags);
+    uint32_t flags = f.load(std::memory_order_acquire);
+    if (!(flags & kAsciiFoldKnown)) {
+        (void)isLowercaseStable(); // publishes both properties atomically
+        flags = f.load(std::memory_order_acquire);
+    }
+    return (flags & kAsciiFoldValue) != 0;
+}
+
 static bool isAsciiOnly(std::u16string_view s) {
     for (char16_t c : s) if (c >= 0x80) return false;
     return true;
+}
+
+// A/B switch for real Scratch workloads. The faster path is enabled by
+// default; disabling it retains the legacy Unicode search/compare behavior.
+static bool unicodeFastEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("XYO_STRING_UNICODE_FAST");
+        return !env || env[0] != '0';
+    }();
+    return enabled;
 }
 
 static int compareLoweredViews(std::u16string_view a, std::u16string_view b);
@@ -829,17 +890,27 @@ int compareStrings(std::u16string_view a, std::u16string_view b) {
 int compareStringsCaseInsensitive(std::u16string_view a, std::u16string_view b) {
     // ASCII 高速パス
     if (isAsciiOnly(a) && isAsciiOnly(b)) return compareAsciiCaseInsensitive(a, b);
-    // Avoid allocating two temporary strings for the common non-ASCII
-    // comparison. Lowercase expansion (U+0130) is handled as a virtual unit.
+    // View-only callers have no cache for the Unicode classification, so
+    // preserve the old allocation-free streaming comparison.
     return compareLoweredViews(a, b);
 }
 
 int compareStringsCaseInsensitive(const SStr* a, const SStr* b) {
+    if (a == b) return 0; // immutable and already in the same representation
     // The ASCII property is cached on the string, so repeated comparisons of
     // the same operands do not rescan them before every compare.
     if (a->isAscii() && b->isAscii())
         return compareAsciiCaseInsensitive(a->view(), b->view());
-    return compareStringsCaseInsensitive(a->view(), b->view());
+    // Japanese, Chinese, Hangul and lowercased mixed-language text often
+    // contain no code points changed by Unicode lowercasing. In that case
+    // direct UTF-16 comparison is exact and skips Unicode folding entirely.
+    if (unicodeFastEnabled()) {
+        if (a->isLowercaseStable() && b->isLowercaseStable())
+            return compareStrings(a->view(), b->view());
+        if (a->isAsciiFoldCompatible() && b->isAsciiFoldCompatible())
+            return compareAsciiCaseInsensitive(a->view(), b->view());
+    }
+    return compareLoweredViews(a->view(), b->view());
 }
 
 bool sstrLetterAt(std::u16string_view s, int64_t idx1, char16_t& out) {
@@ -975,6 +1046,26 @@ static int compareAsciiCaseInsensitive(std::u16string_view a,
     return a.size() < b.size() ? -1 : 1;
 }
 
+// Search mixed Japanese/ASCII text without copying either operand. Only
+// ASCII uppercase needs folding, all other code units compare unchanged.
+// For large needles the exact Unicode fallback has better worst-case behavior.
+static bool containsAsciiFoldCompatible(std::u16string_view hay,
+                                        std::u16string_view needle) {
+    return std::search(hay.begin(), hay.end(),
+                       needle.begin(), needle.end(),
+                       [](char16_t a, char16_t b) {
+                           return foldAscii(a) == foldAscii(b);
+                       }) != hay.end();
+}
+
+// Unicode fallback, preserving full casefold expansion and Final_Sigma.
+static bool containsUnicodeFolded(std::u16string_view hay,
+                                  std::u16string_view needle) {
+    std::u16string h = u16ToLower(hay);
+    std::u16string n = u16ToLower(needle);
+    return h.find(n) != std::u16string::npos;
+}
+
 bool sstrContains(std::u16string_view hay, std::u16string_view needle) {
     if (needle.empty()) return true;
     // Unicode lowercasing can expand code units (U+0130 -> i + U+0307),
@@ -990,11 +1081,18 @@ bool sstrContains(std::u16string_view hay, std::u16string_view needle) {
         if (needle.size() > hay.size()) return false;
         return containsAscii(hay, needle);
     }
-    // Unicode case folding can expand characters and applies Final_Sigma
-    // contextually. Keep the established exact path for those uncommon inputs.
-    std::u16string h = u16ToLower(hay);
-    std::u16string n = u16ToLower(needle);
-    return h.find(n) != std::u16string::npos;
+    if (!unicodeFastEnabled()) return containsUnicodeFolded(hay, needle);
+    // Most CJK text has no Unicode case mappings.
+    const auto hp = lowercaseProperties(hay);
+    const auto np = lowercaseProperties(needle);
+    if (hp.stable && np.stable)
+        return hay.find(needle) != std::u16string_view::npos;
+    if (hp.asciiFoldCompatible && np.asciiFoldCompatible &&
+        needle.size() <= 16) {
+        if (needle.size() > hay.size()) return false;
+        return containsAsciiFoldCompatible(hay, needle);
+    }
+    return containsUnicodeFolded(hay, needle);
 }
 
 bool sstrContains(const SStr* hay, const SStr* needle) {
@@ -1007,7 +1105,18 @@ bool sstrContains(const SStr* hay, const SStr* needle) {
         if (needle->len > hay->len) return false;
         return containsAscii(hay->view(), needle->view());
     }
-    return sstrContains(hay->view(), needle->view());
+    if (unicodeFastEnabled()) {
+        if (hay->isLowercaseStable() && needle->isLowercaseStable()) {
+            if (needle->len > hay->len) return false;
+            return hay->view().find(needle->view()) != std::u16string_view::npos;
+        }
+        if (hay->isAsciiFoldCompatible() && needle->isAsciiFoldCompatible() &&
+            needle->len <= 16) {
+            if (needle->len > hay->len) return false;
+            return containsAsciiFoldCompatible(hay->view(), needle->view());
+        }
+    }
+    return containsUnicodeFolded(hay->view(), needle->view());
 }
 
 SStr* sstrLower(std::u16string_view sv) {

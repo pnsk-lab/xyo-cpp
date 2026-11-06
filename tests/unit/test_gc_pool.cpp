@@ -274,10 +274,32 @@ void workerAllocationAndReclamation() {
     if (gc.smallPoolEnabled()) check(gc.smallPoolReservedBytes() <= afterSweep + 3 * slabBytes, "reallocation uses bounded slab storage");
     gc.removeRootProvider(&roots);
 }
+void registryHighWaterReclamation() {
+    PtrSet set;
+    for (uintptr_t i = 1; i <= 100000; ++i) set.insert(i * 16);
+    const auto peak = set.capacity();
+    check(set.size() == 100000, "registry contains burst objects");
+    set.resetForRebuild(100);
+    check(set.size() == 0, "registry rebuild removes old membership");
+    check(set.capacity() == 1024 && peak >= 131072,
+          "registry releases historical peak capacity");
+    for (uintptr_t i = 1; i <= 100; ++i) set.insert(i * 32);
+    for (uintptr_t i = 1; i <= 100; ++i)
+        check(set.count(i * 32), "rebuilt registry membership survives shrink");
+    check(!set.count(16), "discarded membership does not survive rebuild");
+    set.reserve(1000);
+    const auto moderate = set.capacity();
+    set.resetForRebuild(100);
+    check(set.capacity() == moderate && set.size() == 0,
+          "registry retains capacity across small fluctuations");
+    set.resetForRebuild(0);
+    check(!set.count(32), "empty rebuilt registry rejects old keys");
+}
 } // namespace
 
 int test_gc_pool_main() {
     failures = checks = 0;
+    registryHighWaterReclamation();
     boundariesAndCandidates();
     rootedGraphAndReentrantAllocation();
     workerAllocationAndReclamation();

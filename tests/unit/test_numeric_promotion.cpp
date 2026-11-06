@@ -154,7 +154,7 @@ State run(const Case& c, JitMode mode, bool yieldWriter = false) {
     Target* t = rt.targets[0];
     // Install arbitrary Values, including true numeric NaN/Infinity, instead
     // of accidentally testing only text literals with similar spellings.
-    t->lookupVariableById("source")->list->items[0] = c.input;
+    t->lookupVariableById("source")->list->replace0(0, c.input);
     if (c.initial.bits != Value::undefined().bits)
         t->lookupVariableById("x")->value = c.initial;
     rt.greenFlag();
@@ -287,7 +287,7 @@ State truthRun(Value input, JitMode mode) {
     check(loaded && rt.targets.size() == 1, "load boolean branch fixture");
     if (!loaded || rt.targets.size() != 1) return {};
     Target* t = rt.targets[0];
-    t->lookupVariableById("source")->list->items[0] = input;
+    t->lookupVariableById("source")->list->replace0(0, input);
     rt.greenFlag();
 #ifdef XYO_JIT
     if (mode == JitMode::Eager)
