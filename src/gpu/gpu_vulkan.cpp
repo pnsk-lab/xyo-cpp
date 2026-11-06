@@ -167,6 +167,11 @@ bool libOpen() {
 #ifdef _WIN32
     g.lib = LoadLibraryA("vulkan-1.dll");
     if (!g.lib) g.lib = LoadLibraryA("vulkan.dll");
+#elif defined(__APPLE__)
+    // Optional LunarG loader / MoltenVK on macOS. Absent runtime => CPU fallback.
+    g.lib = dlopen("libvulkan.1.dylib", RTLD_NOW | RTLD_LOCAL);
+    if (!g.lib) g.lib = dlopen("libvulkan.dylib", RTLD_NOW | RTLD_LOCAL);
+    if (!g.lib) g.lib = dlopen("libMoltenVK.dylib", RTLD_NOW | RTLD_LOCAL);
 #else
     g.lib = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
     if (!g.lib) g.lib = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
@@ -306,6 +311,14 @@ bool initImpl() {
         .sType            = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
         .pApplicationInfo = &app,
     };
+#ifdef __APPLE__
+    // MoltenVK devices are portability implementations. They are hidden by
+    // conformant Vulkan loaders unless this extension/flag is enabled.
+    const char* portabilityEnum = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+    ii.flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+    ii.enabledExtensionCount = 1;
+    ii.ppEnabledExtensionNames = &portabilityEnum;
+#endif
     if (vk.CreateInstance(&ii, nullptr, &g.inst) != VK_SUCCESS)
         return false;
 
@@ -378,6 +391,12 @@ bool initImpl() {
         .queueCreateInfoCount  = 1,
         .pQueueCreateInfos     = &qi,
     };
+#ifdef __APPLE__
+    // Required by a VK_KHR_portability_subset physical device.
+    const char* portabilitySubset = "VK_KHR_portability_subset";
+    di.enabledExtensionCount = 1;
+    di.ppEnabledExtensionNames = &portabilitySubset;
+#endif
     if (vk.CreateDevice(g.phys, &di, nullptr, &g.dev) != VK_SUCCESS)
         return false;
 

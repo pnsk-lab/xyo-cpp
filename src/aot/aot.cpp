@@ -33,7 +33,7 @@
 #include <windows.h>
 
 #include <cwchar>
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__APPLE__)
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -329,7 +329,7 @@ bool copySelf(const std::string& outPath, std::string* why) {
         return false;
     }
     return true;
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__APPLE__)
     const std::string self = selfExePath();
     std::FILE* in = fopenUtf8(self.c_str(), "rb");
     if (!in) {

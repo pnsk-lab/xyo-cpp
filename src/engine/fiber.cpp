@@ -82,10 +82,17 @@ Fiber::Fiber(FiberEntry entry, void* arg, size_t stackReserve)
 
     // 初期コンテキスト: rsp = 16B アラインしたスタック先端 - 8
     // （トランポリンが "call から来た" 形で関数規約を満たすように rsp%16==8）
+#if defined(__aarch64__)
+    // AAPCS64 and Darwin require 16-byte SP alignment at function entry.
+    regs_.sp = reinterpret_cast<uintptr_t>(stackBase_) & ~uintptr_t(15);
+    regs_.x30 = reinterpret_cast<uintptr_t>(&xyo_fiber_trampoline);
+    regs_.x19 = reinterpret_cast<uintptr_t>(this);
+#else
     uintptr_t sp = reinterpret_cast<uintptr_t>(stackBase_) - 8;
     regs_.rsp = sp;
     regs_.rip = reinterpret_cast<uint64_t>(&xyo_fiber_trampoline);
     regs_.r15 = reinterpret_cast<uint64_t>(this);       // trampoline → Fiber*
+#endif
 }
 
 Fiber::~Fiber() {
@@ -156,7 +163,11 @@ extern "C" void xyo_yield_fast(Fiber* f) {
 }
 
 void* Fiber::suspendedSp() const {
+#if defined(__aarch64__)
+    return reinterpret_cast<void*>(regs_.sp);
+#else
     return reinterpret_cast<void*>(regs_.rsp);
+#endif
 }
 
 void Fiber::reset(FiberEntry entry, void* arg) {
@@ -168,10 +179,16 @@ void Fiber::reset(FiberEntry entry, void* arg) {
     asanSelfBottom_ = nullptr;
     asanSelfSize_ = 0;
     regs_ = FiberRegs{};
+#if defined(__aarch64__)
+    regs_.sp = reinterpret_cast<uintptr_t>(stackBase_) & ~uintptr_t(15);
+    regs_.x30 = reinterpret_cast<uintptr_t>(&xyo_fiber_trampoline);
+    regs_.x19 = reinterpret_cast<uintptr_t>(this);
+#else
     uintptr_t sp = reinterpret_cast<uintptr_t>(stackBase_) - 8;
     regs_.rsp = sp;
     regs_.rip = reinterpret_cast<uint64_t>(&xyo_fiber_trampoline);
     regs_.r15 = reinterpret_cast<uint64_t>(this);
+#endif
 }
 
 void Fiber::run() {

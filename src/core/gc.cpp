@@ -609,6 +609,31 @@ void Gc::collect() {
             }
             pthread_attr_destroy(&attr);
         }
+#elif defined(__APPLE__)
+        // pthread_get_stackaddr_np returns the high end of the *native*
+        // thread stack. During a fiber switch SP points into mmap memory;
+        // scan from the saved scheduler SP instead of an unrelated fiber SP.
+        {
+            const pthread_t thread = pthread_self();
+            const uintptr_t hi = reinterpret_cast<uintptr_t>(
+                pthread_get_stackaddr_np(thread));
+            const size_t size = pthread_get_stacksize_np(thread);
+            if (hi != 0 && size != 0 && size <= hi) {
+                const uintptr_t base = hi - size;
+                uintptr_t lo = reinterpret_cast<uintptr_t>(__builtin_alloca(0));
+                if (xyo::currentFiber()) {
+#if defined(__aarch64__)
+                    lo = reinterpret_cast<uintptr_t>(xyo::detail::gSchedulerRegs.sp);
+#else
+                    lo = reinterpret_cast<uintptr_t>(xyo::detail::gSchedulerRegs.rsp);
+#endif
+                }
+                if (lo < base) lo = base;
+                if (lo < hi)
+                    scanRange(reinterpret_cast<void*>(lo),
+                              reinterpret_cast<void*>(hi));
+            }
+        }
 #elif defined(__EMSCRIPTEN__)
         // WASM: スタックは下方向成長。現 SP（alloca(0)）から base までを
         // ワード走査する（Linux 経路と同じ「jmp_buf を含む全ローカルが
