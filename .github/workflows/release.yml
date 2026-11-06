@@ -174,9 +174,59 @@ jobs:
           path: dist/xyo-windows-x86_64.zip
           if-no-files-found: error
 
+  macos:
+    name: macOS / ${{ matrix.arch }} / LLVM JIT + SDL2
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Dependencies
+        run: brew install llvm ninja sdl2 pkgconf
+
+      - name: Build
+        run: |
+          cmake -S . -B build-macos -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DXYO_LLVM_MODE=llvm-config \
+            -DLLVM_CONFIG="$(brew --prefix llvm)/bin/llvm-config" \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix)" \
+            -DXYO_BUILD_TESTS=OFF -DXYO_JIT=ON -DXYO_SDL2=ON \
+            -DXYO_REQUIRE_SDL2=ON -DXYO_RSVG=OFF -DXYO_FULL_BUILD=ON \
+            -DXYO_BINARYEN_C_API=OFF
+          cmake --build build-macos --parallel 2
+
+      - name: Smoke
+        run: |
+          bash tools/ci/smoke.sh run build-macos/xyo
+          bash tools/ci/smoke.sh play build-macos/xyo
+
+      - name: Package
+        run: |
+          mkdir -p dist/pkg
+          cp build-macos/xyo LICENSE RUNNING.md dist/pkg/
+          mkdir -p dist/pkg/docs
+          cp docs/macos.md dist/pkg/docs/
+          mv dist/pkg/RUNNING.md dist/pkg/RUNNING.txt
+          tar -C dist/pkg -czf dist/xyo-macos-${{ matrix.arch }}.tar.gz \
+            xyo LICENSE RUNNING.txt docs/macos.md
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: macos-${{ matrix.arch }}-dist
+          path: dist/xyo-macos-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
   release:
     name: GitHub Release
-    needs: [linux, linux-static, windows]
+    needs: [linux, linux-static, windows, macos]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -200,6 +250,8 @@ jobs:
             dist/xyo-linux-x86_64.tar.gz
             dist/xyo-linux-x86_64-static.tar.gz
             dist/xyo-windows-x86_64.zip
+            dist/xyo-macos-arm64.tar.gz
+            dist/xyo-macos-x86_64.tar.gz
             dist/SHA256SUMS.txt
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}

@@ -21,6 +21,54 @@ env:
   LLVM_STATIC: "18"
 
 jobs:
+  macos:
+    name: macOS / ${{ matrix.arch }} / LLVM JIT + SDL2
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: brew install llvm ninja sdl2 pkgconf
+
+      - name: Configure
+        run: |
+          LLVM_CONFIG="$(brew --prefix llvm)/bin/llvm-config"
+          cmake -S . -B build-macos -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DXYO_LLVM_MODE=llvm-config -DLLVM_CONFIG="$LLVM_CONFIG" \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix)" \
+            -DXYO_JIT=ON -DXYO_SDL2=ON -DXYO_REQUIRE_SDL2=ON \
+            -DXYO_RSVG=OFF -DXYO_FULL_BUILD=ON \
+            -DXYO_BINARYEN_C_API=OFF
+
+      - name: Build (limit parallelism on M1 runner)
+        run: cmake --build build-macos --parallel 2
+
+      - name: Unit and interpreter/JIT parity
+        run: |
+          ctest --test-dir build-macos --output-on-failure \
+            -R '^(xyo-fiber-smoke|xyo-tests|xyo-interpreter-parity-regressions|xyo-jit-lazy-integration)$'
+
+      - name: Smoke (JIT / AOT / SDL)
+        run: |
+          bash tools/ci/smoke.sh run build-macos/xyo
+          bash tools/ci/smoke.sh play build-macos/xyo
+          bash tools/ci/smoke.sh gui build-macos/xyo
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: xyo-macos-${{ matrix.arch }}
+          path: build-macos/xyo
+          if-no-files-found: error
+
   linux:
     name: Linux / JIT + SDL2 + Vulkan + librsvg
     runs-on: ubuntu-24.04

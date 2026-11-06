@@ -2,6 +2,14 @@
 # - unit/: cast/compare/list/gc の table-driven テスト
 # - fixtures/: refs/scratch-vm/test/fixtures の実行フィクスチャ（M2 以降）
 # - differential/: node scratch-vm との差分ランナー
+# Architecture-specific context switching must be exercised on macOS runners.
+# The same binary also guards the existing Linux/Windows fiber implementations.
+if(NOT EMSCRIPTEN)
+  add_executable(xyo-fiber-smoke platform/fiber_switch.cpp)
+  target_link_libraries(xyo-fiber-smoke PRIVATE xyo)
+  add_test(NAME xyo-fiber-smoke COMMAND xyo-fiber-smoke)
+endif()
+
 file(GLOB TEST_SOURCES CONFIGURE_DEPENDS unit/*.cpp)
 # MockRenderer subclasses the runtime's no-RTTI RendererAPI.
 set_source_files_properties(unit/test_scheduler.cpp unit/test_motion_numeric.cpp PROPERTIES

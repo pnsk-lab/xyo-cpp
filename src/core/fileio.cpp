@@ -12,6 +12,10 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
+#include <unistd.h>
+#include <cstdlib>
 #elif defined(__linux__)
 #include <unistd.h>
 #endif
@@ -89,6 +93,21 @@ std::string selfExePath() {
     if (n <= 0) return {};
     buf[n] = '\0';
     return std::string(buf);
+#elif defined(__APPLE__)
+    uint32_t size = 1024;
+    std::vector<char> buf(size);
+    if (_NSGetExecutablePath(buf.data(), &size) != 0) {
+        if (size == 0) return {};
+        buf.resize(size);
+        if (_NSGetExecutablePath(buf.data(), &size) != 0) return {};
+    }
+    // dyld can return a relative path containing "..". Resolve it before
+    // copying/appending an AOT payload to the executable.
+    char* resolved = ::realpath(buf.data(), nullptr);
+    if (!resolved) return std::string(buf.data());
+    std::string result(resolved);
+    std::free(resolved);
+    return result;
 #else
     return {};
 #endif

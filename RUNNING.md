@@ -66,6 +66,12 @@ Linux 版は 2 種類あります。どちらも **LLVM は静的リンク**な�
 ./xyo                                # （引数なし）ランチャー GUI
 ```
 
+## macOS (Apple Silicon arm64 / Intel x86-64)
+
+Homebrew を用いた LLVM ORC JIT + SDL2 のネイティブビルドに対応。
+ビルド手順、依存ライブラリ、GPU バックエンドの制約は
+[macOS ビルドガイド](docs/macos.md) を参照してください。
+
 ## Windows x86-64（xyo-windows-x86_64.zip）
 
 同梱: `xyo.exe`（**JIT + SDL2 レンダラ + ランチャー GUI**、LLVM・libstdc++・SDL2 は
