@@ -1264,6 +1264,10 @@ bool Launcher::open() {
                             1120, 760, SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     if (!win_) return false;
     SDL_SetWindowMinimumSize(win_, 760, 560);
+#if defined(__APPLE__) && defined(XYO_PEN_GL)
+    if (!std::getenv("XYO_PEN_CPU"))
+        SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
+#endif
     ren_ = SDL_CreateRenderer(
         win_, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!ren_) ren_ = SDL_CreateRenderer(win_, -1, SDL_RENDERER_SOFTWARE);

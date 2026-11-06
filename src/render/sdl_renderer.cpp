@@ -35,8 +35,12 @@
 
 #if defined(XYO_PEN_GL)
 #define GL_GLEXT_PROTOTYPES
+#if defined(__APPLE__)
+#include <OpenGL/gl3.h>
+#else
 #include <GL/gl.h>
 #include <GL/glext.h>
+#endif
 #endif
 
 #include "../../third_party/stb_image.h"
@@ -227,6 +231,7 @@ struct SdlRenderer::GlPen {
 /// VM compute shader が反復=レーンでバイトコードを解釈して
 /// ストロークレコードを SSBO へ出力 → record-draw プログラムが
 /// VS でレコードをクアッド展開し既存ペン FBO へ描画する。
+#if !defined(__APPLE__)
 struct SdlRenderer::GlCompute {
     GLuint cs = 0;        // VM compute プログラム
     GLuint rp = 0;        // レコード描画プログラム（VS 430 + FS）
@@ -272,6 +277,9 @@ struct SdlRenderer::GlCompute {
     uint32_t timCount = 0;
     bool ok = false;
 };
+#else
+struct SdlRenderer::GlCompute {};
+#endif
 #else
 struct SdlRenderer::GlPen {};
 struct SdlRenderer::GlCompute {};
@@ -368,6 +376,10 @@ bool SdlRenderer::init(Runtime& rt, int scale) {
         std::fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
         return false;
     }
+#if defined(__APPLE__) && defined(XYO_PEN_GL)
+    if (!std::getenv("XYO_PEN_CPU"))
+        SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
+#endif
     renderer_ = SDL_CreateRenderer(
         window_, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!renderer_)
@@ -429,6 +441,7 @@ bool SdlRenderer::initEmbedded(Runtime& rt, SDL_Renderer* renderer) {
     scale_ = 1;
     embedded_ = true;
     renderer_ = renderer;
+    window_ = SDL_RenderGetWindow(renderer_);
     SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
     // stageRect_ は setStageRect でセットされるまで 0（描画しない）。
     stageRect_ = IRect{0, 0, 0, 0};
@@ -493,6 +506,7 @@ SdlRenderer::~SdlRenderer() {
             if (g.recVao) glDeleteVertexArrays(1, &g.recVao);
             if (g.fbo) glDeleteFramebuffers(1, &g.fbo);
             if (g.tex) glDeleteTextures(1, &g.tex);
+#if !defined(__APPLE__)
             if (glComp_) {
                 GlCompute& c = *glComp_;
                 if (c.cs) glDeleteProgram(c.cs);
@@ -516,6 +530,7 @@ SdlRenderer::~SdlRenderer() {
                 glDeleteBuffers(14, bs);
                 if (c.timQ[0]) glDeleteQueries(4, c.timQ);
             }
+#endif
             if (g.upFbo) glDeleteFramebuffers(1, &g.upFbo);
             if (g.upVao) glDeleteVertexArrays(1, &g.upVao);
             if (g.upProg2d) glDeleteProgram(g.upProg2d);
@@ -1607,9 +1622,14 @@ bool SdlRenderer::initGlPen() {
     const bool wantShared =
         sdlGlCtx_ && !(interopEnv && interopEnv[0] == '0');
     static const struct { int major, minor, profile; } kCtxTries[] = {
+#if defined(__APPLE__)
+        {4, 1, SDL_GL_CONTEXT_PROFILE_CORE},
+        {3, 2, SDL_GL_CONTEXT_PROFILE_CORE},
+#else
         {4, 3, SDL_GL_CONTEXT_PROFILE_CORE},   // compute shader 用
         {3, 3, SDL_GL_CONTEXT_PROFILE_CORE},
         {0, 0, 0},   // デフォルト（互換 / ES）
+#endif
     };
     auto tryCtx = [&](bool share) -> SDL_GLContext {
         SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT,
@@ -2012,6 +2032,7 @@ void SdlRenderer::penSyncCpu(bool forceReadback) {
     penDirty_ = true;
 }
 
+#if !defined(__APPLE__)
 // ===================================================== GPU 並列 VM ======
 // src/gpu/gpu_isa.hpp の ISA を解釈する compute shader。
 // 1 反復 = 1 レーン（gl_GlobalInvocationID.x）として本体を実行し、
@@ -3360,6 +3381,12 @@ bool SdlRenderer::gpuExecNative(gpu::NativeRequest& req) {
                      req.rows);
     return true;
 }
+
+#else
+bool SdlRenderer::initGlCompute() { return false; }
+bool SdlRenderer::gpuExecParallel(gpu::ExecRequest&) { return false; }
+bool SdlRenderer::gpuExecNative(gpu::NativeRequest&) { return false; }
+#endif
 
 void SdlRenderer::getFenceRect(int drawableID, double out[4]) const {
     out[0] = -stageW_ / 2.0; out[1] = stageW_ / 2.0;

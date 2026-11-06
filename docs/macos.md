@@ -39,7 +39,8 @@ GUI が不要なら `-DXYO_SDL2=OFF` を指定する。
 
 - SDL2 ウィンドウ/音声は Homebrew の SDL2 に依存。SVG は既定の
   nanosvg で表示する。librsvg を入れた場合は `-DXYO_RSVG=ON` で利用可能。
-- OpenGL ペン描画は Linux 専用。macOS は CPU ペン実装を使う。
+- OpenGL 4.1 Core Profile の GPU ペン描画 (FBO) を有効化。SDL2 は OpenGL を優先する。
+  CPU フォールバックは `XYO_PEN_CPU=1`。OpenGL 4.3 計算シェーダは非対応。
 - Vulkan の計算オフロードは任意機能。glslc と Vulkan-Headers が揃い、
   Vulkan loader または MoltenVK がロードできる場合にのみ有効。
   macOS の Metal を直接呼ぶバックエンドはまだ無い。

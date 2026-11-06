@@ -351,6 +351,11 @@ if(SDL2_FOUND)
   if(PkgConfig_FOUND)
     pkg_check_modules(GLPC QUIET IMPORTED_TARGET gl)
   endif()
+  if(APPLE)
+    find_library(XYO_OPENGL_FRAMEWORK OpenGL REQUIRED)
+    target_compile_definitions(xyo PUBLIC XYO_PEN_GL=1)
+    target_link_libraries(xyo PUBLIC "${XYO_OPENGL_FRAMEWORK}")
+  endif()
   if(GLPC_FOUND AND NOT WIN32 AND NOT APPLE)
     # GPU ペン層（OpenGL レンダラ時のみ有効 — FBO+シェーダで
     # カプセル距離を解析評価、SDL_Renderer では表現不可）。

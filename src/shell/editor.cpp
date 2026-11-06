@@ -6144,6 +6144,10 @@ int editorMain(const char* path, bool danger) {
                               SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE |
                                   SDL_WINDOW_ALLOW_HIGHDPI);
     if (!ed.win) { std::fprintf(stderr, "editor: window failed\n"); return 1; }
+#if defined(__APPLE__) && defined(XYO_PEN_GL)
+    if (!std::getenv("XYO_PEN_CPU"))
+        SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
+#endif
     ed.r = SDL_CreateRenderer(ed.win, -1, SDL_RENDERER_ACCELERATED |
                                               SDL_RENDERER_PRESENTVSYNC);
     if (!ed.r) ed.r = SDL_CreateRenderer(ed.win, -1, SDL_RENDERER_SOFTWARE);
