@@ -3383,6 +3383,9 @@ bool SdlRenderer::gpuExecNative(gpu::NativeRequest& req) {
 }
 
 #else
+// macOS uses FBO strokes but cannot use the GL 4.3 compute/interop upload path.
+// drawPenLayer() will call penSyncCpu() before uploading to SDL.
+bool SdlRenderer::penUploadGpu() { return false; }
 bool SdlRenderer::initGlCompute() { return false; }
 bool SdlRenderer::gpuExecParallel(gpu::ExecRequest&) { return false; }
 bool SdlRenderer::gpuExecNative(gpu::NativeRequest&) { return false; }
