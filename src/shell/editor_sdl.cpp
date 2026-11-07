@@ -3922,7 +3922,10 @@ int editorMainLegacy(const char* path) {
                                   SDL_WINDOW_ALLOW_HIGHDPI);
     if (!ed.win) { std::fprintf(stderr, "editor: window failed\n"); return 1; }
 #if defined(__APPLE__) && defined(XYO_PEN_GL)
-    if (!std::getenv("XYO_PEN_CPU"))
+    // The SDL dummy video driver used in headless CI has no OpenGL renderer.
+    const char* videoDriver = SDL_GetCurrentVideoDriver();
+    if (!std::getenv("XYO_PEN_CPU") && videoDriver &&
+        SDL_strcmp(videoDriver, "dummy") != 0)
         SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
 #endif
     ed.r = SDL_CreateRenderer(ed.win, -1, SDL_RENDERER_ACCELERATED |

@@ -377,7 +377,10 @@ bool SdlRenderer::init(Runtime& rt, int scale) {
         return false;
     }
 #if defined(__APPLE__) && defined(XYO_PEN_GL)
-    if (!std::getenv("XYO_PEN_CPU"))
+    // The SDL dummy video driver used in headless CI has no OpenGL renderer.
+    const char* videoDriver = SDL_GetCurrentVideoDriver();
+    if (!std::getenv("XYO_PEN_CPU") && videoDriver &&
+        SDL_strcmp(videoDriver, "dummy") != 0)
         SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
 #endif
     renderer_ = SDL_CreateRenderer(
