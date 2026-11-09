@@ -467,7 +467,6 @@ void emitNumericRepeatChunk(const NumericRepeatPlan& plan,
             rawCarries.push_back(nullptr);
             numericCarries.push_back(nullptr);
             integerCarries.push_back(carry);
-            state.push_back(numericFromInteger(carry));
         } else {
             auto* raw = b.CreatePHI(i64t, 2, "rep.numeric.raw");
             auto* numeric = b.CreatePHI(f64t, 2, "rep.numeric.number");
@@ -476,8 +475,18 @@ void emitNumericRepeatChunk(const NumericRepeatPlan& plan,
             rawCarries.push_back(raw);
             numericCarries.push_back(numeric);
             integerCarries.push_back(nullptr);
-            state.push_back({raw, numeric, nullptr});
         }
+    }
+    // A loop header must contain *only* PHI nodes before the first
+    // non-PHI instruction. numericFromInteger() emits uitofp/bitcast, so
+    // construct every carry PHI first and materialize numeric views only
+    // afterwards. With multiple integer variables the old interleaving
+    // produced invalid LLVM IR (caught by AOT verifyModule).
+    for (size_t i = 0; i < initial.size(); ++i) {
+        if (integerCarries[i])
+            state.push_back(numericFromInteger(integerCarries[i]));
+        else
+            state.push_back({rawCarries[i], numericCarries[i], nullptr});
     }
     for (const auto& stmt : plan.stmts) {
         const bool integerMode = !plan.integerVars.empty() &&
