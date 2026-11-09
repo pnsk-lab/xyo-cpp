@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -20,6 +21,23 @@ struct Runtime;
 }
 
 namespace xyo::aot {
+
+// Stages are factual checkpoints. Percentages only apply within stages
+// with a known total (scripts or slots), not to LLVM's opaque O2 pipeline.
+enum class ProgressStage {
+    Codegen, Optimize, EmitObject, Compiled, WriteOutput,
+    LoadObject, BindSlots, RegisterScripts, Loaded
+};
+struct Progress {
+    ProgressStage stage;
+    size_t completed = 0;
+    size_t total = 0; // 0 means indeterminate (not zero percent)
+};
+using ProgressCallback = std::function<void(const Progress&)>;
+inline void reportProgress(const ProgressCallback& cb, ProgressStage stage,
+                           size_t done = 0, size_t total = 0) {
+    if (cb) cb({stage, done, total});
+}
 
 struct BuildResult {
     std::string object;  // ターゲットのオブジェクトファイル
@@ -31,7 +49,8 @@ struct BuildResult {
 /// プロジェクト全体を AOT コンパイルする。GPU 並列ループは
 /// ホスト側プログラムを指す定数を埋め込むため対象外（CPU ループへ）。
 bool compileProject(Runtime& rt, uint64_t projectHash, BuildResult& out,
-                    std::string* why);
+                    std::string* why,
+                    const ProgressCallback& progress = {});
 
 /// FNV-1a 64bit（sb3 とメタの対応検査用）。
 uint64_t hashBytes(const void* p, size_t n);

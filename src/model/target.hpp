@@ -13,6 +13,7 @@
 #include "graphic_effects.hpp"
 #include "blocks.hpp"
 #include "variable.hpp"
+#include "variable_map.hpp"
 
 namespace xyo {
 
@@ -60,6 +61,9 @@ struct PenState {
 class Target {
 public:
     explicit Target(Runtime* rt, Sprite* sprite = nullptr);
+    // Restore the ID without reusing the generated-id counter after loading
+    // a snapshot with thousands of previously created Scratch clones.
+    void restoreId(std::string savedId);
 
     Runtime* runtime;
     std::string id;
@@ -73,7 +77,7 @@ public:
     int drawableLayerOrder = 0;
 
     // --- 変数（id → Variable）---
-    std::unordered_map<std::string, Variable> variables;
+    VariableMap variables;
     // SB3 can reuse an ID for a scalar/list and a broadcast.
     std::unordered_map<std::string, Variable> collidingBroadcasts;
     /// 実行中スクリプトコメント（未使用だが保持）
@@ -112,6 +116,7 @@ public:
     /// clone 用カウンタ（Clone counter）
     int cloneCount = 0;
 
+
     // ---------------------------------------------------------------
     std::u16string getName() const { return sprite ? sprite->name : utf8ToU16(id); }
     bool isRenderable() const { return sprite != nullptr; }
@@ -120,6 +125,16 @@ public:
     }
 
     // --- 変数ルックアップ（target.js 移植）---
+    // A binding stamp changes whenever a local/stage variable map is
+    // structurally modified, or when stage ownership changes. Cached
+    // Variable* pointers may only be dereferenced while the stamp matches.
+    struct VariableBindingStamp {
+        const Target* stage = nullptr;
+        uint64_t localGeneration = 0;
+        uint64_t stageGeneration = 0;
+        bool operator==(const VariableBindingStamp&) const = default;
+    };
+    VariableBindingStamp variableBindingStamp() const;
     Variable* lookupVariableById(const std::string& id);
     Variable* lookupVariableByNameAndType(const std::u16string& name,
                                           const char* type,
@@ -183,6 +198,7 @@ public:
     // --- イベント ---
     void onGreenFlag();
     void onStopAll();
+
 };
 
 } // namespace xyo

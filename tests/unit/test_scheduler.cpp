@@ -1,5 +1,7 @@
 // Headless/mock-renderer scheduler integration and dispatch-and-join stress.
+#include <algorithm>
 #include <atomic>
+#include <climits>
 #include <cstdio>
 #include <limits>
 #include <string>
@@ -10,6 +12,7 @@
 #include "core/gc.hpp"
 #include "engine/pool.hpp"
 #include "engine/runtime.hpp"
+#include "engine/event_wait_dependency.hpp"
 #include "engine/sequencer.hpp"
 #include "engine/thread.hpp"
 #include "jit/jit.hpp"
@@ -880,10 +883,395 @@ void testWaitUntilChain() {
         for (size_t i = 0; i < 5; ++i)
             exact &= cast::toNumber(log->list->items[i]) == expected[i];
     check(exact, "wait-until chain observes writer before appending in receiver order");
-    if (eligible && std::getenv("XYO_FIBER_CHAIN") == nullptr &&
+    // Dependency-watched pure waits, even without the global event
+    // scheduler, resume serially so a waiter cannot overtake its writer.
+    // Exact output and receiver order are tested above for both paths.
+    // The low-level fiber-chain counter is meaningful only with regular
+    // polling, not when the watcher intentionally suppresses retries.
+    if (eligible && !rt.sequencer->eventSchedulerEnabled() &&
+        !isolatedEventWaitDependencyEnabled() &&
+        std::getenv("XYO_FIBER_CHAIN") == nullptr &&
         std::getenv("XYO_PROF") == nullptr)
         check(rt.sequencer->parallelStats().chainedPasses > 0,
               "pure wait-until receivers exercise direct fiber chain");
+}
+
+
+void testCloneMutationSchedulerAffinity() {
+    // A native clone-mutation script is never safe for worker threads.
+    // Codegen can mark this once and avoid re-analyzing the same source
+    // separately for thousands of ephemeral clone Target identities.
+    if (!jitEnabled()) return;
+    const std::string blocks =
+        "{\"cloneHat\":{\"opcode\":\"control_start_as_clone\","
+        "\"topLevel\":true,\"next\":\"del\",\"inputs\":{},\"fields\":{}},"
+        "\"del\":{\"opcode\":\"control_delete_this_clone\","
+        "\"next\":null,\"inputs\":{},\"fields\":{}}}";
+    const std::string json =
+        "{\"targets\":[" + target("Stage", "{}", true) + "," +
+        target("CloneHost", blocks, false, 1) +
+        "],\"monitors\":[],\"extensions\":[],\"meta\":{}}";
+    Runtime rt;
+    const auto loaded = loadSb3(rt, json, nullptr);
+    check(loaded.ok, "load clone mutation compiler fixture");
+    if (!loaded.ok) return;
+    Target* sprite = rt.getSpriteTargetByName(u"CloneHost");
+    check(sprite != nullptr, "clone mutation sprite exists");
+    if (!sprite) return;
+
+    Thread thread("cloneHat");
+    thread.target = sprite;
+    thread.blockContainer = sprite->blocks;
+    thread.pushStack("cloneHat");
+    const Block* top = sprite->blocks->getBlock("cloneHat");
+    const CompiledScript* compiled =
+        rt.jit->compile(thread, rt, *rt.sequencer, top);
+    check(compiled != nullptr,
+          "clone mutation script compiles to native JIT");
+    if (!compiled) return;
+    const char* flag = std::getenv("XYO_CLONE_SERIAL_CODEGEN");
+    const bool enabled = !flag || flag[0] != '0';
+    check(compiled->mainThread == enabled,
+          "clone mutation host affinity matches explicit setting");
+
+}
+
+void testShortBroadcastReadyCache() {
+    // A compiled, non-yielding receiver can reattach directly to a cached
+    // native script. Each fire-and-forget broadcast still creates a fresh
+    // logical execution and commits its variable write once.
+    const JitMode previousMode = jitMode();
+    setJitMode(JitMode::HotSpot);
+    const std::string receiver =
+        "{\"recv\":{\"opcode\":\"event_whenbroadcastreceived\","
+        "\"topLevel\":true,\"next\":\"inc\",\"inputs\":{},"
+        "\"fields\":{\"BROADCAST_OPTION\":[\"PING\",null]}},"
+        "\"inc\":" + block("data_changevariableby", nullptr,
+        "{\"VALUE\":[1,[4,\"1\"]]}",
+        "{\"VARIABLE\":[\"s\",\"s\"]}") + "}";
+    const std::string json =
+        "{\"targets\":[" + target("Stage", "{}", true) + "," +
+        target("Receiver", receiver) +
+        "],\"monitors\":[],\"extensions\":[],\"meta\":{}}";
+    Runtime rt;
+    const auto loaded = loadSb3(rt, json, nullptr);
+    check(loaded.ok, "load short broadcast cached-native fixture");
+    if (loaded.ok) {
+        Target* stage = rt.getTargetForStage();
+        Variable* shared = stage->lookupVariableById("s");
+        bool usedShortSync = false;
+        for (int i = 0; i < 12; ++i) {
+            rt.startBroadcast(i & 1 ? u"ping" : u"PING");
+            check(rt.threads.size() == 1,
+                  "one short broadcast starts exactly one script");
+            if (!rt.threads.empty()) {
+                Thread* started = rt.threads.front();
+                if (started->isCompiled) {
+                    const auto* compiled =
+                        static_cast<const CompiledScript*>(started->compiled);
+                    usedShortSync |= compiled && compiled->shortSync &&
+                                     !compiled->mayYield;
+                }
+            }
+            rt.runUntilDone(30);
+            check(rt.threads.empty(),
+                  "short receiver terminates before next broadcast");
+            check(shared && cast::toNumber(shared->value) == i + 1,
+                  "short broadcast increments Stage exactly once");
+        }
+        if (rt.jit && rt.jit->ok())
+            check(usedShortSync,
+                  "HotSpot warms a non-yielding cached broadcast listener");
+    }
+    setJitMode(previousMode);
+}
+
+void testNonRestartBroadcastFanout() {
+    // A non-restarting broadcast must skip a receiver that is already
+    // running without suppressing any of the other matching receivers.
+    // Twenty pre-existing receivers force the lazy membership index to
+    // activate; the remaining twelve must still be started in order.
+    for (int route = 0; route < 3; ++route) {
+        Runtime rt;
+        const std::string receiver =
+            "{\"recv\":{\"opcode\":\"event_whenbroadcastreceived\","
+            "\"topLevel\":true,\"next\":\"inc\",\"inputs\":{},"
+            "\"fields\":{\"BROADCAST_OPTION\":[\"PING\",null]}},"
+            "\"inc\":" +
+            block("data_changevariableby", nullptr,
+                  "{\"VALUE\":[1,[4,\"1\"]]}",
+                  "{\"VARIABLE\":[\"v\",\"v\"]}") + "}";
+        std::string json = "{\"targets\":[" + target("Stage", "{}", true);
+        for (int i = 0; i < 32; ++i) {
+            json += "," + target("Receiver" + std::to_string(i),
+                                  receiver, false, i + 1);
+        }
+        json += "],\"monitors\":[],\"extensions\":[],\"meta\":{}}";
+        const auto loaded = loadSb3(rt, json, nullptr);
+        check(loaded.ok, "load non-restarting broadcast fanout fixture");
+        if (!loaded.ok) continue;
+
+        // Override the registered hat metadata to exercise the non-restart
+        // path (normal Scratch broadcast hats restart existing scripts).
+        rt.registerHat("event_whenbroadcastreceived", HatMeta{false, false});
+        const auto receivers = rt.broadcastReceivers(u"PING");
+        check(receivers && receivers->size() == 32,
+              "all 32 broadcast receiver subscriptions are indexed");
+        if (!receivers || receivers->size() != 32) continue;
+
+        for (size_t i = 0; i < 20; ++i) {
+            const auto& receiverInfo = (*receivers)[i];
+            rt.pushThread(receiverInfo.blockId, receiverInfo.target,
+                          false, false, receiverInfo.top);
+        }
+        check(rt.threads.size() == 20, "twenty receivers are initially running");
+
+        if (route == 1) {
+            rt.startBroadcast(u"PING");
+        } else if (route == 2) {
+            const auto started = rt.startBroadcastAndWait(u"PING");
+            check(started.size() == 12,
+                  "indexed broadcast-and-wait returns only missing receiver handles");
+        } else {
+            std::map<std::string, std::u16string> fields{
+                {"BROADCAST_OPTION", u"PING"}};
+            const auto started =
+                rt.startHats("event_whenbroadcastreceived", &fields, nullptr);
+            check(started.size() == 12,
+                  "generic startHats starts only missing receivers");
+        }
+        check(rt.threads.size() == 32,
+              "non-restart fanout starts every missing receiver");
+        // Repeating the broadcast while all are still active must not
+        // produce additional copies of any of the 32 receiver threads.
+        if (route == 1) rt.startBroadcast(u"PING");
+        else if (route == 2) {
+            const auto started = rt.startBroadcastAndWait(u"PING");
+            check(started.empty(),
+                  "indexed broadcast-and-wait preserves active receiver identity");
+        } else {
+            std::map<std::string, std::u16string> fields{
+                {"BROADCAST_OPTION", u"PING"}};
+            rt.startHats("event_whenbroadcastreceived", &fields, nullptr);
+        }
+        check(rt.threads.size() == 32,
+              "non-restart fanout never duplicates active receivers");
+
+        rt.runUntilDone(200);
+        bool exact = rt.threads.empty();
+        for (Target* t : rt.targets) {
+            if (t->isStage) continue;
+            Variable* v = t->lookupVariableById("v");
+            exact &= v && cast::toNumber(v->value) == 1.0;
+        }
+        check(exact, "each non-restarting receiver runs exactly once");
+    }
+}
+
+void testBroadcastAsciiNamespaceGuard() {
+    Runtime rt;
+    const auto loaded = loadSb3(rt, project(false, false), nullptr);
+    check(loaded.ok, "load broadcast ASCII namespace fixture");
+    if (!loaded.ok) return;
+    Target* stage = rt.getTargetForStage();
+    check(stage != nullptr, "stage exists for namespace guard");
+    if (!stage) return;
+
+    check(rt.stageBroadcastNamesAsciiOnly(), "ordinary stage has ASCII namespace");
+    stage->variables.emplace("bcast-k",
+        Variable::create("bcast-k", u"k", Variable::kBroadcastType, false));
+    rt.invalidateBroadcastIndex();
+    check(rt.stageBroadcastNamesAsciiOnly(),
+          "ASCII broadcast name remains directly indexable");
+
+    // JS lowercasing treats the Kelvin sign as 'k', while uppercasing
+    // does not necessarily produce the same identifier. Preserve the
+    // legacy Stage-variable canonicalization whenever Unicode is present.
+    stage->variables.emplace("bcast-kelvin",
+        Variable::create("bcast-kelvin", u"\u212a",
+                         Variable::kBroadcastType, false));
+    rt.invalidateBroadcastIndex();
+    check(!rt.stageBroadcastNamesAsciiOnly(),
+          "Unicode Stage name disables direct ASCII dispatch");
+    check(!rt.stageBroadcastNamesAsciiOnly(),
+          "Unicode result stays cached for this scheduler tick");
+
+    stage->variables.erase("bcast-kelvin");
+    ++rt.stepSerial;
+    check(rt.stageBroadcastNamesAsciiOnly(),
+          "next scheduler tick invalidates Unicode namespace cache");
+
+    stage->collidingBroadcasts.emplace("collision",
+        Variable::create("collision", u"\u212a",
+                         Variable::kBroadcastType, false));
+    rt.invalidateBroadcastIndex();
+    check(!rt.stageBroadcastNamesAsciiOnly(),
+          "colliding Unicode broadcast also disables direct dispatch");
+}
+
+void testSingleVariableWaitDependency() {
+    // Explicitly exercise the opt-in snapshot even when this test suite
+    // does not enable the event-driven scheduler for other tests.
+    Runtime rt;
+    Sprite sprite(&rt);
+    Target target(&rt, &sprite);
+    target.variables.emplace("gate", Variable::create(
+        "gate", u"gate", Variable::kScalarType, false));
+
+    Block wait;
+    wait.id = "wait";
+    wait.opcode = "control_wait_until";
+    wait.inputs.set("CONDITION", BlockInput{"eq", ""});
+    sprite.blocks->createBlock(std::move(wait));
+    Block eq;
+    eq.id = "eq";
+    eq.opcode = "operator_equals";
+    eq.inputs.set("OPERAND1", BlockInput{"read", ""});
+    eq.inputs.set("OPERAND2", BlockInput{"literal", ""});
+    sprite.blocks->createBlock(std::move(eq));
+    Block read;
+    read.id = "read";
+    read.opcode = "data_variable";
+    read.fields["VARIABLE"] = BlockField{
+        Value::string(SStr::create(u"gate")), "gate"};
+    sprite.blocks->createBlock(std::move(read));
+    Block literal;
+    literal.id = "literal";
+    literal.opcode = "math_number";
+    literal.fields["NUM"] = BlockField{Value::num(1), ""};
+    sprite.blocks->createBlock(std::move(literal));
+
+    Thread thread("wait");
+    thread.target = &target;
+    thread.blockContainer = sprite.blocks.get();
+    const uintptr_t site = reinterpret_cast<uintptr_t>(
+        sprite.blocks->getBlock("wait"));
+    snapshotEventWaitDependency(thread, site);
+    if (!eventWaitDependencyEnabled()) {
+        check(!thread.eventWatchValid,
+              "dependency watchers opt in only when explicitly enabled");
+        return;
+    }
+
+    check(thread.eventWatchValid,
+          "one-variable pure wait predicate is dependency-watchable");
+    check(canSkipEventWaitByDependency(thread),
+          "unchanged scalar value may suppress pure wait resumption");
+
+    Variable* gate = target.lookupVariableById("gate");
+    gate->value = Value::num(1);
+    check(!canSkipEventWaitByDependency(thread),
+          "changed scalar value wakes the suspended condition");
+    gate->value = Value::num(0);
+    snapshotEventWaitDependency(thread, site);
+    check(canSkipEventWaitByDependency(thread),
+          "rearming records the new scalar snapshot");
+
+    target.variables.erase("gate");
+    check(!canSkipEventWaitByDependency(thread),
+          "deleted variable invalidates pointers before dereference");
+    target.variables.emplace("gate", Variable::create(
+        "gate", u"gate", Variable::kScalarType, false));
+    snapshotEventWaitDependency(thread, site);
+    check(canSkipEventWaitByDependency(thread),
+          "variable rebound after mutation yields a new safe snapshot");
+
+    sprite.blocks->resetCache();
+    check(!canSkipEventWaitByDependency(thread),
+          "edited source revision forces condition reevaluation");
+    snapshotEventWaitDependency(thread, site);
+    check(canSkipEventWaitByDependency(thread),
+          "fresh source revision permits safe dependency watching");
+
+    snapshotEventWaitDependency(thread, uintptr_t(0x1234));
+    check(!thread.eventWatchValid,
+          "unknown AOT block tokens never become watchable pointers");
+
+    // Time/random/other nondeterministic reporters must never be cached.
+    auto* expr = sprite.blocks->getBlock("eq");
+    expr->opcode = "sensing_timer";
+    sprite.blocks->resetCache();
+    snapshotEventWaitDependency(thread, site);
+    check(!thread.eventWatchValid,
+          "time-dependent predicates cannot suppress wait reevaluation");
+}
+
+void testMultipleVariableWaitDependency() {
+    Runtime rt;
+    Sprite sprite(&rt);
+    Target target(&rt, &sprite);
+    for (const char* id : {"first", "second"})
+        target.variables.emplace(id, Variable::create(
+            id, utf8ToU16(id), Variable::kScalarType, false));
+
+    Block wait;
+    wait.id = "wait";
+    wait.opcode = "control_wait_until";
+    wait.inputs.set("CONDITION", BlockInput{"eq", ""});
+    sprite.blocks->createBlock(std::move(wait));
+    Block eq;
+    eq.id = "eq";
+    eq.opcode = "operator_equals";
+    eq.inputs.set("OPERAND1", BlockInput{"readFirst", ""});
+    eq.inputs.set("OPERAND2", BlockInput{"readSecond", ""});
+    sprite.blocks->createBlock(std::move(eq));
+    for (const auto& [blockId, varId] : {
+             std::pair<const char*,const char*>{"readFirst", "first"},
+             {"readSecond", "second"}}) {
+        Block block;
+        block.id = blockId;
+        block.opcode = "data_variable";
+        block.fields["VARIABLE"] = BlockField{
+            Value::string(SStr::fromUtf8(varId)), varId};
+        sprite.blocks->createBlock(std::move(block));
+    }
+    Thread thread("wait");
+    thread.target = &target;
+    thread.blockContainer = sprite.blocks.get();
+    const uintptr_t site = reinterpret_cast<uintptr_t>(
+        sprite.blocks->getBlock("wait"));
+    snapshotEventWaitDependency(thread, site);
+    if (!eventWaitDependencyEnabled() || !multiVariableEventWaitEnabled()) {
+        check(!thread.eventWatchValid,
+              "two-variable wait keeps conservative fallback when opt-out");
+        return;
+    }
+    check(thread.eventWatchValid && thread.eventWatchAdditional &&
+          thread.eventWatchAdditional->count == 1,
+          "two distinct scalar variables are captured without aliasing");
+    check(canSkipEventWaitByDependency(thread),
+          "unchanged two-variable wait safely skips reevaluation");
+    Variable* a = target.lookupVariableById("first");
+    Variable* b = target.lookupVariableById("second");
+    a->value = Value::num(17);
+    check(!canSkipEventWaitByDependency(thread),
+          "first variable mutation wakes two-variable condition");
+    snapshotEventWaitDependency(thread, site);
+    check(canSkipEventWaitByDependency(thread),
+          "rearming remembers first variable mutation");
+    b->value = Value::string(SStr::create(u"17"));
+    check(!canSkipEventWaitByDependency(thread),
+          "second variable string-type mutation wakes condition");
+    snapshotEventWaitDependency(thread, site);
+    check(canSkipEventWaitByDependency(thread),
+          "watch snapshots all scalar Value bits, including strings");
+    target.variables.erase("second");
+    check(!canSkipEventWaitByDependency(thread),
+          "binding deletion invalidates watched pointers before access");
+    target.variables.emplace("second", Variable::create(
+        "second", u"second", Variable::kScalarType, false));
+    snapshotEventWaitDependency(thread, site);
+    check(canSkipEventWaitByDependency(thread),
+          "rebound second variable permits a fresh safe snapshot");
+    sprite.blocks->resetCache();
+    check(!canSkipEventWaitByDependency(thread),
+          "source revision mismatch invalidates multi-scalar dependency");
+    snapshotEventWaitDependency(thread, uintptr_t(0x1234));
+    check(!thread.eventWatchValid,
+          "unknown native/AOT site never validates multi-scalar pointers");
+    thread.releaseFinished();
+    check(!thread.eventWatchAdditional,
+          "finished thread releases optional multi-scalar snapshot storage");
 }
 
 void testFractionalLayerMovement() {
@@ -909,6 +1297,28 @@ void testFractionalLayerMovement() {
     rt.moveExecutable(upper, -std::numeric_limits<double>::infinity());
     check(rt.executableTargets[1] == upper,
           "negative infinity keeps sprite behind others but after stage");
+    // setExecutablePosition on a last element is the common clone-insertion
+    // case. Both optimized pop_back and legacy find/erase must preserve
+    // stage-first ordering, vector size, and general non-last moves.
+    Target* stage = rt.executableTargets.front();
+    const size_t targetCount = rt.executableTargets.size();
+    rt.setExecutablePosition(upper, INT_MAX);
+    check(rt.executableTargets.back() == upper,
+          "last-element positioning moves chosen sprite to the end");
+    rt.setExecutablePosition(upper, 0);
+    check(rt.executableTargets.front() == stage &&
+          rt.executableTargets[1] == upper,
+          "last-element insertion clamps behind stage at index 1");
+    Target* nonLast = rt.executableTargets[2];
+    rt.setExecutablePosition(nonLast, INT_MAX);
+    check(rt.executableTargets.back() == nonLast,
+          "non-last target still reorders through the standard path");
+    check(rt.executableTargets.size() == targetCount &&
+          std::count(rt.executableTargets.begin(),
+                     rt.executableTargets.end(), upper) == 1 &&
+          std::count(rt.executableTargets.begin(),
+                     rt.executableTargets.end(), nonLast) == 1,
+          "reordering does not duplicate or lose targets");
 }
 
 void testPool() {
@@ -962,6 +1372,12 @@ int test_scheduler_main() {
     testSharedYieldChain();
     testBroadcastYieldChain();
     testBroadcastReceiverReuse();
+    testShortBroadcastReadyCache();
+    testNonRestartBroadcastFanout();
+    testCloneMutationSchedulerAffinity();
+    testBroadcastAsciiNamespaceGuard();
+    testSingleVariableWaitDependency();
+    testMultipleVariableWaitDependency();
     testGraphicEffectsStorage();
     testBroadcastIndexInvalidation();
     testSelfBroadcastDoesNotRecycleActiveFiber();

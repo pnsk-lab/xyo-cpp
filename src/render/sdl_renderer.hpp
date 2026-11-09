@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <string>
@@ -12,6 +13,12 @@
 #include <vector>
 
 #include "../engine/runtime.hpp"
+#include "gl_effects.hpp"
+#include "gl_fsr_pen.hpp"
+#include "gl_upscale.hpp"
+#if defined(XYO_NVSDK_DLSS_VK) && defined(__linux__) && defined(XYO_HAVE_SDL2)
+#include "dlss_gl_pipeline.hpp"
+#endif
 
 struct SDL_Window;
 struct SDL_Renderer;
@@ -42,6 +49,25 @@ struct PenStats {
            drawMs = 0, presentMs = 0;
 };
 
+/// Optional per-frame renderer statistics, sampled only during xyo play
+/// profiling. Times are CPU wall-clock durations, not GPU timer queries.
+struct SpriteProfileRow {
+    std::string name;
+    double drawMs = 0;
+    uint64_t copies = 0;
+};
+
+struct RenderFrameStats {
+    double drawMs = 0, spriteMs = 0, backdropMs = 0, penMs = 0;
+    double monitorMs = 0, uiMs = 0, presentMs = 0;
+    double costumeDecodeMs = 0, effectBuildMs = 0, collisionMs = 0;
+    uint32_t sprites = 0, backdrops = 0, costumeDecodes = 0;
+    uint32_t effectBuilds = 0, effectHits = 0, textureUploads = 0;
+    uint32_t collisionCalls = 0;
+    uint32_t gpuEffectPasses = 0;
+    double gpuEffectMs = 0;
+};
+
 /// プロセス全体のペン層統計を返す（カウンタはリセットしない）。
 PenStats penStats();
 /// 統計をリセットする（ベンチの区間計測用）。
@@ -67,6 +93,17 @@ public:
     void setStageRect(const IRect& r);
     /// 現在のステージ矩形（renderer クライアント座標）。
     IRect stageRect() const { return stageRect_; }
+    /// TurboWarp's High Quality Pen: match the visible stage's pixel density.
+    /// Can be switched at runtime without erasing existing pen strokes.
+    void setHighQualityPen(bool enabled);
+    bool highQualityPen() const { return highQualityPen_; }
+    /// DLSS-equivalent: render stage content (backdrop / pen / sprites) at a
+    /// reduced internal resolution and reconstruct at display resolution with
+    /// a Catmull-Rom + temporal filter. 1.0 disables the path (legacy exact
+    /// rendering). Values are clamped to [0.25, 1.0].
+    void setRenderScale(double scale);
+    double renderScale() const { return renderScale_; }
+    std::pair<int, int> penResolution() const { return {penW_, penH_}; }
     /// 埋め込みモードか（自前ウィンドウなし）。
     bool embedded() const { return embedded_; }
     bool ok() const { return renderer_ != nullptr; }
@@ -83,11 +120,27 @@ public:
 
     /// SDL イベントを ioDevices/UI に流す。終了要求で false。
     bool pollEvents();
+    bool consumeHotSaveRequest() {
+        const bool value = hotSaveRequested_;
+        hotSaveRequested_ = false;
+        return value;
+    }
     /// 1 イベント分の処理（pollEvents の本体。テスト注入にも使用）
     bool handleEvent(const SDL_Event& ev);
     /// 現在のレンダーターゲットを PPM として保存（検証用）。
     bool savePPM(const char* path);
     void setTitle(const char* title);
+    /// Begin/end one opt-in profile interval surrounding Runtime::step().
+    void beginProfileFrame() {
+        frameProfile_ = {};
+        profileActive_ = true;
+    }
+    RenderFrameStats endProfileFrame() {
+        profileActive_ = false;
+        return frameProfile_;
+    }
+    /// Per-original-sprite cumulative rendering cost, clones aggregated.
+    std::vector<SpriteProfileRow> profileSprites() const;
     void setFrameCapture(std::function<void()> capture) {
         frameCapture_ = std::move(capture);
     }
@@ -118,6 +171,8 @@ public:
                  double x0, double y0, double x1, double y1) override;
     void penPoint(int skin, const float rgba[4], double diameter, double x,
                   double y) override;
+    bool capturePen(std::vector<uint8_t>& pixels) override;
+    bool restorePen(const std::vector<uint8_t>& pixels) override;
     void penClear(int skin) override;
     void penStamp(int skin, int drawableID) override;
     bool gpuExecParallel(gpu::ExecRequest& req) override;
@@ -129,6 +184,8 @@ private:
     struct Skin {
         SDL_Texture* tex = nullptr;
         std::vector<uint8_t> px;   // RGBA8（タッチ判定・スタンプ用に保持）
+        // Computed once on decoded PNG/SVG, including disk-cache hits.
+        bool hasIntrinsicTranslucency = false;
         int w = 0, h = 0;
         double scale = 1;          // テクスチャ px / 論理 px
         double rcx = 0, rcy = 0;   // 回転中心（論理 px）
@@ -142,6 +199,12 @@ private:
     };
     struct Drawable {
         int id = -1;
+        SDL_Texture* gpuEffectTexture = nullptr;
+        SDL_Texture* gpuEffectSource = nullptr;
+        int gpuEffectWidth = 0, gpuEffectHeight = 0;
+        std::string gpuEffectKey;
+        size_t gpuEffectBytes = 0;
+        uint64_t gpuEffectLastUsed = 0;
         Target* target = nullptr;
         std::string group = "sprite";
         double order = 0;
@@ -184,13 +247,15 @@ private:
     Drawable* drawableFor(int id);
     const Drawable* drawableFor(int id) const;
     void createDrawableForTarget(Target* t, const char* group);
+    void releaseGpuEffectTexture(Drawable& drawable);
+    void budgetGpuEffectTexture(const Drawable& drawable, size_t bytes);
     Skin* skinForTarget(Target* t);
     const Skin* skinForTarget(Target* t) const;
     Skin* decodeCostume(const Costume* c);
     static void freeSkin(Skin& s);
     /// ベーススキン + エフェクトの最終ビットマップを返す（base なら s を返却）
-    const Rendered* renderedFor(Target* t, const Skin* s,
-                                Rendered* out) const;
+    const Rendered* renderedFor(Target* t, const Skin* s, Rendered* out,
+                                const GraphicEffects* overrideFx = nullptr) const;
     // スプライトの変換パラメータ（stage 論理 px 座標系）
     struct DrawXform {
         double k;      // テクスチャ px → stage px
@@ -215,6 +280,10 @@ private:
 
     // --- 描画 ---
     void drawStageArea();
+    void drawStageContent();
+    void drawScaledStage();
+    void ensureStageTarget(int w, int h);
+    void releaseStageTarget();
     void drawDrawable(Drawable& d);
     void drawPenLayer();
     void drawBubble(Target* t);
@@ -228,6 +297,8 @@ private:
 
     // --- ペン（CPU ビットマップ + テクスチャ反映）---
     void penEnsure();
+    std::pair<int, int> desiredPenSize() const;
+    void penResizeIfNeeded();
     void penStroke(const float rgba[4], double diameter, double x0,
                    double y0, double x1, double y1);
     void penAppendRecord(const float rgba[4], float width, float x, float y,
@@ -317,11 +388,33 @@ private:
     SDL_Renderer* renderer_ = nullptr;
     bool embedded_ = false;   // initEmbedded: window_/renderer_ を所有しない
     std::function<void()> frameCapture_;
+    bool profileActive_ = false;
+    mutable RenderFrameStats frameProfile_{};
+    std::unordered_map<const Sprite*, SpriteProfileRow> spriteProfileTotals_;
     int stageW_ = 480, stageH_ = 360;
     int scale_ = 2;                  // 初期スケール
     IRect stageRect_;                // ウィンドウ内のステージ表示領域
 
+    // DLSS-equivalent internal-resolution rendering.
+    double renderScale_ = 1.0;       // 1.0 = legacy exact path
+    double renderSharpness_ = 0.35;  // unsharp mask strength
+    bool renderTemporal_ = true;     // reuse history when upscaling
+    std::unique_ptr<GlUpscale> glUpscale_;
+#if defined(XYO_NVSDK_DLSS_VK) && defined(__linux__) && defined(XYO_HAVE_SDL2)
+    bool realDlssEnabled_ = [] {
+        const char* env = std::getenv("XYO_DLSS_REAL");
+        return env && env[0] == '1';
+    }();
+    std::unique_ptr<render::DlssGlPipeline> glDlss_;
+#endif
+    SDL_Texture* stageTarget_ = nullptr;
+    int stageTargetW_ = 0, stageTargetH_ = 0;
+
     std::unordered_map<int, Drawable> drawables_;
+    std::unique_ptr<GlEffects> gpuEffects_;
+    size_t gpuEffectCacheBytes_ = 0;
+    size_t gpuEffectMaxBytes_ = size_t(256) * 1024 * 1024;
+    uint64_t gpuEffectClock_ = 0;
     int nextDrawableId_ = 1;
     std::unordered_map<const Costume*, std::unique_ptr<Skin>> skins_;
     // テキストテクスチャキャッシュ: (文字列,px,rgb) → texture
@@ -336,7 +429,23 @@ private:
     std::vector<uint8_t> penUploadPx_;
     int penW_ = 0, penH_ = 0;
     double penScale_ = 1.0;
+    bool highQualityPen_ = [] {
+        const char* env = std::getenv("XYO_HIGH_QUALITY_PEN");
+        return env && *env && !(env[0] == '0' && env[1] == '\0');
+    }();
+    // Display-only FidelityFX FSR 1 for the logical-resolution pen layer.
+    // Collision/stamp/storage remain at their native Scratch resolution.
+    bool penFsrEnabled_ = [] {
+        const char* env = std::getenv("XYO_PEN_FSR");
+        return env && env[0] == '1';
+    }();
+    bool penFsrRcas_ = [] {
+        const char* env = std::getenv("XYO_PEN_FSR_RCAS");
+        return env && env[0] == '1';
+    }();
+    std::unique_ptr<GlFsrPen> glPenFsr_;
     SDL_Texture* penTex_ = nullptr;
+    bool hotSaveRequested_ = false;
     bool penDirty_ = false;
     int penSkinId_ = -1;
     struct PenKernel {
@@ -361,6 +470,7 @@ private:
     void* sdlGlCtx_ = nullptr;   // SDL_GLContext
     bool initGlPen();
     bool penGpu() const;
+    bool penStampGpu(const Drawable& drawable, const Skin& skin);
     void penFlushGpu();          // バッチを FBO へ描画（readback 無し）
     void penSyncCpu(bool forceReadback = false); // force is for GPU rollback tests
     void penStrokeGpu(const float rgba[4], float width,

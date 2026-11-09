@@ -2,6 +2,7 @@
 // status の数値は ABI 契約（JIT 生成コードが直接参照）。
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -20,7 +21,10 @@ struct BlockCached;
 struct Blocks;
 struct Fiber;
 struct JitCtx;
+namespace ir { class NativeProcedureFrameSession; }
+
 struct Runtime;
+namespace ir { struct NumericThreadSession; }
 class Thread;
 using ScriptFn = void (*)(JitCtx*);
 
@@ -119,6 +123,19 @@ struct StackFrame {
 /// Thread — 実行中スタックコンテキスト。
 struct AccessSet;
 
+// Optional per-Thread cache of nested-WASM scalar variable bindings.
+// The runtime supplies structural generation stamps for local/stage
+// VariableMap changes (including clone/editor replacement). This is
+// allocated only by the explicit nested WASM experiment.
+struct NestedWasmBindingCache {
+    uint64_t codeIdentity = 0;
+    const Target* target = nullptr;
+    const Target* stage = nullptr;
+    uint64_t localGeneration = 0;
+    uint64_t stageGeneration = 0;
+    std::vector<Variable*> variables;
+};
+
 class Thread {
 public:
     explicit Thread(std::string firstBlock);
@@ -148,6 +165,15 @@ public:
     // Distinguish "condition stayed false" from "left this wait and
     // returned to the very same wait site" within one scheduler slice.
     uint64_t eventWaitExitCount = 0;
+    // Optional pure wait-until single-variable dependency snapshot. Only
+    // read eventWatchVariable after source and binding generations match.
+    bool eventWatchValid = false;
+    const Variable* eventWatchVariable = nullptr;
+    uint64_t eventWatchBits = 0;
+    uint64_t eventWatchSourceRevision = 0;
+    const Target* eventWatchStage = nullptr;
+    uint64_t eventWatchLocalGeneration = 0;
+    uint64_t eventWatchStageGeneration = 0;
     // Validated against Runtime::threads before use; public vector edits may
     // invalidate this hint, in which case membership falls back to a scan.
     mutable size_t runtimeIndex = SIZE_MAX;
@@ -166,7 +192,37 @@ public:
     /// ブロック数の記録先）。tryCompile で解決する。
     const Block* topBlockPtr = nullptr;
     bool triedToCompile = false;
+    // Set before the first interpreted Scratch block is evaluated. OSR
+    // switches a started thread only at a verified loop-head checkpoint.
+    bool interpreterStarted = false;
+    // Optional cooperative async JIT warmup deadline. Zero means that the
+    // thread has not yet been deferred. This is reset on Thread recycling.
+    double asyncJitWarmupDeadlineMs = 0.0;
+    bool osrActive = false;
+    double osrRemaining = 0.0;
+    // Browser WebAssembly single-top-level repeat continuation. 0: prefix,
+    // 1: body, 2: suffix. Resets with Thread reconstruction and retirement.
+    uint8_t wasmLoopPhase = 0;
+    uint32_t wasmLoopIndex = 0;
+    double wasmLoopRemaining = 0.0;
+    // Index of the next compiled/interpreted region in the hybrid script.
+    // It survives scheduler yields but resets with recycled Scratch threads.
+    uint32_t wasmRegionIndex = 0;
+    // Scratch-value staging area reused across WASM loop invocations to
+    // avoid two heap allocations per scheduler checkpoint.
+    std::vector<uint64_t> wasmSlotBits;
+    // Optional, explicitly attached shared-IR continuation. This is not
+    // enabled by default or inferred from normal Scratch JIT compilation.
+    std::unique_ptr<ir::NumericThreadSession> numericSession;
+    // Opt-in LLVM native procedure-frame mirror. Independent of normal
+    // Fiber execution, survives scheduler yields, never owns GC pointers.
+    std::unique_ptr<ir::NativeProcedureFrameSession> nativeProcedureFrames;
     bool isCompiled = false;
+    // One-shot permission to attempt a nested WASM dispatch from the next
+    // interpreter execute(). It is consumed before evaluating any primitive,
+    // preventing reentrant callbacks from silently crossing checkpoints.
+    bool nestedWasmEligible = false;
+    std::unique_ptr<NestedWasmBindingCache> nestedWasmBindings;
     // True only for a JIT non-waiting broadcast receiver. Such a Thread*
     // is never handed back to a broadcast-and-wait caller as a join handle.
     bool reusableBroadcastReceiver = false;
@@ -191,7 +247,20 @@ public:
     const AccessSet* accessCache = nullptr;
     bool accessResolved = false;
     uint32_t accessGen = 0;
-
+    // Append-only: all previously emitted JIT field offsets are unchanged.
+    bool nestedOsrActive = false;
+    // Optional mark-epoch for Thread reclamation graph closure. This is
+    // NOT a GC mark, native ABI field, or script-visible state.
+    uint64_t reclaimRetentionEpoch = 0;
+    // Only allocated for native pure wait-until predicates with 2-4
+    // independent scalar dependencies. The common one-variable watcher
+    // remains allocation-free; appended storage preserves JIT ABI offsets.
+    struct AdditionalWaitDependencies {
+        std::array<const Variable*, 3> variables{};
+        std::array<uint64_t, 3> bits{};
+        uint8_t count = 0;
+    };
+    std::unique_ptr<AdditionalWaitDependencies> eventWatchAdditional;
     static std::string getIdFromTargetAndBlock(const Target* target,
                                              const std::string& topBlock);
     /// target.id&topBlock — target セット後は不変なので遅延キャッシュ

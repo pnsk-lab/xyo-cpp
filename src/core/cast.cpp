@@ -1,5 +1,6 @@
 // xyo-cpp: util/cast.js の移植。
 #include "cast.hpp"
+#include "../ir/value_abi.hpp"
 
 #include <cmath>
 #include <cstdlib>
@@ -36,6 +37,65 @@ bool isNotActuallyZero(Value v) {
     return strIsNotActuallyZero(v.asStrPtr());
 }
 
+// The state-dependent part of String -> Number is kept in one place for
+// interpreter and JIT. Called only when the caller saw numState == 0.
+// Concurrent publishers are safe because immutable SStr contents produce
+// identical values; publishNumCache performs release/acquire synchronization.
+static double parseNumberStringUncachedRaw(SStr* s) {
+    // Numeric strings consisting of one ASCII digit need neither UTF-16
+    // flattening nor the general ECMAScript parser. Publish the same state
+    // (1 = genuinely numeric, including "0") as the generic path.
+    if (s->len == 1 || s->len == 2) {
+        // Flat strings store UTF-16 directly after the SStr header. Avoid
+        // a non-inlined unitAt() call in the overwhelmingly common case;
+        // composite strings still use unitAt() to avoid materialization.
+        const bool flat = !s->isComposite() && !s->isLatin1();
+        const char16_t* body = flat ? s->inlineBody() : nullptr;
+        const char16_t first = flat ? body[0] : s->unitAt(0);
+        if (s->len == 1) {
+            if (first >= u'0' && first <= u'9') {
+                const double d = static_cast<double>(first - u'0');
+                s->publishNumCache(d, 1);
+                return d;
+            }
+            // All other one-unit strings are either ECMAScript whitespace
+            // (numeric zero) or invalid numeric literals. Keep Scratch's
+            // historical numState distinction: TAB has numeric state 1,
+            // other whitespace state 3, and invalid strings state 2.
+            if (jsnum::isStrWhiteSpace(first)) {
+                s->publishNumCache(0.0, first == u'\t' ? 1u : 3u);
+                return 0.0;
+            }
+            const double invalid = std::numeric_limits<double>::quiet_NaN();
+            s->publishNumCache(invalid, 2);
+            return invalid;
+        }
+        if (s->len == 2 && (first == u'+' || first == u'-')) {
+            const char16_t second = flat ? body[1] : s->unitAt(1);
+            if (second >= u'0' && second <= u'9') {
+                const double magnitude = static_cast<double>(second - u'0');
+                const double result = first == u'-' ? -magnitude : magnitude;
+                s->publishNumCache(result, 1);
+                return result;
+            }
+        }
+    }
+    double d = jsnum::toNumber(s->view());
+    uint32_t state;
+    if (std::isnan(d)) state = 2;
+    else if (d == 0 && strIsNotActuallyZero(s)) state = 3;
+    else if (std::isinf(d) && isInfinityLiteral(s->view()))
+        state = 4;
+    else state = 1;
+    s->publishNumCache(d, state);
+    return state == 2 ? std::numeric_limits<double>::quiet_NaN() : d;
+}
+
+double parseNumberStringUncached(SStr* s) {
+    double d = parseNumberStringUncachedRaw(s);
+    return std::isnan(d) ? 0.0 : d;
+}
+
 /// Number(v) 相当（NaN を潰さない内部版）
 static double numberOrNaNImpl(Value v) {
     if (v.isNumber()) return v.asNumberUnchecked();
@@ -50,15 +110,7 @@ static double numberOrNaNImpl(Value v) {
         //   state2 になるが文字列比較では等しい — state ショートカット
         //   で誤って非等値にしないため別 state にする）
         uint32_t state = s->loadNumState();
-        if (state == 0) {
-            double d = jsnum::toNumber(s->view());
-            if (std::isnan(d)) state = 2;
-            else if (d == 0 && strIsNotActuallyZero(s)) state = 3;
-            else if (std::isinf(d) && isInfinityLiteral(s->view()))
-                state = 4;
-            else state = 1;
-            s->publishNumCache(d, state);
-        }
+        if (state == 0) return parseNumberStringUncachedRaw(s);
         return state == 2
                    ? std::numeric_limits<double>::quiet_NaN()
                    : s->loadNumCache();
@@ -73,6 +125,10 @@ static double numberOrNaNImpl(Value v) {
 double toNumberOrNaN(Value v) { return numberOrNaNImpl(v); }
 
 double toNumber(Value v) {
+    // Fast immediate tags are shared with LLVM/WASM's scratch-value ABI.
+    // Heap strings retain the existing UTF-16 numeric cache/parser.
+    const auto immediate = ir::toNumberImmediate(v.bits);
+    if (!immediate.needsStringParse) return immediate.value;
     double n = numberOrNaNImpl(v);
     return std::isnan(n) ? 0.0 : n;
 }
@@ -139,8 +195,13 @@ SStr* const* smallIntTable() {
         Gc::get().addRootProvider(g_smallInts, [](Gc& g) {
             for (SStr* s : g_smallInts) g.markPtr(s);
         });
-        for (int i = kSmallIntMin; i <= kSmallIntMax; ++i)
-            g_smallInts[i - kSmallIntMin] = sstrFromAscii(std::to_string(i));
+        for (int i = kSmallIntMin; i <= kSmallIntMax; ++i) {
+            SStr* str = sstrFromAscii(std::to_string(i));
+            // A cached integer string has a known numeric meaning; avoid
+            // running the cold parser the first time Scratch reads it back.
+            str->publishNumCache(static_cast<double>(i), 1);
+            g_smallInts[i - kSmallIntMin] = str;
+        }
         return g_smallInts;
     }();
     return table;
@@ -161,7 +222,16 @@ SStr* smallIntString(double d) {
 // cache states as numberOrNaNImpl without parsing the freshly formatted text.
 static SStr* numberToString(double d) {
     if (SStr* cached = smallIntString(d)) return cached;
+#if defined(XYO_NUM_TO_STR_DIRECT_BUFFER)
+    // The number is formatted once into an on-stack buffer and copied
+    // directly into the GC-owned UTF-16 string. Avoid an intermediate
+    // std::string allocation for 16+ byte decimal representations.
+    char buffer[64];
+    const size_t length = jsnum::toChars(d, buffer);
+    SStr* s = sstrFromAscii(std::string_view(buffer, length));
+#else
     SStr* s = sstrFromAscii(jsnum::toString(d));
+#endif
     const uint32_t state = std::isnan(d) ? 2 : (std::isinf(d) ? 4 : 1);
     const double parsed = std::isnan(d)
         ? std::numeric_limits<double>::quiet_NaN()
@@ -209,27 +279,49 @@ Value toStringValue(Value v) {
     return Value::emptyStr();
 }
 
+// Scratch comparisons use numeric ordering only for valid numeric operands.
+// numState already records whether a parsed string's zero is lexical
+// (state 3), so checking it avoids an O(length) rescan on *every* compare.
+// Keep this separate from toNumber: arithmetic deliberately treats states
+// 2/3 as zero, whereas comparisons must fall back to case-folded text.
+static bool numericCompareOperand(Value v, double& n) {
+    if (v.isNumber()) {
+        n = v.asNumberUnchecked();
+        return !std::isnan(n);
+    }
+    if (v.isBool()) {
+        n = v.asBool() ? 1.0 : 0.0;
+        return true;
+    }
+    if (!v.isString()) return false;
+    SStr* s = v.asStrPtr();
+    if (!s) return false; // The empty string is a lexical zero, not numeric.
+    uint32_t state = s->loadNumState();
+    if (state == 0) {
+        // Preserve the single shared parser and release/acquire num-cache.
+        (void)parseNumberStringUncachedRaw(s);
+        state = s->loadNumState();
+    }
+    if (state != 1 && state != 4) return false;
+    n = s->loadNumCache();
+    return true;
+}
+
 double compare(Value v1, Value v2) {
-    double n1 = numberOrNaNImpl(v1);
-    double n2 = numberOrNaNImpl(v2);
-    if (n1 == 0 && isNotActuallyZero(v1)) {
-        n1 = std::numeric_limits<double>::quiet_NaN();
-    } else if (n2 == 0 && isNotActuallyZero(v2)) {
-        n2 = std::numeric_limits<double>::quiet_NaN();
+    // Identical boxed values, even canonical NaN, compare equal in Scratch:
+    // NaN falls back to comparing the same "NaN" text.
+    if (v1.bits == v2.bits) return 0.0;
+
+    double n1 = 0.0, n2 = 0.0;
+    const bool numeric1 = numericCompareOperand(v1, n1);
+    const bool numeric2 = numericCompareOperand(v2, n2);
+    if (numeric1 && numeric2) {
+        // Subtracting two equal infinities would produce NaN; Scratch's
+        // original Cast.compare explicitly treats those pairs as equal.
+        if (n1 == n2 && std::isinf(n1)) return 0.0;
+        return n1 - n2;
     }
-    if (std::isnan(n1) || std::isnan(n2)) {
-        // 小文字化文字列比較
-        SStr* s1 = toString(v1);
-        SStr* s2 = toString(v2);
-        return compareStringsCaseInsensitive(s1, s2);
-    }
-    if ((n1 == std::numeric_limits<double>::infinity() &&
-         n2 == std::numeric_limits<double>::infinity()) ||
-        (n1 == -std::numeric_limits<double>::infinity() &&
-         n2 == -std::numeric_limits<double>::infinity())) {
-        return 0;
-    }
-    return n1 - n2;
+    return compareStringsCaseInsensitive(toString(v1), toString(v2));
 }
 
 bool isInt(Value v) {

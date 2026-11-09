@@ -23,6 +23,7 @@ CASES = {
     # All equivalence transformations below depend on these kernels' domains.
     # They are diagnostic counterfactuals, NOT general Scratch rewrite rules.
     "primes": ("algo_primes", 600, None),
+    "sieve": ("algo_sieve", 5000, None),
     "primes_divfloor": ("algo_primes", 600, "divfloor"),
     "primes_cmp_mod": ("algo_primes", 600, "cmp_mod"),
     "primes_cmp_flag": ("algo_primes", 600, "cmp_flag"),
@@ -33,12 +34,19 @@ CASES = {
     "join": ("str_join", 20000, None),
     "join_batch4": ("str_join", 20000, "batch4"),
     "raycast": ("app_raycast", 320, None),
+    "life": ("app_life", 1, None),
     "raycast_geom": ("app_raycast", 320, "geom"),
     "raycast_truthy": ("app_raycast", 320, "truthy"),
     "raycast_zero_truthy": ("app_raycast", 320, "truthy"),
     "raycast_all_truthy": ("app_raycast", 320, "truthy"),
+    "clonechurn": ("sched_clonechurn", 1, None),
     "waituntil": ("sched_waituntil", 1, None),
+    "looptick": ("sched_looptick", 1, None),
     "threads": ("sched_threads", 1, None),
+    "pingpong": ("sched_pingpong", 1, None),
+    "fanwait": ("sched_fanwait", 1, None),
+    "fanout": ("sched_fanout", 1, None),
+    "list_append": ("list_append", 10000, None),
 }
 
 def build(name):

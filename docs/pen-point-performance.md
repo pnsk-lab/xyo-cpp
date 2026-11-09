@@ -61,8 +61,8 @@ export XYO_SEED=1
 unset XYO_PROF XYO_PENPROF XYO_PENLOG XYO_PENTRACE XYO_PENSKIP XYO_PEN_POINT_GENERIC
 
 # 同一バイナリで交互に複数回。起動と10 active framesを除外する。
-XYO_PEN_POINT_GENERIC=1 build/tests/xyo-pen-bench --project 3D2.sb3 --frames 30
-build/tests/xyo-pen-bench --project 3D2.sb3 --frames 30
+XYO_PEN_POINT_GENERIC=1 build/tests/xyo-pen-bench --project debug/projects/3D2.sb3 --frames 30
+build/tests/xyo-pen-bench --project debug/projects/3D2.sb3 --frames 30
 
 # --project は3D2用のクリックと >100000 strokes/step の活動判定を使う。
 # 他作品一般のベンチマークではない。

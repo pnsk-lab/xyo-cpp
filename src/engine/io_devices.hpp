@@ -21,6 +21,7 @@ public:
     explicit Clock(Runtime* rt);
     double projectTimer() const;
     void resetProjectTimer();
+    void restoreProjectTimer(double elapsedSeconds);
     void pause();
     void resume();
 private:

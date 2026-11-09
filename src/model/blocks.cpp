@@ -292,11 +292,30 @@ BlockCached* Blocks::getCachedExecute(const std::string& blockId) {
     self->id = block->id;
     self->nextBlockId = block->next;
     self->opcode = block->opcode;
+    self->nestedWasmWarpCandidate =
+        self->opcode == "control_repeat" ||
+        self->opcode == "control_repeat_until" ||
+        self->opcode == "control_while" ||
+        self->opcode == "control_for_each";
+    self->nestedWasmCandidate =
+        self->nestedWasmWarpCandidate ||
+        self->opcode == "data_setvariableto" ||
+        self->opcode == "data_changevariableby" ||
+        self->opcode == "data_addtolist" ||
+        self->opcode == "data_replaceitemoflist" ||
+        self->opcode == "data_insertatlist" ||
+        self->opcode == "data_deleteoflist" ||
+        self->opcode == "data_deletealloflist" ||
+        self->opcode == "control_if" ||
+        self->opcode == "control_if_else";
     self->fields = block->fields;
     // getInputs: SUBSTACK* を除くコピー
     const InputSet* ins = getInputs(block);
     if (ins) self->inputs = *ins;
-    self->mutation = getMutation(block);
+    if (const Mutation* mutation = getMutation(block)) {
+        self->ownedMutation = *mutation;
+        self->mutation = &*self->ownedMutation;
+    }
     self->argValues.mutation = self->mutation;
 
     self->isHat = runtime->getIsHat(self->opcode);
@@ -429,10 +448,14 @@ void Blocks::restoreState(std::unordered_map<std::string, Block> blocks,
 }
 
 void Blocks::resetCache() {
+    revision_ = nextRevision_.fetch_add(1, std::memory_order_relaxed);
     if (runtime) runtime->invalidateBroadcastIndex();
     cache_.inputs.clear();
     cache_.procedureDefinitions.clear();
     cache_.procedurePrototypes.clear();
+    if (!cache_.executeCached.empty())
+        cache_.retiredExecuteCached.push_back(
+            std::move(cache_.executeCached));
     cache_.executeCached.clear();
     cache_.scripts.clear();
     cache_.monitored.reset();

@@ -20,15 +20,7 @@
 
 #if defined(__EMSCRIPTEN__)
 
-/// 生成コードから呼ばれるヘルパディスパッチャ。
-/// JS ブリッジが `Module['_xyo_wasm_h']` として env.h に渡す。
-extern "C" int xyo_wasm_h(int id, int a, int b) {
-    switch (id) {
-        case 1: return a + b;
-        case 2: return a * b;
-        default: return 0;
-    }
-}
+// Runtime helper dispatch lives in host_helpers.cpp.
 
 #endif
 

@@ -247,6 +247,71 @@ State run(const Spec& s, JitMode mode, bool memo,
     out.insert(out.end(), actualRaw.begin(), actualRaw.end());
     return out;
 }
+// Exercise a real compiled list-read loop while the backing storage changes
+// during a scheduler yield. Compare logical states with the interpreter.
+State runAdaptiveEpochTransition(JitMode mode, bool promoteBeforeStart) {
+    setJitMode(mode);
+    Runtime rt;
+    Spec spec{"adaptive epoch interleave", {}, 140};
+    const bool ok = loadSb3(rt, project(spec, ListMutation::Replace), nullptr).ok;
+    check(ok && rt.targets.size() == 1, "adaptive epoch fixture loaded");
+    if (!ok || rt.targets.size() != 1) return {};
+    Target* t = rt.targets[0];
+    SList* list = t->lookupVariableById("L")->list;
+    check(list != nullptr, "adaptive epoch fixture list exists");
+    if (!list) return {};
+    for (int i = 0; i < 512; ++i)
+        list->push(Value::numCanonical(double((i % 11) + 1)));
+    const auto promote = [&] {
+        for (int i = 0; i < 32; ++i) {
+            list->insert0(64, Value::numCanonical(double(50 + i)));
+            list->erase0(65);
+        }
+    };
+    if (promoteBeforeStart) promote();
+    const uint64_t initialEpoch = list->storageEpoch;
+    rt.greenFlag();
+    check(rt.threads.size() == 1, "adaptive epoch reader started");
+    if (rt.threads.size() != 1) return {};
+    Thread* reader = rt.threads[0];
+#ifdef XYO_JIT
+    if (mode == JitMode::Eager)
+        check(reader->isCompiled, "adaptive epoch reader compiled");
+#endif
+    rt.sequencer->timer.start();
+    rt.sequencer->stepThread(*reader);
+    check(reader->status != STATUS_DONE && !reader->stack.empty(),
+          "adaptive epoch reader suspended between reads");
+    if (reader->status == STATUS_DONE || reader->stack.empty()) return {};
+
+    // Cover both epoch paths:
+    // (1) a list becomes gap while the JIT is suspended;
+    // (2) the JIT begins its first read with an already non-flat list.
+    if (!promoteBeforeStart) promote();
+    check(list->extra != nullptr && list->adaptiveBackend == 5,
+          "native edits promote list to gap");
+    check(promoteBeforeStart || list->storageEpoch > initialEpoch,
+          "interleaved promotion invalidates cached items");
+    const uint64_t promotedEpoch = list->storageEpoch;
+    Gc::get().collect();
+    rt.runUntilDone(4000);
+    check(rt.threads.empty(), "adaptive epoch reader finished");
+    if (mode == JitMode::Eager) {
+        check(list->isContiguous(),
+              "adaptive JIT demotes after repeated helper reads");
+        check(list->storageEpoch > promotedEpoch,
+              "JIT demotion invalidates cached gap representation");
+    } else if (list->extra) {
+        // The interpreter's direct get0 path does not count adaptive reads.
+        list->makeContiguous();
+    }
+    State result;
+    for (const char* id : {"sum", "last", "matches", "i"})
+        result.push_back(encode(t->lookupVariableById(id)->value));
+    for (uint32_t i = 0; i < list->len; ++i)
+        result.push_back(encode(list->get0(i)));
+    return result;
+}
 void compare(const Spec& s, ListMutation mutation = ListMutation::None, bool collect = false) {
     const State interp = run(s, JitMode::Off, false, mutation, collect);
     const State disabled = run(s, JitMode::Eager, false, mutation, collect);
@@ -303,6 +368,16 @@ int test_list_read_memo_main() {
         }
         check(!states[0].empty() && states[1] == states[0], "writer/GC memo-disabled JIT matches interp");
         check(!states[0].empty() && states[2] == states[0], "writer/GC memo-enabled JIT matches interp");
+    }
+    if (xyo_list_storage_mode == 7) {
+        for (bool alreadyPromoted : {false, true}) {
+            const State interp =
+                runAdaptiveEpochTransition(JitMode::Off, alreadyPromoted);
+            const State eager =
+                runAdaptiveEpochTransition(JitMode::Eager, alreadyPromoted);
+            check(!interp.empty() && eager == interp,
+                  "adaptive epoch JIT matches interpreter across GC and transitions");
+        }
     }
     setJitMode(saved);
     std::printf("list read memo: %d checks, %d failures\n", checks, failures);

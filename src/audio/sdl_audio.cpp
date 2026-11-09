@@ -12,6 +12,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 
 // M_PI は ISO C++ 標準ではない（mingw の <cmath> では未定義）
@@ -48,12 +50,30 @@ bool SdlAudioBank::init(Runtime& rt) {
         if (t->sprite) t->sprite->soundBank = this;
     rt_->audioEngine = this;
     rt_->onProjectStopped = [this] { stopAll(); };
+    // Never decode a multi-minute MP3 on the render thread. The audio
+    // callback only reads immutable Samples published by update().
+    // Explicit opt-out preserves the synchronous path for comparisons.
+    const char* sync = std::getenv("XYO_AUDIO_SYNC");
+    asyncDecode_ = dev_ && !(sync && sync[0] == '1');
+    if (asyncDecode_) decoder_ = std::thread(&SdlAudioBank::decoderLoop, this);
     return true;
 }
 
 SdlAudioBank::~SdlAudioBank() { shutdown(); }
 
 void SdlAudioBank::shutdown() {
+    if (decoder_.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(decoderMutex_);
+            decoderStop_ = true;
+            decodeQueue_.clear();
+        }
+        decoderCv_.notify_one();
+        decoder_.join(); // Sound data remains valid until the worker exits.
+    }
+    pendingVoices_.clear();
+    decoding_.clear();
+    decodeReady_.clear();
     if (dev_) {
         SDL_CloseAudioDevice(dev_);
         dev_ = 0;
@@ -136,17 +156,33 @@ bool SdlAudioBank::decodeSound(const Sound& s, Sample& out) {
     return false;
 }
 
-const SdlAudioBank::Sample* SdlAudioBank::sampleFor(Target* t,
-                                                  int soundId) {
+const Sound* SdlAudioBank::soundFor(Target* t, int soundId) const {
     if (!t || !t->sprite || soundId < 0 ||
         soundId >= static_cast<int>(t->sprite->sounds.size()))
         return nullptr;
-    const Sound* s = &t->sprite->sounds[soundId];
+    return &t->sprite->sounds[soundId];
+}
+
+const SdlAudioBank::Sample* SdlAudioBank::sampleFor(Target* t,
+                                                  int soundId) {
+    const Sound* s = soundFor(t, soundId);
+    if (!s) return nullptr;
     auto it = decoded_.find(s);
     if (it != decoded_.end()) return &it->second;
     if (decodeFailed_.count(s)) return nullptr;
     Sample smp;
-    if (!decodeSound(*s, smp)) {
+    const bool timing = std::getenv("XYO_AUDIOPROF") != nullptr;
+    const auto t0 = timing ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+    const bool ok = decodeSound(*s, smp);
+    if (timing) {
+        const double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        std::fprintf(stderr, "[audioprof] decode %s bytes=%zu pcm=%zu %.3fms %s\n",
+                     SStr::toUtf8(s->name).c_str(), s->data.size(),
+                     smp.pcm.size() * sizeof(float), ms, ok ? "ok" : "failed");
+    }
+    if (!ok) {
         decodeFailed_[s] = true;
         return nullptr;
     }
@@ -155,27 +191,235 @@ const SdlAudioBank::Sample* SdlAudioBank::sampleFor(Target* t,
 
 // ------------------------------------------------------------- 再生 ----
 
+namespace {
+bool audioWaiterIsLive(Runtime* rt, Thread* wait) {
+    // A stopped script may have been recycled while the worker was
+    // decoding. Check pointer identity *before* inspecting Thread fields.
+    if (!rt || !wait ||
+        std::find(rt->threads.begin(), rt->threads.end(), wait) ==
+            rt->threads.end())
+        return false;
+    return wait->status == STATUS_PROMISE_WAIT ||
+           wait->status == STATUS_YIELD_TICK;
+}
+} // namespace
+
+void SdlAudioBank::decoderLoop() {
+    for (;;) {
+        const Sound* source = nullptr;
+        {
+            std::unique_lock<std::mutex> lock(decoderMutex_);
+            decoderCv_.wait(lock, [this] {
+                return decoderStop_ || !decodeQueue_.empty();
+            });
+            if (decoderStop_) return;
+            source = decodeQueue_.front();
+            decodeQueue_.pop_front();
+        }
+
+        DecodeResult result;
+        result.sound = source;
+        const bool timing = std::getenv("XYO_AUDIOPROF") != nullptr;
+        const auto start = std::chrono::steady_clock::now();
+        result.ok = decodeSound(*source, result.sample);
+        if (timing) {
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count();
+            std::fprintf(stderr,
+                "[audioprof] async decode %s bytes=%zu pcm=%zu %.3fms %s\n",
+                SStr::toUtf8(source->name).c_str(), source->data.size(),
+                result.sample.pcm.size() * sizeof(float), ms,
+                result.ok ? "ok" : "failed");
+        }
+        {
+            std::lock_guard<std::mutex> lock(decoderMutex_);
+            if (decoderStop_) return;
+            decodeReady_.push_back(std::move(result));
+        }
+    }
+}
+
+// Main-thread only: take a snapshot of volatile Scratch target state.
+// The SDL callback must never dereference Target or its soundEffects map.
+void SdlAudioBank::snapshotVoice(Voice& v) const {
+    if (!v.t || !v.s) return;
+    const Target& t = *v.t;
+    const double volume = std::clamp(t.volume, 0.0, 100.0) / 100.0;
+    double pitch = 0.0, pan = 0.0;
+    if (const auto it = t.soundEffects.find("pitch");
+        it != t.soundEffects.end()) pitch = it->second;
+    if (const auto it = t.soundEffects.find("pan");
+        it != t.soundEffects.end()) pan = it->second;
+
+    v.step = (v.s->rate / double(outRate_)) * std::pow(2.0, pitch / 120.0);
+    const double p = (std::clamp(pan, -100.0, 100.0) + 100.0) / 200.0;
+    v.gainL = std::cos(p * M_PI / 2) * volume;
+    v.gainR = std::sin(p * M_PI / 2) * volume;
+}
+
+void SdlAudioBank::requestSound(Target* t, int soundId, Thread* wait) {
+    if (!dev_) {
+        if (audioWaiterIsLive(rt_, wait))
+            resolveWait(*rt_->sequencer, *wait, Value::undefined());
+        return;
+    }
+    const Sound* source = soundFor(t, soundId);
+    if (!source) {
+        if (audioWaiterIsLive(rt_, wait))
+            resolveWait(*rt_->sequencer, *wait, Value::undefined());
+        return;
+    }
+    auto existing = decoded_.find(source);
+    if (existing != decoded_.end()) {
+        Voice voice{&existing->second, 0, t, wait, source};
+        snapshotVoice(voice);
+        SDL_LockAudioDevice(dev_);
+        voices_.push_back(voice);
+        SDL_UnlockAudioDevice(dev_);
+        return;
+    }
+    if (decodeFailed_.count(source)) {
+        if (audioWaiterIsLive(rt_, wait))
+            resolveWait(*rt_->sequencer, *wait, Value::undefined());
+        return;
+    }
+    // Small sound effects should start immediately. A worker-only path
+    // would add up to one full frame of latency even for a 0.05 ms WAV.
+    // Long WAVs and music/MP3s are decoded off the render thread.
+    const bool smallSound = source->dataFormat == "wav"
+        ? source->data.size() <= 1024 * 1024
+        : source->data.size() <= 64 * 1024;
+    const bool forceAsync = std::getenv("XYO_AUDIO_ASYNC_ALL") != nullptr;
+    if (!asyncDecode_ || (smallSound && !forceAsync)) {
+        const Sample* s = sampleFor(t, soundId);
+        if (s) {
+            Voice voice{s, 0, t, wait, source};
+            snapshotVoice(voice);
+            SDL_LockAudioDevice(dev_);
+            voices_.push_back(voice);
+            SDL_UnlockAudioDevice(dev_);
+        } else if (audioWaiterIsLive(rt_, wait)) {
+            resolveWait(*rt_->sequencer, *wait, Value::undefined());
+        }
+        return;
+    }
+    // Queued voices retain their original request order. The decoder
+    // never touches live Target/Thread pointers or the SDL audio callback.
+    pendingVoices_.push_back({source, t, wait});
+    if (decoding_.insert(source).second) {
+        {
+            std::lock_guard<std::mutex> lock(decoderMutex_);
+            decodeQueue_.push_back(source);
+        }
+        decoderCv_.notify_one();
+    }
+}
+
 void SdlAudioBank::playSound(Target* t, int soundId) {
-    if (!dev_) return;   // デバイス無しではボイスが完了しない
-    const Sample* s = sampleFor(t, soundId);
-    if (std::getenv("XYO_DEBUG"))
-        std::fprintf(stderr, "[audio] play id=%d %s\n", soundId,
-                     s ? "ok" : "decode-fail");
-    if (!s) return;
-    SDL_LockAudioDevice(dev_);
-    voices_.push_back({s, 0, t, nullptr});
-    SDL_UnlockAudioDevice(dev_);
+    requestSound(t, soundId, nullptr);
 }
 
 void SdlAudioBank::playSoundAndWait(Target* t, int soundId, Thread* th) {
-    const Sample* s = dev_ ? sampleFor(t, soundId) : nullptr;
-    if (!s) {   // 再生不可なら即座に解決して待ち続けさせない
-        if (rt_ && rt_->isWaitingThread(th))
-            resolveWait(*rt_->sequencer, *th, Value::undefined());
-        return;
-    }
+    requestSound(t, soundId, th);
+}
+
+std::vector<SoundPlaybackState> SdlAudioBank::captureActiveSounds() {
+    std::vector<SoundPlaybackState> state;
     if (dev_) SDL_LockAudioDevice(dev_);
-    voices_.push_back({s, 0, t, th});
+    for (const Voice& voice : voices_) {
+        if (!voice.t || !voice.t->sprite || !voice.sound) continue;
+        const auto& sounds = voice.t->sprite->sounds;
+        for (size_t i = 0; i < sounds.size(); ++i)
+            if (&sounds[i] == voice.sound) {
+                state.push_back({voice.t, voice.wait, int(i), voice.pos, false});
+                break;
+            }
+    }
+    if (dev_) SDL_UnlockAudioDevice(dev_);
+    for (const PendingVoice& voice : pendingVoices_) {
+        if (!voice.target || !voice.target->sprite || !voice.sound) continue;
+        const auto& sounds = voice.target->sprite->sounds;
+        for (size_t i = 0; i < sounds.size(); ++i)
+            if (&sounds[i] == voice.sound) {
+                state.push_back({voice.target, voice.wait,
+                                 int(i), voice.position, true});
+                break;
+            }
+    }
+    return state;
+}
+
+bool SdlAudioBank::restoreActiveSounds(
+    const std::vector<SoundPlaybackState>& state) {
+    if (!dev_) return state.empty();
+    if (!voices_.empty() || !pendingVoices_.empty()) return false;
+    for (const SoundPlaybackState& entry : state) {
+        const Sound* source = soundFor(entry.target, entry.soundId);
+        if (!source || !std::isfinite(entry.position) ||
+            entry.position < 0.0 || entry.position > double(1ull << 40))
+            return false;
+        const auto found = decoded_.find(source);
+        if (found != decoded_.end()) {
+            Voice voice{&found->second, entry.position,
+                        entry.target, entry.wait, source};
+            snapshotVoice(voice);
+            SDL_LockAudioDevice(dev_);
+            voices_.push_back(voice);
+            SDL_UnlockAudioDevice(dev_);
+            continue;
+        }
+        if (decodeFailed_.contains(source)) return false;
+        if (!asyncDecode_) {
+            // XYO_AUDIO_SYNC=1 deliberately has no decoder worker. Resume
+            // synchronously instead of leaving the audio wait stranded.
+            const Sample* sample = sampleFor(entry.target, entry.soundId);
+            if (!sample) return false;
+            Voice voice{sample, entry.position, entry.target,
+                        entry.wait, source};
+            snapshotVoice(voice);
+            SDL_LockAudioDevice(dev_);
+            voices_.push_back(voice);
+            SDL_UnlockAudioDevice(dev_);
+            continue;
+        }
+        // Reconstruct the PCM off-thread and begin at the saved offset.
+        // No expensive multi-minute MP3 decoding on the render thread.
+        pendingVoices_.push_back({
+            source, entry.target, entry.wait, entry.position
+        });
+        if (decoding_.insert(source).second) {
+            {
+                std::lock_guard<std::mutex> lock(decoderMutex_);
+                decodeQueue_.push_back(source);
+            }
+            decoderCv_.notify_one();
+        }
+    }
+    return true;
+}
+
+void SdlAudioBank::setEffects(Target* t) {
+    if (!dev_ || !t) return;
+    // Called on the main thread. The lock excludes the callback while
+    // changing scalars used by the real-time mixer.
+    SDL_LockAudioDevice(dev_);
+    for (Voice& voice : voices_)
+        if (voice.t == t) snapshotVoice(voice);
+    SDL_UnlockAudioDevice(dev_);
+}
+
+void SdlAudioBank::targetDisposed(Target* t) {
+    if (!t) return;
+    if (dev_) SDL_LockAudioDevice(dev_);
+    for (const Voice& voice : voices_)
+        if (voice.t == t && voice.wait)
+            done_.push_back(voice);
+    std::erase_if(voices_, [t](const Voice& v) { return v.t == t; });
+    for (const PendingVoice& voice : pendingVoices_)
+        if (voice.target == t && voice.wait)
+            done_.push_back({nullptr, 0, t, voice.wait});
+    std::erase_if(pendingVoices_,
+                  [t](const PendingVoice& v) { return v.target == t; });
     if (dev_) SDL_UnlockAudioDevice(dev_);
 }
 
@@ -185,7 +429,9 @@ void SdlAudioBank::stopAllSounds(Target*) {
 }
 
 void SdlAudioBank::stop(Target* t, int soundId) {
-    const Sample* s = sampleFor(t, soundId);
+    const Sound* sound = soundFor(t, soundId);
+    const auto it = decoded_.find(sound);
+    const Sample* s = it == decoded_.end() ? nullptr : &it->second;
     if (dev_) SDL_LockAudioDevice(dev_);
     for (auto& v : voices_)
         if (v.t == t && v.s == s)
@@ -194,6 +440,16 @@ void SdlAudioBank::stop(Target* t, int soundId) {
         std::remove_if(voices_.begin(), voices_.end(),
                        [&](const Voice& v) { return v.t == t && v.s == s; }),
         voices_.end());
+    for (const auto& v : pendingVoices_) {
+        if (v.target == t && v.sound == sound && v.wait)
+            done_.push_back({nullptr, 0, t, v.wait});
+    }
+    pendingVoices_.erase(
+        std::remove_if(pendingVoices_.begin(), pendingVoices_.end(),
+                       [&](const PendingVoice& v) {
+                           return v.target == t && v.sound == sound;
+                       }),
+        pendingVoices_.end());
     if (dev_) SDL_UnlockAudioDevice(dev_);
 }
 
@@ -206,6 +462,11 @@ void SdlAudioBank::stopAll() {
 void SdlAudioBank::finishAllVoices() {
     for (auto& v : voices_) done_.push_back(v);
     voices_.clear();
+    // A stopped play-until-done must resolve even if decoding has not
+    // finished. Keep the decode job for future playback/cache reuse.
+    for (const auto& v : pendingVoices_)
+        if (v.wait) done_.push_back({nullptr, 0, v.target, v.wait});
+    pendingVoices_.clear();
 }
 
 // ------------------------------------------------------------ ミックス --
@@ -219,20 +480,11 @@ void SdlAudioBank::audioCb(void* ud, unsigned char* buf, int len) {
 void SdlAudioBank::mix(float* out, int frames) {
     std::memset(out, 0, static_cast<size_t>(frames) * 2 * sizeof(float));
     for (auto& v : voices_) {
-        Target* t = v.t;
-        double vol = t ? std::clamp(t->volume, 0.0, 100.0) / 100.0 : 1.0;
-        double pitch = 0, pan = 0;
-        if (t) {
-            if (auto it = t->soundEffects.find("pitch");
-                it != t->soundEffects.end()) pitch = it->second;
-            if (auto it = t->soundEffects.find("pan");
-                it != t->soundEffects.end()) pan = it->second;
-        }
-        double ratio = std::pow(2.0, pitch / 120.0);   // PitchEffect.getRatio
-        double step = (v.s->rate / double(outRate_)) * ratio;
-        double p = (std::clamp(pan, -100.0, 100.0) + 100.0) / 200.0;
-        double gl = std::cos(p * M_PI / 2) * vol;      // 等ラウドネス
-        double gr = std::sin(p * M_PI / 2) * vol;
+        // No Target reads here: sprites/clones may be mutated or freed
+        // concurrently by the main thread.
+        const double step = v.step;
+        const double gl = v.gainL;
+        const double gr = v.gainR;
         const float* pcm = v.s->pcm.data();
         int sframes = v.s->frames;
         int ch = v.s->ch;
@@ -282,17 +534,64 @@ void SdlAudioBank::mix(float* out, int frames) {
 // -------------------------------------------------------------- update --
 
 void SdlAudioBank::update() {
+    // Publish completed decodes on the main thread. Unordered-map nodes
+    // keep a stable Sample address for the real-time SDL callback.
+    std::deque<DecodeResult> ready;
+    if (asyncDecode_) {
+        std::lock_guard<std::mutex> lock(decoderMutex_);
+        ready.swap(decodeReady_);
+    }
+    for (auto& result : ready) {
+        decoding_.erase(result.sound);
+        const Sample* sample = nullptr;
+        if (result.ok) {
+            sample = &decoded_.emplace(result.sound,
+                                      std::move(result.sample)).first->second;
+        } else {
+            decodeFailed_[result.sound] = true;
+        }
+        std::vector<PendingVoice> requests;
+        for (size_t i = 0; i < pendingVoices_.size();) {
+            if (pendingVoices_[i].sound != result.sound) {
+                ++i;
+                continue;
+            }
+            requests.push_back(pendingVoices_[i]);
+            pendingVoices_.erase(pendingVoices_.begin() + i);
+        }
+        for (const PendingVoice& request : requests) {
+            // A clone may have been deleted since playback was queued.
+            const bool targetAlive = rt_ && std::find(
+                rt_->targets.begin(), rt_->targets.end(),
+                request.target) != rt_->targets.end();
+            if (sample && targetAlive && dev_) {
+                Voice voice{sample, request.position, request.target,
+                            request.wait, result.sound};
+                snapshotVoice(voice);
+                SDL_LockAudioDevice(dev_);
+                voices_.push_back(voice);
+                SDL_UnlockAudioDevice(dev_);
+            } else if (audioWaiterIsLive(rt_, request.wait)) {
+                resolveWait(*rt_->sequencer, *request.wait,
+                            Value::undefined());
+            }
+        }
+    }
     if (dev_) SDL_LockAudioDevice(dev_);
+    // Refresh volume, pitch, pan on the main thread once per frame.
+    // Live voices cannot reference clones after targetDisposed().
+    for (Voice& voice : voices_)
+        snapshotVoice(voice);
+    peak_ *= 0.9f;
     std::deque<Voice> fin;
     fin.swap(done_);
     if (dev_) SDL_UnlockAudioDevice(dev_);
     for (auto& v : fin) {
         if (std::getenv("XYO_DEBUG") && v.wait)
             std::fprintf(stderr, "[audio] voice done → resolveWait\n");
-        if (v.wait && rt_ && rt_->isWaitingThread(v.wait))
+        if (audioWaiterIsLive(rt_, v.wait))
             resolveWait(*rt_->sequencer, *v.wait, Value::undefined());
     }
-    peak_ *= 0.9f;
 }
 
 double SdlAudioBank::getLoudness() const {

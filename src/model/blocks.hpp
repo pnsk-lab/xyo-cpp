@@ -1,6 +1,7 @@
 // xyo-cpp: engine/blocks.js 相当 — ブロックコンテナ + 実行キャッシュ。
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <optional>
@@ -201,6 +202,14 @@ public:
     void restoreState(std::unordered_map<std::string, Block> blocks,
                       std::vector<std::string> scripts);
     void resetCache();
+    // Monotonic structural revision for persistent JIT region caches.
+    // Revisions are globally unique even if Blocks storage is recycled.
+    uint64_t revision() const noexcept { return revision_; }
+    // Test-only revision change: keep live native Fiber BlockCached* valid.
+    // Never use as a substitute for production resetCache().
+    void bumpRevisionForTestingWithoutCacheReset() noexcept {
+        revision_ = nextRevision_.fetch_add(1, std::memory_order_relaxed);
+    }
     void runAllMonitored(Runtime& rt);
 
     size_t size() const { return blocks_.size(); }
@@ -212,12 +221,24 @@ private:
     std::vector<std::string> scripts_;
     /// createBlock ごとに増えるロード/追加順カウンタ（Block::seq の源）
     uint64_t seqCounter_ = 0;
+    inline static std::atomic<uint64_t> nextRevision_{1};
+    uint64_t revision_ = nextRevision_.fetch_add(
+        1, std::memory_order_relaxed);
 
     struct Cache {
         std::unordered_map<std::string, InputSet> inputs;
         std::unordered_map<std::string, std::string> procedureDefinitions; // proccode(u8キー) → blockId
         std::unordered_map<std::string, const Block*> procedurePrototypes; // proccode → first prototype
         std::unordered_map<std::string, std::unique_ptr<BlockCached>> executeCached;
+        // Compiled native/AOT slots and suspended interpreter frames retain
+        // raw BlockCached* across source edits. Retire old generations
+        // instead of deleting them in resetCache(); lookups only use the
+        // current map, so new source immediately receives new cache entries.
+        // A retired generation lasts until Blocks is destroyed: compiled
+        // code may retain addresses even after a Scratch thread exits.
+        std::vector<
+            std::unordered_map<std::string, std::unique_ptr<BlockCached>>>
+            retiredExecuteCached;
         std::unordered_map<std::string, std::vector<RuntimeScriptCache>> scripts;
         std::optional<std::vector<std::pair<std::string, std::string>>> monitored; // blockId → targetId
         bool proceduresPopulated = false;
@@ -240,6 +261,10 @@ struct BlockCached {
     std::string opcode;
     std::map<std::string, BlockField> fields;
     InputSet inputs;
+    // Keep the mutation value independently of Block storage. Editor
+    // deletion/replacement may invalidate the original Block::mutation
+    // while compiled code still references this cached operation.
+    std::optional<Mutation> ownedMutation;
     const Mutation* mutation = nullptr;
 
     bool isHat = false;
@@ -248,6 +273,14 @@ struct BlockCached {
     bool isConditional = false;   // _flowing.conditional（拡張用）
     bool isLoop = false;
     bool isShadowBlock = false;
+    // Precomputed once per source block. The interpreter hot loop must not
+    // perform 10+ opcode string comparisons when nested WASM is enabled.
+    bool nestedWasmCandidate = false;
+    bool nestedWasmWarpCandidate = false;
+    // Persistent negative result of the opt-in nested source compiler.
+    // Reset with BlockCached on source edits; avoid a map lookup for every
+    // repeated invocation of a structurally unsupported Scratch loop.
+    mutable std::atomic<bool> nestedWasmRejected{false};
     // True only for a side-effect-free wait-until CONDITION. False for
     // timers, sensors, random, procedure calls and unknown extension blocks.
     bool eventWaitPure = false;

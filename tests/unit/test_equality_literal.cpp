@@ -157,6 +157,60 @@ void testValues(JitMode mode, const std::string& literal) {
     // Scratch's Value ABI has no separate null tag; JSON null loads undefined.
 }
 
+void testNumericVariableBecomesString(JitMode mode) {
+    // A variable that was numeric when its native code was compiled may
+    // become an arbitrary string afterward. Skipping the SStr-cache *probe*
+    // must still allow the exact generic Scratch comparison fallback.
+    setJitMode(mode);
+    std::string json = project("0", false);
+    const std::string original = "\"x\":[\"x\",null]";
+    const auto pos = json.find(original);
+    check(pos != std::string::npos,
+          "find numeric initial variable in equality project");
+    if (pos == std::string::npos) return;
+    json.replace(pos, original.size(), "\"x\":[\"x\",0]");
+
+    Runtime rt;
+    check(loadSb3(rt, json, nullptr).ok,
+          "load initially numeric variable equality project");
+    if (rt.targets.empty()) return;
+    Target* stage = rt.targets.front();
+    Variable* x = stage->lookupVariableById("x");
+    Variable* out1 = stage->lookupVariableById("out1");
+    Variable* out2 = stage->lookupVariableById("out2");
+    check(x && out1 && out2, "resolve initially numeric equality variables");
+    if (!x || !out1 || !out2) return;
+    RootedValue literal;
+    literal.value = Value::string(SStr::fromUtf8("0"));
+
+    auto run = [&](Value input) {
+        x->value = input;
+        const bool expected = cast::compare(x->value, literal.value) == 0;
+        rt.greenFlag();
+        checkCompiled(rt, mode);
+        rt.runUntilDone(100);
+        check(rt.threads.empty(), "changing-type equality script terminates");
+        check(out1->value.isBool() && out1->value.asBool() == expected,
+              "changing-type variable == zero string remains exact");
+        check(out2->value.isBool() && out2->value.asBool() == expected,
+              "zero string == changing-type variable remains exact");
+    };
+
+    run(Value::num(0.0)); // Warm the JIT while x is a numeric Value.
+    for (const char* text : {
+             "0", "-0", "+0", "0.0", "00", " 0 ", "0e0", "1",
+             "false", "NaN", "Infinity", "nonsense", " ",
+             "1e-999", "null"
+         })
+        run(Value::string(SStr::fromUtf8(text)));
+    for (Value value : {
+             Value::num(-0.0), Value::num(1.0), Value::nan(),
+             Value::boolean(false), Value::boolean(true),
+             Value::undefined(), Value::color(0, 0, 0)
+         })
+        run(value);
+}
+
 std::string* probeOrder = nullptr;
 Value probe(const ArgValues& args, BlockUtility&) {
     if (probeOrder) *probeOrder += SStr::toUtf8(args.get("TAG").asStrPtr()->view());
@@ -196,6 +250,7 @@ int test_equality_literal_main() {
                                     "Infinity", "infinity", "some", "skip", "1",
                                     "abcdefgh", "abcdefghi"})
             testValues(mode, literal);
+        testNumericVariableBecomesString(mode);
         testReporterEffects(mode, "n");
         testReporterEffects(mode, "none");
     }

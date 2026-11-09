@@ -129,16 +129,16 @@ export XYO_SEED=1
 export XYO_BENCH_WARMUP_FRAMES=60
 unset XYO_PROF XYO_PENPROF XYO_PENLOG XYO_PENTRACE
 unset XYO_JIT_EQ_GENERIC XYO_JIT_MOTION_BOXED XYO_JIT_SLOT_RELOAD
-build/tests/xyo-pen-bench --project 3D2.sb3 --frames 30
+build/tests/xyo-pen-bench --project debug/projects/3D2.sb3 --frames 30
 
 # 個別の旧経路対照。JIT生成時に読むので既存AOTには適用されない。
-XYO_JIT_EQ_GENERIC=1 build/tests/xyo-pen-bench --project 3D2.sb3 --frames 30
-XYO_JIT_MOTION_BOXED=1 build/tests/xyo-pen-bench --project 3D2.sb3 --frames 30
-XYO_JIT_SLOT_RELOAD=1 build/tests/xyo-pen-bench --project 3D2.sb3 --frames 30
+XYO_JIT_EQ_GENERIC=1 build/tests/xyo-pen-bench --project debug/projects/3D2.sb3 --frames 30
+XYO_JIT_MOTION_BOXED=1 build/tests/xyo-pen-bench --project debug/projects/3D2.sb3 --frames 30
+XYO_JIT_SLOT_RELOAD=1 build/tests/xyo-pen-bench --project debug/projects/3D2.sb3 --frames 30
 
 # Resを変えた描画互換性確認。値変更は実行中Runtime内だけ。
 XYO_SET=Res=4 XYO_BENCH_ACTIVE_STROKES=10000 \
-  build/tests/xyo-pen-bench --project 3D2.sb3 --frames 30 --shot res4.ppm
+  build/tests/xyo-pen-bench --project debug/projects/3D2.sb3 --frames 30 --shot res4.ppm
 ```
 
 既定の再生FPS設定や画質を変更したわけではない。ここで示すのは、同じ描画量を実行するエンジンの処理時間と描画込みのスループットである。

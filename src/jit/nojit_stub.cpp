@@ -19,6 +19,14 @@ const CompiledScript* JitEngine::compile(Thread&, Runtime&, Sequencer&,
 bool JitEngine::decideCompile(Thread&, const Block*) {
     return false;
 }
+bool JitEngine::tryAttachNumeric(Thread&, const Block*) {
+    return false;
+}
+void JitEngine::pollAsync() {}
+void JitEngine::prefetchWarpBroadcasts(Runtime&) {}
+const CompiledScript* JitEngine::readyScript(const Block*) const {
+    return nullptr;
+}
 void JitEngine::noteInterpBlocks(const void*, uint64_t) {}
 bool JitEngine::scriptStats(const void*, ScriptStats*) const { return false; }
 uint8_t JitEngine::scanScriptLoop(Blocks&, const Block*, uint32_t*) {

@@ -1,4 +1,4 @@
-// xyo-cpp: LLVM ORC JIT — design.md §7。
+// xyo-cpp: Backend-neutral JIT runtime API — design.md §7。
 // スクリプトを `void fn(JitCtx*)` にコンパイルし Fiber 上で実行する。
 // yield は xyo_yield による fiber switch（任意の呼び出し深さから可能）。
 #pragma once
@@ -14,13 +14,12 @@
 #include <unordered_set>
 #include <vector>
 
+#include "../aot/aot.hpp"
 #include "../core/value.hpp"
 #include "../engine/deps.hpp"
 #include "../gpu/gpu_isa.hpp"
 #include "../gpu/gpu_compile.hpp"
 
-namespace llvm { class LLVMContext; }
-namespace llvm::orc { class LLJIT; }
 
 namespace xyo {
 
@@ -32,7 +31,10 @@ struct Blocks;
 struct Block;
 struct ExecContext;
 struct Variable;
+struct NumericJitCode;
 class Fiber;
+namespace wasm { struct HotCode; }
+namespace ir { struct SourceFrameSymbols; }
 
 // --- 実行モード -------------------------------------------------------
 //
@@ -197,7 +199,35 @@ struct JitCtx {
     // Non-null only while the Sequencer watchdog is armed.
     // Unix milliseconds sampled every ~1ms; use the direct clock otherwise.
     std::atomic<int64_t>* sampledUnixMs;
+
+    // Interpreter -> JIT on-stack replacement. Only used by a dedicated
+    // continuation entry; never interpreted as a fresh loop's TIMES input.
+    double osrRepeatRemaining = 0.0;
+
+    /// Shared total and non-atomic per-fiber accumulation. The generated
+    /// native code only updates pendingBlockCount. A context is owned by one
+    /// executing fiber at a time; yield and retirement publish pending counts.
+    /// Appended so older JitCtx ABI offsets remain unchanged.
+    std::atomic<uint64_t>* blockCounter = nullptr;
+    uint64_t pendingBlockCount = 0;
+    // Appended field: existing runtime/AOT JitCtx offsets are unchanged.
+    // Null outside a sampled native tick or with a custom clock.
+    std::atomic<uint64_t>* sampledUnixDaysBits = nullptr;
+    // Safe after an actual native Fiber yield: all promoted variables
+    // have been spilled and the previous counted-loop body has committed.
+    // This is NOT an arbitrary LLVM SSA/effect-PC deoptimizer.
+    int32_t nestedOsrDeoptReady = 0;
+    double nestedOsrDeoptRemaining = 0.0;
 };
+
+/// Publish an entire execution slice with one atomic RMW, including when a
+/// stopped script will never be resumed. A second flush is idempotent.
+inline void flushJitBlockCount(JitCtx* c) {
+    if (!c || !c->blockCounter || !c->pendingBlockCount) return;
+    const uint64_t pending = c->pendingBlockCount;
+    c->pendingBlockCount = 0;
+    c->blockCounter->fetch_add(pending, std::memory_order_relaxed);
+}
 
 static_assert(std::is_trivially_copyable_v<JitCtx>);
 
@@ -218,6 +248,10 @@ extern "C" void xyo_varslot_init(JitCtx* c, uint64_t idx, const char* id,
 /// コンパイル済みスクリプト（target->blocks 共有 — クローン間で共有可）
 struct CompiledScript {
     ScriptFn entry = nullptr;
+    // Non-native browser Wasm callable; dispatched separately by Sequencer.
+    std::shared_ptr<wasm::HotCode> wasm;
+    ScriptFn osrEntry = nullptr;
+    std::string osrLoopId;  // top-level repeat, immutable after publication
     /// True when this script's procedures are compiled on first use.
     bool lazy = false;
     /// variantKey(proccode+warp) → 手続き関数
@@ -235,6 +269,32 @@ struct CompiledScript {
     /// モジュールと同寿命でここが所有）。生成コードが実際に参照する
     /// のは `ParallelLoop::program`。
     std::vector<std::unique_ptr<gpu::ParallelLoop>> gpuProgs;
+    // Append-only: existing fields retain their ABI/layout offsets.
+    // Opt-in bounded native loop region inside a live warp procedure.
+    ScriptFn nestedOsrEntry = nullptr;
+    std::string nestedOsrLoopId;
+    std::string nestedOsrCallId;
+    // Empty for the original 2-frame nested OSR; outer warp call ID for
+    // the opt-in 3-frame case. Metadata only, no native frame ABI change.
+    std::string nestedOsrParentCallId;
+    // Immutable outermost-to-innermost Scratch source callsites.
+    std::vector<std::string> nestedOsrCallPath;
+    // Reject previously compiled native continuation after source edits:
+    // matching block IDs alone do not prove identical reporter semantics.
+    uint64_t nestedOsrSourceRevision = 0;
+    // Full lexical control stack, excluding final counted repeat.
+    // arm==0 is a procedure call, arm 1/2 an IF/IF-ELSE arm.
+    std::vector<std::string> nestedOsrFramePath;
+    std::vector<uint8_t> nestedOsrBranchArms;
+    uint32_t nestedOsrArgFrameIndex = 0;
+    // Optional readonly IR-001 provenance dictionary for an exact source
+    // CallFrame/loop-PC projection. This never supplies executable deopt
+    // machine state or replaces the interpreter's live GC roots.
+    bool nestedOsrSourceProofRequired = false;
+    std::shared_ptr<const ir::SourceFrameSymbols> nestedOsrSourceSymbols;
+    // Requires source proof. Only a completed counted-loop body may be
+    // handed back after a native Fiber scheduler suspension.
+    bool nestedOsrInFlightGuard = false;
 };
 
 class JitEngine {
@@ -251,6 +311,20 @@ public:
     const CompiledScript* compile(Thread& thread, Runtime& runtime,
                                   Sequencer& sequencer,
                                   const Block* topHint = nullptr);
+    // Opt-in path for the validated, resumable numeric CFG. Called only
+    // after decideCompile, before falling back to legacy code generation.
+    bool tryAttachNumeric(Thread& thread, const Block* top);
+    // Publish worker results on the runtime thread, never from the worker.
+    void pollAsync();
+    // Experimental: precompile a small number of expensive broadcast hats
+    // before any user script starts. Only queues work, never executes blocks.
+    void prefetchWarpBroadcasts(Runtime& runtime);
+    // Only for an interpreter thread that has executed no Scratch block yet.
+    const CompiledScript* readyScript(const Block* top) const;
+    // Read-only scheduler query; compiling_ belongs to the main thread.
+    bool isCompiling(const Block* top) const {
+        return top && compiling_.contains(top);
+    }
 
     /// HotSpot のコンパイル判定。spawn ごとに 1 回呼ぶ。プロファイル
     /// （呼び出し回数・解釈実行ブロック数）を更新し、今回のスレッドを
@@ -282,7 +356,8 @@ public:
     /// アドレスを束縛してスクリプトを通常のコンパイルキャッシュへ
     /// 登録する。projectHash は sb3 の FNV-1a（不一致なら拒否）。
     bool loadAot(Runtime& runtime, const void* object, size_t size,
-                 uint64_t projectHash, std::string* why = nullptr);
+                 uint64_t projectHash, std::string* why = nullptr,
+                 const aot::ProgressCallback& progress = {});
 
     /// コンパイル済みスクリプト/依存解析の全キャッシュを破棄する。
     /// 実行中スレッドが無いこと（CompiledScript/BlockCached 参照を
@@ -296,9 +371,6 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
-
-    /// Create the secondary on-demand ORC engine only if a script uses it.
-    bool ensureLazyJit();
 
     /// トップ Block* ごとのコンパイル結果。ティアごとに保持し、実行中
     /// スレッドが参照中の旧ティアのコードを破棄しない（JIT コードは
@@ -321,6 +393,9 @@ private:
     };
     /// トップ Block* → コンパイル結果（Block は Blocks 所有でポインタ安定）
     std::unordered_map<const void*, ScriptEntry> cache_;
+    std::unordered_map<const void*, std::shared_ptr<NumericJitCode>>
+        numericCache_;
+    std::unordered_set<const void*> numericRejected_;
     std::unordered_map<const void*, ScriptProfile> profiles_;
     /// スクリプトの静的走査（初回のみ）。戻り値は hasLoop（0/1/2）、
     /// *nodes に到達可能ブロック数の目安を返す。
@@ -329,6 +404,8 @@ private:
     /// コンパイル失敗/対象外の topBlock（再試行しない — spawn 毎に
     /// compile が呼ばれるためヒット経路を安く保つ）
     std::unordered_set<const void*> failed_;
+    std::unordered_set<const void*> compiling_;
+    uint64_t asyncGeneration_ = 1;
     /// 依存解析キャッシュ: topBlock → (target → AccessSet)。
     /// 変数解決がターゲット依存（自ターゲット→ステージ）のため
     /// target ごとに再計算する。

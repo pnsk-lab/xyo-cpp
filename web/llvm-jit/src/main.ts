@@ -66,3 +66,5 @@ button.addEventListener('click', () => {
   };
   worker.postMessage({ id, bytes: source, steps: 20, origin: location.origin });
 });
+
+import './player-ui';

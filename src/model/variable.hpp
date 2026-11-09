@@ -110,6 +110,16 @@ struct Sound {
 struct Target;
 struct Thread;
 
+// Portable playback references. No SDL handle, PCM pointer, or native thread
+// pointer is written to disk; checkpoint code converts these to indices.
+struct SoundPlaybackState {
+    Target* target = nullptr;
+    Thread* wait = nullptr;
+    int soundId = -1;
+    double position = 0.0; // decoded source PCM frame offset
+    bool pending = false;
+};
+
 /// Sprite::soundBank — AudioBank 抽象（ヘッドレスでは null）。
 /// playSoundAndWait は再生完了時に resolveWait を呼ぶ責務を持つ。
 struct SoundBankAPI {
@@ -118,7 +128,13 @@ struct SoundBankAPI {
     virtual void playSoundAndWait(Target*, int soundId, Thread*) {}
     virtual void stopAllSounds(Target*) {}
     virtual void stop(Target*, int soundId) { (void)soundId; }
+    // Called before a clone is destroyed; audio callbacks must not access it.
+    virtual void targetDisposed(Target*) {}
     virtual void setEffects(Target*) {}
+    virtual std::vector<SoundPlaybackState> captureActiveSounds() { return {}; }
+    virtual bool restoreActiveSounds(const std::vector<SoundPlaybackState>& s) {
+        return s.empty();
+    }
 };
 
 } // namespace xyo

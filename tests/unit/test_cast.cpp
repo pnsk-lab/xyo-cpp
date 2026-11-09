@@ -1,5 +1,6 @@
 // xyo-cpp: cast/jsnum/string/list のユニットテスト。
 // refs/scratch-vm/test/unit/util_cast.js の移植 + ES エッジケース。
+#include <bit>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -70,7 +71,142 @@ static void test_toNumber() {
     CHECK_EQ(tn(s("1e400")), std::numeric_limits<double>::infinity());
     CHECK_EQ(tn(s("9007199254740993")), 9007199254740992.0);
     CHECK_EQ(tn(s("0,5")), 0);            // カンマは小数点ではない
+
+    // Exact short radix decoding and the unchanged long-radix fallback.
+    CHECK_EQ(jsnum::toNumber(u"0xFFFFFFFFFFFFF"), 4503599627370495.0);
+    CHECK_EQ(jsnum::toNumber(u"0o77777777777777777"), 2251799813685247.0);
+    CHECK_EQ(jsnum::toNumber(u"0b11111111111111111111111111111111111111111111111111111"),
+             9007199254740991.0);
+    CHECK_EQ(jsnum::toNumber(u"0x20000000000000"), 9007199254740992.0);
+    CHECK_EQ(jsnum::toNumber(u"0x20000000000001"), 9007199254740992.0);
+    CHECK_EQ(jsnum::toNumber(u"0x00000000000000"), 0.0);
+    CHECK_EQ(jsnum::toNumber(u"0b00000101"), 5.0);
+    CHECK_EQ(jsnum::toNumber(u"0O777"), 511.0);
+    CHECK(std::isnan(jsnum::toNumber(u"0b102")));
+    CHECK(std::isnan(jsnum::toNumber(u"0o89")));
+    CHECK(std::isnan(jsnum::toNumber(u"-0x10")));
 }
+
+static void test_digit_string_cache() {
+    // Test the cold and cached paths separately, including the numeric
+    // comparison state. In particular "0" must be state 1, not a
+    // non-numeric/whitespace zero (state 3).
+    for (char16_t digit = u'0'; digit <= u'9'; ++digit) {
+        SStr* str = SStr::create(std::u16string_view(&digit, 1));
+        Value value = Value::string(str);
+        CHECK_EQ(str->loadNumState(), 0u);
+        const double expected = static_cast<double>(digit - u'0');
+        CHECK_EQ(cast::toNumber(value), expected);
+        CHECK_EQ(str->loadNumState(), 1u);
+        CHECK_EQ(str->loadNumCache(), expected);
+        CHECK_EQ(cast::toNumberOrNaN(value), expected);
+        CHECK_EQ(cast::toNumber(value), expected);
+    }
+
+    // The sign and digit can be parsed without flattening the string or
+    // visiting the general parser. Preserve the signed-zero bit exactly.
+    for (char16_t sign : {u'+', u'-'}) {
+        for (char16_t digit = u'0'; digit <= u'9'; ++digit) {
+            const char16_t chars[2] = {sign, digit};
+            SStr* str = SStr::create(std::u16string_view(chars, 2));
+            const Value value = Value::string(str);
+            const double magnitude = static_cast<double>(digit - u'0');
+            const double expected = sign == u'-' ? -magnitude : magnitude;
+            CHECK_EQ(str->loadNumState(), 0u);
+            CHECK(std::bit_cast<uint64_t>(cast::toNumber(value)) ==
+                  std::bit_cast<uint64_t>(expected));
+            CHECK_EQ(str->loadNumState(), 1u);
+            CHECK(std::bit_cast<uint64_t>(str->loadNumCache()) ==
+                  std::bit_cast<uint64_t>(expected));
+            CHECK(std::bit_cast<uint64_t>(cast::toNumberOrNaN(value)) ==
+                  std::bit_cast<uint64_t>(expected));
+        }
+    }
+
+    // Non-digit one-character strings retain their original cache states.
+    SStr* invalid = SStr::create(u"x");
+    CHECK_EQ(cast::toNumber(Value::string(invalid)), 0.0);
+    CHECK_EQ(invalid->loadNumState(), 2u);
+    SStr* space = SStr::create(u" ");
+    CHECK_EQ(cast::toNumber(Value::string(space)), 0.0);
+    CHECK_EQ(space->loadNumState(), 3u);
+    // Preserve historical special treatment of ASCII TAB.
+    SStr* tab = SStr::create(u"\t");
+    CHECK_EQ(cast::toNumber(Value::string(tab)), 0.0);
+    CHECK_EQ(tab->loadNumState(), 1u);
+
+    for (std::u16string_view whitespace :
+         {std::u16string_view(u"\n"), std::u16string_view(u"\u3000"),
+          std::u16string_view(u"\uFEFF")}) {
+        SStr* str = SStr::create(whitespace);
+        CHECK_EQ(cast::toNumber(Value::string(str)), 0.0);
+        CHECK_EQ(str->loadNumState(), 3u);
+    }
+    for (std::u16string_view invalidLiteral :
+         {std::u16string_view(u"\u200B"), std::u16string_view(u"\uFF19"),
+          std::u16string_view(u".")}) {
+        SStr* str = SStr::create(invalidLiteral);
+        const Value value = Value::string(str);
+        CHECK_EQ(cast::toNumber(value), 0.0);
+        CHECK(std::isnan(cast::toNumberOrNaN(value)));
+        CHECK_EQ(str->loadNumState(), 2u);
+    }
+
+    // Single-character and signed-digit cons strings must retain their
+    // unflattened shape after numeric conversion.
+    {
+        Gc::DeferCollect defer;
+        SStr* digitRope = sstrCons(SStr::create(u""), SStr::create(u"7"));
+        CHECK(digitRope->isCons());
+        CHECK(digitRope->body == nullptr);
+        CHECK_EQ(cast::toNumber(Value::string(digitRope)), 7.0);
+        CHECK_EQ(digitRope->loadNumState(), 1u);
+        CHECK(digitRope->body == nullptr);
+
+        SStr* signedRope = sstrCons(SStr::create(u"-"), SStr::create(u"0"));
+        CHECK(signedRope->isCons());
+        CHECK(signedRope->body == nullptr);
+        CHECK(std::bit_cast<uint64_t>(
+                  cast::toNumber(Value::string(signedRope))) ==
+              std::bit_cast<uint64_t>(-0.0));
+        CHECK_EQ(signedRope->loadNumState(), 1u);
+        CHECK(signedRope->body == nullptr);
+    }
+}
+
+#if defined(XYO_JIT)
+extern "C" double xyo_to_num(uint64_t);
+
+static void test_jit_toNumber() {
+    const Value inputs[] = {
+        n(0), n(-0.0), n(3.14), n(-42.5),
+        n(std::numeric_limits<double>::infinity()),
+        n(-std::numeric_limits<double>::infinity()),
+        n(std::numeric_limits<double>::quiet_NaN()),
+        Value::nan(), b(false), b(true), Value::emptyStr(),
+        Value::string(nullptr), Value::undefined(),
+        Value::color(25, 127, 201),
+        s("123"), s("-00042"), s(" 12.5 "), s("NaN"),
+        s(" "), s("0x10"), s("Infinity"), s("-Infinity"),
+        s("1e400"), s("-0"), s("9007199254740993"),
+        s("4.9e-324"), s("hello"), s("1e3"),
+        Value::string(SStr::create(u""))
+    };
+    // Test cold strings, cached numbers, cached NaN and cached whitespace;
+    // compare exact bits to retain IEEE signed zero and infinities.
+    for (Value input : inputs) {
+        // Invoke the JIT helper FIRST so the test covers an uncached
+        // heap string. The reference conversion may then hit the cache.
+        const uint64_t first =
+            std::bit_cast<uint64_t>(xyo_to_num(input.bits));
+        const uint64_t expected =
+            std::bit_cast<uint64_t>(cast::toNumber(input));
+        CHECK(first == expected);
+        for (int repeat = 0; repeat < 3; ++repeat)
+            CHECK(std::bit_cast<uint64_t>(xyo_to_num(input.bits)) == expected);
+    }
+}
+#endif
 
 static void test_toBoolean() {
     CHECK_EQ(tb(n(0)), false);
@@ -190,6 +326,45 @@ static void test_compare() {
     CHECK(cmp(s("10"), s("9")) > 0);
     // "abc" vs "abd" → 文字列比較
     CHECK(cmp(s("abc"), s("abd")) < 0);
+    // String numeric-cache states must preserve Scratch's lexical-zero rule,
+    // including after a prior arithmetic conversion seeded the cache.
+    const std::vector<Value> operands{
+        n(-0.0), n(0), n(1), n(-2), n(1e308),
+        n(std::numeric_limits<double>::infinity()),
+        n(-std::numeric_limits<double>::infinity()), Value::nan(),
+        b(false), b(true), Value::emptyStr(), Value::undefined(),
+        s("0"), s("00"), s("  "), s("\t"), s(" \t "),
+        s("1"), s("01"), s("1e3"), s("Infinity"),
+        s("+Infinity"), s("-Infinity"), s("infinity"),
+        s("hello"), s("HELLO"), s("NaN"), s("nan"),
+        s("false"), s("FALSE"), s("7"), s("9"), s("0x10"),
+        Value::color(0, 0, 0), Value::color(255, 0, 0),
+    };
+    // Reference implementation: preserve the original Scratch-vm translation
+    // independently of the optimized numericCompareOperand state handling.
+    auto originalCmp = [](Value a, Value b) -> double {
+        double x = cast::toNumberOrNaN(a);
+        double y = cast::toNumberOrNaN(b);
+        if (x == 0 && cast::isNotActuallyZero(a))
+            x = std::numeric_limits<double>::quiet_NaN();
+        else if (y == 0 && cast::isNotActuallyZero(b))
+            y = std::numeric_limits<double>::quiet_NaN();
+        if (std::isnan(x) || std::isnan(y))
+            return compareStringsCaseInsensitive(cast::toString(a),
+                                                 cast::toString(b));
+        if (std::isinf(x) && x == y) return 0.0;
+        return x - y;
+    };
+    // Repeat after all strings have been cached, to cover both cold and hot.
+    for (int pass = 0; pass < 2; ++pass) {
+        for (Value a : operands) for (Value b : operands) {
+            const double expected = originalCmp(a, b);
+            const double actual = cmp(a, b);
+            CHECK((actual < 0) == (expected < 0));
+            CHECK((actual > 0) == (expected > 0));
+            CHECK((actual == 0) == (expected == 0));
+        }
+    }
 }
 
 static void test_isInt() {
@@ -444,8 +619,13 @@ extern int test_scratch_compat_main();
 extern int test_list_limit_main();
 extern int test_sstr_cons_main();
 extern int test_gc_pool_main();
+extern int test_opt_flags_main();
 int main() {
     test_toNumber();
+    test_digit_string_cache();
+#if defined(XYO_JIT)
+    test_jit_toNumber();
+#endif
     test_toBoolean();
     test_toString();
     test_common_string_cache();
@@ -491,12 +671,14 @@ int main() {
     int listLimitFail = test_list_limit_main();
     int sstrConsFail = test_sstr_cons_main();
     int gcPoolFail = test_gc_pool_main();
+    int optFlagsFail = test_opt_flags_main();
     return (g_fail + e2eFail + penFail + aotFail + wasmEmitFail +
             wasmCompileFail + minifyFail + depsFail + analysisFail + parforFail + penHoistFail + rewriteFail +
             parallelStringsFail + schedulerFail +
             equalityLiteralFail + colorFastFail + motionNumericFail + slotHoistFail +
             listCodegenBoundsFail + nanCodegenFail + literalContextFail + numericPromotionFail + typeProfileFail + dangerFail + listStringInternFail +
-            glChunkPlanFail + scratchCompatFail + listLimitFail + listReadMemoFail + sstrConsFail + gcPoolFail)
+            glChunkPlanFail + scratchCompatFail + listLimitFail + listReadMemoFail + sstrConsFail + gcPoolFail +
+            optFlagsFail)
                ? 1
                : 0;
 }

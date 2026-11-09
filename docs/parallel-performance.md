@@ -125,7 +125,7 @@ build/tests/xyo-par-bench --graph 512 --kind disjoint --rounds 21
 # 実3D2。描画区間のdispatch数も表示する。
 SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy \
 __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json \
-XYO_SEED=1 build/tests/xyo-pen-bench --project 3D2.sb3 --frames 30
+XYO_SEED=1 build/tests/xyo-pen-bench --project debug/projects/3D2.sb3 --frames 30
 ```
 
 ## 制約

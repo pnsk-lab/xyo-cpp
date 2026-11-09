@@ -263,6 +263,57 @@ int test_positive_cache_valid_svg() {
     return g_fail;
 }
 
+// Transparency animation must not regenerate/upload a full-size texture
+// each frame. Pixel-accurate queries still get the CPU effect image.
+int test_ghost_gpu_modulation() {
+    Runtime rt;
+    CHECK(loadProject(rt, R"JSON([{"assetId":"v","name":"v",
+        "dataFormat":"svg","md5ext":"v.svg","bitmapResolution":1,
+        "rotationCenterX":10,"rotationCenterY":5}])JSON"));
+    Target* sp = spriteOf(rt);
+    CHECK(sp != nullptr);
+    if (!sp) return g_fail;
+    setCostumeData(sp, 0, kSvgRect, std::strlen(kSvgRect));
+    SdlRenderer ren;
+    CHECK(ren.init(rt, 1));
+    rt.renderer = &ren;
+    GlEffects gpuProbe;
+    const bool gpu = gpuProbe.available(ren.sdlRenderer());
+
+    for (double ghost : {10.0, 50.0, 95.0, 100.0, 0.0}) {
+        sp->effects["ghost"] = ghost;
+        ren.beginProfileFrame();
+        ren.draw();
+        const auto stats = ren.endProfileFrame();
+        CHECK_EQ(stats.effectBuilds, 0u);
+    }
+    const Costume* c = sp->getCurrentCostume();
+    const auto* skin = TA::skin(ren, c);
+    CHECK(skin != nullptr);
+    if (skin) CHECK(skin->fx.empty());
+
+    // Non-ghost effects use the GL shader when available, or the CPU
+    // fallback. Changing ghost alone must reuse that colour/spatial texture.
+    sp->effects["brightness"] = 25;
+    for (double ghost : {50.0, 75.0, 30.0}) {
+        sp->effects["ghost"] = ghost;
+        ren.beginProfileFrame();
+        ren.draw();
+        const auto stats = ren.endProfileFrame();
+        CHECK_EQ(stats.effectBuilds, !gpu && ghost == 50.0 ? 1u : 0u);
+        CHECK_EQ(stats.gpuEffectPasses, gpu && ghost == 50.0 ? 1u : 0u);
+    }
+
+    // Collision/colour sampling is exact and does not inherit visual-only
+    // GPU modulation.
+    sp->effects["brightness"] = 0;
+    sp->effects["ghost"] = 50;
+    CHECK(ren.drawableTouching(sp->drawableID, 0, 0));
+    if (skin) CHECK(!skin->fx.empty());
+    std::printf("ghost-modulation: %d checks, %d failures\n", g_checks, g_fail);
+    return g_fail;
+}
+
 int test_costume_switch_and_clone() {
     Runtime rt;
     CHECK(loadProject(rt, R"JSON([
@@ -410,6 +461,85 @@ void checkPixSet(const uint8_t* buf, int w, int h,
 
 const uint8_t* pxAt(const uint8_t* buf, int w, int x, int y) {
     return &buf[(static_cast<size_t>(y) * w + x) * 4];
+}
+
+int test_high_quality_pen() {
+    Runtime rt;
+    CHECK(loadProject(rt, "[]"));
+    SdlRenderer ren;
+    ren.setHighQualityPen(false);  // independent of ambient env
+    CHECK(ren.init(rt, 2));
+    rt.renderer = &ren;
+    const int skin = ren.createPenSkin();
+    CHECK(skin >= 0);
+    CHECK_EQ(ren.penResolution().first, 480);
+    CHECK_EQ(ren.penResolution().second, 360);
+
+    // Switching resolution must retain the existing pen drawing, including
+    // when a backend's persistent framebuffer is involved.
+    const float red[4] = {1.f, 0.f, 0.f, 1.f};
+    ren.penLine(skin, red, 2.0, -40.0, 10.0, 40.0, 10.0);
+    CHECK(penNonZero(TA::penPx(ren), TA::penW(ren), TA::penH(ren)) > 0);
+
+    ren.setHighQualityPen(true);
+    CHECK(ren.highQualityPen());
+    CHECK_EQ(ren.penResolution().first, 960);
+    CHECK_EQ(ren.penResolution().second, 720);
+    CHECK(penNonZero(TA::penPx(ren), TA::penW(ren), TA::penH(ren)) > 0);
+
+    // A one-logical-pixel pen point gets more real texels at 2x.
+    ren.penClear(skin);
+    ren.penPoint(skin, red, 2.0, 0.0, 0.0);
+    const int hqCoverage =
+        penNonZero(TA::penPx(ren), TA::penW(ren), TA::penH(ren));
+    CHECK(hqCoverage > 2);
+
+    // Resizing a displayed stage changes the physical pen buffer without
+    // erasing the already drawn dots. Setter models embedded editor resize.
+    ren.setStageRect({0, 0, 1440, 1080});
+    CHECK_EQ(ren.penResolution().first, 1440);
+    CHECK_EQ(ren.penResolution().second, 1080);
+    CHECK(penNonZero(TA::penPx(ren), TA::penW(ren), TA::penH(ren)) > 0);
+
+    ren.setHighQualityPen(false);
+    CHECK_EQ(ren.penResolution().first, 480);
+    CHECK_EQ(ren.penResolution().second, 360);
+    CHECK(penNonZero(TA::penPx(ren), TA::penW(ren), TA::penH(ren)) > 0);
+
+    ren.penClear(skin);
+    ren.penPoint(skin, red, 2.0, 0.0, 0.0);
+    const int normalCoverage =
+        penNonZero(TA::penPx(ren), TA::penW(ren), TA::penH(ren));
+    CHECK(hqCoverage > normalCoverage);
+
+    // A costume stamp must use the physical pen resolution too.
+    // Run this separately to cover the actual source-texture sampling path.
+    {
+        Runtime stampRuntime;
+        CHECK(loadProject(stampRuntime, R"JSON([
+          {"assetId":"a","name":"a","dataFormat":"svg",
+           "md5ext":"a.svg","bitmapResolution":1,
+           "rotationCenterX":10,"rotationCenterY":5}
+        ])JSON"));
+        Target* sprite = spriteOf(stampRuntime);
+        CHECK(sprite != nullptr);
+        if (sprite) {
+            setCostumeData(sprite, 0, kSvgRect, std::strlen(kSvgRect));
+            SdlRenderer stampRenderer;
+            stampRenderer.setHighQualityPen(true);
+            CHECK(stampRenderer.init(stampRuntime, 2));
+            stampRuntime.renderer = &stampRenderer;
+            const int penSkin = stampRenderer.createPenSkin();
+            stampRenderer.penStamp(penSkin, sprite->drawableID);
+            const int stamped = penNonZero(
+                TA::penPx(stampRenderer), TA::penW(stampRenderer),
+                TA::penH(stampRenderer));
+            CHECK(stamped >= 400);
+            CHECK_EQ(stampRenderer.penResolution().first, 960);
+        }
+    }
+    std::printf("hq-pen: %d checks, %d failures\n", g_checks, g_fail);
+    return g_fail;
 }
 
 int test_pen_points_gpu() {
@@ -1492,6 +1622,88 @@ int test_frame_capture() {
     return g_fail;
 }
 
+// DLSS-equivalent internal-resolution rendering: the stage is rendered into
+// a smaller offscreen target and reconstructed. 1.0 must stay byte-identical
+// to the legacy path.
+bool samePpmFile(const char* a, const char* b) {
+    FILE* fa = std::fopen(a, "rb");
+    FILE* fb = std::fopen(b, "rb");
+    if (!fa || !fb) {
+        if (fa) std::fclose(fa);
+        if (fb) std::fclose(fb);
+        return false;
+    }
+    bool same = true;
+    char ba[4096], bb[4096];
+    for (;;) {
+        const size_t na = std::fread(ba, 1, sizeof(ba), fa);
+        const size_t nb = std::fread(bb, 1, sizeof(bb), fb);
+        if (na != nb || std::memcmp(ba, bb, na) != 0) {
+            same = false;
+            break;
+        }
+        if (na == 0) break;
+    }
+    std::fclose(fa);
+    std::fclose(fb);
+    return same;
+}
+
+int test_render_scale() {
+    Runtime rt;
+    CHECK(loadProject(rt, R"JSON([{"assetId":"a","name":"a",
+        "dataFormat":"svg","md5ext":"a.svg","bitmapResolution":1,
+        "rotationCenterX":10,"rotationCenterY":5}])JSON"));
+    Target* sp = spriteOf(rt);
+    CHECK(sp != nullptr);
+    if (!sp) return g_fail;
+    setCostumeData(sp, 0, kSvgRect, std::strlen(kSvgRect));
+    sp->setXY(0, 0);
+
+    SdlRenderer ren;
+    CHECK(ren.init(rt, 1));
+    rt.renderer = &ren;
+
+    const char* p0 = "xyo_render_scale_1a.ppm";
+    const char* p1 = "xyo_render_scale_05.ppm";
+    const char* p2 = "xyo_render_scale_1b.ppm";
+    const char* paths[3] = {p0, p1, p2};
+    int calls = 0;
+    ren.setFrameCapture([&] {
+        CHECK(calls < 3);
+        if (calls < 3) CHECK(ren.savePPM(paths[calls]));
+        ++calls;
+    });
+
+    ren.setRenderScale(1.0);
+    CHECK_EQ(ren.renderScale(), 1.0);
+    ren.draw();
+    ren.setRenderScale(0.5);
+    CHECK_EQ(ren.renderScale(), 0.5);
+    ren.draw();
+    ren.setRenderScale(1.0);
+    CHECK_EQ(ren.renderScale(), 1.0);
+    ren.draw();
+    ren.setFrameCapture(nullptr);
+    CHECK_EQ(calls, 3);
+
+    auto isRed = [](const uint8_t* p) {
+        return p[0] > 200 && p[1] < 60 && p[2] < 60;
+    };
+    auto isWhite = [](const uint8_t* p) {
+        return p[0] == 255 && p[1] == 255 && p[2] == 255;
+    };
+    CHECK(ppmCount(p0, isRed) > 0);
+    CHECK(ppmCount(p1, isRed) > 0);
+    CHECK(ppmCount(p1, isWhite) > 0);
+    // Returning to 1.0 must reproduce the legacy frame exactly.
+    CHECK(samePpmFile(p0, p2));
+    for (const char* p : paths) std::remove(p);
+
+    std::printf("render-scale: %d checks, %d failures\n", g_checks, g_fail);
+    return g_fail;
+}
+
 // 逆順合成（遅延バッチ + (T,P) 半群 + 早期終了）の回帰テスト。
 // 強制的に RC 経路を通し、前向き逐次合成との差が知覚閾値内であることを
 // 検証する。順序（描画順）が保たれることも併せて確認する。
@@ -1616,6 +1828,16 @@ int test_svg_nanosvg_fallback() {
 } // namespace
 
 int main() {
+    if (std::getenv("XYO_TEST_HQ_PEN_ONLY")) {
+        test_high_quality_pen();
+        return g_fail ? 1 : 0;
+    }
+    if (std::getenv("XYO_TEST_STAMP_ONLY")) {
+        test_stamp_ghost_and_hidden();
+        test_svg_text_usage();
+        std::printf("stamp-only: %d checks, %d failures\n", g_checks, g_fail);
+        return g_fail ? 1 : 0;
+    }
     if (std::getenv("XYO_TEST_PEN_RECORDS")) {
         test_pen_point_record_parity();
         test_pen_point_record_parity(640, 480);
@@ -1625,6 +1847,7 @@ int main() {
     test_negative_cache_zero_svg();
     test_negative_cache_empty_and_bad_bitmap();
     test_positive_cache_valid_svg();
+    test_ghost_gpu_modulation();
     test_costume_switch_and_clone();
     test_pen_points_gpu();
     test_pen_lines();
@@ -1640,7 +1863,9 @@ int main() {
     test_pen_border_fenced();
     test_pen_full_coverage();
     test_frame_capture();
+    test_render_scale();
     test_pen_reverse_composite();
+    test_high_quality_pen();
 #if !XYO_TEST_RSVG
     test_svg_nanosvg_fallback();
 #endif

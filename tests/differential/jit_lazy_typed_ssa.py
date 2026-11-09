@@ -43,6 +43,19 @@ def fixture(path: Path, warp: bool):
             S_set("value", add(var("sum"), num(1))),
             S_change("sum", var("value")),
             S_set("temporary", var("value")),
+            # Two control-flow predecessors assign different storage types.
+            # The join must merge boxed SSA values without coercion.
+            S_ifelse(lt(var("sum"), num(1000)),
+                [S_set("temporary", text(" 12.5 "))],
+                [S_set("temporary", num(3))]),
+            S_change("sum", var("temporary")),
+            S_change("sum", var("temporary")),
+            # Both branches produce verified numeric SSA values even though
+            # this same scalar has received string writes elsewhere.
+            S_ifelse(gt(var("sum"), num(0)),
+                [S_set("temporary", add(var("sum"), num(1)))],
+                [S_set("temporary", add(var("sum"), num(-4)))]),
+            S_change("sum", var("temporary")),
             S_if(eq(var("temporary"), literal),
                 [S_set("value", num(3))]),
             S_change("sum", var("value")),
@@ -87,6 +100,10 @@ def main():
         for tier,enabled,extra in [
             ("eager",False,{}),("eager",True,{}),
             ("hotspot",True,{}),("eager",True,{"XYO_JIT_O2":"1"}),
+            # Whole-loop type-demand analysis on/off must preserve values.
+            ("eager",False,{"XYO_JIT_TYPE_FLOW":"0"}),
+            ("eager",False,{"XYO_JIT_TYPE_FLOW":"1"}),
+            ("hotspot",False,{"XYO_JIT_TYPE_FLOW":"1"}),
             ("eager",True,{"XYO_JIT_TYPE_PROFILE":"0"}),
         ]:
             actual = run(binary,path,keys,tier,enabled,extra)

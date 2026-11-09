@@ -44,6 +44,16 @@ def fixture(out: Path, warp: bool) -> list[str]:
             S_change("counter", num(1)),
             S_set(keys[i], var("counter")),
         ]
+    # A nested empty repeat used to fall back to the C++ helper because
+    # the enclosing repeat keeps a private yield phase. The direct
+    # scheduler must instead advance the GLOBAL counter just like the
+    # helper, without touching the outer private counter.
+    statements += [
+        S_repeat(num(3), [
+            S_repeat(num(100001 if warp else 3), []),
+            S_change("counter", num(1)),
+        ]),
+    ]
     statements.append(S_set("done", num(1)))
     g.define("test", [], statements, warp=warp)
     g.script([S_call("test")])
@@ -82,12 +92,16 @@ def main():
         for tier in ["eager", "hotspot"]:
             for enabled in [False, True]:
                 for clock in ["1", "0"]:
-                    actual = run(
-                        binary, path, tier, enabled, keys,
-                        {"XYO_JIT_WARP_CLOCK": clock})
-                    assert actual == baseline, (
-                        warp, tier, enabled, clock, actual, baseline)
-                    print("PASS", warp, tier, enabled, clock, flush=True)
+                    for direct in ["0", "1"]:
+                        actual = run(
+                            binary, path, tier, enabled, keys,
+                            {"XYO_JIT_WARP_CLOCK": clock,
+                             "XYO_JIT_INLINE_EMPTY_DIRECT": direct})
+                        assert actual == baseline, (
+                            warp, tier, enabled, clock, direct,
+                            actual, baseline)
+                        print("PASS", warp, tier, enabled, clock,
+                              direct, flush=True)
 
 
 if __name__ == "__main__":

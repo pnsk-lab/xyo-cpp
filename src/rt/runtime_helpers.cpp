@@ -1,5 +1,6 @@
 // xyo-cpp: jsexecute.js runtimeFunctions の移植。
 #include "runtime_helpers.hpp"
+#include "../ir/list_access.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -199,7 +200,7 @@ Value joinStrings(Value a, Value b) {
     if (!s2 || !s2->len) return a;
     if (size_t(s1->len) + s2->len >= 16)
         return Value::string(sstrConsOrAppend(s1, s2));
-    return Value::string(sstrConcat(s1->view(), s2->view()));
+    return Value::string(sstrConcatStrings(s1, s2));
 }
 
 Value join(Value a, Value b) {
@@ -222,7 +223,7 @@ Value join(Value a, Value b) {
             if (!s1 || !s1->len) return Value::string(leaf);
             if (size_t(s1->len) + leaf->len >= 16)
                 return Value::string(sstrConsOrAppend(s1, leaf));
-            return Value::string(sstrConcat(s1->view(), leaf->view()));
+            return Value::string(sstrConcatStrings(s1, leaf));
         }
         std::string ns = jsnum::toString(d);
         // Do not flatten/copy a growing prefix for each numeric append.
@@ -231,8 +232,7 @@ Value join(Value a, Value b) {
             SStr* leaf = sstrFromAscii(ns);
             return Value::string(sstrConsOrAppend(s1, leaf));
         }
-        return Value::string(sstrConcatAscii(
-            s1 ? s1->view() : std::u16string_view(), ns));
+        return Value::string(sstrConcatStringAscii(s1, ns));
     }
     // (num, str): convert the number once, then concatenate directly instead
     // of allocating the numeric string and copying it into a second object.
@@ -249,18 +249,19 @@ Value join(Value a, Value b) {
                 char16_t units[16];
                 for (size_t i = 0; i < ns.size(); ++i)
                     units[i] = static_cast<char16_t>(ns[i]);
-                std::memcpy(units + ns.size(), s2->data(), size_t(s2->len) * 2);
+                for (uint32_t i = 0; i < s2->len; ++i)
+                    units[ns.size() + i] = s2->unitAt(i);
                 return Value::string(SStr::create(units, static_cast<uint32_t>(len)));
             }
             s1 = sstrFromAscii(ns);
         }
         if (s2->len == 1 && !s2->isComposite()) {
-            const char16_t c = s2->data()[0];
+            const char16_t c = s2->unitAt(0);
             if (c < 128) s2 = letterCached(c);
         }
         if (size_t(s1->len) + s2->len >= 16)
             return Value::string(sstrConsOrAppend(s1, s2));
-        return Value::string(sstrConcat(s1->view(), s2->view()));
+        return Value::string(sstrConcatStrings(s1, s2));
     }
     // (num, num): two conversions plus one concatenation, not three objects.
     if (a.isNumber() && b.isNumber()) {
@@ -268,7 +269,7 @@ Value join(Value a, Value b) {
         SStr* s2 = cast::toString(b);
         if (size_t(s1->len) + s2->len >= 16)
             return Value::string(sstrConsOrAppend(s1, s2));
-        return Value::string(sstrConcat(s1->view(), s2->view()));
+        return Value::string(sstrConcatStrings(s1, s2));
     }
     SStr* s1 = cast::toString(a);
     SStr* s2 = cast::toString(b);
@@ -277,7 +278,7 @@ Value join(Value a, Value b) {
     // `x/4 ++ ""` のような数値→文字列の定番形で SStr の確保とコピーが 1 回減る。
     if (s1->len == 0) return Value::string(s2);
     if (s2->len == 0) return Value::string(s1);
-    return Value::string(sstrConcat(s1->view(), s2->view()));
+    return joinStrings(Value::string(s1), Value::string(s2));
 }
 
 /// letterOf の 1 文字結果キャッシュ（ASCII）。毎回の SStr::create を
@@ -340,9 +341,18 @@ SStr* toLowerSStr(Value v) {
 // --- リスト ---
 
 Value listGet(SList* list, Value idx) {
+    if (list) list->noteAdaptiveRead();
+    if (list && list->numericOnly && idx.isNumber()) {
+        // This path only accepts ordinary in-range numeric indices. Large
+        // wraparound indices and special Scratch index syntax fall through
+        // to cast::listIndex, preserving legacy ToInt32 semantics.
+        const ir::NumericListItem fast =
+            ir::readNumericListItem(list, idx.asNumberUnchecked());
+        if (fast.available) return Value{fast.bits};
+    }
     int32_t i = cast::listIndex(idx, list->len);
     if (i < 0) return Value::emptyStr();
-    return list->items[i];
+    return list->get0(i);
 }
 
 void listReplace(SList* list, Value idx, Value v) {
@@ -386,6 +396,8 @@ static bool sameValueZero(Value a, Value b) {
 }
 
 bool listContains(SList* list, Value item) {
+    if (list && list->extra && xyo_list_storage_mode == 7)
+        list->makeContiguous();
     noteCall();
     // Unlike indexOf, contains returns only a boolean: the first strict
     // match and the first Scratch-coercing match have identical results.
@@ -403,7 +415,7 @@ bool listContains(SList* list, Value item) {
             !(numericNeedle == 0.0 && cast::isNotActuallyZero(item));
     }
     for (uint32_t i = 0; i < list->len; ++i) {
-        Value entry = list->items[i];
+        Value entry = list->get0(i);
         bool hit;
         if (numericNeedleValid && entry.isNumber()) {
             hit = entry.asNumberUnchecked() == numericNeedle;
@@ -421,11 +433,13 @@ bool listContains(SList* list, Value item) {
 }
 
 double listIndexOf(SList* list, Value item) {
+    if (list && list->extra && xyo_list_storage_mode == 7)
+        list->makeContiguous();
     noteCall();
     if (item.isNumber() && !std::isnan(item.asNumberUnchecked())) {
         const double needle = item.asNumberUnchecked();
         for (uint32_t i = 0; i < list->len; ++i) {
-            Value entry = list->items[i];
+            Value entry = list->get0(i);
             const bool found = entry.isNumber()
                 ? entry.asNumberUnchecked() == needle
                 : compareEqual(entry, item);
@@ -437,7 +451,7 @@ double listIndexOf(SList* list, Value item) {
         }
     } else {
         for (uint32_t i = 0; i < list->len; ++i) {
-            if (compareEqual(list->items[i], item)) {
+            if (compareEqual(list->get0(i), item)) {
                 noteScanned(i + 1);
                 noteHit(i + 1);
                 return i + 1;
@@ -449,20 +463,22 @@ double listIndexOf(SList* list, Value item) {
 }
 
 Value listContents(SList* list) {
+    if (list && list->extra && xyo_list_storage_mode == 7)
+        list->makeContiguous();
     // scratch-vm getListContents: 全要素が「文字列かつ長さ 1」のときだけ
     // join('')、さもなければ join(' ')。数値 1 は typeof が string ではない
     // ので区切りが入る（TurboWarp コンパイラの (item + '').length 判定とは
     // ここで異なる。公式 Scratch に合わせる）。
     bool allSingleLetters = true;
     for (uint32_t i = 0; i < list->len; ++i) {
-        const Value& it = list->items[i];
+        const Value it = list->get0(i);
         SStr* s = it.isString() ? it.asStrPtr() : nullptr;
         if (!s || s->len != 1) { allSingleLetters = false; break; }
     }
     std::u16string out;
     for (uint32_t j = 0; j < list->len; ++j) {
         if (!allSingleLetters && j) out.push_back(u' ');
-        SStr* e = cast::toString(list->items[j]);
+        SStr* e = cast::toString(list->get0(j));
         out.append(e->view());
     }
     return out.empty() ? Value::emptyStr()

@@ -32,6 +32,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #if !defined(_WIN32)
 #include <pwd.h>
 #include <unistd.h>
@@ -58,13 +59,16 @@
 #include "editor.hpp"
 #ifdef XYO_JIT
 #include "aot/aot.hpp"
+#include "aot/progress_text.hpp"
 #include "jit/jit.hpp"
 #endif
 
 /// main.cpp の再生経路（SDL ウィンドウで実行）。
 /// aotObjPath は事前コンパイル済みオブジェクト（nullptr 可）。
 int xyoShellPlay(const char* path, const char* aotObjPath, int scale,
-                 bool turbo, int fps, int gpuMode);
+                 bool turbo, int fps, int gpuMode,
+                 const std::function<void(int, size_t, size_t)>& onProgress = {},
+                 const std::function<void()>& beforePlayback = {});
 
 namespace xyo {
 namespace {
@@ -612,6 +616,11 @@ public:
     GuiRunOptions options() const { return options_; }
     void setOptions(GuiRunOptions opts) { options_ = opts; }
     void setStatus(const std::string& s, bool err);
+#ifdef XYO_JIT
+    void beginAotProgress(const std::string& operation);
+    void showAotProgress(const aot::Progress& p);
+    void endAotProgress() { aotProgress_ = -1.0; }
+#endif
     void openDir(const std::string& d) { navigatePath(d, false); }
     void setActions(std::vector<std::string> a) {
         actions_ = std::move(a);
@@ -714,6 +723,13 @@ private:
     int mx_ = -1, my_ = -1;
     std::string status_;
     bool statusErr_ = false;
+#ifdef XYO_JIT
+    double aotProgress_ = -1.0; // -1: indeterminate stage / inactive
+    std::string aotOperation_;
+    int aotShownStage_ = -1, aotLastPct_ = -1;
+    std::chrono::steady_clock::time_point aotStartedAt_{};
+    std::chrono::steady_clock::time_point aotLastDraw_{};
+#endif
     size_t actIdx_ = 0;
     std::vector<std::string> actions_;
     bool pendingAot_ = false;
@@ -1290,6 +1306,7 @@ bool Launcher::open() {
 }
 
 void Launcher::close() {
+    if (!win_ && !ren_) return;
     setSearchActive(false);
     setPathActive(false);
     stopThumbs();
@@ -1312,6 +1329,44 @@ void Launcher::setStatus(const std::string& s, bool err) {
     if (std::getenv("XYO_GUI_DEBUG") || err)
         std::fprintf(stderr, "gui: %s\n", s.c_str());
 }
+
+#ifdef XYO_JIT
+void Launcher::beginAotProgress(const std::string& operation) {
+    aotOperation_ = operation;
+    aotStartedAt_ = std::chrono::steady_clock::now();
+    aotLastDraw_ = {};
+    aotShownStage_ = aotLastPct_ = -1;
+    aotProgress_ = -1.0;
+    setStatus(aotOperation_ + " — プロジェクトを読み込み中", false);
+    draw();
+    SDL_RenderPresent(ren_);
+}
+
+void Launcher::showAotProgress(const aot::Progress& p) {
+    // The single-threaded LLVM compiler invokes this at meaningful
+    // checkpoints. Repaint the actual launcher window rather than showing
+    // a frozen "compiling" status while LLVM works synchronously.
+    const int stage = int(p.stage);
+    const int pct = p.total ? int(p.completed * 100 / p.total) : -1;
+    const auto now = std::chrono::steady_clock::now();
+    if (stage == aotShownStage_ && pct != 100 &&
+        (pct < 0 || pct / 5 == aotLastPct_ / 5) &&
+        now - aotLastDraw_ < std::chrono::milliseconds(100))
+        return;
+    aotShownStage_ = stage;
+    aotLastPct_ = pct;
+    aotLastDraw_ = now;
+    aotProgress_ = p.total
+        ? std::clamp(double(p.completed) / p.total, 0.0, 1.0) : -1.0;
+    const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(
+        now - aotStartedAt_).count();
+    setStatus(aotOperation_ + " — " + aot::progressText(p) +
+              "  ·  " + std::to_string(seconds) + "秒", false);
+    SDL_PumpEvents();
+    draw();
+    SDL_RenderPresent(ren_);
+}
+#endif
 
 /// 選択項目を開く。ディレクトリなら移動、プロジェクトなら実行予約。
 void Launcher::activate() {
@@ -1493,10 +1548,7 @@ void Launcher::exportAot() {
         return;
     }
     const Entry e = entries_[size_t(sel_)];
-    // 書き出し中の表示を先に出す
-    setStatus("AOT 書き出し中... " + e.name, false);
-    draw();
-    SDL_RenderPresent(ren_);
+    beginAotProgress("AOT 書き出し: " + e.name);
 
     std::vector<uint8_t> data;
     {
@@ -1515,18 +1567,24 @@ void Launcher::exportAot() {
         }
     }
     if (data.empty()) {
+        endAotProgress();
         setStatus("読み込みに失敗しました: " + e.name, true);
         return;
     }
     const uint64_t hash = aot::hashBytes(data.data(), data.size());
     Runtime rt;
     if (!loadSb3File(rt, data.data(), data.size()).ok) {
+        endAotProgress();
         setStatus("プロジェクトのロードに失敗しました", true);
         return;
     }
     aot::BuildResult br;
     std::string why;
-    if (!aot::compileProject(rt, hash, br, &why)) {
+    if (!aot::compileProject(rt, hash, br, &why,
+                             [this](const aot::Progress& p) {
+                                 showAotProgress(p);
+                             })) {
+        endAotProgress();
         setStatus("AOT コンパイル不可: " + why, true);
         return;
     }
@@ -1536,11 +1594,14 @@ void Launcher::exportAot() {
     if (fs::exists(out, ec)) {
         out = src.parent_path() / (src.stem().string() + "-aot");
     }
+    showAotProgress({aot::ProgressStage::WriteOutput});
     if (!aot::writeExecutable(out.string(), data.data(), data.size(), br,
                               hash, &why)) {
+        endAotProgress();
         setStatus("書き出し失敗: " + why, true);
         return;
     }
+    endAotProgress();
     setStatus("書き出しました: " + out.string() + "（" +
                   std::to_string(br.scripts) + " scripts / " +
                   std::to_string(br.slots) + " slots）",
@@ -2273,6 +2334,16 @@ void Launcher::draw() {
         drawTextClipped(gridX_, H - footerH + 13, selectedLabel, 13,
                         hasSel ? kStrong : kDim, W - gridX_ - 38);
     }
+#ifdef XYO_JIT
+    if (aotProgress_ >= 0.0) {
+        const int barX = gridX_ + 17;
+        const int barW = std::max(0, W - barX - 38);
+        const int barY = H - footerH + 41;
+        roundRect(barX, barY, barW, 5, 2, kField);
+        roundRect(barX, barY,
+                  int(std::lround(barW * aotProgress_)), 5, 2, kAccent);
+    }
+#endif
     const int by = H - 49, bh = 36, space = 8;
     bQuit_ = {W - 20 - 70, by, 70, bh};
     bRun_ = {bQuit_.x - space - 118, by, 118, bh};
@@ -3011,7 +3082,7 @@ int guiMain(const char* startDir) {
         runAot = l.pendingAot();
         const bool runEdit = l.pendingEdit();
         options = l.options();
-        l.close();
+        if (!runAot) l.close();
         if (act == 3) return 0;
         if (act == 4) {
             if (!runPath.empty()) {
@@ -3020,7 +3091,10 @@ int guiMain(const char* startDir) {
             if (oneShot) return 0;
             continue;
         }
-        if (runPath.empty()) return 0;
+        if (runPath.empty()) {
+            if (runAot) l.close();
+            return 0;
+        }
         if (dbg) std::fprintf(stderr,
             "gui: play %s (aot=%d scale=%d fps=%d turbo=%d "
             "jit=%d lazy=%d gpu=%d danger=%d)\n",
@@ -3030,6 +3104,8 @@ int guiMain(const char* startDir) {
         ScopedGuiRunFlags flags(options, runAot);
         if (runAot) {
 #ifdef XYO_JIT
+            l.beginAotProgress("AOT 実行: " +
+                               fs::path(runPath).filename().string());
             // 事前コンパイルしてオブジェクト経由で再生する
             std::vector<uint8_t> data;
             std::FILE* f = std::fopen(runPath.c_str(), "rb");
@@ -3052,14 +3128,32 @@ int guiMain(const char* startDir) {
                     aot::hashBytes(data.data(), data.size());
                 aot::BuildResult br;
                 std::string why;
-                if (aot::compileProject(rt, hash, br, &why)) {
+                if (aot::compileProject(rt, hash, br, &why,
+                                        [&l](const aot::Progress& p) {
+                                            l.showAotProgress(p);
+                                        })) {
                     TemporaryAotObject temp;
                     if (temp.path.empty()) {
                         why = "cannot allocate temporary AOT file";
-                    } else if (aot::writeObjectFile(temp.path, br, &why)) {
+                    } else {
+                        l.showAotProgress({aot::ProgressStage::WriteOutput});
+                    }
+                    if (!temp.path.empty() &&
+                        aot::writeObjectFile(temp.path, br, &why)) {
+                        l.showAotProgress({aot::ProgressStage::LoadObject});
                         xyoShellPlay(runPath.c_str(), temp.path.c_str(),
                                      options.scale, options.turbo,
-                                     options.fps, options.gpuMode);
+                                     options.fps, options.gpuMode,
+                                     [&l](int stage, size_t done, size_t total) {
+                                         l.showAotProgress({
+                                             static_cast<aot::ProgressStage>(stage),
+                                             done, total});
+                                     },
+                                     [&l] {
+                                         l.endAotProgress();
+                                         l.close();
+                                     });
+                        l.close();  // also close on early load failure
                         if (oneShot) return 0;
                         continue;
                     }
@@ -3069,6 +3163,7 @@ int guiMain(const char* startDir) {
             }
 #endif
             // AOT 不可なら通常再生へフォールバック
+            l.close();
             xyoShellPlay(runPath.c_str(), nullptr, options.scale,
                          options.turbo, options.fps, options.gpuMode);
             if (oneShot) return 0;

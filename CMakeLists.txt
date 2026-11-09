@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(xyo-cpp VERSION 1.1.4 LANGUAGES C CXX ASM)
+project(xyo-cpp VERSION 1.2.0 LANGUAGES C CXX ASM)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -7,28 +7,66 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 if(NOT CMAKE_BUILD_TYPE)
-  set(CMAKE_BUILD_TYPE RelWithDebInfo)
+  set(CMAKE_BUILD_TYPE Release) # v1.2.0 performance-oriented default
 endif()
 
-option(XYO_JIT "Enable LLVM JIT" ON)
+option(XYO_JIT "Enable JIT support" ON)
+set(XYO_JIT_BACKEND "llvm" CACHE STRING "JIT backend implementation: llvm | wasm | none")
+set_property(CACHE XYO_JIT_BACKEND PROPERTY STRINGS llvm wasm none)
+if(NOT XYO_JIT_BACKEND STREQUAL "llvm" AND
+   NOT XYO_JIT_BACKEND STREQUAL "none" AND
+   NOT XYO_JIT_BACKEND STREQUAL "wasm")
+  message(FATAL_ERROR "Unsupported XYO_JIT_BACKEND=${XYO_JIT_BACKEND} (llvm|wasm|none)")
+endif()
 option(XYO_BUILD_SHELL "Build xyo CLI shell" ON)
 option(XYO_BUILD_TESTS "Build tests" ON)
+# 現在の作業ツリー diff にある「ビルド時 opt-in 実験」をまとめて有効化する。
+# 実行時の opt-in トグルは `--opt-all` / XYO_OPT_ALL=1（src/engine/opt_flags.cpp）。
+# 個別に -DXYO_...=OFF を渡した場合はそちらが優先される（下の *_default を
+# option() の既定値として使うため）。プロプライエタリな SDK を要する
+# XYO_NVSDK_DLSS_VK は対象外。
+option(XYO_ALL_OPTS "Enable every opt-in compile-time experiment" OFF)
+set(_xyo_opt_in_default OFF)
+if(XYO_ALL_OPTS)
+  set(_xyo_opt_in_default ON)
+endif()
+# asm 実験は Linux x86-64 の SysV 専用（他プラットフォームで ON にすると
+# configure が FATAL_ERROR になるため、既定値の段階で落とす）。
+set(_xyo_asm_default ${_xyo_opt_in_default})
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
+   NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+  set(_xyo_asm_default OFF)
+endif()
+# Optional hand-written SysV x86-64 decimal integer formatter.
+# Other platforms keep std::to_chars.
+option(XYO_ASM_NUM_TO_STR "Use x86-64 assembly for integer-to-string formatting" ${_xyo_asm_default})
+# Experimental x86-64 conversion of shortest scientific digits to the
+# ECMAScript decimal / exponent layout. The digit generation stays in C++.
+option(XYO_ASM_ECMA_FORMAT "Use x86-64 assembly for ECMAScript decimal layout" ${_xyo_asm_default})
+# Experimental Dragonbox adopted by V8, plus V8 SignificandToChars.
+# Dragonbox is BSL-1.0; the adapted V8 helpers are BSD-3.
+option(XYO_NUM_TO_STR_DRAGONBOX "Use V8 Dragonbox number-to-string conversion" ON)
+# When Dragonbox is enabled, eliminate std::string and copy formatted
+# ASCII straight into the GC-owned UTF-16 string. May be toggled for A/B.
+option(XYO_NUM_TO_STR_DIRECT_BUFFER "Avoid intermediate std::string in Dragonbox numeric casts" ON)
 option(XYO_FULL_BUILD "Require all supported native rendering and JIT features (CI/release)" OFF)
 
 # Factorial experiment toggles for string/cons optimization. These are private
 # compile-time switches so each variant has a fixed runtime and JIT path.
-option(XYO_STRING_CONS_POOL "Separate cons allocations into dedicated GC slabs" OFF)
-option(XYO_STRING_JOIN_SPECIALIZED "Lower dynamic string/string joins through a typed helper" OFF)
+option(XYO_STRING_CONS_POOL "Separate cons allocations into dedicated GC slabs" ${_xyo_opt_in_default})
+option(XYO_STRING_JOIN_SPECIALIZED "Lower dynamic string/string joins through a typed helper" ${_xyo_opt_in_default})
 # Production binaries should not pay an instrumentation branch on every
 # runtime helper call. Profile builds retain XYO_PROF=1 diagnostics; pass
 # -DXYO_DISABLE_RT_PROF=OFF to explicitly profile a Release build.
 set(_xyo_disable_rt_prof_default OFF)
-if(CMAKE_BUILD_TYPE STREQUAL "Release")
+if(CMAKE_BUILD_TYPE STREQUAL "Release" OR XYO_ALL_OPTS)
   set(_xyo_disable_rt_prof_default ON)
 endif()
 option(XYO_DISABLE_RT_PROF "Compile out optional runtime profiling instrumentation"
        ${_xyo_disable_rt_prof_default})
 unset(_xyo_disable_rt_prof_default)
+unset(_xyo_opt_in_default)
+unset(_xyo_asm_default)
 
 # --- LLVM ---
 option(XYO_STATIC_LLVM "Link LLVM statically (static archives required)" OFF)
@@ -37,7 +75,10 @@ option(XYO_STATIC "Link the executable fully static (-static)" OFF)
 if(APPLE AND XYO_STATIC)
   message(FATAL_ERROR "macOS does not support fully static executables; use XYO_STATIC=OFF")
 endif()
-if(XYO_JIT)
+if(XYO_JIT AND XYO_JIT_BACKEND STREQUAL "wasm" AND NOT EMSCRIPTEN)
+  message(FATAL_ERROR "XYO_JIT_BACKEND=wasm requires an Emscripten target")
+endif()
+if(XYO_JIT AND XYO_JIT_BACKEND STREQUAL "llvm")
   # auto: config モード（LLVMConfig.cmake）を優先する。静的アーカイブの
   #       依存関係（component → library の順序）を llvm-config より確実に解決できる。
   # config: config モードのみ / llvm-config: llvm-config のみ（--link-static を明示）
@@ -124,16 +165,54 @@ file(GLOB_RECURSE XYO_CORE_SOURCES CONFIGURE_DEPENDS
   src/gpu/*.cpp
   src/wasm/*.cpp
 )
+if(NOT XYO_NUM_TO_STR_DRAGONBOX)
+  list(REMOVE_ITEM XYO_CORE_SOURCES
+       "${CMAKE_CURRENT_SOURCE_DIR}/src/core/v8_decimal.cpp")
+endif()
 if(XYO_JIT)
   file(GLOB_RECURSE XYO_JIT_SOURCES CONFIGURE_DEPENDS src/jit/*.cpp)
   list(REMOVE_ITEM XYO_JIT_SOURCES
        ${CMAKE_CURRENT_SOURCE_DIR}/src/jit/nojit_stub.cpp)
+  if(XYO_JIT_BACKEND STREQUAL "llvm")
+    list(REMOVE_ITEM XYO_JIT_SOURCES
+         ${CMAKE_CURRENT_SOURCE_DIR}/src/jit/backend_none.cpp
+         ${CMAKE_CURRENT_SOURCE_DIR}/src/jit/backend_wasm.cpp)
+    list(APPEND XYO_CORE_SOURCES src/aot/aot.cpp)
+  else()
+    list(REMOVE_ITEM XYO_JIT_SOURCES
+         ${CMAKE_CURRENT_SOURCE_DIR}/src/jit/codegen.cpp
+         ${CMAKE_CURRENT_SOURCE_DIR}/src/jit/backend_llvm.cpp)
+    if(XYO_JIT_BACKEND STREQUAL "wasm")
+      list(REMOVE_ITEM XYO_JIT_SOURCES
+           ${CMAKE_CURRENT_SOURCE_DIR}/src/jit/backend_none.cpp)
+    else()
+      list(REMOVE_ITEM XYO_JIT_SOURCES
+           ${CMAKE_CURRENT_SOURCE_DIR}/src/jit/backend_wasm.cpp)
+    endif()
+    list(APPEND XYO_CORE_SOURCES src/aot/aot_stub.cpp)
+  endif()
   list(APPEND XYO_CORE_SOURCES ${XYO_JIT_SOURCES})
-  # AOT（プロジェクト全体のネイティブコード事前生成）は LLVM 必須
-  list(APPEND XYO_CORE_SOURCES src/aot/aot.cpp)
 else()
-  # JitEngine 空実装 — 依存コード側に ifdef を散らさないためのスタブ
+  # Existing interpreter-only build without JIT runtime helpers.
   list(APPEND XYO_CORE_SOURCES src/jit/nojit_stub.cpp)
+endif()
+
+# Integer decimal formatter: SysV calling convention, ELF syntax.
+if(XYO_ASM_NUM_TO_STR)
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
+     NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+    message(FATAL_ERROR
+      "XYO_ASM_NUM_TO_STR currently supports Linux x86-64 only")
+  endif()
+  list(APPEND XYO_CORE_SOURCES src/core/num_to_str_x86_64_sysv.S)
+endif()
+
+if(XYO_ASM_ECMA_FORMAT)
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
+     NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+    message(FATAL_ERROR "XYO_ASM_ECMA_FORMAT currently supports Linux x86-64 only")
+  endif()
+  list(APPEND XYO_CORE_SOURCES src/core/ecma_format_x86_64_sysv.S)
 endif()
 
 # ファイバ切替アセンブリ
@@ -150,14 +229,64 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
 endif()
 
 add_library(xyo STATIC ${XYO_CORE_SOURCES})
+if(XYO_ASM_NUM_TO_STR)
+  target_compile_definitions(xyo PRIVATE XYO_ASM_NUM_TO_STR=1)
+endif()
+if(XYO_ASM_ECMA_FORMAT)
+  target_compile_definitions(xyo PRIVATE XYO_ASM_ECMA_FORMAT=1)
+endif()
+if(XYO_NUM_TO_STR_DRAGONBOX)
+  target_compile_definitions(xyo PRIVATE XYO_NUM_TO_STR_DRAGONBOX=1)
+  if(XYO_NUM_TO_STR_DIRECT_BUFFER)
+    target_compile_definitions(xyo PRIVATE XYO_NUM_TO_STR_DIRECT_BUFFER=1)
+  endif()
+endif()
 target_include_directories(xyo PUBLIC src)
 target_compile_options(xyo PRIVATE -fno-exceptions $<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>)
+
+# Optional in-process Binaryen (independent of XYO_JIT_BACKEND and LLVM).
+# The CLI can still use wasm-opt when the shared library is not installed.
+set(XYO_BINARYEN_C_API "AUTO" CACHE STRING
+    "Link libbinaryen for in-process WASM optimization: AUTO | ON | OFF")
+set_property(CACHE XYO_BINARYEN_C_API PROPERTY STRINGS AUTO ON OFF)
+if(NOT XYO_BINARYEN_C_API MATCHES "^(AUTO|ON|OFF)$")
+  message(FATAL_ERROR "XYO_BINARYEN_C_API must be AUTO, ON or OFF")
+endif()
+if(EMSCRIPTEN AND XYO_BINARYEN_C_API STREQUAL "AUTO")
+  # Do not discover a host libbinaryen.so while cross-compiling.
+  set(XYO_BINARYEN_C_API "OFF")
+endif()
+if(NOT XYO_BINARYEN_C_API STREQUAL "OFF")
+  find_path(XYO_BINARYEN_INCLUDE_DIR NAMES binaryen-c.h)
+  find_library(XYO_BINARYEN_LIBRARY NAMES binaryen)
+  if(XYO_BINARYEN_INCLUDE_DIR AND XYO_BINARYEN_LIBRARY)
+    target_include_directories(xyo PRIVATE "${XYO_BINARYEN_INCLUDE_DIR}")
+    # On Linux, libbinaryen exports a bundled LLVM C++ ABI. Avoid global ELF
+    # interposition with xyo's LLVM ORC by loading the C API with dlopen.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      target_compile_definitions(xyo PRIVATE XYO_BINARYEN_DLOPEN=1)
+      target_link_libraries(xyo PRIVATE ${CMAKE_DL_LIBS})
+    else()
+      target_link_libraries(xyo PRIVATE ${XYO_BINARYEN_LIBRARY})
+    endif()
+    target_compile_definitions(xyo PRIVATE XYO_HAVE_BINARYEN_C=1)
+    set(XYO_HAVE_BINARYEN_C TRUE)
+    message(STATUS "Binaryen C API: ${XYO_BINARYEN_LIBRARY}")
+  elseif(XYO_BINARYEN_C_API STREQUAL "ON")
+    message(FATAL_ERROR
+      "XYO_BINARYEN_C_API=ON requires binaryen-c.h and libbinaryen; "
+      "on Arch Linux install the binaryen package")
+  else()
+    message(STATUS "Binaryen C API not installed; standalone wasm-opt remains available")
+  endif()
+endif()
 if(XYO_STRING_CONS_POOL)
   set_property(SOURCE src/core/gc.cpp src/core/string_util.cpp
                APPEND PROPERTY COMPILE_DEFINITIONS XYO_STRING_CONS_POOL=1)
 endif()
 if(XYO_STRING_JOIN_SPECIALIZED)
-  set_property(SOURCE src/jit/codegen.cpp src/jit/jit.cpp src/jit/rt_blocks.cpp
+  set_property(SOURCE src/jit/codegen.cpp src/jit/jit.cpp
+                      src/jit/backend_llvm.cpp src/jit/rt_blocks.cpp
                APPEND PROPERTY COMPILE_DEFINITIONS XYO_STRING_JOIN_SPECIALIZED=1)
 endif()
 if(XYO_DISABLE_RT_PROF)
@@ -278,6 +407,40 @@ if(XYO_GLSLC AND XYO_VULKAN_INCLUDE AND NOT EMSCRIPTEN)
   message(STATUS "gpu: Vulkan compute executor enabled")
 else()
   message(STATUS "gpu: Vulkan compute executor disabled (glslc/headers missing)")
+endif()
+
+# --- Optional native NVIDIA NGX DLSS Super Resolution (Vulkan only) ---
+# The proprietary SDK must be provided externally by the developer.
+# Do not vendor NVIDIA headers, binaries or the model into xyo-cpp.
+option(XYO_NVSDK_DLSS_VK "Compile the native NVIDIA NGX DLSS Vulkan adapter" OFF)
+set(XYO_NVSDK_DLSS_SDK_ROOT "" CACHE PATH "NVIDIA DLSS SDK (contains include/ and lib/Linux_x86_64/)")
+if(XYO_NVSDK_DLSS_VK)
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "XYO_NVSDK_DLSS_VK currently supports Linux only")
+  endif()
+  if(NOT XYO_NVSDK_DLSS_SDK_ROOT)
+    message(FATAL_ERROR "Set XYO_NVSDK_DLSS_SDK_ROOT to your licensed NVIDIA DLSS SDK")
+  endif()
+  if(NOT XYO_VULKAN_INCLUDE)
+    message(FATAL_ERROR "Vulkan headers required for NVIDIA NGX DLSS")
+  endif()
+  find_path(XYO_NVSDK_DLSS_INCLUDE_DIR NAMES nvsdk_ngx_helpers_vk.h
+    PATHS "${XYO_NVSDK_DLSS_SDK_ROOT}/include" NO_DEFAULT_PATH)
+  find_library(XYO_NVSDK_DLSS_LIBRARY NAMES nvsdk_ngx
+    PATHS "${XYO_NVSDK_DLSS_SDK_ROOT}/lib/Linux_x86_64"
+          "${XYO_NVSDK_DLSS_SDK_ROOT}/lib/Linux_aarch64" NO_DEFAULT_PATH)
+  if(NOT XYO_NVSDK_DLSS_INCLUDE_DIR OR NOT XYO_NVSDK_DLSS_LIBRARY)
+    message(FATAL_ERROR
+      "Missing NVIDIA NGX SDK Vulkan headers or libnvsdk_ngx.a in "
+      "${XYO_NVSDK_DLSS_SDK_ROOT}")
+  endif()
+  find_library(XYO_NVSDK_VULKAN_LOADER vulkan REQUIRED)
+  target_compile_definitions(xyo PUBLIC XYO_NVSDK_DLSS_VK=1)
+  target_include_directories(xyo PRIVATE "${XYO_NVSDK_DLSS_INCLUDE_DIR}")
+  target_include_directories(xyo PUBLIC "${XYO_VULKAN_INCLUDE}")
+  target_link_libraries(xyo PRIVATE "${XYO_NVSDK_DLSS_LIBRARY}"
+                        "${XYO_NVSDK_VULKAN_LOADER}" ${CMAKE_DL_LIBS})
+  message(STATUS "NVIDIA NGX Vulkan DLSS adapter enabled (SDK external)")
 endif()
 
 # --- vendored deps ---
@@ -423,6 +586,7 @@ endif()
 if(XYO_BUILD_SHELL)
   # editor.cpp が本体（SDL2 が無いビルドでは editor.cpp 内の #else スタブ）。
   add_executable(xyo-cli src/shell/main.cpp src/shell/gui.cpp
+                 src/shell/wasm_command.cpp
                  src/shell/editor.cpp
                  src/blockly/shape.cpp src/blockly/layout.cpp
                  src/blockly/geom.cpp
@@ -471,6 +635,10 @@ if(XYO_BUILD_SHELL)
     #   -sMODULARIZE で createXyo(options) 形式にし、生成モジュールへ
     #   memory とヘルパ（_xyo_wasm_h）を渡せるようにする。
     option(XYO_WASM_JIT "Emscripten: enable the runtime wasm-module JIT bridge" OFF)
+    if(XYO_JIT AND XYO_JIT_BACKEND STREQUAL "wasm")
+      set(XYO_WASM_JIT ON CACHE BOOL "Enable browser WASM module bridge" FORCE)
+      target_compile_definitions(xyo PRIVATE XYO_WASM_HOTSPOT=1)
+    endif()
     if(XYO_WASM_JIT)
       target_link_options(xyo-cli PRIVATE
         -sIMPORTED_MEMORY=1
@@ -503,6 +671,28 @@ if(XYO_BUILD_SHELL)
   endif()
 endif()
 
+# Local end-to-end WASM HotSpot validation: available with tests=OFF.
+# The real Emscripten output is run under Node, using the interpreter as oracle.
+if(EMSCRIPTEN AND XYO_JIT AND XYO_JIT_BACKEND STREQUAL "wasm" AND
+   TARGET xyo-cli AND NOT XYO_WASM_BROWSER)
+  find_package(Python3 QUIET COMPONENTS Interpreter)
+  find_program(XYO_WASM_HOT_NODE node)
+  if(Python3_Interpreter_FOUND AND XYO_WASM_HOT_NODE)
+    add_custom_target(check-wasm-hotspot
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/tests/differential/wasm_hotspot_integration.py"
+              "$<TARGET_FILE:xyo-cli>" --out "${CMAKE_CURRENT_BINARY_DIR}"
+              --node "${XYO_WASM_HOT_NODE}"
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/tests/differential/wasm_compat_fuzz.py"
+              "$<TARGET_FILE:xyo-cli>" --out "${CMAKE_CURRENT_BINARY_DIR}"
+              --cases 32
+      DEPENDS xyo-cli
+      USES_TERMINAL
+      VERBATIM)
+  endif()
+endif()
+
 # --- 静的リンク ---
 if(XYO_JIT)
   if(XYO_STATIC)
@@ -526,7 +716,7 @@ if(XYO_FULL_BUILD)
   if(EMSCRIPTEN)
     message(FATAL_ERROR "XYO_FULL_BUILD is for native targets (WASM uses a separate profile)")
   endif()
-  if(NOT XYO_JIT OR NOT XYO_BUILD_SHELL)
+  if(NOT XYO_JIT OR NOT XYO_JIT_BACKEND STREQUAL "llvm" OR NOT XYO_BUILD_SHELL)
     message(FATAL_ERROR "XYO_FULL_BUILD requires XYO_JIT=ON and XYO_BUILD_SHELL=ON")
   endif()
   if(NOT XYO_SDL2 OR NOT SDL2_FOUND)

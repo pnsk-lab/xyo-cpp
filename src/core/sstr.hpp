@@ -43,6 +43,9 @@ struct SStr {
     static constexpr uint32_t kLowerStableValue = 32;
     static constexpr uint32_t kAsciiFoldKnown = 64;
     static constexpr uint32_t kAsciiFoldValue = 128;
+    // Compact Latin-1 leaf: one byte per UTF-16 code unit (0..255).
+    // Its UTF-16 view is widened lazily into body. Composite flags are separate.
+    static constexpr uint32_t kLatin1Flag = 256;
     /// 全コードユニットが 0x80 未満か。比較・検索の大小文字折り畳みや
     /// u16ToLower のコピーを省く判定に使う。一度だけ計算して flags に
     /// キャッシュする（cons は子の結果を合成する）。
@@ -94,9 +97,20 @@ struct SStr {
     static_assert(std::atomic_ref<double>::required_alignment <= alignof(double));
     static_assert(std::atomic_ref<uint32_t>::required_alignment <= alignof(uint32_t));
 
-    bool isCons() const { return flags & kConsFlag; }
-    bool isAppend() const { return flags & kAppendFlag; }
-    bool isComposite() const { return flags & (kConsFlag | kAppendFlag); }
+    // Cached classification flags are published with atomic_ref elsewhere.
+    // Read the representation bits atomically to avoid racing cache updates.
+    uint32_t loadFlags() const {
+        return std::atomic_ref<uint32_t>(const_cast<uint32_t&>(flags))
+            .load(std::memory_order_relaxed);
+    }
+    bool isCons() const { return loadFlags() & kConsFlag; }
+    bool isAppend() const { return loadFlags() & kAppendFlag; }
+    bool isComposite() const { return loadFlags() & (kConsFlag | kAppendFlag); }
+    bool isLatin1() const { return loadFlags() & kLatin1Flag; }
+    uint8_t* latin1Bytes() { return reinterpret_cast<uint8_t*>(this + 1); }
+    const uint8_t* latin1Bytes() const {
+        return reinterpret_cast<const uint8_t*>(this + 1);
+    }
     /// flat の本体（構造体直後）。cons では left/right がここに入る。
     char16_t* inlineBody() { return reinterpret_cast<char16_t*>(this + 1); }
     const char16_t* inlineBody() const {
@@ -104,29 +118,23 @@ struct SStr {
     }
     char16_t* data() {
         return isCons() ? const_cast<char16_t*>(consBody()) :
-               isAppend() ? const_cast<char16_t*>(appendBody()) : inlineBody();
+               isAppend() ? const_cast<char16_t*>(appendBody()) :
+               isLatin1() ? const_cast<char16_t*>(latin1Body()) : inlineBody();
     }
     const char16_t* data() const { return isCons() ? consBody() :
-                                     isAppend() ? appendBody() : inlineBody(); }
+                                     isAppend() ? appendBody() :
+                                     isLatin1() ? latin1Body() : inlineBody(); }
     std::u16string_view view() const { return {data(), len}; }
     /// cons を 1 回だけ materialize して本体を返す（string_util.cpp）。
     const char16_t* consBody() const;
     const char16_t* appendBody() const;
+    const char16_t* latin1Body() const;
     /// Read one UTF-16 unit without flattening shallow cons paths. The caller
     /// must check index < len. Deep paths fall back to materialization so random
     /// access over a skewed rope cannot repeatedly walk its entire depth.
     char16_t unitAt(uint32_t index) const;
 
-    static SStr* create(std::u16string_view sv) {
-        auto* s = static_cast<SStr*>(
-            Gc::get().alloc(GcType::Str, sizeof(SStr) + (sv.size() + 1) * 2));
-        s->len = static_cast<uint32_t>(sv.size());
-        s->hash = 0;
-        s->initCaches();
-        if (!sv.empty()) std::memcpy(s->data(), sv.data(), sv.size() * 2);
-        s->data()[sv.size()] = 0;
-        return s;
-    }
+    static SStr* create(std::u16string_view sv);
     static SStr* create(const char16_t* p, uint32_t len) {
         return create(std::u16string_view(p, len));
     }
@@ -137,16 +145,37 @@ struct SStr {
     static std::string toUtf8(const SStr* s) { return s ? toUtf8(s->view()) : std::string{}; }
 };
 
+// Process-wide storage policy for Scratch join operations. Already-created
+// strings keep their representation: all three modes share the SStr ABI.
+enum class StringStorageMode : uint8_t { Rope, Flat, AppendLog };
+StringStorageMode stringStorageMode();
+bool setStringStorageMode(std::string_view name);
+
+// Orthogonal to rope/flat/append-log joins: compact Latin-1 leaves retain
+// UTF-16 code-unit semantics, widening on demand for contiguous consumers.
+enum class StringLeafMode : uint8_t { Utf16, Latin1 };
+StringLeafMode stringLeafMode();
+bool setStringLeafMode(std::string_view name);
+
+// Opt-in bounded strong interner for dynamically created 2..4 ASCII units.
+bool stringShortInternEnabled();
+void setStringShortInternEnabled(bool enabled);
+
 // --- UTF-16 文字列操作（string-util/jsexecute 系で使う）---
 
 /// SStr 生成（alloc は GC 管理、空なら nullptr を返さず len=0 のオブジェクト）
 SStr* sstrCreate(std::u16string_view sv);
 SStr* sstrFromAscii(std::string_view sv);
 SStr* sstrConcat(std::u16string_view a, std::u16string_view b);
+/// Join existing leaves without widening Latin-1 inputs unnecessarily.
+SStr* sstrConcatStrings(const SStr* a, const SStr* b);
+SStr* sstrConcatStringAscii(const SStr* a, std::string_view b);
 /// 連結ノード（V8 の cons string 相当）: コピーせず left/right を保持し、
 /// 本文は view()/data() が初めて必要になったときに 1 回だけ作る。
 SStr* sstrCons(SStr* a, SStr* b);
-/// Optional append-log snapshots: enabled by XYO_STRING_APPEND_LOG=1.
+/// Join dispatcher: flat copies; rope builds cons nodes; append-log creates
+/// immutable chunked prefix snapshots (oversized suffixes fall back to rope).
+/// For small concatenations, callers may use sstrConcat directly.
 SStr* sstrConsOrAppend(SStr* a, SStr* b);
 void destroyAppendLog(void* ptr);
 size_t appendLogExternalBytes(void* ptr);

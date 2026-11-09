@@ -4,7 +4,9 @@
 // 中断してもローカル状態は維持される（executeInCompatibilityLayer 相当）。
 #include "jit.hpp"
 #include "rtprof.hpp"
+#include "procedure_frame_state.hpp"
 
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <algorithm>
@@ -18,6 +20,7 @@
 #include "../core/v8math.hpp"
 #include "../engine/block_utility.hpp"
 #include "../engine/fiber.hpp"
+#include "../engine/event_wait_dependency.hpp"
 #include "../engine/runtime.hpp"
 #include "../engine/sequencer.hpp"
 #include "../engine/thread.hpp"
@@ -115,16 +118,28 @@ uint64_t xyo_gc_epoch() {
 // --- 基本 -------------------------------------------------------------
 
 void xyo_yield(JitCtx* c) {
+    // The optional scheduler-owned CallFrame mirror survives the native
+    // Fiber switch. Verify that other scheduler activity did not corrupt
+    // its logical return PCs or numeric argument snapshots.
+    if (c->thread && c->thread->nativeProcedureFrames)
+        c->thread->nativeProcedureFrames->beforeYield();
+    // This is the only native JIT fiber suspension boundary. Commit the
+    // whole slice before the host can observe/suspend/restart this thread.
+    flushJitBlockCount(c);
 #if !defined(XYO_DISABLE_RT_PROF)
     // This is the per-iteration hot path of non-warp Scratch scripts.
     // Avoid constructing two profiling guards when profiling is disabled.
     if (RTProf::get().enabled) {
         XYO_RT_PROF(kYield);
         c->fiber->yield();
+        if (c->thread && c->thread->nativeProcedureFrames)
+            c->thread->nativeProcedureFrames->afterYield();
         return;
     }
 #endif
     c->fiber->yield();
+    if (c->thread && c->thread->nativeProcedureFrames)
+        c->thread->nativeProcedureFrames->afterYield();
 }
 
 int32_t xyo_is_stuck(JitCtx* c) { return isStuck(c) ? 1 : 0; }
@@ -144,6 +159,7 @@ void xyo_wait_event_yield(JitCtx* c, uint64_t site) {
     XYO_RT_PROF(kLoopY);
     if (waitShouldYield(c)) {
         c->sequencer->armEventWait(*c->thread, static_cast<uintptr_t>(site));
+        snapshotEventWaitDependency(*c->thread, static_cast<uintptr_t>(site));
         xyo_yield(c);
     }
 }
@@ -153,6 +169,7 @@ void xyo_wait_event_yield(JitCtx* c, uint64_t site) {
 void xyo_wait_event_done(JitCtx* c) {
     ++c->thread->eventWaitExitCount;
     c->thread->eventWaitArmed = false;
+    c->thread->eventWatchValid = false;
 }
 
 void xyo_loop_yield(JitCtx* c);
@@ -193,7 +210,38 @@ int32_t xyo_warp_yield_due(JitCtx* c) {
 
 // --- 値 ----------------------------------------------------------------
 
-double xyo_to_num(uint64_t bits) { return cast::toNumber(toV(bits)); }
+double xyo_to_num(uint64_t bits) {
+    // The hot JIT helper should not have to reclassify a boxed Value in
+    // cast::toNumber and again in its heap-string fallback. Signed-ordering
+    // the NaN-box bits covers ordinary IEEE numbers (including negative
+    // numbers and -0); canonical/positive NaN tags are handled below.
+    if (std::bit_cast<int64_t>(bits) <
+        std::bit_cast<int64_t>(val::kNan)) {
+        double number;
+        std::memcpy(&number, &bits, sizeof(number));
+        return std::isnan(number) ? 0.0 : number;
+    }
+    if (bits == val::kTrue) return 1.0;
+    if ((bits >> 48) != (val::kTagStr >> 48)) return 0.0;
+
+    SStr* str = reinterpret_cast<SStr*>(bits & val::kPtrMask);
+    if (!str) return 0.0; // Value::string(nullptr)
+    const uint32_t state = str->loadNumState();
+    if (state != 0) return state == 2 ? 0.0 : str->loadNumCache();
+
+    // First use performs the full Scratch string parse and publishes the
+    // string's existing atomic cache; this preserves comparison eligibility
+    // (numState=1/2/3/4) for the JIT's guarded comparisons.
+    return cast::parseNumberStringUncached(str);
+}
+
+// Called only after LLVM has proved the value is a non-null heap SStr
+// and its numeric parse state was zero. Avoid duplicating all the boxed
+// tag/cache checks of xyo_to_num on this cold path. Concurrent parsers are
+// safe: SStr is immutable and publishNumCache uses release semantics.
+double xyo_to_num_uncached(SStr* str) {
+    return cast::parseNumberStringUncached(str);
+}
 
 int32_t xyo_truthy(uint64_t bits) { return cast::toBoolean(toV(bits)) ? 1 : 0; }
 
@@ -471,9 +519,17 @@ void xyo_rt_wait(JitCtx* c, double secs) {
     t.start();
     const double ms = std::max(0.0, secs * 1000.0);
     c->runtime->redrawRequested = true;
-    if (!c->isWarp) xyo_yield(c);
+    if (!c->isWarp) {
+        // Same immediate yield semantics as the interpreter. A renderer
+        // already ends its frame when redrawRequested is set.
+        xyo_yield(c);
+    }
     while (t.timeElapsed() < ms) {
-        if (waitShouldYield(c)) xyo_yield(c);
+        if (waitShouldYield(c)) {
+            // Preserve warp's watchdog and the ordinary Scratch yield
+            // order. STATUS_YIELD_TICK changes GUI receiver sequencing.
+            xyo_yield(c);
+        }
     }
 }
 
@@ -516,13 +572,29 @@ void xyo_broadcast_wait_v(JitCtx* c, uint64_t v) {
     XYO_RT_PROF(kOther);
     // event_broadcastandwait 相当: hats 起動 → 全スレッド終了まで待機
     Runtime* rt = c->runtime;
-    Target* stage = rt->getTargetForStage();
+    // Broadcast subscriptions are already indexed by their uppercase
+    // names. For ASCII inputs, canonicalizing through all Stage broadcast
+    // variables has no effect on the recipient set, but adds a linear
+    // search to every event. Preserve the old lookup for non-ASCII names:
+    // Unicode upper/lower casing is not always reversible.
     std::u16string name(cast::toString(toV(v))->view());
-    Variable* var = stage ? stage->lookupBroadcastMsg("", name) : nullptr;
-    std::map<std::string, std::u16string> m;
-    m["BROADCAST_OPTION"] = var ? var->name : name;
+    static const bool fastAscii = [] {
+        const char* setting = std::getenv("XYO_BCAST_FAST_ASCII");
+        return !setting || setting[0] != '0';
+    }();
+    const bool ascii = fastAscii &&
+        rt->stageBroadcastNamesAsciiOnly() &&
+        std::all_of(name.begin(), name.end(),
+            [](char16_t ch) { return ch < 128; });
+    Variable* var = nullptr;
+    if (!ascii) {
+        Target* stage = rt->getTargetForStage();
+        var = stage ? stage->lookupBroadcastMsg("", name) : nullptr;
+    }
     std::vector<Thread*> started =
-        rt->startHats("event_whenbroadcastreceived", &m, nullptr);
+        rt->startBroadcastAndWait(var ? var->name : name);
+    // The original Fiber stack owns the join-list through every yield;
+    // the journal is only involved in the first receiver launch.
     if (started.empty()) return;
     c->joinRefs = &started;   // 回収側から見えるように（完了スレッドを守る）
     for (;;) {
@@ -607,6 +679,8 @@ uint64_t xyo_rt_compat(JitCtx* c, const BlockCached* op) {
         } else {
             xyo_yield(c);
         }
+        if (c->blockCounter && op->blockFunction)
+            ++c->pendingBlockCount;
         rv = op->blockFunction
             ? op->blockFunction(op->argValues, util)
             : Value::undefined();
@@ -614,6 +688,185 @@ uint64_t xyo_rt_compat(JitCtx* c, const BlockCached* op) {
     util.jitCompatEc = nullptr;
     c->joinRefs = nullptr;
     return toB(rv);
+}
+
+// RT-001 opt-in root-only native checkpoint producer. A Scratch script
+// with no procedures_call has no natural xyo_proc_frame_enter_* site,
+// so the ordinary lazy mirror would never exist. Create the SAME
+// validated source-root session at the compiled script entry, using
+// the revision and 128-bit digest baked into LLVM when it was compiled.
+// Never obtain a new provenance stamp from the live mutable Blocks.
+void xyo_proc_frame_init_root_verified(
+    JitCtx* c, uint64_t compiledRevision,
+    uint64_t digestLo, uint64_t digestHi) {
+    if (!c || !c->thread || !compiledRevision ||
+        (digestLo == 0 && digestHi == 0)) return;
+    Thread& thread = *c->thread;
+    if (thread.nativeProcedureFrames || !thread.blockContainer) return;
+    const Block* root = thread.blockContainer->getBlock(thread.topBlock);
+    if (!root) return;
+    const auto source = ir::ScratchCompilationUnit::capture(
+        *thread.blockContainer, root);
+    // The constructor independently compares the immutable compiler
+    // identity with the live source and refuses a changed revision.
+    thread.nativeProcedureFrames =
+        std::make_unique<ir::NativeProcedureFrameSession>(
+            source, thread.blockContainer, compiledRevision,
+            ir::ScratchSourceDigest{digestLo, digestHi});
+}
+
+// Optional native LLVM bridge to the same scheduler-owned CallFrame
+// format used by the WebAssembly return-PC implementation. Generated
+// calls pass the actual register arguments before the potentially-yielding
+// Scratch procedure push. No GC handles are copied into the frame.
+// New compiled-source-versioned native CallFrame ABI. The epoch comes
+// from the immutable ScratchCompilationUnit captured before LLVM lowering;
+// never derive it from live Blocks at the first callsite.
+void xyo_proc_frame_enter_rev(
+    JitCtx* c, const char* blockId, const char* proccode,
+    const uint64_t* args, uint32_t count, uint64_t compiledRevision) {
+    if (!c || !c->thread) return;
+    Thread& thread = *c->thread;
+    if (!thread.nativeProcedureFrames) {
+        if (!thread.blockContainer) return;
+        const Block* root =
+            thread.blockContainer->getBlock(thread.topBlock);
+        if (!root) return;
+        const ir::ScratchCompilationUnit source =
+            ir::ScratchCompilationUnit::capture(*thread.blockContainer, root);
+        thread.nativeProcedureFrames =
+            std::make_unique<ir::NativeProcedureFrameSession>(
+                source, thread.blockContainer, compiledRevision);
+    }
+    thread.nativeProcedureFrames->enter(blockId, proccode, args, count);
+}
+
+// Full source content provenance is required before a native image may
+// be executed under a different backend. The original live source is
+// re-captured on export (not at every hot call/yield).
+void xyo_proc_frame_enter_verified(
+    JitCtx* c, const char* blockId, const char* proccode,
+    const uint64_t* args, uint32_t count, uint64_t compiledRevision,
+    uint64_t digestLo, uint64_t digestHi) {
+    if (!c || !c->thread) return;
+    Thread& thread = *c->thread;
+    if (!thread.nativeProcedureFrames) {
+        if (!thread.blockContainer) return;
+        const Block* root =
+            thread.blockContainer->getBlock(thread.topBlock);
+        if (!root) return;
+        const auto source = ir::ScratchCompilationUnit::capture(
+            *thread.blockContainer, root);
+        thread.nativeProcedureFrames =
+            std::make_unique<ir::NativeProcedureFrameSession>(
+                source, thread.blockContainer, compiledRevision,
+                ir::ScratchSourceDigest{digestLo, digestHi});
+    }
+    thread.nativeProcedureFrames->enter(blockId, proccode, args, count);
+}
+
+// Verified callsite + lexical loop path on first root call. Native
+// ProcedureFrameSession is created lazily by its first native callee;
+// any earlier root repeat checkpoint had no live session to receive it.
+// The LLVM code generator passes the *same* counter SSA bits used by
+// its ordinary checkpoint helper, immediately before xyo_proc_push.
+// Once a child frame exists the ordinary path helper already captured
+// the parent, and this additional root-only publication is skipped.
+void xyo_proc_frame_enter_verified_rootpath(
+    JitCtx* c, const char* blockId, const char* proccode,
+    const uint64_t* args, uint32_t count, uint64_t compiledRevision,
+    uint64_t digestLo, uint64_t digestHi,
+    const char* const* sourceLoopIds, const uint64_t* counterBits,
+    uint32_t loopCount) {
+    if (!c || !c->thread) return;
+    Thread& thread = *c->thread;
+    if (!thread.nativeProcedureFrames) {
+        if (!thread.blockContainer) return;
+        const Block* root =
+            thread.blockContainer->getBlock(thread.topBlock);
+        if (!root) return;
+        const auto source = ir::ScratchCompilationUnit::capture(
+            *thread.blockContainer, root);
+        thread.nativeProcedureFrames =
+            std::make_unique<ir::NativeProcedureFrameSession>(
+                source, thread.blockContainer, compiledRevision,
+                ir::ScratchSourceDigest{digestLo, digestHi});
+    }
+    auto& frame = *thread.nativeProcedureFrames;
+    if (frame.enabled() && frame.depth() == 1)
+        frame.checkpointPath(sourceLoopIds, counterBits, loopCount,
+                             ir::SourceResumePhase::InsideLoopBody);
+    frame.enter(blockId, proccode, args, count);
+}
+
+// Legacy opt-in instrumentation entrypoint. Frames can be observed but
+// have no compile-time provenance, so the portable deoptimizer refuses
+// to transfer them into an interpreter or a different backend.
+void xyo_proc_frame_enter(JitCtx* c, const char* blockId,
+                          const char* proccode, const uint64_t* args,
+                          uint32_t count) {
+    xyo_proc_frame_enter_rev(c, blockId, proccode, args, count, 0);
+}
+
+void xyo_proc_frame_leave(JitCtx* c) {
+    if (!c || !c->thread || !c->thread->nativeProcedureFrames) return;
+    c->thread->nativeProcedureFrames->leave();
+    // RT-001-only probe of an actual native AfterCallee safe point.
+    // Must run AFTER updating the portable frame, BEFORE the caller
+    // executes any further Scratch statement. The production path is
+    // unchanged when the opt-in test flag is not set.
+    static const bool testYieldAfterCallee = [] {
+        const char* value = std::getenv("XYO_RT_TEST_YIELD_AFTER_CALLEE");
+        return value && value[0] == '1';
+    }();
+    if (testYieldAfterCallee &&
+        c->thread->nativeProcedureFrames->enabled())
+        xyo_yield(c);
+}
+
+// Each source statement expires the previous post-call or loop-latch
+// checkpoint before any of its own reporters/effects can execute.
+void xyo_proc_frame_statement_started(JitCtx* c, const char* blockId) {
+    if (c && c->thread && c->thread->nativeProcedureFrames)
+        c->thread->nativeProcedureFrames->statementStarted(blockId);
+}
+
+// Explicitly invalidate the clean procedure-entry phase once code inside
+// the callee can execute. No SSA state is assumed resumable at this point.
+void xyo_proc_frame_body_started(JitCtx* c) {
+    if (c && c->thread && c->thread->nativeProcedureFrames)
+        c->thread->nativeProcedureFrames->bodyStarted();
+}
+
+// Store the source-level LLVM loop checkpoint before suspending the Fiber.
+void xyo_proc_frame_checkpoint(JitCtx* c, const char* blockId,
+                               uint64_t counterBits) {
+    if (c && c->thread && c->thread->nativeProcedureFrames)
+        c->thread->nativeProcedureFrames->checkpoint(blockId, counterBits);
+}
+
+// One lexical hierarchy is published as a single pointer-free CallFrame
+// checkpoint. The pointers themselves are LLVM native call arguments only;
+// no host/Gc-managed address is stored in the shared numeric frame arena.
+void xyo_proc_frame_checkpoint_path(JitCtx* c, const char* const* ids,
+                                    const uint64_t* counters, uint32_t count) {
+    if (c && c->thread && c->thread->nativeProcedureFrames)
+        c->thread->nativeProcedureFrames->checkpointPath(ids, counters, count);
+}
+
+// The final argument is a versioned source-level phase, never a native PC.
+// The old checkpoint helper remains for existing opt-in ABI clients.
+void xyo_proc_frame_checkpoint_path_phase(
+    JitCtx* c, const char* const* ids,
+    const uint64_t* counters, uint32_t count, uint32_t phase) {
+    if (!c || !c->thread || !c->thread->nativeProcedureFrames) return;
+    if (phase != uint32_t(ir::SourceResumePhase::InsideLoopBody) &&
+        phase != uint32_t(ir::SourceResumePhase::AfterLoopBody)) {
+        c->thread->nativeProcedureFrames->invalidate("invalid-resume-phase");
+        return;
+    }
+    c->thread->nativeProcedureFrames->checkpointPath(
+        ids, counters, count, static_cast<ir::SourceResumePhase>(phase));
 }
 
 /// JIT 手続き呼出し中に interpreter スタックへ残す呼出しフレーム。
@@ -695,6 +948,95 @@ uint64_t xyo_rt_reporter(JitCtx* c, const char* blockId) {
     Value out = t->justReported;
     t->justReported = Value::undefined();
     return toB(out);
+}
+
+// Load a live, GC-rooted procedure argument exactly once at the native
+// continuation entry. This is NOT an independent root: the caller's original
+// interpreter StackFrame continues to own the Value throughout the fiber.
+// An undefined result is only a sentinel: codegen calls the full reporter at
+// each actual use, so dynamic special-name fallbacks stay observable.
+// Called only at the *post-body* native counted warp loop yield site,
+// after all promoted scalar/list writes have been published. The generated
+// loop decrements its own private iteration count AFTER this call, so
+// remainingAfterBody is already adjusted by one. While the Fiber is
+// suspended, the serial scheduler can discard it and restore exactly this
+// count to the interpreter's still-rooted original loop frame.
+void xyo_rt_nested_osr_yield_checkpoint(
+    JitCtx* c, double remainingAfterBody) {
+    if (!c || !c->thread || !c->thread->nestedOsrActive ||
+        !c->thread->compiled)
+        return;
+    const auto* compiled =
+        static_cast<const CompiledScript*>(c->thread->compiled);
+    if (!compiled->nestedOsrInFlightGuard ||
+        !std::isfinite(remainingAfterBody) ||
+        remainingAfterBody < 0.0 ||
+        remainingAfterBody > 1099511627776.0 ||
+        std::floor(remainingAfterBody) != remainingAfterBody)
+        return;
+    c->nestedOsrDeoptRemaining = remainingAfterBody;
+    c->nestedOsrDeoptReady = 1;
+}
+
+uint64_t xyo_rt_nested_osr_arg_peek(
+    JitCtx* c, const char16_t* name, uint32_t length) {
+    Thread* t = c ? c->thread : nullptr;
+    const auto* compiled = t
+        ? static_cast<const CompiledScript*>(t->compiled) : nullptr;
+    if (!t || !compiled || !t->nestedOsrActive ||
+        t->stack.size() < 2 || t->stack.size() > 15 ||
+        t->stackFrames.size() != t->stack.size() ||
+        compiled->nestedOsrFramePath.size() + 1 != t->stack.size() ||
+        compiled->nestedOsrArgFrameIndex >=
+            compiled->nestedOsrFramePath.size() ||
+        t->stack[compiled->nestedOsrArgFrameIndex] !=
+            compiled->nestedOsrCallId ||
+        !t->stackFrames[compiled->nestedOsrArgFrameIndex] ||
+        !t->stackFrames[compiled->nestedOsrArgFrameIndex]->hasParams ||
+        !name || length > 4096)
+        return toB(Value::undefined());
+    const auto& params =
+        t->stackFrames[compiled->nestedOsrArgFrameIndex]->params;
+    const auto found = params.find(std::u16string(name, length));
+    return found == params.end() ? toB(Value::undefined())
+                                 : toB(found->second);
+}
+
+// Read-only argument bridge for an explicitly selected nested warp OSR
+// region. The interpreter call frame remains on the Thread stack and is
+// traced by the GC while the native fiber runs. No argument is copied into
+// unrooted raw storage, nor is any native SSA value invented.
+uint64_t xyo_rt_nested_osr_arg_get(
+    JitCtx* c, const char* reporterBlockId,
+    const char16_t* name, uint32_t length) {
+    Thread* t = c ? c->thread : nullptr;
+    const auto* compiled = t
+        ? static_cast<const CompiledScript*>(t->compiled) : nullptr;
+    if (t && compiled && t->nestedOsrActive &&
+        t->stack.size() >= 2 && t->stack.size() <= 15 &&
+        t->stackFrames.size() == t->stack.size() &&
+        compiled->nestedOsrFramePath.size() + 1 == t->stack.size() &&
+        compiled->nestedOsrArgFrameIndex <
+            compiled->nestedOsrFramePath.size() &&
+        t->stack[compiled->nestedOsrArgFrameIndex] ==
+            compiled->nestedOsrCallId &&
+        t->stackFrames[compiled->nestedOsrArgFrameIndex] &&
+        t->stackFrames[compiled->nestedOsrArgFrameIndex]->hasParams &&
+        name && length <= 4096) {
+        const auto& params =
+            t->stackFrames[compiled->nestedOsrArgFrameIndex]->params;
+        const auto found = params.find(std::u16string(name, length));
+        if (found != params.end() && !found->second.isUndefined()) {
+            // A direct read bypasses the interpreter's reporter executor.
+            // Count exactly that Scratch reporter once, buffered just like
+            // native LLVM's other primitive operations.
+            if (c->blockCounter) ++c->pendingBlockCount;
+            return toB(found->second);
+        }
+    }
+    // Preserve the interpreter's undefined/special-name semantics and
+    // reporter-count accounting when the direct proof does not apply.
+    return xyo_rt_reporter(c, reporterBlockId);
 }
 
 } // extern "C"

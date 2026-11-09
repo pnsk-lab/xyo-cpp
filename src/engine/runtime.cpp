@@ -9,8 +9,12 @@
 #include "../core/cast.hpp"
 #include "../rt/runtime_helpers.hpp"
 #include "fiber.hpp"
+#include "hat_thread_snapshot.hpp"
 #include "sequencer.hpp"
+#include "interpreter_osr_snapshot.hpp"
 #include "../jit/jit.hpp"
+#include "../jit/nested_warp_callframe_projection.hpp"
+#include "../ir/commit_once_effects.hpp"
 
 namespace xyo {
 
@@ -20,6 +24,11 @@ void registerCoreBlocks(Runtime& rt);
 bool dangerModeFromEnv() {
     const char* v = std::getenv("XYO_DANGER");
     return v != nullptr && *v != 0 && std::strcmp(v, "0") != 0;
+}
+
+bool blockCountEnabledFromEnv() {
+    const char* v = std::getenv("XYO_BLOCK_COUNT");
+    return v && *v && std::strcmp(v, "0") != 0;
 }
 
 Runtime::Runtime()
@@ -33,14 +42,52 @@ Runtime::Runtime()
     updateCurrentMSecs();
     registerCoreBlocks(*this);
     Gc::get().addRootProvider(this, [this](Gc& g) { markRoots(g); });
+    // This opt-in is deliberately absent from the ordinary Scratch runtime.
+    // The native JIT non-waiting broadcast path has a synchronous host
+    // commit boundary; the WASM speculative lowering still falls back.
+    if (const char* opt = std::getenv("XYO_EFFECT_JOURNAL");
+        opt && opt[0] == '1')
+        observableJournal = std::make_unique<ir::CommitOnceEffects>();
 }
 
 Runtime::~Runtime() {
+    if (blockCountEnabled) {
+        finishBlockCount();
+        const auto elapsed = blockCountEndedAt - blockCountStartedAt;
+        const double seconds = blockCountStartedAt == std::chrono::steady_clock::time_point{}
+            ? 0.0 : std::chrono::duration<double>(elapsed).count();
+        const uint64_t count = executedBlocks.load(std::memory_order_relaxed);
+        const double rate = seconds > 0.0 ? static_cast<double>(count) / seconds : 0.0;
+        std::fprintf(stderr,
+                     "[block-count] executed=%llu elapsed=%.9fs blocks/s=%.2f "
+                     "(Scratch interpreter/native JIT)\n",
+                     static_cast<unsigned long long>(count), seconds, rate);
+    }
+    if (observableJournal && std::getenv("XYO_EFFECT_JOURNAL_STATS"))
+        std::fprintf(stderr,
+                     "[effect-journal] committed_broadcasts=%llu "
+                     "immediate_broadcasts=%llu pending=%zu rooted=%zu "
+                     "committed_effects=%llu immediate_effects=%llu\n",
+                     static_cast<unsigned long long>(observableCommittedBroadcasts),
+                     static_cast<unsigned long long>(observableImmediateBroadcasts),
+                     observableJournal->pendingCount(),
+                     observableJournal->rootedPayloads(),
+                     static_cast<unsigned long long>(observableCommittedEffects),
+                     static_cast<unsigned long long>(observableImmediateEffects));
+    // Remove journal-owned GC root provider before tearing down targets.
+    observableJournal.reset();
     Gc::get().removeRootProvider(this);
     // targets は所有ポインタ（disposeTarget/stopAll でも delete 済み要素は
     // リストから除去されている）。残りをここで回収する。
     for (Target* t : targets) delete t;
     targets.clear();
+}
+
+void Runtime::finishBlockCount() {
+    if (blockCountEnabled &&
+        blockCountStartedAt != std::chrono::steady_clock::time_point{} &&
+        blockCountEndedAt == std::chrono::steady_clock::time_point{})
+        blockCountEndedAt = std::chrono::steady_clock::now();
 }
 
 // ------------------------------------------------------------- スレッド --
@@ -265,8 +312,7 @@ std::vector<Thread*> Runtime::startHats(
         for (auto& [k, v] : *optMatchFields) matchFields[k] = u16ToUpper(v);
     }
 
-    const size_t startingThreadCount = threads.size();
-
+    HatThreadSnapshot existing(threads);
     const auto spawnMatched = [&](const std::string& topBlockId,
                                   const Block* top, Target* target) {
         if (hatMeta.restartExistingThreads) {
@@ -279,14 +325,8 @@ std::vector<Thread*> Runtime::startHats(
                 newThreads.push_back(restartThread(it->second, top));
                 return;
             }
-        } else {
-            for (size_t j = 0; j < startingThreadCount; ++j) {
-                if (threads[j]->target == target &&
-                    threads[j]->topBlock == topBlockId &&
-                    !threads[j]->stackClick &&
-                    threads[j]->status != STATUS_DONE)
-                    return;
-            }
+        } else if (existing.contains(target, topBlockId)) {
+            return;
         }
         newThreads.push_back(
             pushThread(topBlockId, target, false, false, top));
@@ -330,9 +370,51 @@ std::vector<Thread*> Runtime::startHats(
     return newThreads;
 }
 
+bool Runtime::stageBroadcastNamesAsciiOnly() {
+    const Target* stage = getTargetForStage();
+    if (asciiBroadcastCacheStep == stepSerial &&
+        asciiBroadcastCacheStage == stage)
+        return asciiBroadcastCacheValue;
+
+    bool ascii = stage != nullptr;
+    if (stage) {
+        for (const auto& [id, variable] : stage->variables) {
+            if (variable.type != Variable::kBroadcastType) continue;
+            if (std::any_of(variable.name.begin(), variable.name.end(),
+                            [](char16_t c) { return c >= 128; })) {
+                ascii = false;
+                break;
+            }
+        }
+        if (ascii) {
+            for (const auto& [id, variable] : stage->collidingBroadcasts) {
+                if (std::any_of(variable.name.begin(), variable.name.end(),
+                                [](char16_t c) { return c >= 128; })) {
+                    ascii = false;
+                    break;
+                }
+            }
+        }
+    }
+    asciiBroadcastCacheStage = stage;
+    asciiBroadcastCacheValue = ascii;
+    asciiBroadcastCacheStep = stepSerial;
+    return ascii;
+}
+
 std::shared_ptr<const std::vector<Runtime::BroadcastReceiver>>
 Runtime::broadcastReceivers(std::u16string_view name) {
+    static const bool lastLookupCache = [] {
+        const char* setting = std::getenv("XYO_BCAST_RECEIVER_CACHE");
+        return !setting || setting[0] != '0';
+    }();
+    if (lastLookupCache && !broadcastIndexDirty &&
+        lastBroadcastLookupValid && lastBroadcastLookupName == name)
+        return lastBroadcastLookupReceivers;
+
     if (broadcastIndexDirty) {
+        lastBroadcastLookupValid = false;
+        lastBroadcastLookupReceivers.reset();
         // Collect subscriptions once in Scratch execution order. Clones
         // share Blocks, but retain independent Thread identities and their
         // insertion position in executableTargets.
@@ -362,12 +444,215 @@ Runtime::broadcastReceivers(std::u16string_view name) {
         broadcastIndexDirty = false;
     }
     const auto it = broadcastIndex.find(u16ToUpper(name));
-    return it == broadcastIndex.end() ? nullptr : it->second;
+    const auto receivers = it == broadcastIndex.end() ? nullptr : it->second;
+    if (lastLookupCache) {
+        lastBroadcastLookupName.assign(name);
+        lastBroadcastLookupReceivers = receivers;
+        lastBroadcastLookupValid = true;
+    }
+    return receivers;
 }
 
 // Only the non-waiting broadcast path uses this API. Broadcast-and-wait
 // must preserve the exact returned Thread* set for its join semantics.
 void Runtime::startBroadcast(std::u16string_view name) {
+    // Preserve the original JIT fast path with no indirect callback when
+    // the experimental journal is disabled (the default).
+    if (!observableJournal) {
+        startBroadcastImmediate(name);
+        return;
+    }
+    journalBroadcast(name, [](void* context, std::u16string_view message) noexcept {
+        static_cast<Runtime*>(context)->startBroadcastImmediate(message);
+    }, this);
+}
+
+void Runtime::journalBroadcast(std::u16string_view name,
+                               BroadcastDelivery deliver, void* context) {
+    if (!deliver) return;
+    if (!observableJournal) {
+        deliver(context, name);
+        return;
+    }
+    // A committed broadcast can synchronously start a receiver that
+    // broadcasts again. Deliver it immediately to preserve Scratch's
+    // receiver start order rather than queue it behind the outer drain.
+    if (observableJournal->draining() ||
+        observableJournal->committing() ||
+        observableSliceId == UINT64_MAX) {
+        ++observableImmediateBroadcasts;
+        // The borrowed name may point to GC-managed SStr memory. Nested
+        // delivery can collect that source; copy it before invoking hooks.
+        const std::u16string owned(name);
+        deliver(context, owned);
+        return;
+    }
+    // Own the UTF-16 name before any GC-capable operation, since the
+    // caller may have borrowed a temporary Scratch SStr reporter.
+    const std::u16string owned(name);
+    const uint64_t slice = ++observableSliceId;
+    auto pending = observableJournal->begin(slice);
+    bool staged = false;
+    {
+        Gc::DeferCollect defer; // only until the journal has an exact root
+        const Value payload = owned.empty() ? Value::emptyStr()
+            : Value::string(SStr::create(owned));
+        staged = pending.stage(ir::ObservableOp::Broadcast,
+                               "runtime.broadcast", payload);
+    }
+    // This path runs at a non-speculative synchronous host boundary;
+    // if journaling is unavailable, execute the original immediate
+    // primitive instead. No pending event was ever published on failure.
+    if (!staged || !pending.commit([]() noexcept { return true; })) {
+        ++observableImmediateBroadcasts;
+        deliver(context, owned);
+        return;
+    }
+    const auto result = observableJournal->drain(
+        [deliver, context](ir::ObservableOp op, const std::string&,
+                           Value retained) noexcept {
+            if (op != ir::ObservableOp::Broadcast) return;
+            // The Value remains rooted through any nested callback or GC.
+            const std::u16string message(retained.isEmptyString()
+                ? std::u16string_view{} : retained.asStrPtr()->view());
+            deliver(context, message);
+        });
+    observableCommittedBroadcasts += result.delivered;
+}
+
+// Indexed broadcast-and-wait uses the same receiver snapshot and Scratch
+// ordering as startHats, but skips construction of a one-entry std::map,
+// matching/normalizing fields for every broadcast, and the generic hat walk.
+// Unlike fire-and-forget startBroadcast, it must preserve distinct Thread*
+// join handles until the caller has observed their completion.
+static std::vector<Thread*> startBroadcastAndWaitIndexed(
+    Runtime& rt, std::u16string_view name) {
+    static const std::string opcode = "event_whenbroadcastreceived";
+    const auto hat = rt.hats.find(opcode);
+    if (hat == rt.hats.end()) return {};
+    const HatMeta meta = hat->second;
+    const auto receivers = rt.broadcastReceivers(name);
+    if (!receivers) return {};
+
+    std::vector<Thread*> started;
+    started.reserve(receivers->size());
+    HatThreadSnapshot existing(rt.threads);
+    static thread_local std::string key;
+    for (const Runtime::BroadcastReceiver& receiver : *receivers) {
+        Thread* thread = nullptr;
+        if (meta.restartExistingThreads) {
+            key.assign(receiver.target->id);
+            key.push_back('&');
+            key.append(receiver.blockId);
+            const auto it = rt.threadMap.find(key);
+            if (it != rt.threadMap.end())
+                thread = rt.restartThread(it->second, receiver.top);
+        } else if (existing.contains(receiver.target, receiver.blockId)) {
+            continue;
+        }
+        if (!thread)
+            thread = rt.pushThread(receiver.blockId, receiver.target,
+                                   false, false, receiver.top);
+        started.push_back(thread);
+    }
+    for (Thread* thread : started) {
+        if (!thread->isCompiled) {
+            execute(*rt.sequencer, *thread);
+            thread->goToNextBlock();
+        }
+    }
+    return started;
+}
+
+std::vector<Thread*> Runtime::startBroadcastAndWait(
+    std::u16string_view name) {
+    // Keep the opt-in journal path's original synchronous commit semantics.
+    // Allow an A/B comparison using identical native binaries. The legacy
+    // path is also useful as a conservative fallback for diagnosis.
+    static const bool indexed = [] {
+        const char* env = std::getenv("XYO_BROADCAST_WAIT_INDEXED");
+        return !env || *env != '0';
+    }();
+    if (!observableJournal) {
+        if (indexed)
+            return startBroadcastAndWaitIndexed(*this, name);
+        std::map<std::string, std::u16string> fields{
+            {"BROADCAST_OPTION", std::u16string(name)}};
+        return startHats("event_whenbroadcastreceived", &fields, nullptr);
+    }
+    struct Delivery {
+        Runtime* runtime;
+        std::vector<Thread*> started;
+    } delivery{this, {}};
+    journalBroadcast(name,
+        [](void* state, std::u16string_view message) noexcept {
+            auto& ctx = *static_cast<Delivery*>(state);
+            std::map<std::string, std::u16string> fields{
+                {"BROADCAST_OPTION", std::u16string(message)}};
+            ctx.started = ctx.runtime->startHats(
+                "event_whenbroadcastreceived", &fields, nullptr);
+        }, &delivery);
+    return std::move(delivery.started);
+}
+
+void Runtime::journalObservable(ir::ObservableOp op, Value payload,
+                                ObservableDelivery deliver, void* context) {
+    if (!deliver) return;
+    if (!observableJournal) {
+        deliver(context, payload);
+        return;
+    }
+    // Scratch receiver events can synchronously trigger new host effects.
+    // Maintain original depth-first dispatch order, even under reentrancy.
+    // The usual committed host boundary never has an undrained slice.
+    if (observableJournal->committing() || observableJournal->draining() ||
+        observableJournal->pendingCount() != 0 ||
+        observableSliceId == UINT64_MAX) {
+        ++observableImmediateEffects;
+        // Reentrant effects stay depth-first, but their payload must remain
+        // an exact GC root throughout callbacks that can themselves collect.
+        // Never suppress collection for the entire nested callback.
+        ir::GcValueHandles roots;
+        std::optional<ir::RootedValueHandle> root;
+        {
+            Gc::DeferCollect defer;
+            root = roots.retain(payload);
+        }
+        if (root) {
+            deliver(context, *roots.resolve(*root));
+        } else {
+            // Token exhaustion: retain original host semantics, disabling
+            // collection only when we cannot establish an exact root.
+            Gc::DeferCollect defer;
+            deliver(context, payload);
+        }
+        return;
+    }
+
+    auto slice = observableJournal->begin(++observableSliceId);
+    bool staged = false;
+    {
+        Gc::DeferCollect defer;
+        staged = slice.stage(op, "runtime.observable", payload);
+    }
+    if (!staged || !slice.commit([]() noexcept { return true; })) {
+        ++observableImmediateEffects;
+        Gc::DeferCollect defer;
+        deliver(context, payload);
+        return;
+    }
+    const auto result = observableJournal->drain(
+        [deliver, context, op](ir::ObservableOp actual, const std::string&,
+                               Value exactValue) noexcept {
+            // This synchronous host boundary may have only its one
+            // freshly committed record. If future scheduler async slices
+            // are added, use typed dispatch rather than dropping effects.
+            if (actual == op) deliver(context, exactValue);
+        });
+    observableCommittedEffects += result.delivered;
+}
+
+void Runtime::startBroadcastImmediate(std::u16string_view name) {
     static const std::string opcode = "event_whenbroadcastreceived";
     const auto hat = hats.find(opcode);
     if (hat == hats.end()) return;
@@ -376,7 +661,7 @@ void Runtime::startBroadcast(std::u16string_view name) {
     const auto receivers = broadcastReceivers(name);
     if (!receivers) return;
 
-    const size_t startingThreadCount = threads.size();
+    HatThreadSnapshot existing(threads);
     std::vector<Thread*> interpreted;
     for (const BroadcastReceiver& receiver : *receivers) {
             Target* target = receiver.target;
@@ -412,13 +697,9 @@ void Runtime::startBroadcast(std::u16string_view name) {
                         next = restartThread(previous, receiver.top);
                     }
                 }
-            } else {
-                for (size_t j = 0; j < startingThreadCount; ++j) {
-                    if (threads[j]->target == target &&
-                        threads[j]->topBlock == top &&
-                        !threads[j]->stackClick &&
-                        threads[j]->status != STATUS_DONE) return;
-                }
+            } else if (existing.contains(target, top)) {
+                // Ignore only this receiver. Other matching hats still start.
+                continue;
             }
             if (!next) next = pushThread(top, target, false, false, receiver.top);
             next->reusableBroadcastReceiver = next->isCompiled;
@@ -475,11 +756,26 @@ void Runtime::stopAll() {
 
 void Runtime::greenFlag() {
     stopAll();
+    if (blockCountEnabled) {
+        executedBlocks.store(0, std::memory_order_relaxed);
+        blockCountStartedAt = std::chrono::steady_clock::now();
+        blockCountEndedAt = {};
+    }
     emitProjectStart();
     updateCurrentMSecs();
     ioDevices.clock.resetProjectTimer();
     for (Target* t : targets) t->clearEdgeActivatedValues();
     for (Target* t : targets) t->onGreenFlag();
+    // Opt-in background prefetch never delays or reorders Scratch threads.
+    // It gives one-shot warp broadcast handlers a chance to compile before
+    // their first invocation, where ordinary top-level OSR is unavailable.
+    if (jit) jit->prefetchWarpBroadcasts(*this);
+    // The explicitly blocking experiment may spend a few hundred ms in
+    // LLVM before green flag scripts begin. Do not charge that startup time
+    // against Scratch's project timer.
+    if (const char* prefetch = std::getenv("XYO_JIT_ASYNC_PREFETCH");
+        prefetch && prefetch[0] == '2')
+        ioDevices.clock.resetProjectTimer();
     startHats("event_whenflagclicked", nullptr, nullptr);
     if (onGreenFlag) onGreenFlag();
 }
@@ -491,10 +787,32 @@ void Runtime::reclaimThreads() {
     // scheduler passes and completed receivers held by a join. Moving the
     // unique_ptrs never changes Thread addresses; recycling an observed identity
     // would, however, introduce an ABA bug in broadcast-and-wait.
+    static const bool stampedRefs = [] {
+        const char* env = std::getenv("XYO_THREAD_RECLAIM_STAMP");
+        return env && env[0] == '1';
+    }();
+    uint64_t epoch = 0;
+    if (stampedRefs) {
+        epoch = ++reclaimRetentionEpoch;
+        if (epoch == 0) {
+            // This rollover is practically unreachable, but never allow
+            // an ancient mark to be mistaken for a current live reference.
+            for (auto& up : ownedThreads)
+                if (up) up->reclaimRetentionEpoch = 0;
+            epoch = ++reclaimRetentionEpoch;
+        }
+    }
     std::unordered_set<const Thread*> refs;
     std::vector<Thread*> pending;
     const auto retain = [&](Thread* t) {
-        if (t && refs.insert(t).second) pending.push_back(t);
+        if (!t) return;
+        if (stampedRefs) {
+            if (t->reclaimRetentionEpoch == epoch) return;
+            t->reclaimRetentionEpoch = epoch;
+            pending.push_back(t);
+        } else if (refs.insert(t).second) {
+            pending.push_back(t);
+        }
     };
     for (Thread* t : threads) retain(t);
     for (Thread* t : lastStepDoneThreads) retain(t);
@@ -534,7 +852,9 @@ void Runtime::reclaimThreads() {
     constexpr size_t kMaxReusableThreads = 2048;
     std::erase_if(ownedThreads, [&](auto& up) {
         if (!up) return true;
-        if (refs.contains(up.get())) return false;
+        if (stampedRefs ? up->reclaimRetentionEpoch == epoch
+                        : refs.contains(up.get()))
+            return false;
         if (recycleEnabled && reusableThreads.size() < kMaxReusableThreads) {
             up->releaseFinished();
             reusableThreads.push_back(std::move(up));
@@ -546,6 +866,368 @@ void Runtime::reclaimThreads() {
 
 void Runtime::step() {
     ++stepSerial;
+    static const bool tracePhases = std::getenv("XYO_STEP_PHASES") != nullptr;
+    using ProfileClock = std::chrono::steady_clock;
+    const auto phaseStart = tracePhases ? ProfileClock::now()
+                                        : ProfileClock::time_point{};
+    if (jit) {
+        jit->pollAsync();
+        // A pending thread can become native before its first instruction.
+        // Started interpreter threads need a dedicated OSR continuation:
+        // restarting the original entry would replay earlier side effects.
+        if (jitEnabled()) {
+            static const bool osrEnabled = [] {
+                const char* enabled = std::getenv("XYO_JIT_OSR");
+                return enabled && enabled[0] == '1';
+            }();
+            for (Thread* t : threads) {
+                if (!t || t->isCompiled || !t->triedToCompile ||
+                    t->isKilled || !t->topBlockPtr ||
+                    (t->interpreterStarted && !osrEnabled))
+                    continue;
+                const CompiledScript* ready =
+                    jit->readyScript(t->topBlockPtr);
+                if (!ready) continue;
+                const auto& nestedCalls = ready->nestedOsrCallPath;
+                const auto& nestedFrames = ready->nestedOsrFramePath;
+                const auto& nestedArms = ready->nestedOsrBranchArms;
+                const size_t nestedDepth = nestedFrames.size() + 1;
+                // Only exact immutable source callsites may be adopted.
+                // All procedure frames stay rooted in the interpreter.
+                bool nestedPathMatches = ready->nestedOsrEntry &&
+                    t->blockContainer && ready->nestedOsrSourceRevision != 0 &&
+                    t->blockContainer->revision() ==
+                        ready->nestedOsrSourceRevision &&
+                    !nestedCalls.empty() && nestedCalls.size() <= 8 &&
+                    nestedFrames.size() >= nestedCalls.size() &&
+                    nestedFrames.size() <= 14 &&
+                    nestedArms.size() == nestedFrames.size() &&
+                    ready->nestedOsrArgFrameIndex < nestedFrames.size() &&
+                    nestedArms[ready->nestedOsrArgFrameIndex] == 0 &&
+                    nestedFrames[ready->nestedOsrArgFrameIndex] ==
+                        nestedCalls.back() &&
+                    ready->nestedOsrCallId == nestedCalls.back() &&
+                    t->stack.size() == nestedDepth &&
+                    t->stackFrames.size() == nestedDepth &&
+                    t->stack.back() == ready->nestedOsrLoopId;
+                if (nestedPathMatches) {
+                    for (size_t i = 0; i < nestedFrames.size(); ++i) {
+                        if (t->stack[i] != nestedFrames[i]) {
+                            nestedPathMatches = false;
+                            break;
+                        }
+                    }
+                }
+                if (nestedPathMatches && !t->nestedOsrActive &&
+                    t->interpreterStarted &&
+                    !t->stackClick && !t->updateMonitor &&
+                    (t->status == STATUS_RUNNING ||
+                     t->status == STATUS_YIELD ||
+                     t->status == STATUS_YIELD_TICK)) {
+                    const StackFrame* call =
+                        t->stackFrames[ready->nestedOsrArgFrameIndex].get();
+                    const StackFrame* loop =
+                        t->stackFrames[nestedDepth - 1].get();
+                    const ExecContext* ec = loop && loop->executionContext
+                        ? loop->executionContext.get() : nullptr;
+                    // Everything executed so far (including any side
+                    // effects and procedure prefix) stays committed. Only
+                    // the private remaining count enters the native region.
+                    // In particular no procedure args/reporter temporaries
+                    // are manufactured or re-evaluated after this point.
+                    // The callsite and source lexical ancestry must be
+                    // unchanged. The argument names exactly match the
+                    // immutable procedure signature, without duplicates or
+                    // missing defaults. The original interpreter call frame
+                    // remains alive and GC-rooted throughout native work.
+                    const auto checkpoint = ir::InterpreterOsrSnapshot::capture(
+                        *t, stepSerial);
+                    const auto lexical = checkpoint
+                        ? checkpoint->sourcePath() : std::nullopt;
+                    // Validate each live caller independently, including
+                    // warp signature, argument map and executed callsite.
+                    // Snapshot::sourcePath() additionally proves every
+                    // lexical edge at the current source revision/epoch.
+                    bool argumentsValid = t->blockContainer != nullptr;
+                    size_t innerArguments = 0;
+                    size_t innerExpected = 0;
+                    size_t verifiedCalls = 0;
+                    for (size_t i = 0;
+                         argumentsValid && i < nestedFrames.size(); ++i) {
+                        const StackFrame* frame = t->stackFrames[i].get();
+                        const Block* source =
+                            t->blockContainer->getBlock(nestedFrames[i]);
+                        const uint8_t arm = nestedArms[i];
+                        if (!frame || !source || frame->waitingReporter ||
+                            frame->hasReported || frame->suspendLast ||
+                            !frame->reporting.empty() ||
+                            !frame->reported.empty()) {
+                            argumentsValid = false;
+                            break;
+                        }
+                        if (arm == 3) {
+                            // Parent repeat TIMES was evaluated by the
+                            // original interpreter. Preserve its actual
+                            // counter rather than recomputing it.
+                            const ExecContext* context =
+                                frame->executionContext.get();
+                            argumentsValid =
+                                source->opcode == "control_repeat" &&
+                                !frame->hasParams && frame->isLoop &&
+                                context && context->hasLoopCounter &&
+                                !context->timer &&
+                                std::isfinite(context->loopCounter) &&
+                                context->loopCounter >= 0.0 &&
+                                context->loopCounter <= 1099511627776.0 &&
+                                std::floor(context->loopCounter) ==
+                                    context->loopCounter;
+                            continue;
+                        }
+                        if (arm != 0) {
+                            // Exact, already-entered IF branch. Its source
+                            // arm is checked against sourcePath below.
+                            argumentsValid =
+                                !frame->hasParams && !frame->isLoop &&
+                                (source->opcode == "control_if" ||
+                                 source->opcode == "control_if_else") &&
+                                (arm == 1 ||
+                                 (arm == 2 &&
+                                  source->opcode == "control_if_else"));
+                            continue;
+                        }
+                        if (verifiedCalls >= nestedCalls.size() ||
+                            nestedCalls[verifiedCalls] != source->id) {
+                            argumentsValid = false;
+                            break;
+                        }
+                        ++verifiedCalls;
+                        const Mutation* signature = source->mutation
+                            ? t->blockContainer->getProcedurePrototype(
+                                  source->mutation->attr("proccode"))
+                            : nullptr;
+                        argumentsValid =
+                            source->opcode == "procedures_call" &&
+                            source->mutation &&
+                            !source->mutation->isReporterCall() &&
+                            frame->hasParams && frame->executionContext &&
+                            frame->executionContext->executed &&
+                            signature && signature->warp() &&
+                            signature->argumentNames.size() <= 16 &&
+                            signature->argumentNames.size() ==
+                                signature->argumentIds.size() &&
+                            frame->params.size() ==
+                                signature->argumentNames.size();
+                        if (!argumentsValid) break;
+                        for (const auto& name : signature->argumentNames) {
+                            if (!frame->params.contains(name)) {
+                                argumentsValid = false;
+                                break;
+                            }
+                        }
+                        if (i == ready->nestedOsrArgFrameIndex) {
+                            innerArguments = frame->params.size();
+                            innerExpected = signature->argumentNames.size();
+                        }
+                    }
+                    argumentsValid = argumentsValid &&
+                        verifiedCalls == nestedCalls.size();
+                    if (const char* trace =
+                            std::getenv("XYO_JIT_OSR_NESTED_TRACE");
+                        trace && trace[0] == '1')
+                        std::fprintf(stderr,
+                            "[jit-osr-nested] checkpoint top=%s "
+                            "frames=%zu snapshot=%d lexical=%d argvalid=%d "
+                            "args=%zu expected=%zu loop=%d remaining=%.0f\n",
+                            t->topBlock.c_str(), t->stack.size(),
+                            int(checkpoint.has_value()),
+                            int(lexical.has_value()), int(argumentsValid),
+                            innerArguments, innerExpected,
+                            int(loop && loop->isLoop),
+                            ec && ec->hasLoopCounter ? ec->loopCounter : -1.);
+                    bool lexicalMatches = lexical &&
+                        lexical->size() == nestedDepth;
+                    if (lexicalMatches) {
+                        for (size_t i = 0; i < nestedFrames.size(); ++i) {
+                            const auto& source = (*lexical)[i];
+                            if (source.sourceBlockId != nestedFrames[i]) {
+                                lexicalMatches = false;
+                                break;
+                            }
+                            if (nestedArms[i] == 3) {
+                                if (source.branchArm != 0 ||
+                                    !source.returnBlockId.empty()) {
+                                    lexicalMatches = false;
+                                    break;
+                                }
+                            } else if (nestedArms[i] != 0) {
+                                if (source.branchArm != nestedArms[i] ||
+                                    !source.returnBlockId.empty()) {
+                                    lexicalMatches = false;
+                                    break;
+                                }
+                            } else {
+                                const Block* callsite =
+                                    t->blockContainer->getBlock(
+                                        nestedFrames[i]);
+                                if (!callsite ||
+                                    source.branchArm != 0 ||
+                                    source.returnBlockId != callsite->next) {
+                                    lexicalMatches = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    // The optional IR-001 interoperability proof
+                    // independently reconstructs canonical source PCs,
+                    // verified return sites and typed live loop counters.
+                    // This is readonly: actual execution remains owned by
+                    // the existing Interpreter->LLVM inner-loop handoff.
+                    std::optional<jit::NestedWarpSourceWitness> sourceProof;
+                    bool sourceProofValid =
+                        !ready->nestedOsrSourceProofRequired;
+                    if (ready->nestedOsrSourceProofRequired && checkpoint &&
+                        ready->nestedOsrSourceSymbols &&
+                        checkpoint->validFor(*t, stepSerial)) {
+                        sourceProof = jit::projectNestedWarpSource(
+                            *checkpoint, *ready->nestedOsrSourceSymbols,
+                            t->topBlock, nestedFrames, nestedArms,
+                            ready->nestedOsrLoopId);
+                        sourceProofValid = sourceProof.has_value() &&
+                            sourceProof->calls.size() == nestedCalls.size();
+                        if (sourceProofValid) {
+                            // Revision alone is not enough: tools and
+                            // extensions can directly edit Block payloads
+                            // without calling resetCache(). Reconstruct the
+                            // same immutable source digest used by IR-001.
+                            // This O(source graph) check is opt-in and runs
+                            // only at a *candidate* native adoption point.
+                            const Block* root =
+                                t->blockContainer->getBlock(t->topBlock);
+                            const auto fresh = root
+                                ? ir::ScratchCompilationUnit::capture(
+                                      *t->blockContainer, root)
+                                : ir::ScratchCompilationUnit{};
+                            sourceProofValid = fresh.valid() &&
+                                fresh.sourceRevision ==
+                                    ready->nestedOsrSourceSymbols->sourceRevision &&
+                                ir::scratchSourceDigest(fresh) ==
+                                    ready->nestedOsrSourceSymbols->sourceDigest;
+                        }
+                    }
+                    if (checkpoint && lexicalMatches && argumentsValid &&
+                        sourceProofValid &&
+                        checkpoint->validFor(*t, stepSerial) &&
+                        checkpoint->hasCountedLoopCheckpoint() &&
+                        (*lexical)[nestedDepth - 1].sourceBlockId ==
+                            ready->nestedOsrLoopId &&
+                        call && call->hasParams &&
+                        !call->waitingReporter && !call->hasReported &&
+                        call->reporting.empty() && call->reported.empty() &&
+                        loop && loop->isLoop && loop->warpMode &&
+                        !loop->hasParams && !loop->waitingReporter &&
+                        !loop->hasReported && loop->reporting.empty() &&
+                        loop->reported.empty() && !loop->suspendLast &&
+                        ec && ec->hasLoopCounter &&
+                        !ec->timer && !ec->hasStartedThreads &&
+                        ec->vals.empty() &&
+                        std::isfinite(ec->loopCounter) &&
+                        ec->loopCounter >= 0.0 &&
+                        ec->loopCounter <= 1099511627776.0 &&
+                        std::floor(ec->loopCounter) == ec->loopCounter) {
+                        t->osrRemaining = ec->loopCounter;
+                        t->nestedOsrActive = true;
+                        t->osrActive = true;
+                        t->compiled = ready;
+                        t->isCompiled = true;
+                        if (sourceProof &&
+                            std::getenv("XYO_JIT_OSR_NESTED_TRACE"))
+                            std::fprintf(stderr,
+                                "[jit-osr-source-proof] calls=%zu "
+                                "parent-loops=%zu branches=%zu leaf-pc=%llu "
+                                "revision=%llu\n",
+                                sourceProof->calls.size(),
+                                sourceProof->parentLoops.size(),
+                                sourceProof->branches.size(),
+                                static_cast<unsigned long long>(
+                                    sourceProof->innerLoop.sourcePc),
+                                static_cast<unsigned long long>(
+                                    sourceProof->sourceRevision));
+                        if (std::getenv("XYO_JIT_OSR_TIMING"))
+                            std::fprintf(stderr,
+                                "[jit-osr-nested] promoted loop=%s "
+                                "remaining=%.0f depth=%zu\n",
+                                ready->nestedOsrLoopId.c_str(),
+                                t->osrRemaining, t->stack.size());
+                        continue;
+                    }
+                }
+                if (!t->interpreterStarted) {
+                    t->compiled = ready;
+                    t->isCompiled = true;
+                    continue;
+                }
+                // OSR is legal only at a top-level counted-loop boundary.
+                // The interpreter already ran earlier statements; the
+                // dedicated native entry runs precisely the remaining
+                // iterations and the suffix after this loop.
+                if (!ready->osrEntry || ready->osrLoopId.empty() ||
+                    t->stack.size() != 1 ||
+                    t->stack.back() != ready->osrLoopId ||
+                    t->stackFrames.size() != 1 ||
+                    t->stackClick || t->updateMonitor)
+                    continue;
+                StackFrame* frame = t->stackFrames.back().get();
+                if (!frame || !frame->isLoop || frame->warpMode ||
+                    frame->waitingReporter || frame->hasReported ||
+                    frame->suspendLast || frame->hasParams ||
+                    !frame->reporting.empty() ||
+                    !frame->reported.empty() ||
+                    (frame->executionContext &&
+                     (frame->executionContext->timer ||
+                      frame->executionContext->hasStartedThreads ||
+                      !frame->executionContext->vals.empty())) ||
+                    (t->status != STATUS_RUNNING &&
+                     t->status != STATUS_YIELD &&
+                     t->status != STATUS_YIELD_TICK))
+                    continue;
+                const Block* loop = t->blockContainer
+                    ? t->blockContainer->getBlock(ready->osrLoopId)
+                    : nullptr;
+                if (!loop) continue;
+                double remaining = 0.0;
+                if (loop->opcode == "control_repeat") {
+                    if (!frame->executionContext ||
+                        !frame->executionContext->hasLoopCounter)
+                        continue;
+                    remaining = frame->executionContext->loopCounter;
+                    if (!std::isfinite(remaining) ||
+                        remaining < 0 || remaining > 1099511627776.0 ||
+                        std::floor(remaining) != remaining)
+                        continue;
+                } else if (loop->opcode != "control_while" &&
+                           loop->opcode != "control_repeat_until") {
+                    continue;
+                }
+                t->osrActive = true;
+                t->osrRemaining = remaining;
+                t->compiled = ready;
+                t->isCompiled = true;
+                // A fresh compiled root frame is required by compat
+                // helpers. Previous interpreter frames no longer contain
+                // live reporter state and must not run twice.
+                t->stack.clear();
+                t->stackFrames.clear();
+                t->pushStack(t->topBlock);
+                if (std::getenv("XYO_JIT_OSR_TIMING"))
+                    std::fprintf(stderr,
+                        "[jit-osr] promoted loop=%s remaining=%.0f\n",
+                        ready->osrLoopId.c_str(), remaining);
+            }
+        }
+    }
+    const auto phaseJit = tracePhases ? ProfileClock::now()
+                                       : ProfileClock::time_point{};
     // 停止指示のあったスレッドを除去
     std::vector<Thread*> alive;
     alive.reserve(threads.size());
@@ -571,13 +1253,63 @@ void Runtime::step() {
     redrawRequested = false;
     pushMonitors();
     processWaitQueue();
+    const auto phasePrepare = tracePhases ? ProfileClock::now()
+                                          : ProfileClock::time_point{};
     std::vector<Thread*> doneThreads = sequencer->stepThreads();
+    // A passive, source-versioned, GC-rooted capture of the interpreter's
+    // live nested warp frames. It does not attach a compiled continuation;
+    // the current LLVM ABI cannot adopt an arbitrary deep call stack.
+    static const bool interpOsrCapture = [] {
+        const char* enabled = std::getenv("XYO_INTERP_OSR_SNAPSHOT");
+        return enabled && enabled[0] == '1';
+    }();
+    if (interpOsrCapture && stepSerial <= 20) {
+        for (const Thread* t : threads) {
+            if (!t || !t->interpreterStarted || t->isCompiled ||
+                t->stack.size() < 3)
+                continue;
+            const auto snapshot = ir::InterpreterOsrSnapshot::capture(
+                *t, stepSerial);
+            if (!snapshot) {
+                std::fprintf(stderr,
+                    "[interp-osr-snapshot] frame=%llu script=%s rejected\n",
+                    static_cast<unsigned long long>(stepSerial - 1),
+                    t->topBlock.c_str());
+                continue;
+            }
+            const auto lexical = snapshot->sourcePath();
+            std::fprintf(stderr,
+                "[interp-osr-snapshot] frame=%llu script=%s depth=%zu "
+                "roots=%zu counted_loop=%d valid=%d lexical=%d\n",
+                static_cast<unsigned long long>(stepSerial - 1),
+                t->topBlock.c_str(), snapshot->depth(),
+                snapshot->rootedArguments(),
+                int(snapshot->hasCountedLoopCheckpoint()),
+                int(snapshot->validFor(*t, stepSerial)),
+                int(lexical.has_value()));
+        }
+    }
+    const auto phaseExecute = tracePhases ? ProfileClock::now()
+                                          : ProfileClock::time_point{};
     emitProjectRunStatus(
         int(threads.size() + doneThreads.size() -
             getMonitorThreadCount(threads) -
             getMonitorThreadCount(doneThreads)));
     lastStepDoneThreads = std::move(doneThreads);
     if (renderer) renderer->draw();
+    if (tracePhases) {
+        const auto phaseDraw = ProfileClock::now();
+        const auto ms = [](ProfileClock::duration d) {
+            return std::chrono::duration<double, std::milli>(d).count();
+        };
+        if (ms(phaseDraw - phaseStart) >= 20.0)
+            std::fprintf(stderr,
+                "[step-phase] frame=%llu jit=%.3f prep=%.3f scripts=%.3f draw=%.3f total=%.3fms\n",
+                static_cast<unsigned long long>(stepSerial - 1),
+                ms(phaseJit - phaseStart), ms(phasePrepare - phaseJit),
+                ms(phaseExecute - phasePrepare), ms(phaseDraw - phaseExecute),
+                ms(phaseDraw - phaseStart));
+    }
     if (refreshTargets) {
         emitTargetsUpdate();
         refreshTargets = false;
@@ -665,10 +1397,24 @@ void Runtime::setExecutablePosition(Target* target, int newIndex) {
     // relative move routine searches the same vector twice and converts
     // the index through floating point. Reorder directly, preserving its
     // clamp and stage-first rules (including out-of-range positions).
-    auto it = std::find(executableTargets.begin(), executableTargets.end(), target);
-    if (it == executableTargets.end()) return;
-    invalidateBroadcastIndex();
-    executableTargets.erase(it);
+    static const bool popLastFast = [] {
+        const char* env = std::getenv("XYO_EXEC_ORDER_POP_LAST");
+        return env && env[0] == '1';
+    }();
+    // Newly created clones are appended by addTarget() and then
+    // moved behind their source. Avoid an O(target-count) search
+    // and erase when the element to move is already last.
+    if (popLastFast && !executableTargets.empty() &&
+        executableTargets.back() == target) {
+        invalidateBroadcastIndex();
+        executableTargets.pop_back();
+    } else {
+        auto it = std::find(executableTargets.begin(),
+                            executableTargets.end(), target);
+        if (it == executableTargets.end()) return;
+        invalidateBroadcastIndex();
+        executableTargets.erase(it);
+    }
     int dest = std::clamp(newIndex, 0, int(executableTargets.size()));
     if (dest == 0 && !executableTargets.empty() &&
         executableTargets.front()->isStage)
@@ -687,6 +1433,10 @@ void Runtime::removeExecutable(Target* target) {
 }
 
 void Runtime::disposeTarget(Target* target) {
+    // The audio callback can run concurrently with the main thread. Retire
+    // any voices before the clone's storage becomes invalid.
+    if (target && target->sprite && target->sprite->soundBank)
+        target->sprite->soundBank->targetDisposed(target);
     // Recently created Scratch clones are usually also the last target.
     // Avoid a linear membership scan for the common case, but retain
     // stable ordering and the exact erase semantics for other targets.
@@ -713,6 +1463,12 @@ void Runtime::disposeTarget(Target* target) {
 }
 
 Target* Runtime::getTargetForStage() const {
+    // Normal Scratch projects keep the stage at index 0. The numeric
+    // continuation's binding stamp consults it twice per scheduler slice;
+    // scanning thousands of clones here would erase the slot-cache gain.
+    // Preserve the linear fallback for editor-created/reordered targets.
+    if (!targets.empty() && targets.front()->isStage)
+        return targets.front();
     for (Target* t : targets) if (t->isStage) return t;
     return nullptr;
 }
@@ -945,11 +1701,24 @@ void markBlocks(Gc& g, Blocks* blocks) {
         }
     }
     auto& c = blocks->cache();
-    for (auto& [id, bc] : c.executeCached) {
-        markFieldMap(g, bc->fields);
-        g.markValue(bc->shadowValue);
-        markArgValues(g, bc->argValues);
-    }
+    const auto markCached = [&](const BlockCached& bc) {
+        markFieldMap(g, bc.fields);
+        g.markValue(bc.shadowValue);
+        markArgValues(g, bc.argValues);
+        if (bc.ownedMutation) {
+            bc.ownedMutation->parseArgs();
+            for (const Value& v : bc.ownedMutation->argumentDefaults)
+                g.markValue(v);
+        }
+    };
+    for (const auto& [id, bc] : c.executeCached)
+        markCached(*bc);
+    // Native and interpreter frames may still use any pre-edit cache
+    // generation. Their mutable argument values are GC roots until Blocks
+    // itself is released, not merely until resetCache() invalidates lookup.
+    for (const auto& retired : c.retiredExecuteCached)
+        for (const auto& [id, bc] : retired)
+            markCached(*bc);
     for (auto& [op, scripts] : c.scripts)
         for (auto& s : scripts)
             for (auto& [k, v] : s.fieldsOfInputs) g.markValue(v);

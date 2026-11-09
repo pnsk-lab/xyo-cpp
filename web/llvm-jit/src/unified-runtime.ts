@@ -14,6 +14,21 @@ export interface XyoUnifiedModule {
   _xyo_browser_load_sb3(handle: number, ptr: number, length: number): number;
   _xyo_browser_green_flag(handle: number): number;
   _xyo_browser_step(handle: number): number;
+  _xyo_browser_key(handle: number, key: number, down: number): number;
+  _xyo_browser_mouse(handle: number, x: number, y: number, down: number, button: number, hasDown: number): number;
+  _xyo_browser_wheel(handle: number, dx: number, dy: number): number;
+  _xyo_browser_answer(handle: number, text: number): number;
+  _xyo_browser_audio_count(handle: number): number;
+  _xyo_browser_audio_kind(handle: number, index: number): number;
+  _xyo_browser_audio_id(handle: number, index: number): number;
+  _xyo_browser_audio_bytes(handle: number, index: number): number;
+  _xyo_browser_audio_size(handle: number, index: number): number;
+  _xyo_browser_audio_format(handle: number, index: number): number;
+  _xyo_browser_audio_volume(handle: number, index: number): number;
+  _xyo_browser_audio_pitch(handle: number, index: number): number;
+  _xyo_browser_audio_pan(handle: number, index: number): number;
+  _xyo_browser_audio_consume(handle: number): number;
+  _xyo_browser_audio_complete(handle: number, id: number): number;
   _xyo_browser_stop(handle: number): number;
   _xyo_browser_snapshot(handle: number): number;
   _xyo_browser_error(handle: number): number;
@@ -177,6 +192,61 @@ export class UnifiedSB3Executor {
   step(): void {
     this.ensureActive();
     if (this.m._xyo_browser_step(this.handle) !== 1) throw this.error();
+  }
+  key(key: string, down: boolean): void {
+    this.ensureActive();
+    if (this.withCString(key, p => this.m._xyo_browser_key(this.handle, p, down ? 1 : 0)) !== 1)
+      throw this.error();
+  }
+  mouse(x: number, y: number, down: boolean, button: number, hasDown: boolean): void {
+    this.ensureActive();
+    if (this.m._xyo_browser_mouse(this.handle, x, y, down ? 1 : 0, button, hasDown ? 1 : 0) !== 1)
+      throw this.error();
+  }
+  wheel(dx: number, dy: number): void {
+    this.ensureActive();
+    if (this.m._xyo_browser_wheel(this.handle, dx, dy) !== 1) throw this.error();
+  }
+  answer(text: string): void {
+    this.ensureActive();
+    if (this.withCString(text, p => this.m._xyo_browser_answer(this.handle, p)) !== 1)
+      throw this.error();
+  }
+  audioEvents(): Array<{
+    kind: number; id: number; format: string; bytes: Uint8Array;
+    volume: number; pitch: number; pan: number;
+  }> {
+    this.ensureActive();
+    const m = this.m;
+    const count = m._xyo_browser_audio_count(this.handle);
+    if (!Number.isInteger(count) || count < 0 || count > 256) throw Error('invalid browser audio queue length');
+    const events = [];
+    for (let i = 0; i < count; ++i) {
+      const kind = m._xyo_browser_audio_kind(this.handle, i);
+      const id = m._xyo_browser_audio_id(this.handle, i);
+      const length = m._xyo_browser_audio_size(this.handle, i);
+      const pointer = m._xyo_browser_audio_bytes(this.handle, i);
+      if (kind !== 1 && kind !== 2) throw Error('invalid sound event type');
+      if (!Number.isInteger(length) || length < 0 || length > 8 * 1024 * 1024 ||
+          (length > 0 && (!pointer || pointer + length > m.HEAPU8.length)))
+        throw Error('invalid sound data pointer');
+      const volume = m._xyo_browser_audio_volume(this.handle, i);
+      const pitch = m._xyo_browser_audio_pitch(this.handle, i);
+      const pan = m._xyo_browser_audio_pan(this.handle, i);
+      if (![volume, pitch, pan].every(Number.isFinite)) throw Error('invalid audio parameters');
+      events.push({
+        kind, id, format: this.readCString(m._xyo_browser_audio_format(this.handle, i)),
+        bytes: length ? Uint8Array.from(m.HEAPU8.subarray(pointer, pointer + length)) : new Uint8Array(),
+        volume, pitch, pan,
+      });
+    }
+    if (m._xyo_browser_audio_consume(this.handle) !== 1) throw Error('could not consume audio queue');
+    return events;
+  }
+  completeSound(id: number): void {
+    this.ensureActive();
+    if (!Number.isInteger(id) || id <= 0 || id > 0xffffffff) return;
+    if (this.m._xyo_browser_audio_complete(this.handle, id) !== 1) throw this.error();
   }
   snapshot(): unknown {
     this.ensureActive();

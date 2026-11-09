@@ -215,6 +215,136 @@ void run(JitMode mode, int arithmeticIndex = 0) {
         check(scalar == double(i) + 2, "scalar alias write visible after list accesses");
     }
 }
+// A malformed Scratch project can reuse a scalar ID in a list field.
+// The helper lazily creates the SList even if a replacement index is out
+// of range; skipping the null branch in a promoted loop must not suppress
+// this observable initialization.
+void testLazyListOnScalarId(JitMode mode) {
+    setJitMode(mode);
+    Graph g;
+    const std::string mutation =
+        ",\"mutation\":{\"proccode\":\"test\","
+        "\"argumentids\":\"[]\",\"argumentnames\":\"[]\","
+        "\"argumentdefaults\":\"[]\",\"warp\":\"true\"}";
+    g.add("hat", "event_whenflagclicked", "call", "{}", "{}",
+          ",\"topLevel\":true");
+    g.add("call", "procedures_call", "", "{}", "{}", mutation);
+    g.add("def", "procedures_definition", "loop",
+          "{\"custom_block\":[1,\"proto\"]}", "{}",
+          ",\"topLevel\":true");
+    g.add("proto", "procedures_prototype", "", "{}", "{}",
+          ",\"shadow\":true" + mutation);
+    g.add("loop", "control_repeat", "",
+          "{\"TIMES\":" + number(3) +
+          ",\"SUBSTACK\":" + blockRef("replace") + "}");
+    g.add("replace", "data_replaceitemoflist", "",
+          "{\"INDEX\":" + number(1) +
+          ",\"ITEM\":" + number(42) + "}",
+          field("LIST", "collision", "collision"));
+    const std::string json =
+        "{\"targets\":[{\"isStage\":true,\"name\":\"Stage\","
+        "\"variables\":{},\"lists\":{},\"blocks\":{},"
+        "\"costumes\":[],\"sounds\":[]},"
+        "{\"isStage\":false,\"name\":\"Test\","
+        "\"variables\":{\"collision\":[\"collision\",9]},"
+        "\"lists\":{},\"blocks\":{" + g.blocks + "},"
+        "\"costumes\":[],\"sounds\":[]}],"
+        "\"monitors\":[],\"extensions\":[],\"meta\":{}}";
+    Runtime rt;
+    check(loadSb3(rt, json, nullptr).ok,
+          "load scalar/list-ID collision project");
+    if (rt.targets.size() != 2) return;
+    Target* t = rt.targets[1];
+    Variable* v = t->lookupVariableById("collision");
+    check(v && v->list == nullptr,
+          "scalar/list-ID collision starts without an SList");
+    if (!v) return;
+    rt.greenFlag();
+#ifdef XYO_JIT
+    if (mode == JitMode::Eager)
+        for (Thread* th : rt.threads)
+            check(th->isCompiled,
+                  "scalar/list-ID collision eagerly compiles");
+#endif
+    rt.runUntilDone(100);
+    check(rt.threads.empty(),
+          "scalar/list-ID collision script terminates");
+    check(v->list && v->list->len == 0,
+          "out-of-bounds replace still creates missing SList");
+    check(cast::toNumber(v->value) == 9,
+          "list replacement never corrupts original scalar");
+}
+
+void testMonotoneNumericFlag(JitMode mode) {
+    // JIT writes to the same list: a numeric insert preserves numericOnly,
+    // a string clears it, and a later numeric replacement must not restore
+    // it. An unrelated list of numeric-only writes must stay numericOnly.
+    Graph g;
+    g.add("hat", "event_whenflagclicked", "writeNumber", "{}", "{}",
+          ",\"topLevel\":true");
+    g.add("writeNumber", "data_replaceitemoflist", "writeString",
+          "{\"INDEX\":" + number(1) + ",\"ITEM\":" + blockRef("number10") + "}",
+          field("LIST", "mixed", "mixed"));
+    g.add("writeString", "data_replaceitemoflist", "writeAfterString",
+          "{\"INDEX\":" + number(2) +
+          ",\"ITEM\":[1,[10,\"text\"]]}",
+          field("LIST", "mixed", "mixed"));
+    g.add("writeAfterString", "data_replaceitemoflist", "numberOnly",
+          "{\"INDEX\":" + number(3) + ",\"ITEM\":" + blockRef("number30") + "}",
+          field("LIST", "mixed", "mixed"));
+    g.add("numberOnly", "data_replaceitemoflist", "",
+          "{\"INDEX\":" + number(1) + ",\"ITEM\":" + blockRef("number40") + "}",
+          field("LIST", "numbers", "numbers"));
+    // Numeric-looking [4, "40"] shadows can remain Scratch *strings*.
+    // Use arithmetic reporters to produce real IEEE-754 Value::num slots.
+    g.add("number10", "operator_add", "",
+          "{\"NUM1\":" + number(9) + ",\"NUM2\":" + number(1) + "}");
+    g.add("number30", "operator_add", "",
+          "{\"NUM1\":" + number(20) + ",\"NUM2\":" + number(10) + "}");
+    g.add("number40", "operator_add", "",
+          "{\"NUM1\":" + number(30) + ",\"NUM2\":" + number(10) + "}");
+    const std::string json =
+        "{\"targets\":[{\"isStage\":true,\"name\":\"Stage\","
+        "\"variables\":{},\"lists\":{\"mixed\":[\"mixed\",[1,2,3]],"
+        "\"numbers\":[\"numbers\",[4,5,6]]},\"blocks\":{" +
+        g.blocks +
+        "},\"costumes\":[],\"sounds\":[]}],\"monitors\":[],"
+        "\"extensions\":[],\"meta\":{}}";
+    setJitMode(mode);
+    Runtime rt;
+    check(loadSb3(rt, json, nullptr).ok,
+          "load monotone numeric-only flag fixture");
+    Target* target = rt.getTargetForStage();
+    if (!target) return;
+    Variable* mixed = target->lookupVariableById("mixed");
+    Variable* numbers = target->lookupVariableById("numbers");
+    check(mixed && mixed->list && mixed->list->numericOnly,
+          "numeric mixed list starts numeric-only");
+    check(numbers && numbers->list && numbers->list->numericOnly,
+          "numeric control list starts numeric-only");
+    if (!mixed || !mixed->list || !numbers || !numbers->list) return;
+    rt.greenFlag();
+#ifdef XYO_JIT
+    if (mode == JitMode::Eager)
+        for (Thread* t : rt.threads)
+            check(t->isCompiled, "numeric-only list writes compile eagerly");
+#endif
+    rt.runUntilDone(100);
+    check(rt.threads.empty(), "numeric-only list test terminates");
+    check(mixed->list->len == 3 && !mixed->list->numericOnly,
+          "nonnumeric replacement permanently clears numeric-only flag");
+    check(numbers->list->len == 3 && numbers->list->numericOnly,
+          "numeric-only replacement preserves numeric-only flag");
+    check(cast::toNumber(mixed->list->get0(0)) == 10 &&
+          cast::toNumber(mixed->list->get0(2)) == 30,
+          "numeric replacement values preserved");
+    check(mixed->list->get0(1).isString() &&
+          cast::toString(mixed->list->get0(1))->view() == u"text",
+          "string replacement value preserved");
+    check(cast::toNumber(numbers->list->get0(0)) == 40,
+          "separate numeric list value preserved");
+}
+
 } // namespace
 
 int test_list_codegen_bounds_main() {
@@ -223,6 +353,10 @@ int test_list_codegen_bounds_main() {
         run(JitMode::Off, arithmeticIndex);
         run(JitMode::Eager, arithmeticIndex);
     }
+    testLazyListOnScalarId(JitMode::Off);
+    testLazyListOnScalarId(JitMode::Eager);
+    testMonotoneNumericFlag(JitMode::Off);
+    testMonotoneNumericFlag(JitMode::Eager);
     setJitMode(saved);
     std::printf("list codegen bounds: %d checks, %d failures\n", checks, failures);
     return failures;

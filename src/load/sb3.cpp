@@ -760,15 +760,17 @@ void applyTwProjectOptions(Runtime& runtime,
     }
 }
 
-Sb3LoadResult loadSb3(Runtime& runtime, const std::string& projectJson,
-                      const ZipReader* zip, bool isSingleSprite) {
+// Both raw-JSON imports and the ZIP entry loader use the same parsed tree.
+// In particular, the ZIP loader has already parsed project.json once to
+// distinguish SB2 from SB3; parsing it again costs O(project size) at startup.
+static Sb3LoadResult loadSb3Parsed(Runtime& runtime, const JsonValue& json,
+                                   const ZipReader* zip, bool isSingleSprite) {
     // ロード中は Target が runtime.targets に未登録の区間があり、
     // そこへ格納した SStr/SList が GC から到達不能に見える。
     // collect を遅延させ、全てがルートへ接続されてから回収可能にする。
     Gc::DeferCollect gcDefer;
     InitialListStrings listStrings;
     Sb3LoadResult result;
-    JsonValue json = jsonParse(projectJson);
     if (!json.isObject()) {
         result.error = "project.json parse failed";
         return result;
@@ -835,6 +837,11 @@ Sb3LoadResult loadSb3(Runtime& runtime, const std::string& projectJson,
 
     result.ok = true;
     return result;
+}
+
+Sb3LoadResult loadSb3(Runtime& runtime, const std::string& projectJson,
+                      const ZipReader* zip, bool isSingleSprite) {
+    return loadSb3Parsed(runtime, jsonParse(projectJson), zip, isSingleSprite);
 }
 
 std::vector<std::string> loadBlocksFragment(Blocks& out, const JsonValue& fragment,
@@ -906,8 +913,7 @@ Sb3LoadResult loadSb3File(Runtime& runtime, const uint8_t* data,
     if (peek.isObject() && peek.has("objName") && !peek.has("targets")) {
         return loadSb2(runtime, peek, &zip);
     }
-    return loadSb3(runtime,
-                   std::string(jsonData.begin(), jsonData.end()), &zip);
+    return loadSb3Parsed(runtime, peek, &zip, false);
 }
 
 } // namespace xyo

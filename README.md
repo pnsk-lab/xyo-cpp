@@ -4,6 +4,8 @@
 [![Documentation](https://github.com/pnsk-lab/xyo-cpp/actions/workflows/docs.yml/badge.svg)](https://github.com/pnsk-lab/xyo-cpp/actions/workflows/docs.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+マルチエージェント共同開発: [掲示板・タスク一覧](BOARD.md) / [運用ルール](board/README.md)。
+
 **Scratch プロジェクトを C++ で高速に実行するランタイム。**
 
 xyo-cpp は Scratch の `.sb3` プロジェクトを読み込み、インタプリタ、LLVM ベースの JIT（実行時コンパイル）、AOT（事前コンパイル）で実行するオープンソースプロジェクトです。SDL2 によるプレイヤー、プロジェクトランチャー、エディタも備えています。

@@ -246,7 +246,7 @@ asPtr(v)     = v & 0x0000'FFFF'FFFF'FFFF
   - 走査はワード単位、`(w>>48)==0x7FF9` → `asPtr` をヒープ所属に照合して mark。タグ付きポインタも原生ポインタも捕捉できる（自前 GC だから実現できる点）
   - 中断中ファイバは「SP〜スタック底」を走査。呼び出し規約上 suspend 時の live 値は必ず callee-saved または spill 済み
   - 実行中ファイバ上で collect が走った場合も同様に「現 SP〜そのファイバ底」を走査し、切替中のスケジューラ側退避レジスタ（`detail::gSchedulerRegs`）も対象に含める（`Runtime::markRoots` 実装）
-- **ロード中は collect を遅延**（`Gc::DeferCollect`）: `loadTargetObject` 中の Target は `runtime.targets` 未登録でルート走査から不可視。変数・リスト・ブロック field 等の GC オブジェクトがスタック残滓だけで生き延びるのは非決定的なため、区間中は回収自体を止める（3D2.sb3 のクラッシュ原因）
+- **ロード中は collect を遅延**（`Gc::DeferCollect`）: `loadTargetObject` 中の Target は `runtime.targets` 未登録でルート走査から不可視。変数・リスト・ブロック field 等の GC オブジェクトがスタック残滓だけで生き延びるのは非決定的なため、区間中は回収自体を止める（debug/projects/3D2.sb3 のクラッシュ原因）
 - 割当: bump allocator + フリーリスト、マークは非移動。トリガは割当バイト数閾値（経験的に 1-2MiB 起点、ヒープ拡大係数 2.0）
   - マークフェーズ中の割当は**黒色割当**（`collecting_` 中は mark=1 で生成）— ルート走査が `Mutation::parseArgs` 等で SStr を遅延生成するため、同 sweep で即解放されるのを防ぐ
   - 上記の再入割当のため `allocMtx_` は `std::recursive_mutex`（`collect()` が mutex 保持下でルート走査を呼ぶ）

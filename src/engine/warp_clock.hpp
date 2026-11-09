@@ -21,6 +21,9 @@ public:
     // system_clock Unix milliseconds for Scratch's days since 2000.
     // Separate cache line to avoid invalidating the warp polling clock.
     alignas(64) std::atomic<int64_t> sampledUnixMs{0};
+    // The same ms sample converted to Scratch's NaN-boxed days value once.
+    // Native JIT can load these bits without div/convert/boxing each iteration.
+    alignas(64) std::atomic<uint64_t> sampledUnixDaysBits{0};
 
     explicit WarpClockWatchdog(bool sampleWallClock = false);
     ~WarpClockWatchdog();

@@ -14,6 +14,10 @@ if(NOT DEFINED ENV{EMSDK})
 endif()
 include("$ENV{EMSDK}/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake")
 
-# Phase A: ブラウザ WASM にはネイティブ LLVM ORC JIT が存在しないため interp のみ。
-# コンパイル速度の WASM 対応（WASM モジュール化 JIT）は Phase C のロードマップ。
-set(XYO_JIT OFF CACHE BOOL "" FORCE)
+# Native LLVM ORC cannot run inside WASM. Use the dedicated browser
+# WebAssembly HotSpot backend or retain the interpreter-only build.
+if(XYO_JIT_BACKEND STREQUAL "wasm")
+  set(XYO_JIT ON CACHE BOOL "" FORCE)
+else()
+  set(XYO_JIT OFF CACHE BOOL "" FORCE)
+endif()

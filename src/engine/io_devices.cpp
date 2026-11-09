@@ -23,6 +23,10 @@ double Clock::projectTimer() const {
 }
 
 void Clock::resetProjectTimer() { timer_.start(); }
+void Clock::restoreProjectTimer(double elapsedSeconds) {
+    paused_ = false;
+    timer_.setStartTime(runtime->currentMSecs - elapsedSeconds * 1000.0);
+}
 
 void Clock::pause() {
     paused_ = true;

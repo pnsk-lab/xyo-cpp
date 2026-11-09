@@ -8,6 +8,10 @@
 //   xyo minify <in.sb3> [-o out.sb3] sb3 を小さくする（zip 圧縮 + ID 短縮）
 //   xyo rewrite <in.sb3> [-o out.sb3] 最適化しやすい形へ書き換える（warp 化・一時変数）
 //   xyo test <fixture.sb3|dir>      execute フィクスチャ（SAY pass/fail/end）
+//
+// 共通オプション:
+//   --opt-all  現在の作業ツリー diff の opt-in 最適化を一括で有効化
+//              （XYO_OPT_ALL=1。明示した個別 XYO_* は上書きしない）
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX          // std::min/std::max をマクロで壊させない
@@ -27,18 +31,29 @@
 #include <thread>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <sstream>
 #include <string>
 #include <vector>
+#if defined(__linux__)
+#include <unistd.h>
+#endif
 
 #include "gui.hpp"
 #include "editor.hpp"
+#include "wasm_command.hpp"
 
 #include "core/cast.hpp"
 #include "core/slist.hpp"
 #include "core/fileio.hpp"
 #include "core/sstr.hpp"
 #include "analysis/project_analysis.hpp"
+#include "analysis/type_sites.hpp"
+#include "analysis/type_flow.hpp"
+#include "analysis/procedure_effects.hpp"
 #include "engine/runtime.hpp"
+#include "engine/hot_start.hpp"
+#include "engine/opt_flags.hpp"
 #include "load/sb3.hpp"
 #include "load/sb3_minify.hpp"
 #include "load/sb3_rewrite.hpp"
@@ -49,6 +64,7 @@
 #include "jit/jit.hpp"
 #ifdef XYO_JIT
 #include "aot/aot.hpp"
+#include "aot/progress_text.hpp"
 #endif
 #include "wasm/host_bridge.hpp"
 
@@ -61,18 +77,62 @@ static const char* g_aotObj = nullptr;
 /// `--danger`: スレッドごとの実行時間予算（warp 500ms）を外す危険モード。
 /// 環境変数 `XYO_DANGER` は Runtime 構築時に読まれる（こちらは上書き）。
 static bool g_danger = false;
+static bool g_blockCount = false;
+#ifdef XYO_JIT
+static bool g_aotProgress = true;
+static bool g_aotRun = false;
+
+// Stable stderr lines so progress survives redirection to build logs.
+// Only stage changes, >=5% advances, or 200ms of work produce a line.
+static aot::ProgressCallback aotCliProgress(const char* operation) {
+    if (!g_aotProgress) return {};
+    if (const char* e = std::getenv("XYO_AOT_PROGRESS"))
+        if (e[0] == '0') return {};
+    return [operation, phase = -1, bucket = -1,
+            last = std::chrono::steady_clock::time_point{}]
+           (const aot::Progress& p) mutable {
+        const int next = static_cast<int>(p.stage);
+        const int pct = p.total > 0
+            ? int(p.completed * 100 / p.total) : -1;
+        const int nextBucket = pct >= 0 ? pct / 5 : -1;
+        const auto now = std::chrono::steady_clock::now();
+        if (phase == next && p.completed != p.total &&
+            nextBucket == bucket &&
+            now - last < std::chrono::milliseconds(200))
+            return;
+        phase = next;
+        bucket = nextBucket;
+        last = now;
+        std::fprintf(stderr, "[aot-%s] %s\n", operation,
+                     aot::progressText(p).c_str());
+        std::fflush(stderr);
+    };
+}
+#endif
+static bool g_highQualityPen = false;
+// --render-scale: DLSS 相当の内部解像度（0 以下 = 未指定 → env/既定 1.0）
+static double g_renderScale = -1.0;
 
 /// ロード直後の Runtime に CLI の危険モードを反映する。
-static void applyDangerMode(Runtime& rt) {
+static void applyRuntimeOptions(Runtime& rt) {
     if (g_danger) rt.dangerMode = true;
+    if (g_blockCount) rt.blockCountEnabled = true;
 }
 
 static int usage() {
     std::fprintf(stderr,
         "usage:\n"
+        "  --string-storage rope|flat|append-log  (XYO_STRING_STORAGE; default rope)\n"
+        "  --string-leaf utf16|latin1  (XYO_STRING_LEAF; default utf16)\n"
+        "  --string-short-intern on|off  (XYO_STRING_SHORT_INTERN=1; default off)\n"
+        "  --opt-all  (XYO_OPT_ALL=1; 現在の作業ツリー diff の opt-in 最適化を一括 ON。\n"
+        "              明示した個別 XYO_* は上書きしない)\n"
         "  xyo run <project.sb3> [--frames N] [--aot obj]"
         " [--jit hotspot|eager|off] [--jit-lazy auto|on|off] [--danger]\n"
+        "          [--block-count]  (XYO_BLOCK_COUNT=1; exact interpreter count)\n"
         "          [--fps N] [--print-list NAME]\n"
+        "          [--hot-save FILE] [--hot-load FILE]"
+        " [--hot-save-frame N]  (interpreter checkpoint)\n"
         "      --fps: 1 ステップを 1/N 秒に合わせる（scratch-vm の 30fps 相当。"
         "既定 0 = 最速）\n"
         "      --print-list: ステージのリスト NAME の未出力要素を 1 行ずつ"
@@ -80,12 +140,21 @@ static int usage() {
         "          （ログ出力つきプロジェクトをヘッドレスで観察する用。"
         "他は stderr へ退避）\n"
         "  xyo play <project.sb3> [--scale N] [--turbo] [--fps N]"
-        " [--gpu-realtime ray|path] [--danger]\n"
+        "  (XYO_PLAY_PROFILE=/path/to/log.csv for frame profiling)\\n"
+        "  --hot-save FILE: F5/save at exit; --hot-load FILE: resume state;"
+        " --hot-save-frame N: save and exit after N frames\n"
+        " [--gpu-realtime ray|path] [--danger] [--block-count]\n"
+        " [--high-quality-pen] (XYO_HIGH_QUALITY_PEN=1; display pixel resolution)\n"
+        " [--render-scale N] (XYO_RENDER_SCALE; 0.25..1.0, DLSS-equivalent)\n"
+        "  xyo wasm <project.sb3> -o <out.wasm> [--script ID]\n"
+        "           [--backend binaryen|builtin] [--opt 0|1|2|3]\n"
+        "           生成 WASM は env.memory をインポートする (f(i32)->i32)\n"
         "  xyo aot <project.sb3> (-o <out> | --obj <file>)  "
-        "事前コンパイル（実験的）\n"
+        "事前コンパイル（実験的; 進捗は stderr）\n"
+        "  --no-progress  AOT 進捗ログを無効化 (XYO_AOT_PROGRESS=0)\n"
         "  xyo gui [dir]                   ランチャー GUI（引数なしでも起動）\n  xyo edit <project.sb3>             ビルトインエディタ\n"
         "  xyo dump <project.sb3>\n"
-        "  xyo analyze <project.sb3> [--dot out.dot] [--top N] [--scripts N]\n"
+        "  xyo analyze <project.sb3> [--dot out.dot] [--top N] [--scripts N] [--type-flow]\n"
         "      実行せずに構造を解析（並列性・直列化キー・warp化候補・ループ内アンチパターン）\n"
         "      --dot: workerSafe スクリプトの衝突グラフを Graphviz DOT で出力\n"
         "      --top: 衝突キーの表示件数（既定 20）/ --scripts: スクリプト表の件数（0=全部）\n"
@@ -113,9 +182,28 @@ static int usage() {
 }
 
 static std::vector<uint8_t> readFile(const char* path, bool& ok) {
-    // Windows では UTF-8 パスを UTF-16 へ変換して開く
+    // Windows では UTF-8 パスを UTF-16 へ変換して開く。
+    // Binary SB3s can be many megabytes: a single sized read avoids a
+    // per-byte stream iterator and repeated vector growth on startup.
     std::ifstream f(pathFromUtf8(path), std::ios::binary);
     if (!f) { ok = false; return {}; }
+    f.seekg(0, std::ios::end);
+    const auto size = f.tellg();
+    if (size >= 0) {
+        f.seekg(0, std::ios::beg);
+        auto bytes = std::vector<uint8_t>(static_cast<size_t>(size));
+        if (!bytes.empty() &&
+            !f.read(reinterpret_cast<char*>(bytes.data()),
+                    static_cast<std::streamsize>(bytes.size()))) {
+            ok = false;
+            return {};
+        }
+        ok = true;
+        return bytes;
+    }
+    // Keep non-seekable inputs compatible with the old stream path.
+    f.clear();
+    f.seekg(0, std::ios::beg);
     ok = true;
     return {std::istreambuf_iterator<char>(f),
             std::istreambuf_iterator<char>()};
@@ -124,7 +212,8 @@ static std::vector<uint8_t> readFile(const char* path, bool& ok) {
 #ifdef XYO_JIT
 /// ロード済み sb3 に AOT オブジェクトを適用する（--aot / AOT 実行ファイル）。
 static void applyAotObject(Runtime& rt, const char* objPath,
-                           const void* sb3, size_t n) {
+                           const void* sb3, size_t n,
+                           const aot::ProgressCallback& extra = {}) {
     if (!objPath || !rt.jit) return;
     bool ok;
     std::vector<uint8_t> obj = readFile(objPath, ok);
@@ -133,8 +222,13 @@ static void applyAotObject(Runtime& rt, const char* objPath,
         return;
     }
     std::string why;
+    const auto printer = aotCliProgress("run");
+    const aot::ProgressCallback both = [&](const aot::Progress& p) {
+        if (printer) printer(p);
+        if (extra) extra(p);
+    };
     if (!rt.jit->loadAot(rt, obj.data(), obj.size(),
-                         aot::hashBytes(sb3, n), &why))
+                         aot::hashBytes(sb3, n), &why, both))
         std::fprintf(stderr, "aot: load failed (%s)\n", why.c_str());
 }
 #endif
@@ -195,7 +289,7 @@ static void dumpVarsJson(Runtime& rt) {
                 for (uint32_t i = 0; l && i < l->len; ++i) {
                     if (i) out += ',';
                     std::string item;
-                    SStr* s = cast::toString(l->items[i]);
+                    SStr* s = cast::toString(l->get0(i));
                     if (s) item = SStr::toUtf8(s->view());
                     jsonEscapeTo(item, out);
                 }
@@ -233,7 +327,7 @@ static void dumpVarsIfRequested(Runtime& rt) {
                             nm.c_str(), id.c_str(), l ? l->len : 0u);
                 if (l)
                     for (uint32_t i = 0; i < l->len; ++i) {
-                        SStr* s = cast::toString(l->items[i]);
+                        SStr* s = cast::toString(l->get0(i));
                         std::printf(" %s",
                                     s ? SStr::toUtf8(s->view()).c_str() : "");
                     }
@@ -264,6 +358,13 @@ static void printLoadInfo(Runtime& rt, const Sb3LoadResult& r, FILE* out) {
 }
 
 static const char* g_saveAfterRun = nullptr;
+// Portable interpreter checkpoints. These are intentionally independent of
+// the Scratch project's --save (which exports only project data).
+static const char* g_hotSave = nullptr;
+static const char* g_hotLoad = nullptr;
+static int g_hotSaveFrame = 0;
+static uint64_t g_hotFingerprint = 0;
+
 
 /// ステージ（無ければ先に見つかったターゲット）のリスト変数を名前で探す。
 /// `--print-list NAME` が tail する対象。
@@ -287,7 +388,7 @@ static void flushList(SList* l, size_t& printed) {
     if (!l) return;
     if (l->len < printed) printed = l->len;
     for (; printed < l->len; ++printed) {
-        SStr* s = cast::toString(l->items[printed]);
+        SStr* s = cast::toString(l->get0(printed));
         const std::string u = s ? SStr::toUtf8(s->view()) : std::string();
         std::fwrite(u.data(), 1, u.size(), stdout);
         std::fputc('\n', stdout);
@@ -306,15 +407,39 @@ static int runLoaded(Runtime& rt, const Sb3LoadResult* r, int maxFrames,
                      int fps = 0) {
     const bool quietOut = g_printList != nullptr;
     if (r) printLoadInfo(rt, *r, quietOut ? stderr : stdout);
-    SList* list = g_printList ? findListByName(rt, g_printList) : nullptr;
+    SList* list = nullptr;
+    size_t printed = 0;
+    const bool startupTiming = std::getenv("XYO_STARTUP_TIMING") != nullptr;
+    const auto startupT0 = std::chrono::steady_clock::now();
+    if (g_hotLoad) {
+        std::string why;
+        if (!loadHotStart(rt, g_hotLoad, g_hotFingerprint, &why)) {
+            std::fprintf(stderr, "hot-load: %s\n", why.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "hot-load: %s\n", g_hotLoad);
+    } else {
+        rt.greenFlag();
+    }
+    // A hot-load replaces scalar/list variable nodes and SList objects:
+    // resolve the print-list pointer only after the restored state is live.
+    list = g_printList ? findListByName(rt, g_printList) : nullptr;
     if (g_printList && !list)
         std::fprintf(stderr, "no list named \"%s\"\n", g_printList);
-    size_t printed = 0;
-    rt.greenFlag();
+    if (startupTiming)
+        std::fprintf(stderr, "[startup] greenflag-spawn  %.3fms\n",
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - startupT0).count());
     const int limit = maxFrames > 0 ? maxFrames : 1000000;
     const auto frameDur =
         std::chrono::microseconds(fps > 0 ? 1000000 / fps : 0);
     bool finished = false;
+    int executedFrames = 0;
+#ifdef XYO_JIT
+    const bool showAotFrames = g_aotRun && bool(aotCliProgress("run"));
+    const auto aotFrameStart = std::chrono::steady_clock::now();
+    auto lastAotFrameReport = aotFrameStart;
+#endif
     for (int step = 0; step < limit; ++step) {
         bool anyActive = false;
         for (Thread* t : rt.threads) {
@@ -326,12 +451,64 @@ static int runLoaded(Runtime& rt, const Sb3LoadResult* r, int maxFrames,
         if (!anyActive) { finished = true; break; }
         const auto t0 = std::chrono::steady_clock::now();
         rt.step();
+        executedFrames = step + 1;
+#ifdef XYO_JIT
+        if (showAotFrames) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - lastAotFrameReport >= std::chrono::seconds(1)) {
+                const double seconds = std::chrono::duration<double>(
+                    now - aotFrameStart).count();
+                if (maxFrames > 0)
+                    std::fprintf(stderr,
+                        "[aot-run] frame=%d/%d (上限比 %.0f%%) elapsed=%.1fs threads=%zu\n",
+                        executedFrames, maxFrames,
+                        double(executedFrames) * 100 / maxFrames,
+                        seconds, rt.threads.size());
+                else
+                    std::fprintf(stderr,
+                        "[aot-run] frame=%d elapsed=%.1fs threads=%zu\n",
+                        executedFrames, seconds, rt.threads.size());
+                std::fflush(stderr);
+                lastAotFrameReport = now;
+            }
+        }
+#endif
+        if (startupTiming && step == 0)
+            std::fprintf(stderr, "[startup] first-step       %.3fms\n",
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - startupT0).count());
         if (g_printList) flushList(list, printed);
+        if (g_hotSave && g_hotSaveFrame > 0 &&
+            step + 1 == g_hotSaveFrame) {
+            std::string why;
+            if (!saveHotStart(rt, g_hotSave, g_hotFingerprint, &why)) {
+                std::fprintf(stderr, "hot-save: %s\n", why.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "hot-save: %s\n", g_hotSave);
+            return 0;
+        }
         if (fps > 0) {
             const auto dt = std::chrono::steady_clock::now() - t0;
             if (dt < frameDur)
                 std::this_thread::sleep_for(frameDur - dt);
         }
+    }
+    rt.finishBlockCount();
+#ifdef XYO_JIT
+    if (showAotFrames)
+        std::fprintf(stderr, "[aot-run] 終了 frames=%d elapsed=%.3fs (%s)\n",
+            executedFrames, std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - aotFrameStart).count(),
+            finished ? "全スレッド終了" : "フレーム上限");
+#endif
+    if (g_hotSave && !g_hotSaveFrame) {
+        std::string why;
+        if (!saveHotStart(rt, g_hotSave, g_hotFingerprint, &why)) {
+            std::fprintf(stderr, "hot-save: %s\n", why.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "hot-save: %s\n", g_hotSave);
     }
     if (g_printList) flushList(list, printed);
     if (g_saveAfterRun) {
@@ -365,21 +542,37 @@ static int runLoaded(Runtime& rt, const Sb3LoadResult* r, int maxFrames,
 }
 
 static int cmdRun(const char* path, int maxFrames, int fps) {
+    using StartupClock = std::chrono::steady_clock;
+    const bool startupTiming = std::getenv("XYO_STARTUP_TIMING") != nullptr;
+    const auto startupT0 = StartupClock::now();
+    auto timeMark = [&](const char* name) {
+        if (startupTiming)
+            std::fprintf(stderr, "[startup] %-16s %.3fms\n", name,
+                std::chrono::duration<double, std::milli>(
+                    StartupClock::now() - startupT0).count());
+    };
     bool ok;
     std::vector<uint8_t> data = readFile(path, ok);
+    timeMark("read-sb3");
     if (!ok) { std::fprintf(stderr, "cannot read %s\n", path); return 1; }
+    g_hotFingerprint = hotStartFingerprint(data.data(), data.size());
 
     Runtime rt;
+    timeMark("runtime-init");
     Sb3LoadResult r = loadSb3File(rt, data.data(), data.size());
+    timeMark("sb3-parse");
     if (!r.ok) {
         std::fprintf(stderr, "load failed: %s\n", r.error.c_str());
         return 1;
     }
-    applyDangerMode(rt);
+    applyRuntimeOptions(rt);
 #ifdef XYO_JIT
     applyAotObject(rt, g_aotObj, data.data(), data.size());
 #endif
-    return runLoaded(rt, &r, maxFrames, fps);
+    timeMark("before-greenflag");
+    int result = runLoaded(rt, &r, maxFrames, fps);
+    timeMark("after-run");
+    return result;
 }
 
 static int cmdDump(const char* path) {
@@ -416,6 +609,7 @@ static int cmdDump(const char* path) {
 static int cmdAnalyze(int argc, char** argv) {
     const char* path = argv[2];
     std::string dotPath;
+    bool typeFlow = false;
     analysis::Options opt;
     for (int i = 3; i < argc; ++i) {
         if ((!std::strcmp(argv[i], "--dot") || !std::strcmp(argv[i], "-o")) &&
@@ -425,6 +619,8 @@ static int cmdAnalyze(int argc, char** argv) {
             opt.topConflicts = size_t(std::atoi(argv[++i]));
         else if (std::strcmp(argv[i], "--scripts") == 0 && i + 1 < argc)
             opt.topScripts = size_t(std::atoi(argv[++i]));
+        else if (std::strcmp(argv[i], "--type-flow") == 0)
+            typeFlow = true;
         else
             return usage();
     }
@@ -439,6 +635,116 @@ static int cmdAnalyze(int argc, char** argv) {
     }
     analysis::Report rep = analysis::analyzeProject(rt, path, opt);
     std::string text = analysis::formatText(rep, opt);
+    text += analysis::formatTypeSites(analysis::analyzeTypeSites(rt));
+    if (typeFlow) {
+        std::ostringstream out;
+        out << "\n== CFG / 型集合の固定点解析 ==\n";
+        size_t scripts = 0, totalNodes = 0, totalLatches = 0;
+        size_t shown = 0;
+        for (Target* target : rt.targets) {
+            if (!target || !target->blocks) continue;
+            for (const std::string& topId : target->blocks->getScripts()) {
+                const Block* top = target->blocks->getBlock(topId);
+                if (!top) continue;
+                const auto flow = analysis::analyzeTypeFlow(
+                    *target->blocks, top->next, 16384, target);
+                ++scripts;
+                totalNodes += flow.cfg.nodes.size();
+                size_t latches = 0, knownWrites = 0, barriers = 0;
+                for (size_t i = 0; i < flow.cfg.nodes.size(); ++i) {
+                    const auto& node = flow.cfg.nodes[i];
+                    latches += node.kind == analysis::FlowNodeKind::LoopLatch;
+                    barriers += node.kind == analysis::FlowNodeKind::Barrier;
+                    if (node.opcode != "data_setvariableto" &&
+                        node.opcode != "data_changevariableby") continue;
+                    const Block* block = target->blocks->getBlock(node.blockId);
+                    if (!block) continue;
+                    auto it = block->fields.find("VARIABLE");
+                    if (it == block->fields.end()) continue;
+                    constexpr uint32_t any =
+                        Variable::kObservedNumber |
+                        Variable::kObservedString |
+                        Variable::kObservedBoolean |
+                        Variable::kObservedColor |
+                        Variable::kObservedOther;
+                    uint32_t mask = flow.kindAfter(i, it->second.id);
+                    if (mask == any) continue;
+                    ++knownWrites;
+                    if (shown++ < 40) {
+                        out << "  " << SStr::toUtf8(target->getName())
+                            << '/' << node.blockId << ' '
+                            << it->second.id << " -> ";
+                        bool firstKind = true;
+                        for (auto [kind, name] : {
+                            std::pair{uint32_t(Variable::kObservedNumber), "number"},
+                            std::pair{uint32_t(Variable::kObservedString), "string"},
+                            std::pair{uint32_t(Variable::kObservedBoolean), "boolean"},
+                            std::pair{uint32_t(Variable::kObservedColor), "color"},
+                            std::pair{uint32_t(Variable::kObservedOther), "other"}}) {
+                            if (!(mask & kind)) continue;
+                            if (!firstKind) out << '|';
+                            out << name;
+                            firstKind = false;
+                        }
+                        out << "\n";
+                    }
+                }
+                totalLatches += latches;
+                if (top->opcode == "procedures_definition") {
+                    const BlockInput* prototypeInput =
+                        top->inputs.find("custom_block");
+                    const Block* prototype = prototypeInput
+                        ? target->blocks->getBlock(prototypeInput->block)
+                        : nullptr;
+                    if (prototype && prototype->mutation) {
+                        const std::string code =
+                            prototype->mutation->attr("proccode");
+                        const auto effects =
+                            analysis::summarizeProcedureEffects(
+                                *target->blocks, target, code);
+                        std::vector<std::string> writes(
+                            effects.writtenScalarIds.begin(),
+                            effects.writtenScalarIds.end());
+                        std::sort(writes.begin(), writes.end());
+                        out << "  procedure=" << code
+                            << " scalar-writes={";
+                        const size_t displayCount = std::min<size_t>(
+                            writes.size(), 12);
+                        for (size_t wi = 0; wi < displayCount; ++wi) {
+                            if (wi) out << ',';
+                            if (Variable* v =
+                                    target->lookupVariableById(writes[wi])) {
+                                out << SStr::toUtf8(v->name) << '['
+                                    << writes[wi] << ']';
+                            } else {
+                                out << writes[wi];
+                            }
+                        }
+                        if (writes.size() > displayCount)
+                            out << ",...+" << (writes.size() - displayCount);
+                        out << "} unknown-writes="
+                            << effects.unknownScalarWrites
+                            << " body-yield=" << effects.bodyMayYield
+                            << " call-yield=" << effects.callMayYield
+                            << " recursion=" << effects.recursive
+                            << " truncated=" << effects.truncated << "\n";
+                    }
+                }
+                out << "  script=" << SStr::toUtf8(target->getName())
+                    << '/' << topId << " nodes=" << flow.cfg.nodes.size()
+                    << " loop-latches=" << latches
+                    << " known-writes=" << knownWrites
+                    << " barriers=" << barriers
+                    << (flow.cfg.truncated ? " (truncated)" : "") << "\n";
+            }
+        }
+        out << "total: scripts=" << scripts
+            << " nodes=" << totalNodes << " loop-latches="
+            << totalLatches << "\n"
+            << "注: 型集合は保守的な静的候補。実行時ガード削除の根拠には"
+               "利用していない。\n";
+        text += out.str();
+    }
     std::fwrite(text.data(), 1, text.size(), stdout);
     if (!dotPath.empty()) {
         std::string dot = analysis::formatDot(rep);
@@ -598,7 +904,7 @@ static TestResult runFixture(const std::string& path) {
         res.firstFail = "load: " + r.error;
         return res;
     }
-    applyDangerMode(rt);
+    applyRuntimeOptions(rt);
 #ifdef XYO_JIT
     applyAotObject(rt, g_aotObj, data.data(), data.size());
 #endif
@@ -704,7 +1010,8 @@ static int cmdTest(const char* path) {
 
 // 検証用イベントインジェクタ:
 //   XYO_INJECT="N:op:args|N:op:args|..."
-//   op: md:x,y / mu:x,y / mm:x,y (window px), txt:<utf8>, key:<name>
+//   op: md:x,y / mu:x,y / mm:x,y (window px), txt:<utf8>,
+//       key:<name> / ku:<name> (key down/up), bc:<broadcast-name>
 // フレーム N の pollEvents 前に SDL_PushEvent する。
 struct InjectEvent {
     long frame;
@@ -736,7 +1043,7 @@ static bool pushInjected(SdlRenderer& ren, const InjectEvent& e) {
         std::strncpy(ev.text.text, e.arg.c_str(),
                      sizeof(ev.text.text) - 1);
     } else if (e.op[0] == 'k') {
-        ev.type = SDL_KEYDOWN;
+        ev.type = e.op[1] == 'u' ? SDL_KEYUP : SDL_KEYDOWN;
         const char* n = e.arg.c_str();
         SDL_Keycode sym = SDLK_UNKNOWN;
         if (!std::strcmp(n, "enter")) sym = SDLK_RETURN;
@@ -789,7 +1096,10 @@ static std::vector<InjectEvent> parseInject(const char* spec) {
 static int playLoaded(Runtime& rt, const std::string& title, int scale,
                       bool turbo, int fps, int gpuMode) {
     SdlRenderer ren;
+    if (g_highQualityPen) ren.setHighQualityPen(true);
     if (!ren.init(rt, scale)) return 1;
+    // CLI が env より優先（init 内で XYO_RENDER_SCALE を反映済み）。
+    if (g_renderScale > 0.0) ren.setRenderScale(g_renderScale);
     ren.setTitle(title.c_str());
     rt.renderer = &ren;
     rt.turboMode = turbo || rt.turboMode;   // _twconfig_ の turbo を潰さない
@@ -809,7 +1119,16 @@ static int playLoaded(Runtime& rt, const std::string& title, int scale,
                          why.c_str());
         }
     }
-    rt.greenFlag();
+    if (g_hotLoad) {
+        std::string why;
+        if (!loadHotStart(rt, g_hotLoad, g_hotFingerprint, &why)) {
+            std::fprintf(stderr, "hot-load: %s\n", why.c_str());
+            return 2;
+        }
+        std::fprintf(stderr, "hot-load: %s\n", g_hotLoad);
+    } else {
+        rt.greenFlag();
+    }
 
     // 検証用: XYO_SET="name=value;name2=value2" で緑旗直後に変数をセット
     // （name は変数名か id。値は数値にパースできなければ文字列）。
@@ -858,11 +1177,55 @@ static int playLoaded(Runtime& rt, const std::string& title, int scale,
     // ごとに stdout へ（パリティテストのような「GUI が要るが結果は行で出る」
     // プロジェクトをヘッドレスに測るため）。XYO_EXIT_ON_DONE=1 で全スレッド
     // 終了時に終了する。
+    // The list is resolved after hot-load, which replaces VariableMap nodes.
     SList* printListObj = g_printList ? findListByName(rt, g_printList) : nullptr;
     if (g_printList && !printListObj)
         std::fprintf(stderr, "no list named \"%s\"\n", g_printList);
     size_t printListAt = 0;
     const bool exitOnDone = std::getenv("XYO_EXIT_ON_DONE") != nullptr;
+
+    // Play-time frame profiler. Opt-in only, so normal games pay no timer
+    // or file I/O overhead. The CSV is streaming and survives a window
+    // close; flush once per second for postmortem inspection.
+    FILE* profile = nullptr;
+    if (const char* file = std::getenv("XYO_PLAY_PROFILE");
+        file && *file) {
+        profile = std::fopen(file, "wb");
+        if (!profile) {
+            std::fprintf(stderr, "cannot open XYO_PLAY_PROFILE=%s\n", file);
+        } else {
+            std::fprintf(profile,
+                "frame,elapsed_s,frame_interval_ms,step_ms,vm_ms,draw_ms,"
+                "sprite_ms,backdrop_ms,pen_ms,monitor_ms,ui_ms,present_ms,"
+                "costume_decode_ms,effect_build_ms,collision_ms,"
+                "sprite_copies,backdrop_copies,costume_decodes,effect_builds,"
+                "effect_hits,texture_uploads,collision_calls,"
+                "threads,rss_kib,gpu_effect_passes,gpu_effect_ms\n");
+            std::fprintf(stderr, "PLAYPROFILE recording: %s\n", file);
+        }
+    }
+    auto profileStarted = std::chrono::steady_clock::now();
+    auto lastFrameStarted = profileStarted;
+#ifdef XYO_JIT
+    const bool showAotFrames = g_aotRun && bool(aotCliProgress("run"));
+    auto lastAotFrameReport = profileStarted;
+    long aotFrames = 0;
+#endif
+    const auto currentRssKiB = []() -> unsigned long {
+#if defined(__linux__)
+        FILE* fp = std::fopen("/proc/self/statm", "r");
+        if (!fp) return 0;
+        unsigned long resident = 0;
+        const int matched = std::fscanf(fp, "%*lu %lu", &resident);
+        std::fclose(fp);
+        const long pageSize = sysconf(_SC_PAGESIZE);
+        return matched == 1 && pageSize > 0
+            ? resident * (static_cast<unsigned long>(pageSize) / 1024UL)
+            : 0UL;
+#else
+        return 0UL;
+#endif
+    };
 
     // フレーム駆動: 既定 ~30fps（JS: STEP_TIME≈33ms 周期）。
     // --fps N で step 間隔を変更（TurboWarp のカスタム fps 相当 —
@@ -872,11 +1235,73 @@ static int playLoaded(Runtime& rt, const std::string& title, int scale,
         fps > 0 ? 1000000 / fps : 33333);
     for (long frame = 0; ; ++frame) {
         auto t0 = clock::now();
-        while (injectIdx < inject.size() && inject[injectIdx].frame <= frame)
-            if (!pushInjected(ren, inject[injectIdx++])) goto done;
+        while (injectIdx < inject.size() && inject[injectIdx].frame <= frame) {
+            const InjectEvent& event = inject[injectIdx++];
+            if (std::strcmp(event.op, "bc") == 0) {
+                SStr* name = SStr::fromUtf8(event.arg);
+                rt.startBroadcast(name->view());
+            } else if (!pushInjected(ren, event)) {
+                goto done;
+            }
+        }
         if (!ren.pollEvents()) break;
+        if (profile) ren.beginProfileFrame();
+        const auto stepStarted = profile ? clock::now() : t0;
         rt.step();
+#ifdef XYO_JIT
+        ++aotFrames;
+        if (showAotFrames &&
+            clock::now() - lastAotFrameReport >= std::chrono::seconds(1)) {
+            const double seconds = std::chrono::duration<double>(
+                clock::now() - profileStarted).count();
+            std::fprintf(stderr,
+                "[aot-run] 再生中 frame=%ld elapsed=%.1fs threads=%zu\n",
+                aotFrames, seconds, rt.threads.size());
+            std::fflush(stderr);
+            lastAotFrameReport = clock::now();
+        }
+#endif
+        const auto stepFinished = profile ? clock::now() : t0;
+        if (profile) {
+            const RenderFrameStats stats = ren.endProfileFrame();
+            const auto milliseconds = [](clock::duration d) {
+                return std::chrono::duration<double, std::milli>(d).count();
+            };
+            const double stepMs = milliseconds(stepFinished - stepStarted);
+            const double intervalMs = frame == 0 ? 0 :
+                milliseconds(t0 - lastFrameStarted);
+            const double elapsed = std::chrono::duration<double>(
+                t0 - profileStarted).count();
+            const double vmMs = std::max(0.0, stepMs - stats.drawMs);
+            std::fprintf(profile,
+                "%ld,%.6f,%.4f,%.4f,%.4f,%.4f,"
+                "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
+                "%.4f,%.4f,%.4f,"
+                "%u,%u,%u,%u,%u,%u,%u,%zu,%lu,%u,%.4f\n",
+                frame, elapsed, intervalMs, stepMs, vmMs, stats.drawMs,
+                stats.spriteMs, stats.backdropMs, stats.penMs,
+                stats.monitorMs, stats.uiMs, stats.presentMs,
+                stats.costumeDecodeMs, stats.effectBuildMs,
+                stats.collisionMs, stats.sprites, stats.backdrops,
+                stats.costumeDecodes, stats.effectBuilds, stats.effectHits,
+                stats.textureUploads, stats.collisionCalls,
+                rt.threads.size(), currentRssKiB(),
+                stats.gpuEffectPasses, stats.gpuEffectMs);
+            if ((frame % 30) == 0) std::fflush(profile);
+        }
+        lastFrameStarted = t0;
         audio.update();   // 再生完了 wait の解決（メインスレッド必須）
+        if (g_hotSave && (ren.consumeHotSaveRequest() ||
+            (g_hotSaveFrame > 0 && frame + 1 == g_hotSaveFrame))) {
+            std::string why;
+            if (!saveHotStart(rt, g_hotSave, g_hotFingerprint, &why)) {
+                std::fprintf(stderr, "hot-save: %s\n", why.c_str());
+                return 2;
+            }
+            std::fprintf(stderr, "hot-save: %s\n", g_hotSave);
+            if (g_hotSaveFrame > 0 && frame + 1 == g_hotSaveFrame)
+                break;
+        }
         if (g_printList) flushList(printListObj, printListAt);
         if ((exitOnStop && projectStopped) ||
             (exitOnDone && rt.threads.empty()) ||
@@ -891,6 +1316,41 @@ static int playLoaded(Runtime& rt, const std::string& title, int scale,
         }
     }
 done:
+#ifdef XYO_JIT
+    if (showAotFrames)
+        std::fprintf(stderr, "[aot-run] 再生終了 frames=%ld elapsed=%.3fs\n",
+            aotFrames, std::chrono::duration<double>(
+                clock::now() - profileStarted).count());
+#endif
+    if (g_hotSave && g_hotSaveFrame == 0) {
+        std::string why;
+        if (!saveHotStart(rt, g_hotSave, g_hotFingerprint, &why)) {
+            std::fprintf(stderr, "hot-save: %s\n", why.c_str());
+            return 2;
+        }
+        std::fprintf(stderr, "hot-save: %s\n", g_hotSave);
+    }
+    if (profile) {
+        std::fflush(profile);
+        std::fclose(profile);
+        const std::string spritePath =
+            std::string(std::getenv("XYO_PLAY_PROFILE")) + ".sprites.csv";
+        if (FILE* sprites = std::fopen(spritePath.c_str(), "wb")) {
+            std::fprintf(sprites, "sprite,draw_ms,copies\n");
+            for (const SpriteProfileRow& row : ren.profileSprites()) {
+                std::string escaped;
+                for (char c : row.name) {
+                    if (c == '"') escaped += "\"\"";
+                    else escaped += c;
+                }
+                std::fprintf(sprites, "\"%s\",%.4f,%llu\n",
+                             escaped.c_str(), row.drawMs,
+                             static_cast<unsigned long long>(row.copies));
+            }
+            std::fclose(sprites);
+        }
+        std::fprintf(stderr, "PLAYPROFILE finished\n");
+    }
     if (exitOnStop) rt.onProjectStopped = std::move(previousStopped);
     dumpVarsIfRequested(rt);
     return 0;
@@ -899,7 +1359,12 @@ done:
 /// GUI からも呼ぶ再生経路（aotObjPath は事前コンパイル済み
 /// オブジェクト、nullptr 可。nullptr なら --aot 指定を使う）。
 int xyoShellPlay(const char* path, const char* aotObjPath, int scale,
-                 bool turbo, int fps, int gpuMode) {
+                 bool turbo, int fps, int gpuMode,
+                 const std::function<void(int, size_t, size_t)>& onProgress = {},
+                 const std::function<void()>& beforePlayback = {}) {
+#ifdef XYO_JIT
+    g_aotRun = aotObjPath || g_aotObj;
+#endif
     bool ok;
     std::vector<uint8_t> data = readFile(path, ok);
     if (!ok) { std::fprintf(stderr, "cannot read %s\n", path); return 1; }
@@ -909,11 +1374,20 @@ int xyoShellPlay(const char* path, const char* aotObjPath, int scale,
         std::fprintf(stderr, "load failed: %s\n", r.error.c_str());
         return 1;
     }
-    applyDangerMode(rt);
+    applyRuntimeOptions(rt);
+    g_hotFingerprint = hotStartFingerprint(data.data(), data.size());
 #ifdef XYO_JIT
+    const auto onLoad = [&](const aot::Progress& p) {
+        if (onProgress)
+            onProgress(int(p.stage), p.completed, p.total);
+    };
     applyAotObject(rt, aotObjPath ? aotObjPath : g_aotObj, data.data(),
-                   data.size());
+                   data.size(), onProgress ? aot::ProgressCallback(onLoad)
+                                           : aot::ProgressCallback{});
 #endif
+    // GUI AOT Run can close its launcher exactly after the object is loaded,
+    // before this playback creates a separate SDL window.
+    if (beforePlayback) beforePlayback();
     std::string base = path;
     auto sl = base.find_last_of("/\\");
     if (sl != std::string::npos) base = base.substr(sl + 1);
@@ -955,11 +1429,14 @@ static int cmdAot(const char* path, const char* out, const char* objOut) {
     const uint64_t hash = aot::hashBytes(data.data(), data.size());
     aot::BuildResult br;
     std::string why;
-    if (!aot::compileProject(rt, hash, br, &why)) {
+    if (!aot::compileProject(rt, hash, br, &why,
+                             aotCliProgress("build"))) {
         std::fprintf(stderr, "aot: %s\n", why.c_str());
         return 1;
     }
     if (objOut) {
+        aot::reportProgress(aotCliProgress("build"),
+                            aot::ProgressStage::WriteOutput);
         if (!aot::writeObjectFile(objOut, br, &why)) {
             std::fprintf(stderr, "aot: %s\n", why.c_str());
             return 1;
@@ -968,6 +1445,8 @@ static int cmdAot(const char* path, const char* out, const char* objOut) {
                     br.scripts, br.slots, br.object.size(), objOut);
         return 0;
     }
+    aot::reportProgress(aotCliProgress("build"),
+                        aot::ProgressStage::WriteOutput);
     if (!aot::writeExecutable(out, data.data(), data.size(), br, hash,
                               &why)) {
         std::fprintf(stderr, "aot: %s\n", why.c_str());
@@ -1002,8 +1481,14 @@ static int runEmbedded(const std::vector<uint8_t>& sb3,
             turbo = true;
         else if (!std::strcmp(argv[i], "--danger"))
             danger = true;
+        else if (!std::strcmp(argv[i], "--no-progress"))
+            g_aotProgress = false;
         else
             return usage();
+    }
+    g_aotRun = true;
+    if (auto p = aotCliProgress("run")) {
+        std::fprintf(stderr, "[aot-run] プロジェクト初期化\n");
     }
     Runtime rt;
     Sb3LoadResult r = loadSb3File(rt, sb3.data(), sb3.size());
@@ -1014,7 +1499,8 @@ static int runEmbedded(const std::vector<uint8_t>& sb3,
     if (danger) rt.dangerMode = true;
     if (rt.jit) {
         std::string why;
-        if (!rt.jit->loadAot(rt, object.data(), object.size(), hash, &why))
+        if (!rt.jit->loadAot(rt, object.data(), object.size(), hash, &why,
+                             aotCliProgress("run")))
             std::fprintf(stderr,
                          "aot: load failed (%s) — JIT へフォールバック\n",
                          why.c_str());
@@ -1090,19 +1576,150 @@ static void applyListLimitConfig(int argc, char** argv) {
     }
 }
 
+// `--opt-all` / `XYO_OPT_ALL=1`: 現在の作業ツリー diff にある opt-in 最適化を
+// 一括で有効化する（名前は engine/opt_flags.cpp の kToggles）。個別の
+// XYO_* を明示している場合はそちらを上書きしない。プロジェクトをロードする
+// 前に適用するので、AOT 実行ファイルでも同じ経路で効く。
+static void applyOptAllConfig(int argc, char** argv) {
+    enableReleaseOptimizations(); // v1.2.0 production defaults (not experimental opt-all)
+    bool requested = allOptimizationsRequested();
+    bool fromCli = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--opt-all") == 0) {
+            requested = true;
+            fromCli = true;
+        }
+    }
+    if (!requested) return;
+    const int applied = enableAllOptimizations();
+    if (fromCli || std::getenv("XYO_OPT_ALL_LOG")) {
+        std::fprintf(stderr,
+                     "[opt-all] %d/%d experimental optimizations enabled "
+                     "(unset XYO_OPT_ALL / drop --opt-all for A/B)\n",
+                     applied, allOptimizationCount());
+    }
+}
+
+// Select the Scratch join representation before any project is loaded.
+// Environment is the default; CLI overrides it for run/test/play and AOT.
+static bool applyStringStorageConfig(int argc, char** argv) {
+    if (const char* env = std::getenv("XYO_STRING_STORAGE")) {
+        if (!setStringStorageMode(env)) {
+            std::fprintf(stderr, "invalid XYO_STRING_STORAGE: %s (rope|flat|append-log)\n", env);
+            return false;
+        }
+    }
+    for (int i = 1; i < argc; ++i) {
+        const char* mode = nullptr;
+        if (std::strcmp(argv[i], "--string-storage") == 0) {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "--string-storage requires a value\n");
+                return false;
+            }
+            mode = argv[++i];
+        } else if (std::strncmp(argv[i], "--string-storage=", 17) == 0) {
+            mode = argv[i] + 17;
+        }
+        if (mode && !setStringStorageMode(mode)) {
+            std::fprintf(stderr, "invalid --string-storage: %s (rope|flat|append-log)\n", mode);
+            return false;
+        }
+    }
+    return true;
+}
+
+// Independently select leaf encoding; all joins and the JIT keep the same ABI.
+static bool applyStringLeafConfig(int argc, char** argv) {
+    if (const char* env = std::getenv("XYO_STRING_LEAF")) {
+        if (!setStringLeafMode(env)) {
+            std::fprintf(stderr, "invalid XYO_STRING_LEAF: %s (utf16|latin1)\n", env);
+            return false;
+        }
+    }
+    for (int i = 1; i < argc; ++i) {
+        const char* mode = nullptr;
+        if (std::strcmp(argv[i], "--string-leaf") == 0) {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "--string-leaf requires a value\n");
+                return false;
+            }
+            mode = argv[++i];
+        } else if (std::strncmp(argv[i], "--string-leaf=", 14) == 0) {
+            mode = argv[i] + 14;
+        }
+        if (mode && !setStringLeafMode(mode)) {
+            std::fprintf(stderr, "invalid --string-leaf: %s (utf16|latin1)\n", mode);
+            return false;
+        }
+    }
+    return true;
+}
+
+// An experimental, capped strong cache for short ASCII join results.
+static bool applyStringShortInternConfig(int argc, char** argv) {
+    if (const char* env = std::getenv("XYO_STRING_SHORT_INTERN")) {
+        if (std::strcmp(env, "1") == 0 || std::strcmp(env, "on") == 0)
+            setStringShortInternEnabled(true);
+        else if (std::strcmp(env, "0") == 0 || std::strcmp(env, "off") == 0)
+            setStringShortInternEnabled(false);
+        else {
+            std::fprintf(stderr,
+                         "invalid XYO_STRING_SHORT_INTERN: %s (0|1)\n", env);
+            return false;
+        }
+    }
+    for (int i = 1; i < argc; ++i) {
+        const char* value = nullptr;
+        if (std::strcmp(argv[i], "--string-short-intern") == 0) {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "--string-short-intern requires a value\n");
+                return false;
+            }
+            value = argv[++i];
+        } else if (std::strncmp(argv[i], "--string-short-intern=", 22) == 0) {
+            value = argv[i] + 22;
+        }
+        if (!value) continue;
+        if (std::strcmp(value, "1") == 0 ||
+            std::strcmp(value, "on") == 0) {
+            setStringShortInternEnabled(true);
+        } else if (std::strcmp(value, "0") == 0 ||
+                   std::strcmp(value, "off") == 0) {
+            setStringShortInternEnabled(false);
+        } else {
+            std::fprintf(stderr,
+                         "invalid --string-short-intern: %s (on|off)\n", value);
+            return false;
+        }
+    }
+    return true;
+}
+
 int main(int argc, char** argv) {
 #ifdef _WIN32
     WinArgs winArgs;
     winInit(winArgs, argc, argv);
 #endif
     // 実行前設定（AOT 実行ファイルでも同じ経路で効かせる）
+    applyOptAllConfig(argc, argv);
     applyListLimitConfig(argc, argv);
+    if (!applyStringStorageConfig(argc, argv)) return 2;
+    if (!applyStringLeafConfig(argc, argv)) return 2;
+    if (!applyStringShortInternConfig(argc, argv)) return 2;
 #ifdef XYO_JIT
     {
         std::vector<uint8_t> sb3, object;
         uint64_t hash = 0;
-        if (aot::readSelf(sb3, object, &hash))
+        if (aot::readSelf(sb3, object, &hash)) {
+            bool countRequested = blockCountEnabledFromEnv();
+            for (int i = 1; i < argc; ++i)
+                countRequested |= std::strcmp(argv[i], "--block-count") == 0;
+            if (countRequested) {
+                std::fprintf(stderr, "block-count: embedded AOT cannot be counted exactly; run the .sb3 with --block-count instead\n");
+                return 2;
+            }
             return runEmbedded(sb3, object, hash, argc, argv);
+        }
     }
 #endif
     // wasm JIT ブリッジの自己テスト（Emscripten ビルドでのみ実処理）
@@ -1122,6 +1739,8 @@ int main(int argc, char** argv) {
             maxFrames = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--scale") == 0 && i + 1 < argc)
             scale = std::atoi(argv[++i]);
+        else if (std::strcmp(argv[i], "--render-scale") == 0 && i + 1 < argc)
+            g_renderScale = std::atof(argv[++i]);
         else if (std::strcmp(argv[i], "--fps") == 0 && i + 1 < argc)
             fps = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--gpu-realtime") == 0 &&
@@ -1135,6 +1754,15 @@ int main(int argc, char** argv) {
             turbo = true;
         else if (std::strcmp(argv[i], "--danger") == 0)
             g_danger = true;
+        else if (std::strcmp(argv[i], "--block-count") == 0)
+            g_blockCount = true;
+#ifdef XYO_JIT
+        else if (std::strcmp(argv[i], "--no-progress") == 0)
+            g_aotProgress = false;
+#endif
+        else if (std::strcmp(argv[i], "--high-quality-pen") == 0 ||
+                 std::strcmp(argv[i], "--hq-pen") == 0)
+            g_highQualityPen = true;
         else if (std::strncmp(argv[i], "--jit=", 6) == 0) {
             JitMode m;
             if (!parseJitMode(argv[i] + 6, &m)) return usage();
@@ -1159,6 +1787,15 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--save") == 0 && i + 1 < argc) {
             g_saveAfterRun = argv[++i];
         }
+        else if (std::strcmp(argv[i], "--hot-save") == 0 && i + 1 < argc) {
+            g_hotSave = argv[++i];
+        }
+        else if (std::strcmp(argv[i], "--hot-load") == 0 && i + 1 < argc) {
+            g_hotLoad = argv[++i];
+        }
+        else if (std::strcmp(argv[i], "--hot-save-frame") == 0 && i + 1 < argc) {
+            g_hotSaveFrame = std::atoi(argv[++i]);
+        }
         else if (std::strcmp(argv[i], "--print-list") == 0 && i + 1 < argc) {
             g_printList = argv[++i];
         }
@@ -1167,6 +1804,28 @@ int main(int argc, char** argv) {
             g_aotObj = argv[++i];
 #endif
     }
+#ifdef XYO_JIT
+    g_aotRun = g_aotObj != nullptr;
+#endif
+    if ((g_hotSave || g_hotLoad) && (std::strcmp(cmd, "play") == 0 ||
+                                     std::strcmp(cmd, "run") == 0)) {
+        if (jitMode() != JitMode::Off) {
+            std::fprintf(stderr,
+                "hot-start: switching to interpreter; native fiber stacks "
+                "cannot be serialized\n");
+            setJitMode(JitMode::Off);
+        }
+        if (g_hotSaveFrame < 0 || (g_hotSaveFrame && !g_hotSave))
+            return usage();
+    }
+#ifdef XYO_JIT
+    if (g_aotObj && (g_blockCount || blockCountEnabledFromEnv())) {
+        std::fprintf(stderr, "block-count: --aot cannot be counted exactly; remove --aot to use interpreter counting\n");
+        return 2;
+    }
+#endif
+    if (std::strcmp(cmd, "wasm") == 0)
+        return cmdWasm(argc, argv);
     if (std::strcmp(cmd, "run") == 0)
         return cmdRun(argv[2], maxFrames, fps > 0 ? fps : 0);
     if (std::strcmp(cmd, "play") == 0)

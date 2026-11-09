@@ -659,6 +659,16 @@ void testSampledWarpClock() {
           "danger mode never reaches the sampled warp deadline");
     clock.disarm();
     check(!clock.armed(), "watchdog disarmed after tick");
+    // disarm synchronizes with the sampler; both atomics must represent
+    // the exact same millisecond sample after the watchdog stops.
+    const int64_t settledMs =
+        clock.sampledUnixMs.load(std::memory_order_relaxed);
+    const uint64_t settledDays =
+        clock.sampledUnixDaysBits.load(std::memory_order_relaxed);
+    const uint64_t expectedDays =
+        Value::num((double(settledMs) - 946684800000.0) / 86400000.0).bits;
+    check(settledDays == expectedDays,
+          "preboxed Scratch days match last sampled wall milliseconds");
 }
 
 int test_danger_main() {

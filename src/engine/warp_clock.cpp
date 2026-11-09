@@ -1,4 +1,5 @@
 #include "warp_clock.hpp"
+#include "../core/value.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -42,8 +43,13 @@ void WarpClockWatchdog::arm(double deadlineMs, bool unlimited) {
                   : toMicroseconds(deadline_),
         std::memory_order_release);
     sampledUs.store(toMicroseconds(Clock::now()), std::memory_order_relaxed);
-    if (sampleWallClock_)
-        sampledUnixMs.store(unixMilliseconds(), std::memory_order_relaxed);
+    if (sampleWallClock_) {
+        const auto ms = unixMilliseconds();
+        sampledUnixMs.store(ms, std::memory_order_relaxed);
+        sampledUnixDaysBits.store(
+            Value::num((double(ms) - 946684800000.0) / 86400000.0).bits,
+            std::memory_order_relaxed);
+    }
     active_ = true;
     armed_.store(true, std::memory_order_release);
     ++generation_;
@@ -89,7 +95,11 @@ void WarpClockWatchdog::run() {
         const auto now = Clock::now();
         sampledUs.store(toMicroseconds(now), std::memory_order_relaxed);
         if (sampleWallClock_) {
-            sampledUnixMs.store(unixMilliseconds(), std::memory_order_relaxed);
+            const auto ms = unixMilliseconds();
+            sampledUnixMs.store(ms, std::memory_order_relaxed);
+            sampledUnixDaysBits.store(
+                Value::num((double(ms) - 946684800000.0) / 86400000.0).bits,
+                std::memory_order_relaxed);
         } else if (now >= deadline_) {
             cv_.wait(lock, [&] {
                 return stopped_ || !active_ || generation_ != generation;

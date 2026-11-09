@@ -129,8 +129,11 @@ void applyEffects(const uint8_t* src, int w, int h,
     const FxUniforms u = toUniforms(effects);
     out.resize(static_cast<size_t>(w) * h * 4);
 
+    // The neutral fisheye uniform is 1.0, not 0.0. Treating it as
+    // active forces a sqrt/pow and bilinear sample for every pixel even
+    // when the only change is ghost/brightness/color.
     const bool spatial = u.mosaic > 1 || u.pixelate > 0.001 ||
-                         u.whirl != 0 || u.fisheye > 0.001;
+                         u.whirl != 0 || u.fisheye != 1.0f;
     const bool colorize = u.color != 0 || u.brightness != 0;
     // u.ghost は alpha 乗数（ghost 0 → 1.0、ghost 100 → 0.0）。
     // 0 を「効果なし」と取り違えると ghost 100 が不透明になってしまう。
@@ -167,7 +170,7 @@ void applyEffects(const uint8_t* src, int w, int h,
                     tu = cs * ox - sn * oy + kC;
                     tv = sn * ox + cs * oy + kC;
                 }
-                if (u.fisheye > 0.001) {
+                if (u.fisheye != 1.0f) {
                     double vx = (tu - kC) / kC, vy = (tv - kC) / kC;
                     double l = std::sqrt(vx * vx + vy * vy) + 1e-9;
                     double r = std::pow(std::min(l, 1.0), u.fisheye) *
@@ -176,7 +179,15 @@ void applyEffects(const uint8_t* src, int w, int h,
                     tv = kC + r * vy / l * kC;
                 }
             }
-            sampleBilinear(src, w, h, tu, tv, px4);
+            if (spatial) {
+                sampleBilinear(src, w, h, tu, tv, px4);
+            } else {
+                // Exact texel-center sampling is the identity transform.
+                // Avoid four bilinear taps, clamps and floating-point work.
+                const uint8_t* pixel = src +
+                    (static_cast<size_t>(y) * w + x) * 4;
+                for (int c = 0; c < 4; ++c) px4[c] = pixel[c];
+            }
             float rr = px4[0], gg = px4[1], bb = px4[2], aa = px4[3];
             if (colorize) {
                 // premult 除算相当: straight-alpha なので rgb に直接適用

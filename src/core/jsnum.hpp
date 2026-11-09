@@ -12,6 +12,11 @@ namespace xyo::jsnum {
 /// 0→"0", -0→"0", NaN→"NaN", ±Inf→"±Infinity",
 /// 指数表記は |指数|>=21 または n<=-6 のときのみ、他は小数表記。
 std::string toString(double v);
+#if defined(XYO_NUM_TO_STR_DRAGONBOX)
+// Allocation-free Dragonbox formatter; caller provides >=64 bytes.
+// Handles NaN, +/-Infinity, signed zero and exact integers.
+size_t toChars(double value, char* output);
+#endif
 /// UTF-16 版（SSStr 生成時に使う）
 std::u16string toString16(double v);
 

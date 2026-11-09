@@ -2,6 +2,8 @@
 #include "thread.hpp"
 
 #include "../jit/jit.hpp"
+#include "numeric_thread.hpp"
+#include "../jit/procedure_frame_state.hpp"
 #include "../model/target.hpp"
 #include "fiber.hpp"
 #include "runtime.hpp"
@@ -28,7 +30,26 @@ const std::string& Thread::getId() const {
 }
 
 void Thread::releaseFinished() {
+    if (nativeProcedureFrames) {
+        if (std::getenv("XYO_JIT_CALLFRAME_STATS"))
+            nativeProcedureFrames->report(topBlock.c_str());
+        nativeProcedureFrames.reset();
+    }
+    numericSession.reset();
+    osrActive = false;
+    nestedOsrActive = false;
+    osrRemaining = 0.0;
     eventWaitArmed = false;
+    eventWatchValid = false;
+    eventWatchVariable = nullptr;
+    eventWatchAdditional.reset();
+    wasmLoopPhase = 0;
+    wasmLoopIndex = 0;
+    wasmLoopRemaining = 0.0;
+    wasmRegionIndex = 0;
+    nestedWasmEligible = false;
+    nestedWasmBindings.reset();
+    wasmSlotBits.clear();
     stack.clear();
     stackFrames.clear();
     trashFrames.clear();
@@ -198,11 +219,37 @@ void Thread::tryCompile(const Block* topHint) {
     triedToCompile = true;
     Runtime* rt = target ? target->runtime : nullptr;
     if (!rt || !rt->jit || !jitEnabled() || !blockContainer) return;
+#if defined(__EMSCRIPTEN__)
+    // Browser WASM/Binaryen has no counting instrumentation yet; never
+    // silently report incomplete totals.
+    if (rt->blockCountEnabled) return;
+#endif
     const Block* top =
         topHint ? topHint : blockContainer->getBlock(topBlock);
     if (!top) return;
     topBlockPtr = top;
     static const bool verbose = std::getenv("XYO_JIT_VERBOSE") != nullptr;
+
+    // A short non-yielding native broadcast listener has no per-thread
+    // compilation decision left to make once the JIT cache is populated.
+    // Keep the normal HotSpot/numeric CFG path for all other scripts.
+    // XYO_JIT_READY_CACHE_FAST=0 restores the historical behavior.
+    static const bool readyCacheFast = [] {
+        const char* env = std::getenv("XYO_JIT_READY_CACHE_FAST");
+        return !env || env[0] != '0';
+    }();
+    const char* cfg = std::getenv("XYO_JIT_COMMON_CFG");
+    const bool numericCfg = cfg && cfg[0] == '1' && cfg[1] == '\0';
+    if (readyCacheFast && !numericCfg &&
+        top->opcode == "event_whenbroadcastreceived") {
+        if (const CompiledScript* ready = rt->jit->readyScript(top);
+            ready && ready->shortSync && !ready->mayYield &&
+            !ready->mainThread) {
+            compiled = ready;
+            isCompiled = true;
+            return;
+        }
+    }
 
     // HotSpot: 呼び出し回数・解釈実行ブロック数・スクリプト形状から
     // 今回のスレッドを JIT で走らせるか決める（Eager は常に JIT）。
@@ -228,6 +275,7 @@ void Thread::tryCompile(const Block* topHint) {
     std::chrono::steady_clock::time_point t0;
     if (cp.enabled) t0 = std::chrono::steady_clock::now();
 #endif
+    if (rt->jit->tryAttachNumeric(*this, top)) return;
     const CompiledScript* cs =
         rt->jit->compile(*this, *rt, *rt->sequencer, top);
 #if !defined(XYO_DISABLE_RT_PROF)

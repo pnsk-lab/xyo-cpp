@@ -16,6 +16,10 @@ bool isNotActuallyZero(Value v);
 
 double toNumber(Value v);        // NaN → 0
 double toNumberOrNaN(Value v);   // NaN 保持（+v 相当）
+// Low-level JIT cold-string entry. The caller has already observed numState
+// == 0; this parses once, atomically publishes the existing string cache,
+// and returns Scratch toNumber (invalid strings become 0).
+double parseNumberStringUncached(SStr* str);
 bool   toBoolean(Value v);
 SStr*  toString(Value v);        // 常に非 null。空文字列は len=0 SStr
 Value  toStringValue(Value v);   // 空文字列は kEmptyStr シングルトン

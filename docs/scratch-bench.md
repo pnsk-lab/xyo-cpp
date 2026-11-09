@@ -36,6 +36,21 @@ xyo には同じことを CLI でやらせた:
 しまい比較にならない。カーネル自身が計時するベンチ（warp 手続き内）は
 ペーシングの影響を受けない。
 
+### Real Project: 同値の画像効果とフレーム終了
+
+`Target::setEffect()` で現在値と設定値が同じときは、レンダラーへの
+`emitVisualChange()` は維持しつつ、スケジューラを打ち切る
+`redrawRequested` の設定を省く。**既定で有効**。
+`XYO_SKIP_SAME_EFFECT_REDRAW=0` で Scratch VM と同様の
+「同値設定でも再描画要求」へ戻せる。設定はプロセス起動時に一度評価する。
+
+SGBE Game Boy の録画908,881 tickでは、Release HotSpot・SDL offscreen・
+同じマシンで逐次実行すると、従来設定は30秒で約900 tickしか消化できず、
+同値効果の再描画要求を省くと約6.3秒で全908,881 tickを消化できた。
+変更後の実 Scratch GUI Parity Test は Interpreter / HotSpot / Eager の全方式で
+2,123/2,123合格。**ただしフレーム途中のスレッド実行回数が変わるため、
+Scratch とスケジューリングが厳密に等価であるとは主張しない。**
+
 アダプタ（`scratch-bench/src/runtimes/xyo.ts`）は xyo をソースからビルドして
 （cmake + ninja、Release、JIT on）`.cache/runtimes/xyo-build/<hash>/xyo` に置き、
 `XYO_JIT_MODE` を切り替えて **hotspot / interpreter / eager / AOT** を 1 つの
@@ -143,3 +158,15 @@ Scratch 631ms / 442MB。起動時間は hotspot JIT が緑旗スクリプトを�
    Custom Blocks: Recursion 8/10、Fencing 18/20、If On Edge Bounce 15/16、
    Pen: Color Params 6/8、Touching Sprite 15/20、Color Touching Color 4/13、
    Looks: Layers 19/33 など — どれも「何が違うか」がそのまま出る。
+
+## Real Project 追加分析（2026-11-08）
+
+描画専用の `SdlRenderer::drawDrawable` では完全透明 (`ghost >= 100`) のスプライトを早期スキップする。既定で有効。`XYO_RENDER_GHOST100_CULL=0` で旧経路に戻せる。画像の当たり判定・ペンスタンプは別経路であり、変更していない。
+
+SDL offscreen Glue3D の150フレーム単発試験では 18.63→14.55秒だったが、同一バイナリを固定した交互測定で再現せず、作品全体の高速化は確定できなかった。描画／画像効果の不要な処理を省くこと自体は有効だが、時刻依存スクリプトと非同期 JIT の影響が大きい。GPU effect passes は0で CPU effects のコストが残っている。GUI Scratch Parity は3モードすべて2,123/2,123、SDL dummy環境の renderer CTest は1,141チェック成功。
+
+Linux RISC-V では GUI HotSpot の既定非同期JITが長い初期化スクリプトで低速だった。28フレーム、`XYO_BLOCK_COUNT=1` の比較で、`XYO_JIT_ASYNC=1` は12.85秒／約2.14億ブロック、`XYO_JIT_ASYNC=0` は7.52秒／約101.49億ブロック。同期JITは画面が停止する可能性があるため、既定にはしない。実行中のOSR / continuationへの移行が根本対策になる。
+
+同じ Linux RISC-V で `XYO_JIT_NUMERIC_LIST=1` は blocks/s を約1.291B→1.114Bへ悪化させたため既定では無効のまま。
+
+測定ログ: `board/realproject-glue-ghost-*.csv`, `board/realproject-ghost-repeat-*.csv`, `board/realproject-ghost-render-ctest.log`, `board/realproject-linux-async-*.log`。

@@ -1,7 +1,11 @@
 // xyo-cpp: target.js / rendered-target.js / sprite.js 移植。
 #include "target.hpp"
 
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <climits>
+#include <cstdlib>
 #include <cmath>
 #include <limits>
 
@@ -9,6 +13,51 @@
 #include "../engine/runtime.hpp"
 
 namespace xyo {
+
+// Opt-in phase attribution for clone churn. A few aggregate atomic writes
+// are intentionally excluded from production; XYO_CLONE_LIFECYCLE_PROF=1
+// explicitly measures clone cost instead of changing any execution semantics.
+namespace {
+using CloneClock = std::chrono::steady_clock;
+using CloneTime = CloneClock::time_point;
+static uint64_t elapsedNs(CloneTime begin, CloneTime end) {
+    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        end - begin).count());
+}
+struct CloneLifecycleProfile {
+    bool enabled = [] {
+        const char* e = std::getenv("XYO_CLONE_LIFECYCLE_PROF");
+        return e && e[0] == '1';
+    }();
+    std::atomic<uint64_t> created{0}, destroyed{0};
+    std::atomic<uint64_t> newTargetNs{0}, variableCopyNs{0};
+    std::atomic<uint64_t> setupNs{0}, hatsNs{0}, totalCreateNs{0};
+    std::atomic<uint64_t> monitorNs{0}, stopNs{0}, execRemovalNs{0};
+    std::atomic<uint64_t> totalDisposeNs{0};
+    ~CloneLifecycleProfile() {
+        if (!enabled) return;
+        auto v = [](const std::atomic<uint64_t>& n) {
+            return double(n.load(std::memory_order_relaxed)) / 1e6;
+        };
+        std::fprintf(stderr,
+            "[clone-prof] creations=%llu deletions=%llu\n"
+            "[clone-prof] make: total=%.3fms new=%.3fms vars=%.3fms"
+            " setup=%.3fms hats=%.3fms\n"
+            "[clone-prof] dispose: total=%.3fms monitors=%.3fms"
+            " stop=%.3fms exec=%.3fms\n",
+            (unsigned long long)created.load(),
+            (unsigned long long)destroyed.load(),
+            v(totalCreateNs), v(newTargetNs), v(variableCopyNs),
+            v(setupNs), v(hatsNs),
+            v(totalDisposeNs), v(monitorNs), v(stopNs),
+            v(execRemovalNs));
+    }
+};
+CloneLifecycleProfile& cloneProfile() {
+    static CloneLifecycleProfile p;
+    return p;
+}
+} // namespace
 
 static int g_nextTargetId = 0;
 static std::string genId() {
@@ -43,7 +92,28 @@ Target::Target(Runtime* rt, Sprite* spr)
     // nodes. Clones copy their source's fixed-size array in makeClone().
 }
 
+void Target::restoreId(std::string savedId) {
+    if (savedId.starts_with("target-")) {
+        const char* number = savedId.c_str() + 7;
+        char* end = nullptr;
+        const long value = std::strtol(number, &end, 10);
+        if (end != number && *end == '\0' && value > g_nextTargetId &&
+            value <= INT_MAX)
+            g_nextTargetId = int(value);
+    }
+    id = std::move(savedId);
+}
+
 // ---------------------------------------------------------------- 変数 --
+
+Target::VariableBindingStamp Target::variableBindingStamp() const {
+    const Target* stage = (runtime && !isStage)
+        ? runtime->getTargetForStage() : nullptr;
+    return {
+        stage, variables.generation(),
+        stage ? stage->variables.generation() : uint64_t(0)
+    };
+}
 
 Variable* Target::lookupVariableById(const std::string& vid) {
     auto it = variables.find(vid);
@@ -263,10 +333,20 @@ const Costume* Target::getCurrentCostume() const {
 
 void Target::setEffect(const std::string& name, double value) {
     if (!effects.count(name)) return;
+    // Avoid redraw requests when an effect value is unchanged. Repeated
+    // identical effects otherwise terminate the current Scratch scheduler
+    // slice without making any visual change. This performance policy is
+    // enabled by default; set XYO_SKIP_SAME_EFFECT_REDRAW=0 for the original
+    // Scratch requestRedraw timing (which can affect thread interleaving).
+    static const bool skipIdenticalRedraw = [] {
+        const char* flag = std::getenv("XYO_SKIP_SAME_EFFECT_REDRAW");
+        return !flag || flag[0] != '0';
+    }();
+    const bool unchanged = skipIdenticalRedraw && effects[name] == value;
     effects[name] = value;
     if (runtime && runtime->renderer && visible) {
         emitVisualChange();
-        runtime->redrawRequested = true;
+        if (!unchanged) runtime->redrawRequested = true;
     }
 }
 
@@ -438,8 +518,11 @@ std::unordered_map<std::string, Variable> Target::duplicateVariables() {
 
 Target* Target::makeClone() {
     if (!runtime || !runtime->clonesAvailable() || isStage) return nullptr;
+    auto& profile = cloneProfile();
+    const auto started = profile.enabled ? CloneClock::now() : CloneTime{};
     runtime->changeCloneCounter(1);
     Target* c = sprite->createClone();
+    const auto allocated = profile.enabled ? CloneClock::now() : CloneTime{};
     c->x = x; c->y = y;
     c->direction = direction;
     c->draggable = draggable;
@@ -449,6 +532,7 @@ Target* Target::makeClone() {
     c->rotationStyle = rotationStyle;
     c->effects = effects;
     c->variables = duplicateVariables();
+    const auto copied = profile.enabled ? CloneClock::now() : CloneTime{};
     c->collidingBroadcasts = collidingBroadcasts;
     c->edgeActivatedHatValues = edgeActivatedHatValues;
     c->soundEffects = soundEffects;
@@ -459,18 +543,47 @@ Target* Target::makeClone() {
     }
     if (runtime->onTargetCreated) runtime->onTargetCreated(c);
     c->updateAllDrawableProperties();
+    const auto prepared = profile.enabled ? CloneClock::now() : CloneTime{};
     // JS: initDrawable — クローンはここで start_as_clone ハットを起動
     if (!c->isOriginal)
         runtime->startHats("control_start_as_clone", nullptr, c);
+    if (profile.enabled) {
+        const auto ended = CloneClock::now();
+        profile.created.fetch_add(1, std::memory_order_relaxed);
+        profile.newTargetNs.fetch_add(elapsedNs(started, allocated),
+            std::memory_order_relaxed);
+        profile.variableCopyNs.fetch_add(elapsedNs(allocated, copied),
+            std::memory_order_relaxed);
+        profile.setupNs.fetch_add(elapsedNs(copied, prepared),
+            std::memory_order_relaxed);
+        profile.hatsNs.fetch_add(elapsedNs(prepared, ended),
+            std::memory_order_relaxed);
+        profile.totalCreateNs.fetch_add(elapsedNs(started, ended),
+            std::memory_order_relaxed);
+    }
     return c;
 }
 
 void Target::dispose() {
+    auto& profile = cloneProfile();
+    const bool measure = profile.enabled && !isOriginal;
+    const auto started = measure ? CloneClock::now() : CloneTime{};
     if (!isOriginal && runtime) runtime->changeCloneCounter(-1);
     if (runtime) {
         runtime->requestRemoveMonitorByTargetId(id);
+        const auto afterMonitor = measure ? CloneClock::now() : CloneTime{};
         runtime->stopForTarget(this, nullptr);
+        const auto afterStop = measure ? CloneClock::now() : CloneTime{};
         runtime->removeExecutable(this);
+        const auto afterExec = measure ? CloneClock::now() : CloneTime{};
+        if (measure) {
+            profile.monitorNs.fetch_add(elapsedNs(started, afterMonitor),
+                std::memory_order_relaxed);
+            profile.stopNs.fetch_add(elapsedNs(afterMonitor, afterStop),
+                std::memory_order_relaxed);
+            profile.execRemovalNs.fetch_add(elapsedNs(afterStop, afterExec),
+                std::memory_order_relaxed);
+        }
         if (runtime->renderer && drawableID >= 0) {
             runtime->renderer->destroyDrawable(drawableID);
             if (visible) {
@@ -480,6 +593,12 @@ void Target::dispose() {
         }
     }
     if (sprite) sprite->removeClone(this);
+    if (measure) {
+        const auto ended = CloneClock::now();
+        profile.destroyed.fetch_add(1, std::memory_order_relaxed);
+        profile.totalDisposeNs.fetch_add(elapsedNs(started, ended),
+            std::memory_order_relaxed);
+    }
 }
 
 // ------------------------------------------------------- edge-activated --

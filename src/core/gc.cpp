@@ -468,7 +468,7 @@ void Gc::drainPending() {
         if (h->type == GcType::List) {
             auto* list = reinterpret_cast<SList*>(h + 1);
             for (uint32_t i = 0; i < list->len; ++i) {
-                markValue(list->items[i]);
+                markValue(list->get0(i));
             }
         } else if (h->type == GcType::Str) {
             auto* s = reinterpret_cast<SStr*>(h + 1);
@@ -675,7 +675,7 @@ void Gc::collect() {
             // 次回閾値を live 比例で引き上げる。
             if (h->type == GcType::List) {
                 auto* list = reinterpret_cast<SList*>(h + 1);
-                listBytes += size_t(list->cap) * sizeof(Value);
+                listBytes += list->externalBytes();
             } else if (h->type == GcType::AppendLog) {
                 listBytes += appendLogExternalBytes(h + 1);
             }
@@ -736,11 +736,12 @@ void Gc::collect() {
 void Gc::destroyPayload(GcHeader* h) {
     if (h->type == GcType::List) {
         auto* list = reinterpret_cast<SList*>(h + 1);
-        std::free(list->items);
+        list->destroyStorage();
     } else if (h->type == GcType::Str) {
         // cons の flatten 結果は GC オブジェクトではないので明示的に返す。
         auto* s = reinterpret_cast<SStr*>(h + 1);
-        if (s->isComposite() && s->body) std::free(s->body);
+        if ((s->isComposite() || s->isLatin1()) && s->body)
+            std::free(s->body);
     } else if (h->type == GcType::AppendLog) {
         destroyAppendLog(h + 1);
     }

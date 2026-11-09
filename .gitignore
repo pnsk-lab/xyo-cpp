@@ -25,6 +25,7 @@ __pycache__/
 /.refs/
 
 # --- ローカルの作業ディレクトリ・実験出力 ---
+/debug/
 /.scratch/
 /.bench/
 /.calc/
@@ -46,3 +47,7 @@ tests/bench/algos/v8out/
 
 # 独立した実験用 Git チェックアウト（本リポジトリには含めない）
 /scratch-bench/
+
+# Multi-agent board: transient exclusive claim locks
+/board/.locks/
+/board/.test-sandbox/

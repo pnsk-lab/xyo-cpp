@@ -15,7 +15,7 @@ Replace block-shape-specific rewrites with an extension to the existing generic 
 
 ## Configuration
 
-XYO_JIT_LAZY_TYPED_SSA=1 enables the new path; default is OFF until independently selected real SB3s establish a reproducible benefit without memory, compilation, and frame-time regressions. The unrelated experimental conditional-SSA and nested empty-loop changes are not included in this release.
+XYO_JIT_LAZY_TYPED_SSA=1 enables the new path; default is OFF until independently selected real SB3s establish a reproducible benefit without memory, compilation, and frame-time regressions. The earlier experimental conditional-SSA and nested empty-loop changes remain independent and default OFF.
 
 ## Verification
 
@@ -23,7 +23,7 @@ XYO_JIT_LAZY_TYPED_SSA=1 enables the new path; default is OFF until independentl
 - Interpreter baseline matches eager JIT with the feature OFF and ON, HotSpot ON, O2 ON and type-profile OFF, for both warp and non-warp: 10 configurations passed.
 - AOT compilation and execution of both generated projects: 14 compared variables for warp, 14 for non-warp, all equal to the interpreter.
 - LLVM O3 optimized IR shows typed.ssa.number PHIs and typed.ssa cached/conversion control flow. That confirms generated use, not a claimed speedup.
-- A clean, standalone v1.1.3 build and test is required before release; development-tree GUI changes are intentionally excluded.
+- The current working tree includes concurrent GUI changes; a GUI compilation error unrelated to this optimization prevents a clean CLI rebuild. The latest libxyo.a has been linked to already-built GUI objects as build/xyo-typed-ssa for functional verification. Neither GUI source nor unrelated files were changed as part of this work.
 
 ## Limits
 

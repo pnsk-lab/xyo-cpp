@@ -5,7 +5,16 @@
 //   window 座標:  SDL クライアント px（stageRect_ 内にレターボックス表示）
 //   pen 座標:     stage 座標を penScale_ 倍した CPU ビットマップ
 
+// NVIDIA DLSS Vulkan/GL interop adds GL headers to sdl_renderer.hpp.
+// Declare GL prototypes before those headers are first included.
+#if defined(XYO_PEN_GL)
+#ifndef GL_GLEXT_PROTOTYPES
+#define GL_GLEXT_PROTOTYPES
+#endif
+#endif
 #include "sdl_renderer.hpp"
+#include "gl_effects.hpp"
+#include "dlss_alpha_coverage.hpp"
 
 #if defined(XYO_HAVE_SDL2)
 
@@ -18,6 +27,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
+#include <fstream>
+#include <thread>
 #include <unordered_map>
 
 // M_PI は ISO C++ 標準ではない（mingw の <cmath> では未定義）
@@ -42,6 +54,9 @@
 #include <GL/glext.h>
 #endif
 #endif
+#if defined(XYO_NVSDK_DLSS_VK) && defined(__linux__) && defined(XYO_HAVE_SDL2)
+#include "dlss_gl_pipeline.hpp"
+#endif
 
 #include "../../third_party/stb_image.h"
 #include "../core/cast.hpp"
@@ -58,6 +73,38 @@
 
 namespace xyo {
 
+// ================================================ DLSS-equivalent options ====
+// `XYO_RENDER_SCALE` selects the internal stage resolution. Values outside
+// [0.25, 1.0] are clamped; 1.0 keeps the byte-exact legacy path.
+namespace {
+
+struct RenderScaleOptions {
+    double scale = 1.0;
+    double sharpness = 0.35;
+    bool temporal = true;
+};
+
+RenderScaleOptions renderScaleOptionsFromEnv() {
+    RenderScaleOptions o;
+    if (const char* v = std::getenv("XYO_RENDER_SCALE"); v && *v) {
+        char* end = nullptr;
+        const double d = std::strtod(v, &end);
+        if (end != v && std::isfinite(d))
+            o.scale = std::clamp(d, 0.25, 1.0);
+    }
+    if (const char* v = std::getenv("XYO_DLSS_SHARP"); v && *v) {
+        char* end = nullptr;
+        const double d = std::strtod(v, &end);
+        if (end != v && std::isfinite(d))
+            o.sharpness = std::clamp(d, 0.0, 1.5);
+    }
+    if (const char* v = std::getenv("XYO_DLSS_TEMPORAL"))
+        o.temporal = v[0] != '0';
+    return o;
+}
+
+} // namespace
+
 // ===================================================== ペン層プロファイル ====
 // XYO_PENPROF=1 でストローク/フラッシュ/readback/変換/upload/present の
 // 内訳を終了時に stderr へ出す。計測は単一スレッド前提の素朴な累算。
@@ -67,6 +114,8 @@ struct PenProf {
     bool on = false;
     // 回数
     uint64_t strokes = 0;      // penStroke 呼び出し
+    uint64_t stamps = 0;       // penStamp 呼び出し
+    uint64_t gpuStamps = 0;    // 直接FBO合成されたスタンプ
     uint64_t rasterPx = 0;     // CPU ラスタが触れた画素
     uint64_t quads = 0;        // GPU バッチへ積んだストローク
     uint64_t flushes = 0;      // FBO への glDrawElements 回数
@@ -78,6 +127,7 @@ struct PenProf {
     uint64_t rcFlushes = 0, fwdFlushes = 0;
     // 時間 (ms)
     double strokeMs = 0;       // penStroke 全体
+    double stampMs = 0;        // penStamp 全体
     double rasterMs = 0;       // CPU ラスタ（penGpu()==false 経路）
     double quadMs = 0;         // quad 生成
     double flushMs = 0;        // GPU バッチ描画
@@ -97,18 +147,21 @@ struct PenProfDump {
         std::fprintf(stderr,
             "PENPROF strokes=%llu rasterPx=%llu quads=%llu flushes=%llu "
             "readbacks=%llu convPx=%llu uploads=%llu frames=%llu "
-            "records=%llu\n",
+            "records=%llu stamps=%llu gpuStamps=%llu\n",
             (unsigned long long)p.strokes, (unsigned long long)p.rasterPx,
             (unsigned long long)p.quads, (unsigned long long)p.flushes,
             (unsigned long long)p.readbacks,
             (unsigned long long)p.convPx, (unsigned long long)p.uploads,
-            (unsigned long long)p.frames, (unsigned long long)p.records);
+            (unsigned long long)p.frames, (unsigned long long)p.records,
+            (unsigned long long)p.stamps,
+            (unsigned long long)p.gpuStamps);
         std::fprintf(stderr,
             "PENPROF ms stroke=%.1f raster=%.1f quad=%.1f flush=%.1f "
             "readback=%.1f convert=%.1f upload=%.1f copy=%.1f draw=%.1f "
-            "present=%.1f\n",
+            "present=%.1f stamp=%.1f\n",
             p.strokeMs, p.rasterMs, p.quadMs, p.flushMs, p.readbackMs,
-            p.convertMs, p.uploadMs, p.copyMs, p.drawMs, p.presentMs);
+            p.convertMs, p.uploadMs, p.copyMs, p.drawMs, p.presentMs,
+            p.stampMs);
     }
 } g_penProfDump;
 
@@ -130,6 +183,28 @@ struct PenTimer {
         if (!on) return;
         *acc += std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - t0).count();
+    }
+};
+
+// A wall-clock timer that is strictly opt-in. No clock reads or heap
+// allocations occur on the normal renderer path.
+struct RenderProfileTimer {
+    using Clock = std::chrono::steady_clock;
+    bool active = false;
+    double* destination = nullptr;
+    double* additional = nullptr;
+    Clock::time_point start{};
+    RenderProfileTimer(bool enabled, double& sum, double* second = nullptr)
+        : active(enabled), destination(&sum), additional(second) {
+        if (active) start = Clock::now();
+    }
+    ~RenderProfileTimer() {
+        if (active) {
+            const double elapsed = std::chrono::duration<double, std::milli>(
+                Clock::now() - start).count();
+            *destination += elapsed;
+            if (additional) *additional += elapsed;
+        }
     }
 };
 
@@ -220,7 +295,11 @@ struct SdlRenderer::GlPen {
     // に比べ CPU 側の書き込みと転送量が ~2.5x 少ない。
     bool useRecords = false;
     GLuint recProg = 0, recVbo = 0, recVao = 0;
-    GLint recUSize = -1, recUHalf = -1;
+    GLint recUSize = -1, recUHalf = -1, recUScale = -1;
+    GLuint stampProg = 0, stampVao = 0;
+    GLint stampCanvas = -1, stampCenter = -1, stampPivot = -1;
+    GLint stampSize = -1, stampRotation = -1, stampScale = -1;
+    GLint stampFlip = -1, stampSampler = -1;
     float* rec = nullptr;
     size_t recLen = 0, recCap = 0;   // recLen は float 数
     size_t recStrokes = 0;
@@ -287,7 +366,9 @@ struct SdlRenderer::GlCompute {};
 
 namespace {
 
-constexpr double kPenScale = 1.0;   // ペン解像度: 論理 px あたりの texel 数
+// Standard Scratch always renders its pen to the logical stage resolution.
+// TurboWarp High Quality Pen instead uses the displayed stage's pixel size.
+constexpr double kPenScale = 1.0;
 
 uint8_t clampByte(double v) {
     return static_cast<uint8_t>(std::clamp(v, 0.0, 255.0));
@@ -355,11 +436,33 @@ void fillOctagon(SDL_Renderer* r, int cx, int cy, int rad) {
 
 // ============================================================ 初期化 ====
 
+void SdlRenderer::setHighQualityPen(bool enabled) {
+    if (highQualityPen_ == enabled) return;
+    highQualityPen_ = enabled;
+    penResizeIfNeeded();
+}
+
+void SdlRenderer::setRenderScale(double scale) {
+    if (!std::isfinite(scale)) return;
+    const double clamped = std::clamp(scale, 0.25, 1.0);
+    if (std::abs(clamped - renderScale_) < 1e-9) return;
+    renderScale_ = clamped;
+    releaseStageTarget();
+    if (glUpscale_) glUpscale_->reset();
+    penResizeIfNeeded();
+}
+
 bool SdlRenderer::init(Runtime& rt, int scale) {
     rt_ = &rt;
     stageW_ = rt.stageWidth;
     stageH_ = rt.stageHeight;
     scale_ = std::max(1, scale);
+    {
+        const RenderScaleOptions rs = renderScaleOptionsFromEnv();
+        renderSharpness_ = rs.sharpness;
+        renderTemporal_ = rs.temporal;
+        setRenderScale(rs.scale);
+    }
 
     // Windows の SDL2 は SDL_MAIN_NEEDED でビルドされており、SDL_main を
     // 使わない（SDL_MAIN_HANDLED）アプリは SDL_SetMainReady() を呼ばないと
@@ -391,6 +494,18 @@ bool SdlRenderer::init(Runtime& rt, int scale) {
         std::fprintf(stderr, "SDL_CreateRenderer: %s\n", SDL_GetError());
         return false;
     }
+    // Native NVIDIA DLSS requires SDL's desktop OpenGL backend. Keep the
+    // selected driver observable without enabling diagnostics by default.
+    if (std::getenv("XYO_DLSS_REAL_DEBUG")) {
+        SDL_RendererInfo debugInfo{};
+        SDL_GetRendererInfo(renderer_, &debugInfo);
+        std::fprintf(stderr,
+            "[real DLSS] SDL renderer=%s, OpenGL context=%s, stage=%dx%d, "
+            "requested render scale=%.3f\n",
+            debugInfo.name ? debugInfo.name : "(unknown)",
+            SDL_GL_GetCurrentContext() ? "yes" : "no",
+            stageW_, stageH_, renderScale_);
+    }
     SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
     recomputeViewport();
     initTargetsAndUi();
@@ -399,6 +514,14 @@ bool SdlRenderer::init(Runtime& rt, int scale) {
 
 /// init/initEmbedded 共通: drawable 生成・コールバック・カーソル・ask。
 void SdlRenderer::initTargetsAndUi() {
+    // Keep GPU memory bounded in clone-heavy projects. The cache owns only
+    // display-side textures; CPU hit-testing and costume assets are separate.
+    if (const char* budget = std::getenv("XYO_FX_CACHE_MB")) {
+        char* end = nullptr;
+        const unsigned long mb = std::strtoul(budget, &end, 10);
+        if (end != budget && *end == '\0' && mb >= 1 && mb <= 4096)
+            gpuEffectMaxBytes_ = size_t(mb) * 1024 * 1024;
+    }
     for (Target* t : rt_->targets) {
         if (t->isStage) createDrawableForTarget(t, "backdrop");
         else if (t->isRenderable()) createDrawableForTarget(t, "sprite");
@@ -442,6 +565,12 @@ bool SdlRenderer::initEmbedded(Runtime& rt, SDL_Renderer* renderer) {
     stageW_ = rt.stageWidth;
     stageH_ = rt.stageHeight;
     scale_ = 1;
+    {
+        const RenderScaleOptions rs = renderScaleOptionsFromEnv();
+        renderSharpness_ = rs.sharpness;
+        renderTemporal_ = rs.temporal;
+        setRenderScale(rs.scale);
+    }
     embedded_ = true;
     renderer_ = renderer;
     window_ = SDL_RenderGetWindow(renderer_);
@@ -456,6 +585,7 @@ bool SdlRenderer::initEmbedded(Runtime& rt, SDL_Renderer* renderer) {
 
 void SdlRenderer::setStageRect(const IRect& r) {
     stageRect_ = r;
+    penResizeIfNeeded();
     // 埋め込みでは緑旗/停止はエディタ側が描くので chrome は無効。
     flagRect_[0] = flagRect_[1] = flagRect_[2] = flagRect_[3] = 0;
     stopRect_[0] = stopRect_[1] = stopRect_[2] = stopRect_[3] = 0;
@@ -493,6 +623,14 @@ SdlRenderer::~SdlRenderer() {
     if (curArrow_) SDL_FreeCursor(curArrow_);
     if (curHand_) SDL_FreeCursor(curHand_);
     if (curIbeam_) SDL_FreeCursor(curIbeam_);
+    for (auto& [id, d] : drawables_) releaseGpuEffectTexture(d);
+    gpuEffects_.reset();
+#if defined(XYO_NVSDK_DLSS_VK) && defined(__linux__) && defined(XYO_HAVE_SDL2)
+    glDlss_.reset();
+#endif
+    releaseStageTarget();
+    glUpscale_.reset();
+    glPenFsr_.reset();
     for (auto& [id, e] : textCache_) SDL_DestroyTexture(e.tex);
     for (auto& [c, s] : skins_) if (s) freeSkin(*s);
     if (penTex_) SDL_DestroyTexture(penTex_);
@@ -507,6 +645,8 @@ SdlRenderer::~SdlRenderer() {
             if (g.recProg) glDeleteProgram(g.recProg);
             if (g.recVbo) glDeleteBuffers(1, &g.recVbo);
             if (g.recVao) glDeleteVertexArrays(1, &g.recVao);
+            if (g.stampProg) glDeleteProgram(g.stampProg);
+            if (g.stampVao) glDeleteVertexArrays(1, &g.stampVao);
             if (g.fbo) glDeleteFramebuffers(1, &g.fbo);
             if (g.tex) glDeleteTextures(1, &g.tex);
 #if !defined(__APPLE__)
@@ -573,6 +713,7 @@ void SdlRenderer::recomputeViewport() {
     stopRect_[0] = stageRect_.x + stageRect_.w - bs - 6;
     stopRect_[1] = stageRect_.y + 6;
     stopRect_[2] = stopRect_[3] = bs;
+    penResizeIfNeeded();
 }
 
 // ========================================================= drawable ====
@@ -605,7 +746,190 @@ void SdlRenderer::freeSkin(Skin& s) {
     s.fx.clear();
 }
 
+namespace {
+// Cache only large, expensive SVG rasterizations. Reuse exact RGBA pixels
+// and geometry; SDL textures remain per-renderer/main-thread objects.
+// The format version must change when rasterization semantics change.
+constexpr uint64_t kSkinCacheMagic =
+#ifdef XYO_HAVE_RSVG
+    0x58594f534b494e75ULL; // librsvg+premultiplied-alpha correction
+#else
+    0x58594f534b494e76ULL; // nanosvg fallback
+#endif
+
+struct CachedSkinPixels {
+    int32_t w = 0, h = 0;
+    double scale = 1, rcx = 0, rcy = 0, logicalW = 0, logicalH = 0;
+    std::vector<uint8_t> pixels;
+};
+
+struct SkinCacheHeader {
+    uint64_t magic = kSkinCacheMagic;
+    uint64_t sourceHash = 0;
+    uint64_t pixelHash = 0;
+    uint64_t bytes = 0;
+    int32_t w = 0, h = 0;
+    double scale = 1, rcx = 0, rcy = 0, logicalW = 0, logicalH = 0;
+};
+
+uint64_t hashSkinBytes(const void* bytes, size_t length,
+                       uint64_t hash = 14695981039346656037ULL) {
+    const auto* src = static_cast<const uint8_t*>(bytes);
+    for (size_t i = 0; i < length; ++i)
+        hash = (hash ^ src[i]) * 1099511628211ULL;
+    return hash;
+}
+
+struct SkinCacheKey {
+    std::filesystem::path path;
+    uint64_t hash = 0;
+};
+
+SkinCacheKey skinCacheKey(const Costume& c) {
+    const char* disabled = std::getenv("XYO_SKIN_CACHE");
+    if ((disabled && disabled[0] == '0') || c.dataFormat != "svg" ||
+        c.data.size() < 16384)
+        return {};
+    const char* root = std::getenv("XYO_SKIN_CACHE_DIR");
+    std::filesystem::path dir;
+    if (root && *root) dir = root;
+    else if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg)
+        dir = std::filesystem::path(xdg) / "xyo-cpp" / "skins";
+    else if (const char* home = std::getenv("HOME"); home && *home)
+        dir = std::filesystem::path(home) / ".cache" / "xyo-cpp" / "skins";
+    else return {};
+
+    uint64_t h = hashSkinBytes(c.data.data(), c.data.size());
+    h = hashSkinBytes(&c.bitmapResolution, sizeof(c.bitmapResolution), h);
+    h = hashSkinBytes(&c.rotationCenterX, sizeof(c.rotationCenterX), h);
+    h = hashSkinBytes(&c.rotationCenterY, sizeof(c.rotationCenterY), h);
+    h = hashSkinBytes(&kSkinCacheMagic, sizeof(kSkinCacheMagic), h);
+#ifdef XYO_HAVE_RSVG
+    // A different librsvg build may rasterize the same SVG differently.
+    constexpr uint64_t rasterVersion =
+        (uint64_t(LIBRSVG_MAJOR_VERSION) << 40) |
+        (uint64_t(LIBRSVG_MINOR_VERSION) << 20) |
+        uint64_t(LIBRSVG_MICRO_VERSION);
+    h = hashSkinBytes(&rasterVersion, sizeof(rasterVersion), h);
+#endif
+    char filename[48];
+    std::snprintf(filename, sizeof(filename), "skin-%016llx.rgba",
+                  static_cast<unsigned long long>(h));
+    return {dir / filename, h};
+}
+
+bool readSkinCache(const SkinCacheKey& key, CachedSkinPixels& out) {
+    if (key.path.empty()) return false;
+    std::ifstream f(key.path, std::ios::binary);
+    if (!f) return false;
+    SkinCacheHeader hdr;
+    if (!f.read(reinterpret_cast<char*>(&hdr), sizeof(hdr))) return false;
+    if (hdr.magic != kSkinCacheMagic || hdr.sourceHash != key.hash ||
+        hdr.w <= 0 || hdr.h <= 0 || hdr.w > 8192 || hdr.h > 8192 ||
+        uint64_t(hdr.w) * uint64_t(hdr.h) > 64ULL * 1024 * 1024 ||
+        hdr.bytes != uint64_t(hdr.w) * hdr.h * 4 ||
+        hdr.bytes > 64ULL * 1024 * 1024 ||
+        !std::isfinite(hdr.scale) || hdr.scale <= 0 ||
+        !std::isfinite(hdr.rcx) || !std::isfinite(hdr.rcy) ||
+        !std::isfinite(hdr.logicalW) || !std::isfinite(hdr.logicalH))
+        return false;
+    out.pixels.resize(static_cast<size_t>(hdr.bytes));
+    if (!f.read(reinterpret_cast<char*>(out.pixels.data()), hdr.bytes) ||
+        hashSkinBytes(out.pixels.data(), out.pixels.size()) != hdr.pixelHash) {
+        out.pixels.clear();
+        return false;
+    }
+    out.w = hdr.w; out.h = hdr.h;
+    out.scale = hdr.scale; out.rcx = hdr.rcx; out.rcy = hdr.rcy;
+    out.logicalW = hdr.logicalW; out.logicalH = hdr.logicalH;
+    return true;
+}
+
+void trimSkinCache(const std::filesystem::path& dir) {
+    // Bound persistent cache growth across unrelated Scratch projects.
+    size_t maxMb = 512;
+    if (const char* value = std::getenv("XYO_SKIN_CACHE_MB")) {
+        const long n = std::strtol(value, nullptr, 10);
+        if (n >= 64 && n <= 4096) maxMb = size_t(n);
+    }
+    const uintmax_t budget = uintmax_t(maxMb) * 1024 * 1024;
+    struct Entry {
+        std::filesystem::path path;
+        uintmax_t bytes;
+        std::filesystem::file_time_type time;
+    };
+    std::vector<Entry> entries;
+    uintmax_t total = 0;
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(dir, ec), end;
+         !ec && it != end; it.increment(ec)) {
+        const auto name = it->path().filename().string();
+        if (name.size() != 26 || name.substr(0, 5) != "skin-" ||
+            name.substr(name.size() - 5) != ".rgba" ||
+            !it->is_regular_file(ec))
+            continue;
+        const uintmax_t size = it->file_size(ec);
+        if (ec) break;
+        const auto when = it->last_write_time(ec);
+        if (ec) break;
+        total += size;
+        entries.push_back({it->path(), size, when});
+    }
+    if (ec || total <= budget) return;
+    std::sort(entries.begin(), entries.end(),
+              [](const Entry& a, const Entry& b) {
+                  return a.time < b.time;
+              });
+    for (const Entry& item : entries) {
+        if (total <= budget) break;
+        std::filesystem::remove(item.path, ec);
+        if (!ec) total -= item.bytes;
+        ec.clear();
+    }
+}
+
+void writeSkinCache(const SkinCacheKey& key, const CachedSkinPixels& data) {
+    // Cache writes are opportunistic: never fail a project on IO errors.
+    if (key.path.empty() || data.pixels.empty() ||
+        data.pixels.size() > 32ULL * 1024 * 1024)
+        return;
+    std::error_code ec;
+    std::filesystem::create_directories(key.path.parent_path(), ec);
+    if (ec) return;
+    SkinCacheHeader hdr;
+    hdr.sourceHash = key.hash;
+    hdr.pixelHash = hashSkinBytes(data.pixels.data(), data.pixels.size());
+    hdr.bytes = data.pixels.size();
+    hdr.w = data.w; hdr.h = data.h;
+    hdr.scale = data.scale; hdr.rcx = data.rcx; hdr.rcy = data.rcy;
+    hdr.logicalW = data.logicalW; hdr.logicalH = data.logicalH;
+    const auto temp = key.path.string() + ".tmp-" +
+        std::to_string(std::chrono::steady_clock::now().
+                       time_since_epoch().count()) + "-" +
+        std::to_string(std::hash<std::thread::id>{}(
+            std::this_thread::get_id()));
+    {
+        std::ofstream f(temp, std::ios::binary | std::ios::trunc);
+        if (!f || !f.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr)) ||
+            !f.write(reinterpret_cast<const char*>(data.pixels.data()),
+                     data.pixels.size())) {
+            f.close();
+            std::filesystem::remove(temp, ec);
+            return;
+        }
+    }
+    std::filesystem::rename(temp, key.path, ec);
+    if (ec) std::filesystem::remove(temp, ec);
+    else trimSkinCache(key.path.parent_path());
+}
+} // namespace
+
 SdlRenderer::Skin* SdlRenderer::decodeCostume(const Costume* c) {
+    const bool traceSkin = std::getenv("XYO_SKINPROF") != nullptr;
+    const auto startedSkin = traceSkin ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
+    RenderProfileTimer timing(profileActive_, frameProfile_.costumeDecodeMs);
+    if (profileActive_) ++frameProfile_.costumeDecodes;
     if (!c) return nullptr;
     auto fail = [this, c]() -> Skin* {
         skins_.try_emplace(c);
@@ -618,7 +942,19 @@ SdlRenderer::Skin* SdlRenderer::decodeCostume(const Costume* c) {
     // ラスタライズ後の ceil された px 数を論理サイズにすると 0.3〜0.5px
     // ずれ、フェンス位置が 1px 変わる。viewBox がある場合だけ上書きする。
     double svgLogicalW = 0, svgLogicalH = 0;
-
+    const SkinCacheKey cacheKey = skinCacheKey(*c);
+    CachedSkinPixels cached;
+    const bool cacheHit = readSkinCache(cacheKey, cached);
+    if (cacheHit) {
+        skin->w = cached.w;
+        skin->h = cached.h;
+        skin->scale = cached.scale;
+        skin->rcx = cached.rcx;
+        skin->rcy = cached.rcy;
+        skin->logicalW = cached.logicalW;
+        skin->logicalH = cached.logicalH;
+        skin->px = std::move(cached.pixels);
+    } else {
     if (c->dataFormat == "svg") {
 #ifndef XYO_HAVE_RSVG
         // librsvg の無いビルド（Windows 等）は nanosvg でラスタ化する。
@@ -803,12 +1139,47 @@ SdlRenderer::Skin* SdlRenderer::decodeCostume(const Costume* c) {
         skin->logicalW = svgLogicalW;
         skin->logicalH = svgLogicalH;
     }
+    if (!cacheKey.path.empty()) {
+        CachedSkinPixels toCache;
+        toCache.w = skin->w;
+        toCache.h = skin->h;
+        toCache.scale = skin->scale;
+        toCache.rcx = skin->rcx;
+        toCache.rcy = skin->rcy;
+        toCache.logicalW = skin->logicalW;
+        toCache.logicalH = skin->logicalH;
+        toCache.pixels = std::move(skin->px);
+        writeSkinCache(cacheKey, toCache);
+        skin->px = std::move(toCache.pixels);
+    }
+    } // cache miss
 
+#if defined(XYO_NVSDK_DLSS_VK) && defined(__linux__) && defined(XYO_HAVE_SDL2)
+    // Only incur the one-time pixel scan in the explicitly enabled
+    // hardware-DLSS alpha-safety mode. Legacy renderer remains unaffected.
+    if (realDlssEnabled_) {
+        const char* alphaSafe = std::getenv("XYO_DLSS_ALPHA_SAFE");
+        if (alphaSafe && alphaSafe[0] == '1') {
+            skin->hasIntrinsicTranslucency =
+                render::hasInteriorTranslucency(
+                    skin->px.data(), skin->w, skin->h);
+        }
+    }
+#endif
     skin->tex = SDL_CreateTexture(renderer_, SDL_PIXELFORMAT_RGBA32,
                                   SDL_TEXTUREACCESS_STATIC, skin->w, skin->h);
     if (!skin->tex) return nullptr;
     SDL_UpdateTexture(skin->tex, nullptr, skin->px.data(), skin->w * 4);
+    if (profileActive_) ++frameProfile_.textureUploads;
     SDL_SetTextureBlendMode(skin->tex, SDL_BLENDMODE_BLEND);
+    if (traceSkin) {
+        const double elapsed = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - startedSkin).count();
+        std::fprintf(stderr, "[skinprof] %s %s %dx%d %.3fms cache=%s\n",
+                     SStr::toUtf8(c->name).c_str(), c->dataFormat.c_str(),
+                     skin->w, skin->h, elapsed,
+                     cacheHit ? "hit" : "miss");
+    }
     auto [it, _] = skins_.emplace(c, std::move(skin));
     return it->second.get();
 }
@@ -826,16 +1197,21 @@ const SdlRenderer::Skin* SdlRenderer::skinForTarget(Target* t) const {
 // ベーススキンにターゲットのエフェクトを適用した最終ビットマップ。
 // エフェクト無しなら元のテクスチャ/画素をそのまま返す。
 const SdlRenderer::Rendered* SdlRenderer::renderedFor(
-        Target* t, const Skin* s, Rendered* out) const {
+        Target* t, const Skin* s, Rendered* out,
+        const GraphicEffects* overrideFx) const {
     out->tex = s->tex;
     out->px = s->px.data();
     out->w = s->w;
     out->h = s->h;
-    if (!t || !hasActiveEffects(t->effects)) return out;
-    std::string key = effectKey(t->effects);
+    if (!t) return out;
+    const GraphicEffects& effects = overrideFx ? *overrideFx : t->effects;
+    if (!hasActiveEffects(effects)) return out;
+    std::string key = effectKey(effects);
     Skin* mut = const_cast<Skin*>(s);
     auto it = mut->fx.find(key);
     if (it == mut->fx.end()) {
+        RenderProfileTimer timing(profileActive_, frameProfile_.effectBuildMs);
+        if (profileActive_) ++frameProfile_.effectBuilds;
         if (mut->fx.size() >= 24) {   // 値の連続変化での肥大化を全破棄で抑止
             for (auto& [k, v] : mut->fx)
                 if (v.tex)
@@ -843,16 +1219,26 @@ const SdlRenderer::Rendered* SdlRenderer::renderedFor(
             mut->fx.clear();
         }
         Skin::FxVariant v;
-        applyEffects(s->px.data(), s->w, s->h, t->effects, v.px);
+        if (std::getenv("XYO_FX_TRACE")) {
+            static int logged = 0;
+            if (logged++ < 40)
+                std::fprintf(stderr, "[fx] sprite=%s size=%dx%d key=%s\n",
+                    t->sprite ? SStr::toUtf8(t->sprite->name).c_str() : "(stage)",
+                    s->w, s->h, key.c_str());
+        }
+        applyEffects(s->px.data(), s->w, s->h, effects, v.px);
         v.tex = SDL_CreateTexture(renderer_, SDL_PIXELFORMAT_RGBA32,
                                   SDL_TEXTUREACCESS_STATIC, s->w, s->h);
         if (v.tex) {
             SDL_UpdateTexture(static_cast<SDL_Texture*>(v.tex), nullptr,
                               v.px.data(), s->w * 4);
+            if (profileActive_) ++frameProfile_.textureUploads;
             SDL_SetTextureBlendMode(static_cast<SDL_Texture*>(v.tex),
                                     SDL_BLENDMODE_BLEND);
         }
         it = mut->fx.emplace(std::move(key), std::move(v)).first;
+    } else if (profileActive_) {
+        ++frameProfile_.effectHits;
     }
     out->tex = static_cast<SDL_Texture*>(it->second.tex);
     out->px = it->second.px.data();
@@ -1227,8 +1613,40 @@ double SdlRenderer::setDrawableOrder(int drawableID, double order,
     return d->order;
 }
 
+void SdlRenderer::releaseGpuEffectTexture(Drawable& d) {
+    if (d.gpuEffectTexture) {
+        SDL_DestroyTexture(d.gpuEffectTexture);
+        d.gpuEffectTexture = nullptr;
+        gpuEffectCacheBytes_ -= d.gpuEffectBytes;
+    }
+    d.gpuEffectBytes = 0;
+    d.gpuEffectSource = nullptr;
+    d.gpuEffectKey.clear();
+    d.gpuEffectLastUsed = 0;
+}
+
+void SdlRenderer::budgetGpuEffectTexture(const Drawable& current, size_t bytes) {
+    // LRU eviction is needed only when a new effect texture is allocated.
+    // Avoid scans or allocation overhead on every normal frame.
+    while (gpuEffectCacheBytes_ + bytes > gpuEffectMaxBytes_) {
+        Drawable* oldest = nullptr;
+        for (auto& [id, other] : drawables_) {
+            if (&other == &current || !other.gpuEffectTexture) continue;
+            if (!oldest || other.gpuEffectLastUsed < oldest->gpuEffectLastUsed)
+                oldest = &other;
+        }
+        if (!oldest) break; // One oversized costume may exceed the soft limit.
+        SDL_RenderFlush(renderer_); // Flush any queued copies before destruction.
+        releaseGpuEffectTexture(*oldest);
+    }
+}
+
 void SdlRenderer::destroyDrawable(int drawableID) {
-    drawables_.erase(drawableID);
+    auto it = drawables_.find(drawableID);
+    if (it != drawables_.end()) {
+        releaseGpuEffectTexture(it->second);
+        drawables_.erase(it);
+    }
     if (lastFenceId_ == drawableID) {
         lastFenceId_ = -1;
         lastFenceDrawable_ = nullptr;
@@ -1262,6 +1680,8 @@ int SdlRenderer::drawableOfTarget(Target* t) const {
 // ------------------------------------------------------------ タッチ判定
 
 bool SdlRenderer::drawableTouching(int drawableID, double x, double y) {
+    RenderProfileTimer timing(profileActive_, frameProfile_.collisionMs);
+    if (profileActive_) ++frameProfile_.collisionCalls;
     const Drawable* d = drawableFor(drawableID);
     if (!d) return false;
     uint8_t px4[4];
@@ -1270,6 +1690,8 @@ bool SdlRenderer::drawableTouching(int drawableID, double x, double y) {
 
 bool SdlRenderer::isTouchingDrawables(int drawableID, const int* others,
                                       size_t n) {
+    RenderProfileTimer timing(profileActive_, frameProfile_.collisionMs);
+    if (profileActive_) ++frameProfile_.collisionCalls;
     const Drawable* a = drawableFor(drawableID);
     if (!a || !a->target || !a->target->visible) return false;
     const Skin* sa = skinForTarget(a->target);
@@ -1349,6 +1771,8 @@ static inline bool maskColorMatches(uint8_t r, uint8_t g, uint8_t b,
 }
 
 bool SdlRenderer::isTouchingColor(int drawableID, uint32_t rgb) {
+    RenderProfileTimer timing(profileActive_, frameProfile_.collisionMs);
+    if (profileActive_) ++frameProfile_.collisionCalls;
     const Drawable* d = drawableFor(drawableID);
     if (!d || !d->target) return false;
     double b[4];
@@ -1397,6 +1821,8 @@ bool SdlRenderer::isTouchingColor(int drawableID, uint32_t rgb) {
 
 bool SdlRenderer::colorTouchingColor(uint32_t color, uint32_t target,
                                      int drawableID) {
+    RenderProfileTimer timing(profileActive_, frameProfile_.collisionMs);
+    if (profileActive_) ++frameProfile_.collisionCalls;
     const Drawable* d = drawableFor(drawableID);
     if (!d || !d->target) return false;
     double b[4];
@@ -1429,11 +1855,45 @@ int SdlRenderer::createPenSkin() {
     return penSkinId_;
 }
 
+std::pair<int, int> SdlRenderer::desiredPenSize() const {
+    if (!highQualityPen_ || stageRect_.w <= 0 || stageRect_.h <= 0)
+        return {stageW_, stageH_};
+    // SDL renderer coordinates are window points on HiDPI displays. Convert
+    // the stage rectangle to render-target pixels rather than assuming 1:1.
+    double outputScale = 1.0;
+    if (renderer_ && window_) {
+        int rw = 0, rh = 0, ww = 0, wh = 0;
+        SDL_GetRendererOutputSize(renderer_, &rw, &rh);
+        SDL_GetWindowSize(window_, &ww, &wh);
+        if (rw > 0 && rh > 0 && ww > 0 && wh > 0)
+            outputScale = std::min(double(rw) / ww, double(rh) / wh);
+    }
+    const double factor = std::max(1.0,
+        std::min(double(stageRect_.w) * outputScale / stageW_,
+                 double(stageRect_.h) * outputScale / stageH_) *
+            renderScale_);
+    // Avoid excessive allocations and SDL/GL maximum texture dimensions.
+    int maxDim = 8192;
+    SDL_RendererInfo info{};
+    if (renderer_ && SDL_GetRendererInfo(renderer_, &info) == 0) {
+        if (info.max_texture_width > 0)
+            maxDim = std::min(maxDim, int(info.max_texture_width));
+        if (info.max_texture_height > 0)
+            maxDim = std::min(maxDim, int(info.max_texture_height));
+    }
+    const double safe = std::min(factor, double(maxDim) /
+        double(std::max(stageW_, stageH_)));
+    if (safe <= 1.0) return {stageW_, stageH_};
+    return {std::max(stageW_, int(std::lround(stageW_ * safe))),
+            std::max(stageH_, int(std::lround(stageH_ * safe)))};
+}
+
 void SdlRenderer::penEnsure() {
     if (penTex_) return;
-    penScale_ = kPenScale;
-    penW_ = static_cast<int>(stageW_ * penScale_);
-    penH_ = static_cast<int>(stageH_ * penScale_);
+    const auto [w, h] = desiredPenSize();
+    penW_ = w;
+    penH_ = h;
+    penScale_ = double(penW_) / stageW_;
     penPx_.assign(static_cast<size_t>(penW_) * penH_ * 4, 0);
     penUploadPx_.assign(penPx_.size(), 0);
     penTex_ = SDL_CreateTexture(renderer_, SDL_PIXELFORMAT_RGBA32,
@@ -1445,6 +1905,150 @@ void SdlRenderer::penEnsure() {
     if (!glPen_ && !initGlPen() && std::getenv("XYO_DEBUG"))
         std::fprintf(stderr, "GL pen unavailable; CPU raster\n");
 #endif
+}
+
+// Resize the persistent pen layer as the stage display resolution changes.
+// Preserve accumulated strokes by resampling premultiplied RGBA pixels.
+// Pending GPU/CPU strokes must be committed before changing dimensions.
+void SdlRenderer::penResizeIfNeeded() {
+    if (!penTex_) return;
+    const auto [newW, newH] = desiredPenSize();
+    if (newW == penW_ && newH == penH_) return;
+    SDL_Texture* nextTex = SDL_CreateTexture(renderer_, SDL_PIXELFORMAT_RGBA32,
+                                             SDL_TEXTUREACCESS_STREAMING,
+                                             newW, newH);
+    if (!nextTex) return;
+    SDL_SetTextureBlendMode(nextTex, SDL_BLENDMODE_BLEND);
+
+    penFlushCpuBatch();
+    penSyncCpu();   // includes outstanding GL strokes and FBO readback
+    const int oldW = penW_, oldH = penH_;
+    std::vector<uint8_t> pixels(size_t(newW) * newH * 4);
+    for (int y = 0; y < newH; ++y) {
+        const double fy = (y + 0.5) * double(oldH) / newH - 0.5;
+        const int ya = std::clamp(int(std::floor(fy)), 0, oldH - 1);
+        const int yb = std::min(ya + 1, oldH - 1);
+        const double wy = std::clamp(fy, 0.0, double(oldH - 1)) - ya;
+        for (int x = 0; x < newW; ++x) {
+            const double fx = (x + 0.5) * double(oldW) / newW - 0.5;
+            const int xa = std::clamp(int(std::floor(fx)), 0, oldW - 1);
+            const int xb = std::min(xa + 1, oldW - 1);
+            const double wx = std::clamp(fx, 0.0, double(oldW - 1)) - xa;
+            const auto p00 = (size_t(ya) * oldW + xa) * 4;
+            const auto p10 = (size_t(ya) * oldW + xb) * 4;
+            const auto p01 = (size_t(yb) * oldW + xa) * 4;
+            const auto p11 = (size_t(yb) * oldW + xb) * 4;
+            const size_t dest = (size_t(y) * newW + x) * 4;
+            for (int channel = 0; channel < 4; ++channel) {
+                const double top =
+                    penPx_[p00 + channel] * (1.0 - wx) +
+                    penPx_[p10 + channel] * wx;
+                const double bottom =
+                    penPx_[p01 + channel] * (1.0 - wx) +
+                    penPx_[p11 + channel] * wx;
+                pixels[dest + channel] = penTo255(
+                    top * (1.0 - wy) + bottom * wy);
+            }
+        }
+    }
+
+    // Allocate a GL-compatible bottom-up copy. This also preserves the
+    // texture's premultiplied-alpha representation on the GPU.
+#if defined(XYO_PEN_GL)
+    std::vector<uint8_t> flipped;
+    if (penGpu()) {
+        flipped.resize(pixels.size());
+        const size_t row = size_t(newW) * 4;
+        for (int y = 0; y < newH; ++y)
+            std::memcpy(flipped.data() + size_t(y) * row,
+                        pixels.data() + size_t(newH - 1 - y) * row, row);
+    }
+#endif
+
+    penW_ = newW;
+    penH_ = newH;
+    penScale_ = double(newW) / stageW_;
+    penPx_ = std::move(pixels);
+    penUploadPx_.resize(penPx_.size());
+    penAcc_.clear();
+    penRowOpen_.clear();
+    penKernelNext_ = 0;
+    for (auto& kernel : penKernels_) kernel.width = -1;
+    penDirty_ = true;
+#if defined(XYO_PEN_GL)
+    if (penGpu()) {
+        GlPen& g = *glPen_;
+        if (SDL_GL_MakeCurrent(window_, g.ctx) == 0) {
+            glBindTexture(GL_TEXTURE_2D, g.tex);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, newW, newH, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, flipped.data());
+            g.interop = false;
+            g.upTex = 0;
+            glBindFramebuffer(GL_FRAMEBUFFER, g.fbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                   GL_TEXTURE_2D, g.tex, 0);
+            // Restore direct SDL/GL interop when contexts share resources.
+            if (g.shared && sdlGlCtx_ &&
+                SDL_GL_MakeCurrent(window_, sdlGlCtx_) == 0) {
+                GLint prior = 0, id = 0;
+                glGetIntegerv(GL_TEXTURE_BINDING_2D, &prior);
+                if (SDL_GL_BindTexture(nextTex, nullptr, nullptr) == 0) {
+                    glGetIntegerv(GL_TEXTURE_BINDING_2D, &id);
+                    SDL_GL_UnbindTexture(nextTex);
+                }
+                glBindTexture(GL_TEXTURE_2D, GLuint(prior));
+                if (SDL_GL_MakeCurrent(window_, g.ctx) == 0 && id > 0) {
+                    glBindFramebuffer(GL_FRAMEBUFFER, g.fbo);
+                    glFramebufferTexture2D(GL_FRAMEBUFFER,
+                                           GL_COLOR_ATTACHMENT0,
+                                           GL_TEXTURE_2D, GLuint(id), 0);
+                    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) ==
+                        GL_FRAMEBUFFER_COMPLETE) {
+                        SDL_BlendMode blend = SDL_ComposeCustomBlendMode(
+                            SDL_BLENDFACTOR_ONE,
+                            SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+                            SDL_BLENDOPERATION_ADD,
+                            SDL_BLENDFACTOR_ONE,
+                            SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+                            SDL_BLENDOPERATION_ADD);
+                        if (blend != SDL_BLENDMODE_INVALID &&
+                            SDL_SetTextureBlendMode(nextTex, blend) == 0) {
+                            g.interop = true;
+                            g.upTex = GLuint(id);
+                            glBindTexture(GL_TEXTURE_2D, GLuint(id));
+                            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, newW, newH,
+                                            GL_RGBA, GL_UNSIGNED_BYTE,
+                                            flipped.data());
+                        }
+                    }
+                }
+            }
+            if (SDL_GL_MakeCurrent(window_, g.ctx) == 0) {
+                glBindFramebuffer(GL_FRAMEBUFFER, g.fbo);
+                if (!g.interop)
+                    glFramebufferTexture2D(GL_FRAMEBUFFER,
+                                           GL_COLOR_ATTACHMENT0,
+                                           GL_TEXTURE_2D, g.tex, 0);
+                g.ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) ==
+                       GL_FRAMEBUFFER_COMPLETE;
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                if (sdlGlCtx_) SDL_GL_MakeCurrent(window_, sdlGlCtx_);
+            } else {
+                g.ok = false; // fail closed: CPU owns preserved pixels
+            }
+            g.readback.clear();
+            g.fboDirty = false;
+            g.sdlTexDirty = true;
+        } else {
+            g.ok = false;
+        }
+    }
+#endif
+    SDL_DestroyTexture(penTex_);
+    penTex_ = nextTex;
+    if (std::getenv("XYO_DEBUG"))
+        std::fprintf(stderr, "high-quality-pen: %dx%d scale=%.3f\n",
+                     penW_, penH_, penScale_);
 }
 
 void SdlRenderer::penBlendPremult(uint8_t* p, const float rgba[4],
@@ -1531,6 +2135,43 @@ void main() {
 }
 )GLSL";
 
+// Pen stamps use native GL compositing into the persistent pen FBO instead
+// of doing per-pixel CPU hit-tests followed by a full framebuffer upload.
+// Coordinates match skinPxAt's inverse transform and stage top-left origin.
+const char* kStampVsCore = R"GLSL(#version 330 core
+uniform vec2 uCanvas;
+uniform vec2 uCenter;
+uniform vec2 uPivot;
+uniform vec2 uSize;
+uniform vec2 uRot;
+uniform float uScale;
+uniform float uFlip;
+out vec2 vUV;
+void main() {
+    int c = gl_VertexID;
+    vec2 corner = vec2((c == 1 || c == 4 || c == 5) ? 1.0 : 0.0,
+                       (c == 2 || c == 3 || c == 5) ? 1.0 : 0.0);
+    vec2 local = (corner * uSize - uPivot) * uScale;
+    local.x *= uFlip;
+    vec2 at = uCenter + vec2(local.x * uRot.x - local.y * uRot.y,
+                             local.x * uRot.y + local.y * uRot.x);
+    gl_Position = vec4(2.0 * at.x / uCanvas.x - 1.0,
+                       1.0 - 2.0 * at.y / uCanvas.y, 0.0, 1.0);
+    vUV = corner;
+}
+)GLSL";
+
+const char* kStampFsCore = R"GLSL(#version 330 core
+uniform sampler2D uSource;
+in vec2 vUV;
+out vec4 outColor;
+void main() {
+    vec4 color = texture(uSource, vUV);
+    if (color.a < (10.0 / 255.0)) discard;
+    outColor = vec4(color.rgb * color.a, color.a);
+}
+)GLSL";
+
 const char* kPenFsCompat = R"GLSL(#version 120
 varying vec2 vUV;
 varying vec2 vMeta;
@@ -1557,19 +2198,20 @@ layout(location=1) in vec2 aP1;
 layout(location=2) in vec4 aColor;
 uniform vec2 uSize;
 uniform vec2 uHalf;
+uniform float uPenScale;
 out vec2 vUV;
 out vec2 vMeta;
 out vec4 vColor;
 void main() {
-    float fdx = aP0.z, fdy = aP0.w;
-    float L = aP1.x, width = aP1.y;
+    float fdx = aP0.z * uPenScale, fdy = aP0.w * uPenScale;
+    float L = aP1.x * uPenScale, width = aP1.y * uPenScale;
     float dx = fdx, dy = -fdy;
     const float eps = 1e-3;
     float basisX = (abs(dx) < eps && abs(dy) < eps) ? eps : dx;
     float denom = max(L, eps);
     float nx = basisX / denom, ny = dy / denom;
-    float ax = aP0.x + uHalf.x;
-    float ay = uHalf.y - aP0.y;
+    float ax = (aP0.x + uHalf.x) * uPenScale;
+    float ay = (uHalf.y - aP0.y) * uPenScale;
     float radius = width * 0.5;
     float m = radius + 1.0;
     // 頂点列は CPU 側クアッドと同じ (0,1,2, 2,1,3):
@@ -1832,6 +2474,7 @@ bool SdlRenderer::initGlPen() {
         if (g.recProg) {
             g.recUSize = glGetUniformLocation(g.recProg, "uSize");
             g.recUHalf = glGetUniformLocation(g.recProg, "uHalf");
+            g.recUScale = glGetUniformLocation(g.recProg, "uPenScale");
             glGenBuffers(1, &g.recVbo);
             glGenVertexArrays(1, &g.recVao);
             glBindVertexArray(g.recVao);
@@ -1864,6 +2507,150 @@ bool SdlRenderer::initGlPen() {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     g.ok = true;
     if (sdlGlCtx_) SDL_GL_MakeCurrent(window_, sdlGlCtx_);
+    return true;
+}
+
+// Fast stamping for a shared OpenGL pen FBO. This writes the same
+// premultiplied composited pixels as penBlendPx without transferring the
+// pen layer back to CPU. All texture effects are already applied to source.
+bool SdlRenderer::penStampGpu(const Drawable& d, const Skin& skin) {
+    if (!penGpu() || !glPen_->shared || !sdlGlCtx_ ||
+        std::getenv("XYO_PEN_STAMP_CPU")) return false;
+    GlPen& g = *glPen_;
+    if (SDL_GL_MakeCurrent(window_, g.ctx) != 0) return false;
+    GLint version = 0, minor = 0;
+    glGetIntegerv(GL_MAJOR_VERSION, &version);
+    glGetIntegerv(GL_MINOR_VERSION, &minor);
+    if (version < 3 || (version == 3 && minor < 3)) {
+        SDL_GL_MakeCurrent(window_, sdlGlCtx_);
+        return false;
+    }
+    if (!g.stampProg) {
+        GLuint vs = penCompileShader(GL_VERTEX_SHADER, kStampVsCore);
+        GLuint fs = penCompileShader(GL_FRAGMENT_SHADER, kStampFsCore);
+        if (vs && fs) {
+            GLuint prog = glCreateProgram();
+            glAttachShader(prog, vs);
+            glAttachShader(prog, fs);
+            glLinkProgram(prog);
+            GLint linked = 0;
+            glGetProgramiv(prog, GL_LINK_STATUS, &linked);
+            if (linked) {
+                g.stampProg = prog;
+                glGenVertexArrays(1, &g.stampVao);
+                g.stampCanvas = glGetUniformLocation(prog, "uCanvas");
+                g.stampCenter = glGetUniformLocation(prog, "uCenter");
+                g.stampPivot = glGetUniformLocation(prog, "uPivot");
+                g.stampSize = glGetUniformLocation(prog, "uSize");
+                g.stampRotation = glGetUniformLocation(prog, "uRot");
+                g.stampScale = glGetUniformLocation(prog, "uScale");
+                g.stampFlip = glGetUniformLocation(prog, "uFlip");
+                g.stampSampler = glGetUniformLocation(prog, "uSource");
+            } else {
+                if (std::getenv("XYO_DEBUG")) {
+                    char log[1024]{};
+                    glGetProgramInfoLog(prog, sizeof(log), nullptr, log);
+                    std::fprintf(stderr, "GL stamp shader link: %s\n", log);
+                }
+                glDeleteProgram(prog);
+            }
+        }
+        if (vs) glDeleteShader(vs);
+        if (fs) glDeleteShader(fs);
+    }
+    if (!g.stampProg || !g.stampVao) {
+        SDL_GL_MakeCurrent(window_, sdlGlCtx_);
+        return false;
+    }
+    // Preserve sprite effects for stamp parity. The GL path only replaces
+    // the final pixel-by-pixel sampling/compositing work.
+    Rendered rendered;
+    const Rendered* image = renderedFor(d.target, &skin, &rendered);
+    DrawXform f;
+    if (!image || !image->tex || !xformFor(d, skin, f)) {
+        SDL_GL_MakeCurrent(window_, sdlGlCtx_);
+        return false;
+    }
+    // Before querying SDL's GL handle, finish its queued drawing commands.
+    SDL_RenderFlush(renderer_);
+    if (SDL_GL_MakeCurrent(window_, sdlGlCtx_) != 0) return false;
+    GLfloat uvX = 1.0f, uvY = 1.0f;
+    if (SDL_GL_BindTexture(image->tex, &uvX, &uvY) != 0) return false;
+    GLint input = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &input);
+    SDL_GL_UnbindTexture(image->tex);
+    if (input <= 0 || uvX != 1.0f || uvY != 1.0f) return false;
+
+    // A point/line may have been queued before the stamp.
+    penFlushGpu();
+    if (SDL_GL_MakeCurrent(window_, g.ctx) != 0) return false;
+
+    GLint oldTex = 0, oldFilterMin = 0, oldFilterMag = 0;
+    GLint oldProgram = 0, oldVao = 0, oldFbo = 0, oldActive = 0;
+    GLint oldBlendSrcRgb = 0, oldBlendDstRgb = 0;
+    GLint oldBlendSrcAlpha = 0, oldBlendDstAlpha = 0;
+    GLint oldViewport[4]{};
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &oldActive);
+    glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &oldTex);
+    glGetIntegerv(GL_CURRENT_PROGRAM, &oldProgram);
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &oldVao);
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &oldFbo);
+    glGetIntegerv(GL_VIEWPORT, oldViewport);
+    const bool blending = glIsEnabled(GL_BLEND);
+    const bool scissor = glIsEnabled(GL_SCISSOR_TEST);
+    const bool depth = glIsEnabled(GL_DEPTH_TEST);
+    glGetIntegerv(GL_BLEND_SRC_RGB, &oldBlendSrcRgb);
+    glGetIntegerv(GL_BLEND_DST_RGB, &oldBlendDstRgb);
+    glGetIntegerv(GL_BLEND_SRC_ALPHA, &oldBlendSrcAlpha);
+    glGetIntegerv(GL_BLEND_DST_ALPHA, &oldBlendDstAlpha);
+    glBindTexture(GL_TEXTURE_2D, GLuint(input));
+    glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, &oldFilterMin);
+    glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, &oldFilterMag);
+    // In HQ mode a low-resolution costume should interpolate when stamped
+    // to the higher resolution pen buffer, instead of becoming blocky.
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                    highQualityPen_ ? GL_LINEAR : GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
+                    highQualityPen_ ? GL_LINEAR : GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, g.fbo);
+    glViewport(0, 0, penW_, penH_);
+    glEnable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    glUseProgram(g.stampProg);
+    glBindVertexArray(g.stampVao);
+    glUniform1i(g.stampSampler, 0);
+    glUniform2f(g.stampCanvas, float(stageW_), float(stageH_));
+    glUniform2f(g.stampCenter, float(f.cx), float(f.cy));
+    glUniform2f(g.stampPivot, float(skin.rcx * skin.scale),
+                float(skin.rcy * skin.scale));
+    glUniform2f(g.stampSize, float(image->w), float(image->h));
+    glUniform2f(g.stampRotation, float(f.cos), float(f.sin));
+    glUniform1f(g.stampScale, float(f.k));
+    glUniform1f(g.stampFlip, float(f.dirScaleX));
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    g.fboDirty = true;
+    g.sdlTexDirty = true;
+    penDirty_ = true;
+
+    glBindVertexArray(oldVao);
+    glUseProgram(oldProgram);
+    glBindFramebuffer(GL_FRAMEBUFFER, oldFbo);
+    glViewport(oldViewport[0], oldViewport[1],
+               oldViewport[2], oldViewport[3]);
+    glBlendFuncSeparate(oldBlendSrcRgb, oldBlendDstRgb,
+                        oldBlendSrcAlpha, oldBlendDstAlpha);
+    if (!blending) glDisable(GL_BLEND);
+    if (scissor) glEnable(GL_SCISSOR_TEST);
+    if (depth) glEnable(GL_DEPTH_TEST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, oldFilterMin);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, oldFilterMag);
+    glBindTexture(GL_TEXTURE_2D, oldTex);
+    glActiveTexture(oldActive);
+    SDL_GL_MakeCurrent(window_, sdlGlCtx_);
+    if (g_penProfOn) ++g_penProf.gpuStamps;
     return true;
 }
 
@@ -1907,8 +2694,12 @@ void SdlRenderer::penStrokeGpu(const float rgba[4], float width,
     float nx = basisX / denom, ny = dy / denom;
     float nn = nx * nx + ny * ny;
     if (!(nn > 0.0f) || !std::isfinite(nn)) return;
-    float ax = static_cast<float>(stageX(fx0));
-    float ay = static_cast<float>(stageY(fy0));
+    // Keep the fallback quad in physical pen-layer pixels, just like the
+    // instanced record shader and CPU raster path.
+    L *= float(penScale_);
+    width *= float(penScale_);
+    float ax = static_cast<float>(stageX(fx0) * penScale_);
+    float ay = static_cast<float>(stageY(fy0) * penScale_);
     float radius = width * 0.5f;
     float m = radius + 1.0f;   // cov>0 の半径 r+0.5 + ラスタ余白
     // quad 角: (u,v) ∈ {-m, L+m} × {-m, m} → 位置 A + u*T + v*N
@@ -1962,6 +2753,7 @@ void SdlRenderer::penFlushGpu() {
         glUseProgram(g.recProg);
         glUniform2f(g.recUSize, float(penW_), float(penH_));
         glUniform2f(g.recUHalf, float(stageW_ / 2), float(stageH_ / 2));
+        glUniform1f(g.recUScale, float(penScale_));
         glBindBuffer(GL_ARRAY_BUFFER, g.recVbo);
         glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(g.recLen * sizeof(float)),
                      g.rec, GL_STREAM_DRAW);
@@ -3528,11 +4320,11 @@ void SdlRenderer::penStroke(const float rgba[4], double diameter,
 // CPU ラスタ本体（前向き逐次合成）。引数は penStroke で正規化済み。
 void SdlRenderer::penStrokeRaster(const PenRec& rec) {
     const float* rgba = rec.rgba;
-    const double width = double(rec.width);
+    const double width = double(rec.width) * penScale_;
     const float fx0 = rec.fx0, fy0 = rec.fy0;
     const float fdx = rec.fdx, fdy = rec.fdy;
     double dx = double(fdx), dy = -double(fdy);
-    double L = double(rec.L);
+    double L = double(rec.L) * penScale_;
     const double eps = double(static_cast<float>(1e-3));
     double basisX = (std::abs(dx) < eps && std::abs(dy) < eps) ? eps : dx;
     double denom = std::max(L, eps);
@@ -3541,7 +4333,8 @@ void SdlRenderer::penStrokeRaster(const PenRec& rec) {
     if (!std::isfinite(nx) || !std::isfinite(ny) || !(nn > 0.0) ||
         !std::isfinite(nn)) return;
     double inv = 1.0 / nn;
-    double ax = stageX(double(fx0)), ay = stageY(double(fy0));
+    double ax = stageX(double(fx0)) * penScale_;
+    double ay = stageY(double(fy0)) * penScale_;
     double bx = ax + nx * L, by = ay + ny * L;
     double radius = width * 0.5;
     double support = (radius + 0.5) * std::hypot(nx, ny);
@@ -3722,9 +4515,9 @@ void SdlRenderer::penRasterReverse() {
         const float cr = std::clamp(rgba[0], 0.0f, 1.0f);
         const float cg = std::clamp(rgba[1], 0.0f, 1.0f);
         const float cb = std::clamp(rgba[2], 0.0f, 1.0f);
-        const double width = double(rec.width);
+        const double width = double(rec.width) * penScale_;
         double dx = double(rec.fdx), dy = -double(rec.fdy);
-        double L = double(rec.L);
+        double L = double(rec.L) * penScale_;
         double basisX =
             (std::abs(dx) < epsG && std::abs(dy) < epsG) ? epsG : dx;
         double denom = std::max(L, epsG);
@@ -3732,7 +4525,8 @@ void SdlRenderer::penRasterReverse() {
         double nn = nx * nx + ny * ny;
         if (!(nn > 0.0) || !std::isfinite(nn)) continue;
         double inv = 1.0 / nn;
-        double ax = stageX(double(rec.fx0)), ay = stageY(double(rec.fy0));
+        double ax = stageX(double(rec.fx0)) * penScale_;
+        double ay = stageY(double(rec.fy0)) * penScale_;
         double bx = ax + nx * L, by = ay + ny * L;
         double radius = width * 0.5;
         double support = (radius + 0.5) * std::hypot(nx, ny);
@@ -3921,6 +4715,47 @@ void SdlRenderer::penLine(int skin, const float rgba[4], double diameter,
 }
 
 
+bool SdlRenderer::capturePen(std::vector<uint8_t>& pixels) {
+    pixels.clear();
+    if (!penTex_) return true;
+    penFlushCpuBatch();
+    penSyncCpu();
+    if (penPx_.size() != size_t(penW_) * size_t(penH_) * 4) return false;
+    pixels = penPx_;
+    return true;
+}
+
+bool SdlRenderer::restorePen(const std::vector<uint8_t>& pixels) {
+    if (pixels.empty()) return true;
+    penEnsure();
+    if (!penTex_ || pixels.size() != size_t(penW_) * size_t(penH_) * 4)
+        return false;
+    penBatch_.clear();
+    penPx_ = pixels;
+    penDirty_ = true;
+#if defined(XYO_PEN_GL)
+    if (penGpu()) {
+        // A fresh GL FBO has no queued geometry. Synchronize the restored
+        // top-down premultiplied pixels to the bottom-up GL texture.
+        if (SDL_GL_MakeCurrent(window_, glPen_->ctx) != 0) return false;
+        const size_t row = size_t(penW_) * 4;
+        std::vector<uint8_t> flipped(pixels.size());
+        for (int y = 0; y < penH_; ++y)
+            std::memcpy(flipped.data() + size_t(penH_ - 1 - y) * row,
+                        pixels.data() + size_t(y) * row, row);
+        glBindTexture(GL_TEXTURE_2D,
+                      glPen_->interop ? glPen_->upTex : glPen_->tex);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, penW_, penH_,
+                        GL_RGBA, GL_UNSIGNED_BYTE, flipped.data());
+        glPen_->fboDirty = false;
+        glPen_->sdlTexDirty = true;
+        if (sdlGlCtx_) SDL_GL_MakeCurrent(window_, sdlGlCtx_);
+    }
+#endif
+    return true;
+}
+
 void SdlRenderer::penClear(int skin) {
     if (skin != penSkinId_) return;
     penEnsure();
@@ -3952,10 +4787,11 @@ void SdlRenderer::penClear(int skin) {
 }
 
 void SdlRenderer::penStamp(int skin, int drawableID) {
+    if (g_penProfOn) ++g_penProf.stamps;
+    PenTimer stampTimer(&g_penProf.stampMs);
     if (skin != penSkinId_) return;
     penEnsure();
     penFlushCpuBatch();   // CPU 遅延バッチを先に反映
-    penSyncCpu();   // GPU バッチを先に描画して penPx_ を最新化
     Drawable* d = drawableFor(drawableID);
     if (!d || !d->target) return;
     // scratch-render の penStamp は _drawThese(..., {ignoreVisibility: true})
@@ -3963,20 +4799,88 @@ void SdlRenderer::penStamp(int skin, int drawableID) {
     // スプライト描画と同じく適用される（ghost 100 なら何も残らない）。
     const Skin* s = skinForTarget(d->target);
     if (!s) return;
+#if defined(XYO_PEN_GL)
+    if (penStampGpu(*d, *s)) return;
+#endif
+    penSyncCpu();   // GPU unavailable: use exact CPU pixel sampling
     double b[4];
     getDrawableBounds(drawableID, b);
-    int x0 = static_cast<int>(stageX(std::min(b[0], b[1])));
-    int x1 = static_cast<int>(std::ceil(stageX(std::max(b[0], b[1]))));
-    int y0 = static_cast<int>(stageY(std::max(b[2], b[3])));
-    int y1 = static_cast<int>(std::ceil(stageY(std::min(b[2], b[3]))));
-    uint8_t px4[4];
-    for (int y = y0; y < y1; ++y)
+    int x0 = std::clamp(int(std::floor(
+        stageX(std::min(b[0], b[1])) * penScale_)), 0, penW_);
+    int x1 = std::clamp(int(std::ceil(
+        stageX(std::max(b[0], b[1])) * penScale_)), 0, penW_);
+    int y0 = std::clamp(int(std::floor(
+        stageY(std::max(b[2], b[3])) * penScale_)), 0, penH_);
+    int y1 = std::clamp(int(std::ceil(
+        stageY(std::min(b[2], b[3])) * penScale_)), 0, penH_);
+    // A stamp samples one immutable costume and one transform for its
+    // entire draw. Do not repeat skinForTarget(), xformFor(), effectKey(),
+    // and renderedFor() on *every pixel* (hundreds of thousands of calls
+    // per animated backdrop in ASTERIA). Keep exact Scratch centre sampling.
+    Rendered rendered;
+    const Rendered* rd = renderedFor(d->target, s, &rendered);
+    DrawXform transform;
+    if (!rd || !rd->px || !xformFor(*d, *s, transform)) return;
+    const double size = d->target->size / 100.0;
+    if (!std::isfinite(size) || size == 0.0) return;
+    const double sx = s->scale;
+    const double cx = transform.cx, cy = transform.cy;
+    const double cs = transform.cos, sn = transform.sin;
+    const double flip = transform.dirScaleX;
+    const int width = rd->w, height = rd->h;
+    const uint8_t* pixels = rd->px;
+    const double invPenScale = 1.0 / penScale_;
+    for (int y = y0; y < y1; ++y) {
+        const double dy = (y + 0.5) * invPenScale - cy;
         for (int x = x0; x < x1; ++x) {
-            if (!skinPxAt(*d, x + 0.5, y + 0.5, px4,
-                          /*ignoreVisibility=*/true)) continue;
-            penBlendPx(static_cast<int>((x + 0.5) * penScale_),
-                       static_cast<int>((y + 0.5) * penScale_), px4);
+            const double dx = (x + 0.5) * invPenScale - cx;
+            const double lx = (dx * cs + dy * sn) * flip;
+            const double ly = -dx * sn + dy * cs;
+            const double tx = (lx / size + s->rcx) * sx;
+            const double ty = (ly / size + s->rcy) * sx;
+            // Reject non-finite transformed coordinates before casting.
+            if (!(tx >= 0.0 && tx < width && ty >= 0.0 && ty < height))
+                continue;
+            const int ix = static_cast<int>(std::floor(tx));
+            const int iy = static_cast<int>(std::floor(ty));
+            const uint8_t* px4 =
+                pixels + (static_cast<size_t>(iy) * width + ix) * 4;
+            uint8_t filtered[4];
+            if (highQualityPen_ && penScale_ > 1.0) {
+                // Match GL_LINEAR's texel-center interpolation. Interpolate
+                // *premultiplied* channels to avoid transparent-edge halos.
+                const double u = tx - 0.5, v = ty - 0.5;
+                const int xa = std::clamp(int(std::floor(u)), 0, width - 1);
+                const int ya = std::clamp(int(std::floor(v)), 0, height - 1);
+                const int xb = std::min(xa + 1, width - 1);
+                const int yb = std::min(ya + 1, height - 1);
+                const double wx = std::clamp(u, 0.0, double(width - 1)) - xa;
+                const double wy = std::clamp(v, 0.0, double(height - 1)) - ya;
+                const auto sample = [&](int sx, int sy) {
+                    return pixels + (size_t(sy) * width + sx) * 4;
+                };
+                const uint8_t* src[4] = {
+                    sample(xa, ya), sample(xb, ya),
+                    sample(xa, yb), sample(xb, yb)};
+                const double weights[4] = {
+                    (1.0-wx)*(1.0-wy), wx*(1.0-wy),
+                    (1.0-wx)*wy, wx*wy};
+                double a = 0.0, rgb[3] = {};
+                for (int i = 0; i < 4; ++i) {
+                    const double alpha = src[i][3] * weights[i];
+                    a += alpha;
+                    for (int c = 0; c < 3; ++c)
+                        rgb[c] += src[i][c] * alpha;
+                }
+                filtered[3] = penTo255(a);
+                for (int c = 0; c < 3; ++c)
+                    filtered[c] = a > 0.0 ? penTo255(rgb[c] / a) : 0;
+                px4 = filtered;
+            }
+            if (px4[3] < 10) continue;
+            penBlendPx(x, y, px4);
         }
+    }
 #if defined(XYO_PEN_GL)
     // CPU 側のスタンプ結果を FBO へ戻して同期を保つ。
     // penPx_ は top-down、FBO は GL 座標（bottom-up）なので行反転する。
@@ -4001,8 +4905,26 @@ void SdlRenderer::penStamp(int skin, int drawableID) {
 // ================================================================ 描画 ===
 
 void SdlRenderer::draw() {
+    if (std::getenv("XYO_DLSS_REAL_DEBUG")) {
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            std::fprintf(stderr,
+                "[real DLSS] draw(): renderer=%s, profile=%d, "
+                "stage rect=%dx%d, render scale=%.3f, enabled=%d\n",
+                renderer_ ? "yes" : "no",
+                int(profileActive_), stageRect_.w, stageRect_.h,
+                renderScale_,
+#if defined(XYO_NVSDK_DLSS_VK) && defined(__linux__) && defined(XYO_HAVE_SDL2)
+                int(realDlssEnabled_));
+#else
+                0);
+#endif
+        }
+    }
     if (!renderer_) return;
     if (embedded_ && (stageRect_.w <= 0 || stageRect_.h <= 0)) return;
+    RenderProfileTimer timing(profileActive_, frameProfile_.drawMs);
     PenTimer pdraw(&g_penProf.drawMs, true);
     ++g_penProf.frames;
     if (!embedded_) {
@@ -4014,6 +4936,43 @@ void SdlRenderer::draw() {
                       stageRect_.h};
         SDL_RenderSetClipRect(renderer_, &clip);
     }
+    // DLSS-equivalent: stage content at reduced internal resolution, then
+    // reconstructed at display resolution. Bubbles/ask/monitors stay native.
+    if (renderScale_ < 0.999 && stageRect_.w > 0 && stageRect_.h > 0)
+        drawScaledStage();
+    else
+        drawStageContent();
+
+    std::vector<Drawable*> order;
+    order.reserve(drawables_.size());
+    for (auto& [id, d] : drawables_) order.push_back(&d);
+    std::sort(order.begin(), order.end(), [](const Drawable* a,
+                                             const Drawable* b) {
+        return a->order < b->order;
+    });
+    for (Drawable* d : order)
+        if (d->group == "sprite" && d->target && d->target->visible &&
+            !d->target->bubbleText.empty())
+            drawBubble(d->target);
+    // Scratch ではモニタはステージ canvas の上に載る HTML オーバーレイ
+    // なので、green flag/stop や ask バーより後に描く。
+    drawAskBar();
+    if (!embedded_) drawUiChrome();
+    drawMonitors();
+    if (embedded_) SDL_RenderSetClipRect(renderer_, nullptr);
+    if (frameCapture_) frameCapture_();
+    if (!embedded_) {
+        RenderProfileTimer timingPresent(profileActive_, frameProfile_.presentMs);
+        PenTimer ppres(&g_penProf.presentMs, true);
+        SDL_RenderPresent(renderer_);
+    }
+}
+
+static SDL_Rect sdlRect(const IRect& r) {
+    return {r.x, r.y, r.w, r.h};
+}
+
+void SdlRenderer::drawStageContent() {
     drawStageArea();
 
     // 描画順: backdrop → pen → sprites（order 昇順）
@@ -4029,25 +4988,156 @@ void SdlRenderer::draw() {
     drawPenLayer();
     for (Drawable* d : order)
         if (d->group == "sprite") drawDrawable(*d);
-    for (Drawable* d : order)
-        if (d->group == "sprite" && d->target && d->target->visible &&
-            !d->target->bubbleText.empty())
-            drawBubble(d->target);
-    // Scratch ではモニタはステージ canvas の上に載る HTML オーバーレイ
-    // なので、green flag/stop や ask バーより後に描く。
-    drawAskBar();
-    if (!embedded_) drawUiChrome();
-    drawMonitors();
-    if (embedded_) SDL_RenderSetClipRect(renderer_, nullptr);
-    if (frameCapture_) frameCapture_();
-    if (!embedded_) {
-        PenTimer ppres(&g_penProf.presentMs, true);
-        SDL_RenderPresent(renderer_);
-    }
 }
 
-static SDL_Rect sdlRect(const IRect& r) {
-    return {r.x, r.y, r.w, r.h};
+void SdlRenderer::ensureStageTarget(int w, int h) {
+    if (stageTarget_ && stageTargetW_ == w && stageTargetH_ == h) return;
+    releaseStageTarget();
+    stageTarget_ = SDL_CreateTexture(renderer_, SDL_PIXELFORMAT_RGBA32,
+                                     SDL_TEXTUREACCESS_TARGET, w, h);
+    if (!stageTarget_) return;
+    stageTargetW_ = w;
+    stageTargetH_ = h;
+    SDL_SetTextureBlendMode(stageTarget_, SDL_BLENDMODE_NONE);
+    if (glUpscale_) glUpscale_->reset();
+}
+
+void SdlRenderer::releaseStageTarget() {
+    if (stageTarget_) SDL_DestroyTexture(stageTarget_);
+    stageTarget_ = nullptr;
+    stageTargetW_ = stageTargetH_ = 0;
+}
+
+void SdlRenderer::drawScaledStage() {
+    if (!glUpscale_) glUpscale_ = std::make_unique<GlUpscale>();
+    if (!glUpscale_->available(renderer_)) {
+        // Software / Emscripten renderers have no filtered upscale pass; an
+        // extra full-window blit is slower than drawing directly, so keep the
+        // legacy exact path instead of a costlier low-resolution one.
+        drawStageContent();
+        return;
+    }
+    // Renderer output pixels per window point (HiDPI). Embedded mode draws
+    // into an editor-owned texture whose pixels already equal stageRect_.
+    double pixelScale = 1.0;
+    if (!embedded_ && renderer_ && window_) {
+        int rw = 0, rh = 0, ww = 0, wh = 0;
+        SDL_GetRendererOutputSize(renderer_, &rw, &rh);
+        SDL_GetWindowSize(window_, &ww, &wh);
+        if (rw > 0 && rh > 0 && ww > 0 && wh > 0)
+            pixelScale = std::max(1.0, std::min(double(rw) / ww,
+                                               double(rh) / wh));
+    }
+    const int iw = std::max(1, static_cast<int>(std::lround(
+        stageRect_.w * pixelScale * renderScale_)));
+    const int ih = std::max(1, static_cast<int>(std::lround(
+        stageRect_.h * pixelScale * renderScale_)));
+    ensureStageTarget(iw, ih);
+    if (!stageTarget_) {
+        drawStageContent();   // allocation failure: exact path
+        return;
+    }
+
+    SDL_Texture* previous = SDL_GetRenderTarget(renderer_);
+    SDL_RenderSetClipRect(renderer_, nullptr);
+    if (SDL_SetRenderTarget(renderer_, stageTarget_) != 0) {
+        SDL_SetRenderTarget(renderer_, previous);
+        if (embedded_) {
+            SDL_Rect clip{stageRect_.x, stageRect_.y, stageRect_.w,
+                          stageRect_.h};
+            SDL_RenderSetClipRect(renderer_, &clip);
+        }
+        drawStageContent();
+        return;
+    }
+    const IRect saved = stageRect_;
+    stageRect_ = IRect{0, 0, iw, ih};
+    drawStageContent();
+    stageRect_ = saved;
+    SDL_SetRenderTarget(renderer_, previous);
+    if (embedded_) {
+        SDL_Rect clip{saved.x, saved.y, saved.w, saved.h};
+        SDL_RenderSetClipRect(renderer_, &clip);
+    } else {
+        SDL_RenderSetClipRect(renderer_, nullptr);
+    }
+
+    const int ow = std::max(1, static_cast<int>(std::lround(
+        iw / renderScale_)));
+    const int oh = std::max(1, static_cast<int>(std::lround(
+        ih / renderScale_)));
+    // 0.72 history weight is enough to remove frame-to-frame crawling without
+    // visible trails; the shader clamps history to the local min/max so moving
+    // sprites cannot smear.
+#if defined(XYO_NVSDK_DLSS_VK) && defined(__linux__) && defined(XYO_HAVE_SDL2)
+    // Experimental real NVIDIA NGX path, opt-in only.
+    // Scratch has no depth/motion buffer; NGX temporal history is reset.
+    if (realDlssEnabled_) {
+        if (!glDlss_) glDlss_ = std::make_unique<render::DlssGlPipeline>();
+        // Optical Flow cannot recover separate geometry at translucent
+        // boundaries. Opt-in alpha-safe mode resets history only while a
+        // partially translucent sprite intersects the stage viewport.
+        static const bool safeAlphaTemporal = [] {
+            const char* env = std::getenv("XYO_DLSS_ALPHA_SAFE");
+            return env && env[0] == '1';
+        }();
+        bool forceHistoryReset = false;
+        if (safeAlphaTemporal) {
+            for (const auto& [id, drawable] : drawables_) {
+                Target* target = drawable.target;
+                if (!target || drawable.group != "sprite" ||
+                    !target->visible) continue;
+                const double ghost = target->effects.get("ghost");
+                if (std::isfinite(ghost) && ghost >= 100.0) continue;
+                const Skin* skin = skinForTarget(target);
+                if (!skin) continue;
+                const bool ghostPartial =
+                    std::isfinite(ghost) && ghost > 0.0 && ghost < 100.0;
+                if (!ghostPartial && !skin->hasIntrinsicTranslucency) continue;
+
+                // Avoid resetting the entire frame for translucent sprites
+                // which are completely outside the Scratch stage viewport.
+                double bounds[4]{};
+                getDrawableBounds(drawable.id, bounds);
+                const double halfW = stageW_ * 0.5;
+                const double halfH = stageH_ * 0.5;
+                if (bounds[1] <= -halfW || bounds[0] >= halfW ||
+                    bounds[2] <= -halfH || bounds[3] >= halfH)
+                    continue;
+                forceHistoryReset = true;
+                break;
+            }
+        }
+        if (forceHistoryReset && std::getenv("XYO_DLSS_REAL_DEBUG")) {
+            static bool loggedGhostReset = false;
+            if (!loggedGhostReset) {
+                loggedGhostReset = true;
+                std::fprintf(stderr,
+                    "[real DLSS] alpha-safe: visible partial opacity "
+                    "(ghost effect or intrinsic costume alpha); "
+                    "temporal history reset (XYO_DLSS_ALPHA_SAFE=1)\n");
+            }
+        }
+        if (SDL_Texture* result = glDlss_->apply(renderer_, stageTarget_,
+                                                 ow, oh, forceHistoryReset)) {
+            const SDL_Rect dst = sdlRect(saved);
+            SDL_RenderCopy(renderer_, result, nullptr, &dst);
+            return;
+        }
+    }
+#endif
+    const float history = renderTemporal_ ? 0.72f : 0.0f;
+    SDL_Texture* upscaled = glUpscale_->apply(
+        renderer_, stageTarget_, ow, oh,
+        static_cast<float>(renderSharpness_), history);
+    const SDL_Rect dst = sdlRect(saved);
+    if (upscaled) {
+        SDL_RenderCopy(renderer_, upscaled, nullptr, &dst);
+    } else {
+        // Unexpected GL failure: still show the frame (nearest/linear stretch).
+        SDL_SetTextureScaleMode(stageTarget_, SDL_ScaleModeLinear);
+        SDL_RenderCopy(renderer_, stageTarget_, nullptr, &dst);
+    }
 }
 
 void SdlRenderer::drawStageArea() {
@@ -4058,15 +5148,104 @@ void SdlRenderer::drawStageArea() {
 
 void SdlRenderer::drawDrawable(Drawable& d) {
     Target* t = d.target;
+    SpriteProfileRow* perSprite = nullptr;
+    if (profileActive_ && t && t->sprite && d.group == "sprite") {
+        auto [it, inserted] = spriteProfileTotals_.try_emplace(t->sprite);
+        perSprite = &it->second;
+        if (inserted) perSprite->name = SStr::toUtf8(t->sprite->name);
+    }
+    RenderProfileTimer timing(profileActive_, d.group == "sprite"
+        ? frameProfile_.spriteMs : frameProfile_.backdropMs,
+        perSprite ? &perSprite->drawMs : nullptr);
     if (!t) return;
     if (d.group == "sprite" && !t->visible) return;
+    // ghost >= 100 produces zero alpha for every source texel, regardless
+    // of the other six graphic effects. Nothing can contribute to the
+    // displayed framebuffer. Skip costly software effect image generation
+    // and texture uploads here; collision and pen stamping use independent
+    // renderer paths and still inspect the unmodified target effects.
+    static const bool cullTransparentGhost = [] {
+        const char* flag = std::getenv("XYO_RENDER_GHOST100_CULL");
+        return !flag || flag[0] != '0';
+    }();
+    if (cullTransparentGhost && t->effects.get("ghost") >= 100.0)
+        return;
     Skin* s = skinForTarget(t);
     if (!s || !s->tex) return;
     DrawXform f;
     if (!xformFor(d, *s, f)) return;
+    // A changing ghost value is a texture-wide alpha modulation, not an
+    // image-processing operation. Keep the base texture resident on the GPU
+    // instead of generating/uploading a new full-size effect texture for each
+    // animation frame. Collision, colour sampling and stamping still use
+    // renderedFor() and its CPU pixels when they need an exact image.
+    const double ghost = t->effects.get("ghost");
+    const bool modulateGhost = std::isfinite(ghost) && ghost != 0.0;
+    // The colour/spatial variant is independent of ghost. Reuse it while
+    // opacity animates, instead of caching one large image per ghost value.
+    GraphicEffects withoutGhost;
+    if (modulateGhost) {
+        withoutGhost = t->effects;
+        withoutGhost["ghost"] = 0.0;
+    }
+    const GraphicEffects& visualFx =
+        modulateGhost ? withoutGhost : t->effects;
+    SDL_Texture* texture = nullptr;
+    if (hasActiveEffects(visualFx)) {
+        if (!gpuEffects_) gpuEffects_ = std::make_unique<GlEffects>();
+        if (gpuEffects_->available(renderer_)) {
+            if (d.gpuEffectTexture &&
+                (d.gpuEffectWidth != s->w || d.gpuEffectHeight != s->h))
+                releaseGpuEffectTexture(d);
+            if (!d.gpuEffectTexture) {
+                const size_t bytes = size_t(s->w) * s->h * 4;
+                budgetGpuEffectTexture(d, bytes);
+                d.gpuEffectTexture = SDL_CreateTexture(
+                    renderer_, SDL_PIXELFORMAT_RGBA32,
+                    SDL_TEXTUREACCESS_TARGET, s->w, s->h);
+                if (d.gpuEffectTexture) {
+                    d.gpuEffectWidth = s->w;
+                    d.gpuEffectHeight = s->h;
+                    d.gpuEffectBytes = bytes;
+                    gpuEffectCacheBytes_ += bytes;
+                    SDL_SetTextureBlendMode(d.gpuEffectTexture,
+                                            SDL_BLENDMODE_BLEND);
+                }
+            }
+            if (d.gpuEffectTexture) {
+                std::string key = effectKey(visualFx);
+                if (d.gpuEffectSource != s->tex || d.gpuEffectKey != key) {
+                    RenderProfileTimer timer(profileActive_,
+                                             frameProfile_.gpuEffectMs);
+                    if (gpuEffects_->apply(renderer_, s->tex,
+                                           d.gpuEffectTexture,
+                                           s->w, s->h, visualFx)) {
+                        d.gpuEffectSource = s->tex;
+                        d.gpuEffectKey = key;
+                        if (profileActive_) ++frameProfile_.gpuEffectPasses;
+                    } else {
+                        d.gpuEffectSource = nullptr;
+                        d.gpuEffectKey.clear();
+                    }
+                }
+                if (d.gpuEffectSource == s->tex &&
+                    d.gpuEffectKey == key) {
+                    texture = d.gpuEffectTexture;
+                    d.gpuEffectLastUsed = ++gpuEffectClock_;
+                }
+            }
+        }
+    }
+    // Software, OpenGL ES and unsupported GL drivers use the original CPU
+    // path. Collision queries never use the GPU cache.
     Rendered r;
-    const Rendered* rd = renderedFor(t, s, &r);
-    if (!rd->tex) return;
+    const Rendered* rd = nullptr;
+    if (!texture) {
+        rd = renderedFor(t, s, &r,
+                         modulateGhost ? &withoutGhost : nullptr);
+        texture = rd ? rd->tex : nullptr;
+    }
+    if (!texture) return;
 
     double scr = stageRect_.w / double(stageW_);      // window px / 論理 px
     double k = (t->size / 100.0) / s->scale * scr;    // tex px → window px
@@ -4075,8 +5254,8 @@ void SdlRenderer::drawDrawable(Drawable& d) {
     SDL_Rect dst{
         static_cast<int>(std::lround(winCx - s->rcx * s->scale * k)),
         static_cast<int>(std::lround(winCy - s->rcy * s->scale * k)),
-        static_cast<int>(std::lround(rd->w * k)),
-        static_cast<int>(std::lround(rd->h * k)),
+        static_cast<int>(std::lround(s->w * k)),
+        static_cast<int>(std::lround(s->h * k)),
     };
     if (dst.w <= 0 || dst.h <= 0) return;
 
@@ -4089,11 +5268,39 @@ void SdlRenderer::drawDrawable(Drawable& d) {
         flip = SDL_FLIP_HORIZONTAL;
     SDL_Point center{static_cast<int>(s->rcx * s->scale * k),
                      static_cast<int>(s->rcy * s->scale * k)};
-    SDL_RenderCopyEx(renderer_, rd->tex, nullptr, &dst, angle, &center,
+    uint8_t originalAlpha = 255;
+    if (modulateGhost) {
+        SDL_GetTextureAlphaMod(texture, &originalAlpha);
+        const auto opacity = static_cast<uint8_t>(std::lround(
+            (1.0 - std::clamp(ghost, 0.0, 100.0) / 100.0) * 255.0));
+        SDL_SetTextureAlphaMod(texture, opacity);
+    }
+    SDL_RenderCopyEx(renderer_, texture, nullptr, &dst, angle, &center,
                      flip);
+    if (modulateGhost) SDL_SetTextureAlphaMod(texture, originalAlpha);
+    if (profileActive_) {
+        if (d.group == "sprite") ++frameProfile_.sprites;
+        else ++frameProfile_.backdrops;
+        if (perSprite) ++perSprite->copies;
+    }
+}
+
+std::vector<SpriteProfileRow> SdlRenderer::profileSprites() const {
+    std::vector<SpriteProfileRow> result;
+    result.reserve(spriteProfileTotals_.size());
+    for (const auto& [sprite, row] : spriteProfileTotals_) {
+        (void)sprite;
+        result.push_back(row);
+    }
+    std::sort(result.begin(), result.end(),
+              [](const SpriteProfileRow& a, const SpriteProfileRow& b) {
+                  return a.drawMs > b.drawMs;
+              });
+    return result;
 }
 
 void SdlRenderer::drawPenLayer() {
+    RenderProfileTimer timing(profileActive_, frameProfile_.penMs);
     if (!penTex_) return;
     penFlushCpuBatch();   // 遅延バッチを penPx_ へ反映
     // gpuDirect: ペン FBO が SDL テクスチャそのもの（interop）。readback も
@@ -4104,6 +5311,13 @@ void SdlRenderer::drawPenLayer() {
     if (!gpuDirect) penSyncCpu();
 #else
     penSyncCpu();   // GPU バッチが残っていれば FBO へ描画し penPx_ へ戻す
+#endif
+    // Capture the content change before CPU upload clears penDirty_.
+    // With zero-copy GL interop, penDirty_ can remain true indefinitely:
+    // sdlTexDirty is the actual change flag for that path.
+    bool penVisualChanged = penDirty_;
+#if defined(XYO_PEN_GL)
+    if (gpuDirect) penVisualChanged = glPen_ && glPen_->sdlTexDirty;
 #endif
     if (penDirty_ && !gpuDirect) {
         {
@@ -4128,6 +5342,34 @@ void SdlRenderer::drawPenLayer() {
         }
         penDirty_ = false;
     }
+    // Pen-only FidelityFX FSR 1 (EASU + RCAS). Keep the persistent pen FBO
+    // at native resolution; only its display copy is reconstructed.
+    SDL_Texture* displayPen = penTex_;
+    if (penFsrEnabled_ && stageRect_.w > 0 && stageRect_.h > 0) {
+        double outputScale = 1.0;
+        if (!embedded_ && window_) {
+            int rw = 0, rh = 0, ww = 0, wh = 0;
+            SDL_GetRendererOutputSize(renderer_, &rw, &rh);
+            SDL_GetWindowSize(window_, &ww, &wh);
+            if (rw > 0 && rh > 0 && ww > 0 && wh > 0)
+                outputScale = std::min(double(rw) / ww, double(rh) / wh);
+        }
+        const int outputW = std::max(1, int(std::lround(stageRect_.w * outputScale)));
+        const int outputH = std::max(1, int(std::lround(stageRect_.h * outputScale)));
+        if (outputW > penW_ && outputH > penH_) {
+            if (!glPenFsr_) glPenFsr_ = std::make_unique<GlFsrPen>();
+            if (glPenFsr_->available(renderer_)) {
+                if (SDL_Texture* result = glPenFsr_->apply(
+                        renderer_, penTex_, outputW, outputH,
+                        gpuDirect, 0.65f, penVisualChanged, penFsrRcas_)) {
+                    displayPen = result;
+#if defined(XYO_PEN_GL)
+                    if (glPen_) glPen_->sdlTexDirty = false;
+#endif
+                }
+            }
+        }
+    }
     SDL_Rect r = sdlRect(stageRect_);
     {
         PenTimer pcopy(&g_penProf.copyMs, true);
@@ -4135,10 +5377,10 @@ void SdlRenderer::drawPenLayer() {
         // テクスチャ行 0 は画面下端なので、SDL 側で上下反転して描く
         // （非 interop 経路は readback 時に CPU 側で反転済み）。
         if (gpuDirect)
-            SDL_RenderCopyEx(renderer_, penTex_, nullptr, &r, 0.0, nullptr,
+            SDL_RenderCopyEx(renderer_, displayPen, nullptr, &r, 0.0, nullptr,
                              SDL_FLIP_VERTICAL);
         else
-            SDL_RenderCopy(renderer_, penTex_, nullptr, &r);
+            SDL_RenderCopy(renderer_, displayPen, nullptr, &r);
     }
 }
 
@@ -4175,6 +5417,7 @@ SDL_Texture* SdlRenderer::textTexture(const std::u16string& s, int px,
 }
 
 void SdlRenderer::drawBubble(Target* t) {
+    RenderProfileTimer timing(profileActive_, frameProfile_.uiMs);
     FontRenderer* fr = FontRenderer::get();
     if (!fr->ok()) return;
     double scr = stageRect_.w / double(stageW_);
@@ -4331,6 +5574,7 @@ std::u16string monitorText(Value v, bool round6) {
 ///             （太字 index + 値チップ #FF661A + 白文字 + 1px 枠）/ 白フッタ
 /// コンテナは #E5F0FF + 1px rgba(0,0,0,.15) + radius 4（$space/2）。
 void SdlRenderer::drawMonitors() {
+    RenderProfileTimer timing(profileActive_, frameProfile_.monitorMs);
     FontRenderer* fr = FontRenderer::get();
     if (!fr->ok()) return;
 
@@ -4491,7 +5735,7 @@ void SdlRenderer::drawMonitors() {
                            255, kMonBorder[0], kMonBorder[1], kMonBorder[2],
                            kMonBorder[3]);
                 const std::u16string item =
-                    list ? monitorText(list->items[i], false)
+                    list ? monitorText(list->get0(i), false)
                          : std::u16string();
                 int tw = 0, th = 0;
                 SDL_Texture* tt =
@@ -4618,6 +5862,7 @@ void SdlRenderer::askSubmit() {
 }
 
 void SdlRenderer::drawAskBar() {
+    RenderProfileTimer timing(profileActive_, frameProfile_.uiMs);
     if (!askActive_) return;
     double scr = stageRect_.h / double(stageH_);
     int barH = askBarHeightPx(stageRect_, stageH_);
@@ -4768,6 +6013,7 @@ void SdlRenderer::sliderDragTo(int mx) {
 }
 
 void SdlRenderer::drawUiChrome() {
+    RenderProfileTimer timing(profileActive_, frameProfile_.uiMs);
     int hov = -1;
     {
         int mx = 0, my = 0;
@@ -5085,6 +6331,12 @@ bool SdlRenderer::handleEvent(const SDL_Event& ev) {
         break;
     case SDL_KEYDOWN:
     case SDL_KEYUP: {
+        if (ev.type == SDL_KEYDOWN && !ev.key.repeat &&
+            ev.key.keysym.sym == SDLK_F5) {
+            hotSaveRequested_ = true;
+            break;
+        }
+        if (ev.key.keysym.sym == SDLK_F5) break;
         if (askActive_) {   // 入力中はキーをランタイムへ流さず全て消費
             if (ev.type == SDL_KEYDOWN)
                 askEditKey(ev.key.keysym.sym);

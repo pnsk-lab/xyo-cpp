@@ -104,13 +104,30 @@ void runData(const char* rel, const std::vector<uint8_t>& data, int frames) {
 
     aot::BuildResult br;
     std::string why;
-    if (!aot::compileProject(a, hash, br, &why)) {
+    std::vector<aot::Progress> buildProgress;
+    if (!aot::compileProject(a, hash, br, &why,
+        [&](const aot::Progress& p) { buildProgress.push_back(p); })) {
         std::printf("FAIL aot %s: compile: %s\n", rel, why.c_str());
         ++g_aotFails;
         ++g_aotChecks;
         return;
     }
     check(br.scripts > 0, "compiled at least one script");
+    check(!buildProgress.empty() &&
+          buildProgress.front().stage == aot::ProgressStage::Codegen &&
+          buildProgress.back().stage == aot::ProgressStage::Compiled,
+          "AOT build stage boundaries reported");
+    const auto saw = [&](aot::ProgressStage stage) {
+        return std::any_of(buildProgress.begin(), buildProgress.end(),
+            [stage](const aot::Progress& p) {
+                return p.stage == stage;
+            });
+    };
+    check(saw(aot::ProgressStage::Optimize) &&
+          saw(aot::ProgressStage::EmitObject), "AOT LLVM stages reported");
+    for (const auto& p : buildProgress)
+        check(p.completed <= p.total || p.total == 0,
+              "AOT build progress bounded");
 
     a.greenFlag();
     a.runUntilDone(frames);
@@ -121,12 +138,31 @@ void runData(const char* rel, const std::vector<uint8_t>& data, int frames) {
         check(false, "second load / JIT unavailable");
         return;
     }
-    if (!b.jit->loadAot(b, br.object.data(), br.object.size(), hash, &why)) {
+    std::vector<aot::Progress> loadProgress;
+    if (!b.jit->loadAot(b, br.object.data(), br.object.size(), hash,
+                        &why, [&](const aot::Progress& p) {
+                            loadProgress.push_back(p);
+                        })) {
         std::printf("FAIL aot %s: loadAot: %s\n", rel, why.c_str());
         ++g_aotFails;
         ++g_aotChecks;
         return;
     }
+    check(!loadProgress.empty() &&
+          loadProgress.front().stage == aot::ProgressStage::LoadObject &&
+          loadProgress.back().stage == aot::ProgressStage::Loaded,
+          "AOT run startup stage boundaries reported");
+    check(std::any_of(loadProgress.begin(), loadProgress.end(),
+          [](const aot::Progress& p) {
+              return p.stage == aot::ProgressStage::BindSlots;
+          }) &&
+          std::any_of(loadProgress.begin(), loadProgress.end(),
+          [](const aot::Progress& p) {
+              return p.stage == aot::ProgressStage::RegisterScripts;
+          }), "AOT slot and script loading progress reported");
+    for (const auto& p : loadProgress)
+        check(p.completed <= p.total || p.total == 0,
+              "AOT run startup progress bounded");
     b.greenFlag();
     b.runUntilDone(frames);
     const bool same = ref == dumpState(b);

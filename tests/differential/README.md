@@ -12,6 +12,30 @@ those fixes, these cases exposed the documented divergences and two of them
 terminated xyo with `SIGSEGV`; after the fixes `run_repros.py` must report
 `0 differ` in both modes (currently 19 cases).
 
+## GUI Scratch parity (renderer and scheduler)
+
+`gui_scratch_parity_regression.py` runs the actual
+`scratch-bench/parity/Scratch Parity Test.sb3` test oracle with the SDL
+offscreen renderer. It rejects any failed test group and requires at least
+2,123 executed checks. Unlike
+`wasm_scratchbench_backend_parity.py`, which compares output equality
+**between xyo backends**, this measures whether xyo actually passes each
+Scratch test. Their score labels must not be conflated.
+
+```sh
+python3 tests/differential/gui_scratch_parity_regression.py --native build/xyo
+ctest --test-dir build-list-epoch --output-on-failure -R '^xyo-gui-scratch-parity$'
+```
+
+This test covers Interpreter, HotSpot and Eager JIT. It caught a regression
+where renderer-attached `control_wait` and the native JIT `xyo_rt_wait`
+switched from normal yield to `STATUS_YIELD_TICK`: the real GUI suite
+dropped from 2,123/2,123 passing to 2,107/2,125. Normal yield with
+`redrawRequested` is the tested Scratch-compatible behavior. The extra
+two checks reported only by the regressed schedule have not been
+independently characterized; do not equate their count with added
+coverage without a reference Scratch run.
+
 ## Layout
 
 | File | Purpose |
@@ -76,3 +100,9 @@ The scratch-vm runner attaches the repository's `FakeRenderer` and stubs
 
 Time-, random-, renderer-, audio-, and input-dependent blocks are deliberately
 not used, so a run is reproducible.
+
+## Extended semantic gauntlet
+
+For large deterministic Scratch VM vs xyo parity tests (coercion, Unicode,
+lists, floating point, and JIT type transitions), see
+[SCRATCH_GAUNTLET.md](SCRATCH_GAUNTLET.md).

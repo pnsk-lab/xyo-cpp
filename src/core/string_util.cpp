@@ -35,6 +35,224 @@ StrDebug& strDebug() { static StrDebug d; return d; }
 } // namespace
 
 
+namespace {
+StringStorageMode initialStringStorageMode() {
+    const char* name = std::getenv("XYO_STRING_STORAGE");
+    if (name) {
+        if (std::strcmp(name, "flat") == 0) return StringStorageMode::Flat;
+        if (std::strcmp(name, "append-log") == 0 || std::strcmp(name, "append") == 0)
+            return StringStorageMode::AppendLog;
+        return StringStorageMode::Rope;
+    }
+    // Backward compatibility for existing append-log A/B benchmarks.
+    const char* legacy = std::getenv("XYO_STRING_APPEND_LOG");
+    return legacy && legacy[0] == '1' ? StringStorageMode::AppendLog
+                                      : StringStorageMode::Rope;
+}
+std::atomic<StringStorageMode>& storageMode() {
+    static std::atomic<StringStorageMode> mode{initialStringStorageMode()};
+    return mode;
+}
+} // namespace
+
+StringStorageMode stringStorageMode() {
+    return storageMode().load(std::memory_order_relaxed);
+}
+
+bool setStringStorageMode(std::string_view name) {
+    StringStorageMode mode;
+    if (name == "rope") mode = StringStorageMode::Rope;
+    else if (name == "flat") mode = StringStorageMode::Flat;
+    else if (name == "append-log" || name == "append")
+        mode = StringStorageMode::AppendLog;
+    else return false;
+    storageMode().store(mode, std::memory_order_relaxed);
+    return true;
+}
+
+namespace {
+StringLeafMode initialStringLeafMode() {
+    const char* mode = std::getenv("XYO_STRING_LEAF");
+    return mode && std::strcmp(mode, "latin1") == 0
+        ? StringLeafMode::Latin1 : StringLeafMode::Utf16;
+}
+std::atomic<StringLeafMode>& leafMode() {
+    static std::atomic<StringLeafMode> mode{initialStringLeafMode()};
+    return mode;
+}
+bool fitsLatin1(std::u16string_view text) {
+    for (char16_t c : text)
+        if (c > 0xFF) return false;
+    return true;
+}
+uint32_t checkedLeafLength(size_t length, bool compact) {
+    if (length > UINT32_MAX) std::abort();
+    const size_t bytes = sizeof(SStr) +
+        (length + 1) * (compact ? sizeof(uint8_t) : sizeof(char16_t));
+    if (bytes > UINT32_MAX) std::abort();
+    return static_cast<uint32_t>(bytes);
+}
+SStr* allocateLeaf(size_t length, bool compact) {
+    auto* s = static_cast<SStr*>(Gc::get().alloc(
+        GcType::Str, checkedLeafLength(length, compact)));
+    s->len = static_cast<uint32_t>(length);
+    s->hash = 0;
+    s->initCaches();
+    if (compact) s->flags = SStr::kLatin1Flag;
+    return s;
+}
+} // namespace
+
+StringLeafMode stringLeafMode() {
+    return leafMode().load(std::memory_order_relaxed);
+}
+
+bool setStringLeafMode(std::string_view name) {
+    StringLeafMode mode;
+    if (name == "utf16") mode = StringLeafMode::Utf16;
+    else if (name == "latin1") mode = StringLeafMode::Latin1;
+    else return false;
+    leafMode().store(mode, std::memory_order_relaxed);
+    return true;
+}
+
+// A direct-mapped, strongly rooted table. There is deliberately no
+// eviction: GC can safely trace every published entry, and memory usage is
+// bounded by 4096 retained leaves. Colliding strings simply bypass the cache.
+// This is separate from the SB3 per-load interner and the small integer cache.
+namespace {
+constexpr size_t kShortInternSlots = 4096;
+constexpr uint64_t kNoShortKey = UINT64_MAX;
+
+struct ShortInternTable {
+    std::atomic<SStr*> slots[kShortInternSlots]{};
+    ShortInternTable() {
+        Gc::get().addRootProvider(this, [this](Gc& gc) {
+            for (auto& slot : slots) {
+                if (SStr* str = slot.load(std::memory_order_acquire))
+                    gc.markPtr(str);
+            }
+        });
+    }
+};
+ShortInternTable& shortInternTable() {
+    // Keep the table alive even while static GC teardown is in progress.
+    static auto* table = new ShortInternTable();
+    return *table;
+}
+std::atomic<bool>& shortInternMode() {
+    static std::atomic<bool> enabled{[] {
+        const char* setting = std::getenv("XYO_STRING_SHORT_INTERN");
+        return setting && (std::strcmp(setting, "1") == 0 ||
+                           std::strcmp(setting, "on") == 0);
+    }()};
+    return enabled;
+}
+uint64_t shortInternKey(std::u16string_view s) {
+    if (s.size() < 2 || s.size() > 4) return kNoShortKey;
+    uint64_t key = uint64_t(s.size()) << 32;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] >= 0x80) return kNoShortKey;
+        key |= uint64_t(s[i]) << (8 * i);
+    }
+    // A run can switch between UTF-16 and Latin-1 encodings. Keep the two
+    // modes distinct for reproducible representation A/B measurements.
+    if (stringLeafMode() == StringLeafMode::Latin1) key |= 1ull << 40;
+    return key;
+}
+size_t shortInternSlot(uint64_t key) {
+    key ^= key >> 29;
+    key *= 0xbf58476d1ce4e5b9ull;
+    key ^= key >> 32;
+    return static_cast<size_t>(key) & (kShortInternSlots - 1);
+}
+bool matchesShortIntern(const SStr* candidate, std::u16string_view s) {
+    if (candidate->len != s.size()) return false;
+    if (candidate->isLatin1() !=
+        (stringLeafMode() == StringLeafMode::Latin1)) return false;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (candidate->unitAt(static_cast<uint32_t>(i)) != s[i])
+            return false;
+    }
+    return true;
+}
+SStr* lookupShortIntern(std::u16string_view text, uint64_t key) {
+    if (key == kNoShortKey) return nullptr;
+    SStr* existing = shortInternTable().slots[shortInternSlot(key)]
+                         .load(std::memory_order_acquire);
+    return existing && matchesShortIntern(existing, text) ? existing : nullptr;
+}
+SStr* publishShortIntern(std::u16string_view text, uint64_t key, SStr* fresh) {
+    if (key == kNoShortKey) return fresh;
+    auto& slot = shortInternTable().slots[shortInternSlot(key)];
+    SStr* expected = nullptr;
+    if (slot.compare_exchange_strong(expected, fresh,
+                                     std::memory_order_release,
+                                     std::memory_order_acquire))
+        return fresh;
+    // If a racing thread published the same text, reuse that object.
+    // Otherwise the first admitted string wins the slot permanently.
+    return matchesShortIntern(expected, text) ? expected : fresh;
+}
+} // namespace
+
+bool stringShortInternEnabled() {
+    return shortInternMode().load(std::memory_order_relaxed);
+}
+void setStringShortInternEnabled(bool enabled) {
+    shortInternMode().store(enabled, std::memory_order_relaxed);
+}
+
+SStr* SStr::create(std::u16string_view text) {
+    // Plain SStr construction is deliberately NOT globally interned.
+    // SB3 load scopes and numeric-formatting caches own their own identity.
+    const bool compact = stringLeafMode() == StringLeafMode::Latin1 &&
+        fitsLatin1(text);
+    SStr* s = allocateLeaf(text.size(), compact);
+    if (compact) {
+        uint8_t* dst = s->latin1Bytes();
+        for (size_t i = 0; i < text.size(); ++i)
+            dst[i] = static_cast<uint8_t>(text[i]);
+        dst[text.size()] = 0;
+    } else {
+        char16_t* dst = s->inlineBody();
+        if (!text.empty()) std::memcpy(dst, text.data(), text.size() * 2);
+        dst[text.size()] = 0;
+    }
+    return s;
+}
+
+// Only transient results of Scratch joins go through the global experiment.
+static SStr* internJoinedShort(std::u16string_view text) {
+    const uint64_t key = stringShortInternEnabled()
+        ? shortInternKey(text) : kNoShortKey;
+    if (SStr* cached = lookupShortIntern(text, key)) return cached;
+    SStr* fresh = SStr::create(text);
+    return publishShortIntern(text, key, fresh);
+}
+
+const char16_t* SStr::latin1Body() const {
+    auto* self = const_cast<SStr*>(this);
+    auto access = std::atomic_ref<char16_t*>(self->body);
+    if (char16_t* cached = access.load(std::memory_order_acquire))
+        return cached;
+    const size_t n = len;
+    auto* wide = static_cast<char16_t*>(std::malloc((n + 1) * sizeof(char16_t)));
+    if (!wide) std::abort();
+    const uint8_t* src = latin1Bytes();
+    for (size_t i = 0; i < n; ++i)
+        wide[i] = src[i];
+    wide[n] = 0;
+    char16_t* expected = nullptr;
+    if (!access.compare_exchange_strong(
+            expected, wide, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        std::free(wide);
+        return expected;
+    }
+    return wide;
+}
+
 // Experimental append-only log. Each immutable SStr snapshot holds (log, prefix
 // length). Later appends only write *past* that prefix; a fork from an old
 // snapshot allocates a new log. Fixed chunks avoid invalidating existing bytes
@@ -232,11 +450,10 @@ static SStr* makeAppendSnapshot(AppendLog* log, uint32_t length, bool ascii) {
 }
 
 SStr* sstrConsOrAppend(SStr* a, SStr* b) {
-    static const bool enabled = [] {
-        const char* v = std::getenv("XYO_STRING_APPEND_LOG");
-        return v && v[0] == '1';
-    }();
-    if (!enabled || !a || !b || b->len > 256 ||
+    const auto mode = stringStorageMode();
+    if (mode == StringStorageMode::Flat)
+        return sstrConcatStrings(a, b);
+    if (mode == StringStorageMode::Rope || !a || !b || b->len > 256 ||
         size_t(a->len) + b->len > std::numeric_limits<uint32_t>::max())
         return sstrCons(a, b);
 
@@ -500,8 +717,14 @@ const char16_t* SStr::consBody() const {
             stack.push_back(s->left);
             continue;
         }
-        std::memcpy(buf + at, s->inlineBody(),
-                    size_t(s->len) * sizeof(char16_t));
+        if (s->isLatin1()) {
+            const uint8_t* bytes = s->latin1Bytes();
+            for (uint32_t i = 0; i < s->len; ++i)
+                buf[at + i] = bytes[i];
+        } else {
+            std::memcpy(buf + at, s->inlineBody(),
+                        size_t(s->len) * sizeof(char16_t));
+        }
         at += s->len;
     }
     buf[n] = 0;
@@ -533,7 +756,9 @@ char16_t SStr::unitAt(uint32_t index) const {
     const SStr* node = this;
     for (unsigned depth = 0; depth < 32; ++depth) {
         if (node->isAppend()) return node->unitAt(index);
-        if (!node->isCons()) return node->inlineBody()[index];
+        if (!node->isCons())
+            return node->isLatin1()
+                ? node->latin1Bytes()[index] : node->inlineBody()[index];
         if (auto* flat = std::atomic_ref<char16_t*>(
                 const_cast<SStr*>(node)->body).load(std::memory_order_acquire))
             return flat[index];
@@ -592,41 +817,169 @@ SStr* sstrCreate(std::u16string_view sv) {
 }
 
 SStr* sstrFromAscii(std::string_view sv) {
-    auto* s = static_cast<SStr*>(
-        Gc::get().alloc(GcType::Str, sizeof(SStr) + (sv.size() + 1) * 2));
-    s->len = static_cast<uint32_t>(sv.size());
-    s->hash = 0;
-    s->initCaches();
-    s->flags = SStr::kAsciiKnown | SStr::kAsciiValue;   // ASCII by construction
-    for (size_t i = 0; i < sv.size(); ++i) s->data()[i] = static_cast<char16_t>(sv[i]);
-    s->data()[sv.size()] = 0;
+    const bool compact = stringLeafMode() == StringLeafMode::Latin1;
+    SStr* s = allocateLeaf(sv.size(), compact);
+    bool ascii = true;
+    if (compact) {
+        uint8_t* dst = s->latin1Bytes();
+        for (size_t i = 0; i < sv.size(); ++i) {
+            dst[i] = static_cast<uint8_t>(sv[i]);
+            if (dst[i] >= 128) ascii = false;
+        }
+        dst[sv.size()] = 0;
+    } else {
+        char16_t* dst = s->inlineBody();
+        for (size_t i = 0; i < sv.size(); ++i) {
+            dst[i] = static_cast<unsigned char>(sv[i]);
+            if (dst[i] >= 128) ascii = false;
+        }
+        dst[sv.size()] = 0;
+    }
+    s->flags |= SStr::kAsciiKnown | (ascii ? SStr::kAsciiValue : 0);
     return s;
 }
 
 SStr* sstrConcat(std::u16string_view a, std::u16string_view b) {
-    auto* s = static_cast<SStr*>(
-        Gc::get().alloc(GcType::Str,
-                        sizeof(SStr) + (a.size() + b.size() + 1) * 2));
-    s->len = static_cast<uint32_t>(a.size() + b.size());
-    s->hash = 0;
-    s->initCaches();
-    std::memcpy(s->data(), a.data(), a.size() * 2);
-    std::memcpy(s->data() + a.size(), b.data(), b.size() * 2);
-    s->data()[s->len] = 0;
+    if (stringShortInternEnabled() && a.size() + b.size() >= 2 &&
+        a.size() + b.size() <= 4) {
+        char16_t chars[4];
+        size_t pos = 0;
+        for (char16_t c : a) chars[pos++] = c;
+        for (char16_t c : b) chars[pos++] = c;
+        return internJoinedShort({chars, pos});
+    }
+    const bool compact = stringLeafMode() == StringLeafMode::Latin1 &&
+        fitsLatin1(a) && fitsLatin1(b);
+    SStr* s = allocateLeaf(a.size() + b.size(), compact);
+    if (compact) {
+        uint8_t* dst = s->latin1Bytes();
+        size_t i = 0;
+        for (char16_t c : a) dst[i++] = static_cast<uint8_t>(c);
+        for (char16_t c : b) dst[i++] = static_cast<uint8_t>(c);
+        dst[i] = 0;
+    } else {
+        char16_t* dst = s->inlineBody();
+        if (!a.empty()) std::memcpy(dst, a.data(), a.size() * 2);
+        if (!b.empty()) std::memcpy(dst + a.size(), b.data(), b.size() * 2);
+        dst[s->len] = 0;
+    }
     return s;
 }
 
 SStr* sstrConcatAscii(std::u16string_view a, std::string_view b) {
-    auto* s = static_cast<SStr*>(
-        Gc::get().alloc(GcType::Str,
-                        sizeof(SStr) + (a.size() + b.size() + 1) * 2));
-    s->len = static_cast<uint32_t>(a.size() + b.size());
-    s->hash = 0;
-    s->initCaches();
-    std::memcpy(s->data(), a.data(), a.size() * 2);
-    for (size_t i = 0; i < b.size(); ++i)
-        s->data()[a.size() + i] = static_cast<char16_t>(b[i]);
-    s->data()[s->len] = 0;
+    if (stringShortInternEnabled() && a.size() + b.size() >= 2 &&
+        a.size() + b.size() <= 4) {
+        char16_t chars[4];
+        size_t pos = 0;
+        for (char16_t c : a) chars[pos++] = c;
+        for (unsigned char c : b) chars[pos++] = c;
+        return internJoinedShort({chars, pos});
+    }
+    const bool compact = stringLeafMode() == StringLeafMode::Latin1 &&
+        fitsLatin1(a);
+    SStr* s = allocateLeaf(a.size() + b.size(), compact);
+    if (compact) {
+        uint8_t* dst = s->latin1Bytes();
+        size_t i = 0;
+        for (char16_t c : a) dst[i++] = static_cast<uint8_t>(c);
+        for (unsigned char c : b) dst[i++] = c;
+        dst[i] = 0;
+    } else {
+        char16_t* dst = s->inlineBody();
+        if (!a.empty()) std::memcpy(dst, a.data(), a.size() * 2);
+        for (size_t i = 0; i < b.size(); ++i)
+            dst[a.size() + i] = static_cast<unsigned char>(b[i]);
+        dst[s->len] = 0;
+    }
+    return s;
+}
+
+namespace {
+// Use the byte representation directly. A wide or composite operand may
+// still be Latin-1 after flattening, but must be scanned to prove it.
+bool canCopyAsLatin1(const SStr* s) {
+    if (s->isLatin1()) return true;
+    return fitsLatin1(s->view());
+}
+void copyToLatin1(uint8_t* dst, const SStr* s) {
+    if (s->isLatin1()) {
+        std::memcpy(dst, s->latin1Bytes(), s->len);
+    } else {
+        const char16_t* text = s->data();
+        for (uint32_t i = 0; i < s->len; ++i)
+            dst[i] = static_cast<uint8_t>(text[i]);
+    }
+}
+void copyToUtf16(char16_t* dst, const SStr* s) {
+    if (s->isLatin1()) {
+        const uint8_t* src = s->latin1Bytes();
+        for (uint32_t i = 0; i < s->len; ++i)
+            dst[i] = src[i];
+    } else {
+        std::memcpy(dst, s->data(), size_t(s->len) * sizeof(char16_t));
+    }
+}
+} // namespace
+
+SStr* sstrConcatStrings(const SStr* a, const SStr* b) {
+    if (stringShortInternEnabled() && size_t(a->len) + b->len >= 2 &&
+        size_t(a->len) + b->len <= 4) {
+        char16_t chars[4];
+        size_t pos = 0;
+        for (uint32_t i = 0; i < a->len; ++i) chars[pos++] = a->unitAt(i);
+        for (uint32_t i = 0; i < b->len; ++i) chars[pos++] = b->unitAt(i);
+        return internJoinedShort({chars, pos});
+    }
+    // Keep the legacy UTF-16 path identical outside compact-leaf experiments.
+    if (stringLeafMode() != StringLeafMode::Latin1 &&
+        !a->isLatin1() && !b->isLatin1())
+        return sstrConcat(a->view(), b->view());
+
+    const bool compact = stringLeafMode() == StringLeafMode::Latin1 &&
+        canCopyAsLatin1(a) && canCopyAsLatin1(b);
+    SStr* s = allocateLeaf(size_t(a->len) + b->len, compact);
+    if (compact) {
+        uint8_t* dst = s->latin1Bytes();
+        copyToLatin1(dst, a);
+        copyToLatin1(dst + a->len, b);
+        dst[s->len] = 0;
+    } else {
+        char16_t* dst = s->inlineBody();
+        copyToUtf16(dst, a);
+        copyToUtf16(dst + a->len, b);
+        dst[s->len] = 0;
+    }
+    return s;
+}
+
+SStr* sstrConcatStringAscii(const SStr* a, std::string_view b) {
+    if (!a || a->len == 0) return sstrFromAscii(b);
+    if (stringShortInternEnabled() && size_t(a->len) + b.size() >= 2 &&
+        size_t(a->len) + b.size() <= 4) {
+        char16_t chars[4];
+        size_t pos = 0;
+        for (uint32_t i = 0; i < a->len; ++i) chars[pos++] = a->unitAt(i);
+        for (unsigned char ch : b) chars[pos++] = ch;
+        return internJoinedShort({chars, pos});
+    }
+    if (stringLeafMode() != StringLeafMode::Latin1 && !a->isLatin1())
+        return sstrConcatAscii(a->view(), b);
+    const bool compact = stringLeafMode() == StringLeafMode::Latin1 &&
+        canCopyAsLatin1(a);
+    SStr* s = allocateLeaf(size_t(a->len) + b.size(), compact);
+    if (compact) {
+        uint8_t* dst = s->latin1Bytes();
+        copyToLatin1(dst, a);
+        for (size_t i = 0; i < b.size(); ++i)
+            dst[a->len + i] = static_cast<uint8_t>(b[i]);
+        dst[s->len] = 0;
+    } else {
+        char16_t* dst = s->inlineBody();
+        copyToUtf16(dst, a);
+        for (size_t i = 0; i < b.size(); ++i)
+            dst[a->len + i] = static_cast<unsigned char>(b[i]);
+        dst[s->len] = 0;
+    }
     return s;
 }
 
@@ -779,9 +1132,16 @@ bool SStr::isAscii() const {
             pending.pop_back();
         } else if (!(f & kConsFlag)) {
             bool ascii = true;
-            const char16_t* d = node->inlineBody();
-            for (uint32_t i = 0; i < node->len; ++i) {
-                if (d[i] >= 0x80) { ascii = false; break; }
+            if (node->isLatin1()) {
+                const uint8_t* d = node->latin1Bytes();
+                for (uint32_t i = 0; i < node->len; ++i) {
+                    if (d[i] >= 0x80) { ascii = false; break; }
+                }
+            } else {
+                const char16_t* d = node->inlineBody();
+                for (uint32_t i = 0; i < node->len; ++i) {
+                    if (d[i] >= 0x80) { ascii = false; break; }
+                }
             }
             publish(node, ascii);
             pending.pop_back();
@@ -895,12 +1255,30 @@ int compareStringsCaseInsensitive(std::u16string_view a, std::u16string_view b) 
     return compareLoweredViews(a, b);
 }
 
+// Exact ASCII case-insensitive comparison on compact bytes. No UTF-16
+// materialization or temporary buffers; non-ASCII keeps the Unicode path.
+static int compareLatin1Ascii(const SStr* a, const SStr* b) {
+    const auto* lhs = a->latin1Bytes();
+    const auto* rhs = b->latin1Bytes();
+    const size_t end = std::min<size_t>(a->len, b->len);
+    for (size_t i = 0; i < end; ++i) {
+        uint8_t x = lhs[i], y = rhs[i];
+        if (x >= 'A' && x <= 'Z') x = static_cast<uint8_t>(x + 32);
+        if (y >= 'A' && y <= 'Z') y = static_cast<uint8_t>(y + 32);
+        if (x != y) return x < y ? -1 : 1;
+    }
+    return a->len == b->len ? 0 : (a->len < b->len ? -1 : 1);
+}
+
 int compareStringsCaseInsensitive(const SStr* a, const SStr* b) {
     if (a == b) return 0; // immutable and already in the same representation
     // The ASCII property is cached on the string, so repeated comparisons of
     // the same operands do not rescan them before every compare.
-    if (a->isAscii() && b->isAscii())
+    if (a->isAscii() && b->isAscii()) {
+        if (a->isLatin1() && b->isLatin1())
+            return compareLatin1Ascii(a, b);
         return compareAsciiCaseInsensitive(a->view(), b->view());
+    }
     // Japanese, Chinese, Hangul and lowercased mixed-language text often
     // contain no code points changed by Unicode lowercasing. In that case
     // direct UTF-16 comparison is exact and skips Unicode folding entirely.
@@ -1095,6 +1473,42 @@ bool sstrContains(std::u16string_view hay, std::u16string_view needle) {
     return containsUnicodeFolded(hay, needle);
 }
 
+// Compact ASCII search without widening either operand; matches the Scratch
+// lowercase comparison for the ASCII-only case. Needle lengths are often 1-3.
+static bool containsLatin1Ascii(const SStr* hay, const SStr* needle) {
+    const auto* h = hay->latin1Bytes();
+    const auto* n = needle->latin1Bytes();
+    const auto fold = [](uint8_t c) {
+        return static_cast<uint8_t>(
+            c >= 'A' && c <= 'Z' ? c + 32 : c);
+    };
+    const size_t length = needle->len;
+    const size_t end = hay->len - length;
+    if (length < 4) {
+        for (size_t i = 0; i <= end; ++i) {
+            size_t j = 0;
+            for (; j < length; ++j)
+                if (fold(h[i + j]) != fold(n[j])) break;
+            if (j == length) return true;
+        }
+        return false;
+    }
+    // Match the existing UTF-16 BMH strategy for longer ASCII needles:
+    // a naive byte scan would regress badly on repetitive negative searches.
+    size_t skip[128];
+    std::fill(std::begin(skip), std::end(skip), length);
+    for (size_t i = 0; i + 1 < length; ++i)
+        skip[fold(n[i])] = length - 1 - i;
+    size_t pos = 0;
+    while (pos <= end) {
+        size_t j = length;
+        while (j && fold(h[pos + j - 1]) == fold(n[j - 1])) --j;
+        if (j == 0) return true;
+        pos += skip[fold(h[pos + length - 1])];
+    }
+    return false;
+}
+
 bool sstrContains(const SStr* hay, const SStr* needle) {
     if (needle->len == 0) return true;
     // Do not compare unlowercased UTF-16 lengths here: Unicode lowercase
@@ -1103,6 +1517,8 @@ bool sstrContains(const SStr* hay, const SStr* needle) {
     // haystack does not rescan it before the search itself.
     if (hay->isAscii() && needle->isAscii()) {
         if (needle->len > hay->len) return false;
+        if (hay->isLatin1() && needle->isLatin1())
+            return containsLatin1Ascii(hay, needle);
         return containsAscii(hay->view(), needle->view());
     }
     if (unicodeFastEnabled()) {

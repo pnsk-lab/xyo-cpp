@@ -4,7 +4,11 @@
 // playSoundAndWait の完了通知は update() がメインスレッドで resolveWait。
 #pragma once
 
+#include <condition_variable>
 #include <deque>
+#include <mutex>
+#include <thread>
+#include <unordered_set>
 #include <unordered_map>
 #include <vector>
 
@@ -37,7 +41,10 @@ public:
     void playSoundAndWait(Target*, int soundId, Thread*) override;
     void stopAllSounds(Target*) override;   // TW: 全ボイス停止
     void stop(Target*, int soundId) override;
-    void setEffects(Target*) override {}    // ボイスが target を生参照するため no-op
+    void targetDisposed(Target*) override;
+    void setEffects(Target*) override; // Snapshots updated under SDL device lock.
+    std::vector<SoundPlaybackState> captureActiveSounds() override;
+    bool restoreActiveSounds(const std::vector<SoundPlaybackState>&) override;
 
     // --- AudioAPI ---
     double getLoudness() const override;
@@ -52,14 +59,35 @@ private:
     struct Voice {
         const Sample* s = nullptr;
         double pos = 0;
+        // Target is an identity only. Never dereference from audio callback:
+        // clone disposal and Scratch effects run on the main thread.
         Target* t = nullptr;
         Thread* wait = nullptr;
+        const Sound* sound = nullptr;
+        double step = 1.0;
+        double gainL = 0.0, gainR = 0.0;
+    };
+
+    struct PendingVoice {
+        const Sound* sound = nullptr;
+        Target* target = nullptr;
+        Thread* wait = nullptr;
+        double position = 0.0;
+    };
+    struct DecodeResult {
+        const Sound* sound = nullptr;
+        Sample sample;
+        bool ok = false;
     };
 
     static void audioCb(void* ud, unsigned char* buf, int len);
     void mix(float* out, int frames);
+    const Sound* soundFor(Target* t, int soundId) const;
     const Sample* sampleFor(Target* t, int soundId);
     static bool decodeSound(const Sound& s, Sample& out);
+    void requestSound(Target* t, int soundId, Thread* wait);
+    void decoderLoop();
+    void snapshotVoice(Voice& voice) const; // main-thread only
     void finishAllVoices();
 
     Runtime* rt_ = nullptr;
@@ -67,6 +95,17 @@ private:
     int outRate_ = 48000;
     std::unordered_map<const Sound*, Sample> decoded_;
     std::unordered_map<const Sound*, bool> decodeFailed_;
+    // Only the main thread accesses decoded_/decodeFailed_/pendingVoices_.
+    // The worker owns decode calculations and passes whole Samples to update().
+    bool asyncDecode_ = false;
+    std::thread decoder_;
+    std::mutex decoderMutex_;
+    std::condition_variable decoderCv_;
+    bool decoderStop_ = false;
+    std::deque<const Sound*> decodeQueue_;
+    std::deque<DecodeResult> decodeReady_;
+    std::unordered_set<const Sound*> decoding_;
+    std::vector<PendingVoice> pendingVoices_;
     std::vector<Voice> voices_;
     std::deque<Voice> done_;      // 完了済み（wait 解決待ち）
     float peak_ = 0.0f;

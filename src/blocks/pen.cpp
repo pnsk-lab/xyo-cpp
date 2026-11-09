@@ -13,6 +13,7 @@
 #include "../core/color.hpp"
 #include "../engine/block_utility.hpp"
 #include "../engine/runtime.hpp"
+#include "../ir/commit_once_effects.hpp"
 #include "../model/target.hpp"
 
 namespace xyo {
@@ -226,12 +227,32 @@ void penClearCore(Runtime* rt) {
         rt->redrawRequested = true;
     }
 }
-void penStampCore(Target* t, Runtime* rt) {
+void penStampImmediate(Target* t, Runtime* rt) {
     int skin = penSkin(rt);
     if (skin >= 0) {
         rt->renderer->penStamp(skin, t->drawableID);
         rt->redrawRequested = true;
     }
+}
+
+void penStampCore(Target* t, Runtime* rt) {
+    if (!rt->observableJournal) {
+        penStampImmediate(t, rt);
+        return;
+    }
+    struct StampContext {
+        Target* target;
+        Runtime* runtime;
+    } context{t, rt};
+    // Interpreter and native LLVM JIT both reach this exact renderer
+    // primitive. Keep the target and renderer reference local to the
+    // synchronous host call; the queued ABI never stores a raw pointer.
+    rt->journalObservable(ir::ObservableOp::PenStamp,
+        Value::undefined(),
+        [](void* pointer, Value) noexcept {
+            auto& ctx = *static_cast<StampContext*>(pointer);
+            penStampImmediate(ctx.target, ctx.runtime);
+        }, &context);
 }
 void penSetColorToColorCore(Target* t, Value color) {
     PenState& p = penStateOf(t);

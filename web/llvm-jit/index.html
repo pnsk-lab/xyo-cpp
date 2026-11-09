@@ -12,10 +12,27 @@
     <p id="status" role="status">SB3ファイルを選択してください。</p>
   </section>
   <section class="panel">
+    <h2>ブラウザ版 Scratch プレイヤー</h2>
+    <div class="play-controls">
+      <button id="play" type="button">緑旗 / 読み込み・再生</button>
+      <button id="stop" type="button" disabled>停止</button>
+    </div>
+    <canvas id="stage" width="480" height="360" aria-label="Scratch stage" tabindex="0"></canvas>
+    <p id="player-status" role="status">SB3を選択し、緑旗で実行してください。</p>
+    <form id="ask-form" hidden>
+      <label id="ask-question" for="ask-answer"></label>
+      <input id="ask-answer" maxlength="4096" autocomplete="off" placeholder="回答を入力">
+      <button type="submit">答える</button>
+    </form>
+    <p id="player-frame" class="footnote">フレーム 0</p>
+    <pre id="player-vars" class="player-vars" aria-label="Scratch variables"></pre>
+    <p class="footnote">Canvas2Dによるコスチューム・ペン描画。キーボード操作はステージを選択してください。色判定や音声は未対応です。</p>
+  </section>
+  <section class="panel">
     <h2>xyo-cpp実行結果</h2>
     <pre id="result">実行結果はここに表示されます。</pre>
     <details><summary>参考: LLVM IR生成対象の概要</summary><pre id="ir"></pre></details>
   </section>
-  <p class="footnote">ブラウザ用のLLVMとxyo-cppランタイムは <code>public/llvm-assets/</code> に別途配置する必要があります。非対応スクリプトはxyoインタプリタへフォールバックします。レンダラ、音声、全Scratch機能のブラウザ互換性は未検証です。</p>
+  <p class="footnote">ブラウザ用のLLVMとxyo-cppランタイムは <code>public/llvm-assets/</code> に別途配置する必要があります。非対応スクリプトはxyoインタプリタへフォールバックします。Canvas2Dの描画・ペン・基本入力を接続しています。全Scratch機能の互換性は未保証です。</p>
 </main><script type="module" src="/src/main.ts"></script></body>
 </html>

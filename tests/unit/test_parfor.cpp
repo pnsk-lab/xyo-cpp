@@ -4,6 +4,7 @@
 //   - 実行: warp 手続き内の「カウンタ + append」ループが並列実行され、
 //     リスト内容・カウンタ最終値が逐次実行と完全一致する
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -268,10 +269,18 @@ std::vector<uint8_t> zipWithProject(const char* json) {
     return zw.finish();
 }
 
-void testRun() {
-    const int64_t n = 4000;
+void testRun(int64_t n, bool expectParallel) {
     const int64_t before = xyo_parfor_runs;
-    const std::vector<uint8_t> sb3 = zipWithProject(kProject);
+    // Exercise both the serial-batch and worker-parallel branches with
+    // exactly the same Scratch script and its output/counter assertions.
+    std::string project = kProject;
+    const std::string original = "\"NUM\": [4000, null]";
+    const size_t pos = project.find(original);
+    CHECK(pos != std::string::npos);
+    if (pos == std::string::npos) return;
+    project.replace(pos, original.size(),
+                    "\"NUM\": [" + std::to_string(n) + ", null]");
+    const std::vector<uint8_t> sb3 = zipWithProject(project.c_str());
     Runtime rt;
     Sb3LoadResult lr = loadSb3File(rt, sb3.data(), sb3.size());
     CHECK(lr.ok);
@@ -301,16 +310,67 @@ void testRun() {
         CHECK(allOk);
     }
 #ifndef XYO_JIT_DISABLED
-    if (jitEnabled())
-        CHECK(xyo_parfor_runs > before);   // 並列パスが実際に走った
+    if (jitEnabled()) {
+        if (expectParallel)
+            CHECK(xyo_parfor_runs > before);
+        else if (!std::getenv("XYO_PARFOR_PARALLEL_MIN") &&
+                 !std::getenv("XYO_PARFOR_CHUNK"))
+            CHECK_EQ(xyo_parfor_runs, before); // serial batch, no workers
+    }
 #endif
+}
+
+// Dynamic text append exercises tagged SStr stores, GC deferral,
+// and iteration order for helper and direct LLVM paths.
+void testRunString() {
+    std::string project = kProject;
+    const auto replaceOnce = [&](std::string_view before, std::string_view after) {
+        const size_t pos = project.find(before);
+        CHECK(pos != std::string::npos);
+        if (pos != std::string::npos)
+            project.replace(pos, before.size(), after);
+    };
+    replaceOnce("\"NUM\": [4000, null]", "\"NUM\": [1000, null]");
+    replaceOnce("\"opcode\": \"operator_multiply\"",
+                "\"opcode\": \"operator_join\"");
+    replaceOnce("\"NUM1\": [3, \"rdi\", [4, \"0\"]]",
+                "\"STRING1\": [1, [10, \"v=\"]]");
+    replaceOnce("\"NUM2\": [3, \"rdi2\", [4, \"1\"]]",
+                "\"STRING2\": [3, \"rdi\", [10, \"0\"]]");
+    const auto sb3 = zipWithProject(project.c_str());
+    Runtime rt;
+    Sb3LoadResult loaded = loadSb3File(rt, sb3.data(), sb3.size());
+    CHECK(loaded.ok);
+    if (!loaded.ok) return;
+    rt.greenFlag();
+    rt.runUntilDone(10000);
+    Target* sprite = rt.getSpriteTargetByName(u"S");
+    CHECK(sprite != nullptr);
+    if (!sprite) return;
+    Variable* var = sprite->lookupVariableById("vL");
+    CHECK(var != nullptr && var->list != nullptr);
+    if (!var || !var->list) return;
+    CHECK_EQ(var->list->len, 1000u);
+    if (var->list->len != 1000) return;
+    bool allStrings = true;
+    for (uint32_t i = 0; i < 1000; ++i) {
+        const Value v = var->list->items[i];
+        const auto expected = utf8ToU16("v=" + std::to_string(i + 1));
+        if (!v.isString() || cast::toString(v)->view() != expected) {
+            allStrings = false;
+            break;
+        }
+    }
+    CHECK(allStrings);
 }
 
 }  // namespace
 
 int test_parfor_main() {
     testDetect();
-    testRun();
+    testRun(1000, false);
+    testRun(4000, true);
+    testRunString();
     std::printf("parfor: %d checks, %d failures\n", g_checks, g_fail);
     return g_fail;
 }

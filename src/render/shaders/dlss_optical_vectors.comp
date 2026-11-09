@@ -1,0 +1,54 @@
+#version 450
+
+// Vulkan optical flow produces R16G16_SFIXED5_NV on a coarse grid.
+// A Vulkan transfer copies that VkImage into an SSBO packed as int16 x/y.
+// This compute kernel decodes the signed fixed-point values and expands
+// them to the per-render-pixel RG16F motion vector image required by DLSS.
+// Optical flow INPUT=current, REFERENCE=previous => vectors current->previous.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly buffer OpticalFlowPacked {
+    uint words[];
+} flow;
+
+layout(rg16f, binding = 1) writeonly uniform image2D dlssMotion;
+
+// Optional NVIDIA NVOFA cost map. Four 8-bit costs per uint32.
+// A non-zero threshold gates unreliable *local* motion to zero.
+// This is a diagnostic policy: no guarantee of reducing DLSS ghosting.
+layout(std430, binding = 2) readonly buffer FlowCosts {
+    uint words[];
+} costs;
+
+layout(push_constant) uniform GridParams {
+    int outputWidth;
+    int outputHeight;
+    int gridWidth;
+    int gridHeight;
+    int gridSize;
+    int costLimit;
+} params;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= params.outputWidth || p.y >= params.outputHeight)
+        return;
+
+    // The fixed-point values use 5 fractional bits: 1 raw count = 1/32px.
+    ivec2 g = clamp(p / params.gridSize, ivec2(0),
+                    ivec2(params.gridWidth - 1, params.gridHeight - 1));
+    uint packed = flow.words[g.y * params.gridWidth + g.x];
+    int vx = int(packed << 16) >> 16;
+    int vy = int(packed) >> 16;
+    if (params.costLimit > 0) {
+        uint index = uint(g.y * params.gridWidth + g.x);
+        uint word = costs.words[index / 4u];
+        uint cost = (word >> ((index % 4u) * 8u)) & 255u;
+        if (cost >= uint(params.costLimit)) {
+            vx = 0;
+            vy = 0;
+        }
+    }
+    imageStore(dlssMotion, p, vec4(float(vx) / 32.0,
+                                  float(vy) / 32.0, 0.0, 0.0));
+}

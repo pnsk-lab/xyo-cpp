@@ -43,6 +43,15 @@ bool getTargetXY(Value targetName, Runtime& rt, double& tx, double& ty);
 /// サウンド名/番号 → sounds index（見つからなければ -1）。
 int getSoundIndex(Value soundName, Target* t);
 
+// Exactly one host-side sound playback start. The optional waiting Thread*
+// retains the historical promise/wait-queue contract; the host journal
+// commits only the start, not completion or any future audio callback.
+void startSoundPlayback(Target* target, int soundId, Thread* waitingThread);
+
+// Synchronous create-clone host boundary; cloning itself may start clone
+// hats, but no generated code may replay it after a speculative rollback.
+void createCloneForTarget(Target* source, Runtime* runtime);
+
 /// looks effect の範囲クランプ。
 double clampEffect(const std::u16string& effect, double value);
 

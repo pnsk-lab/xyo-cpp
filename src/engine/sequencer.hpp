@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 #include "pool.hpp"
@@ -12,10 +13,13 @@
 namespace xyo {
 
 struct Runtime;
+struct Block;
+namespace wasm { class NestedJitCache; }
 struct DepGraph;
 struct AccessSet;
 class Fiber;
 class WarpClockWatchdog;
+struct NativeSourceHandoff;
 
 class Sequencer {
 public:
@@ -26,6 +30,7 @@ public:
     std::atomic<int64_t>* sampledWarpClock() const;
     std::atomic<int64_t>* sampledWarpDeadline() const;
     std::atomic<int64_t>* sampledUnixClock() const;
+    std::atomic<uint64_t>* sampledUnixDays() const;
 
     Runtime& runtime;
     Timer timer;
@@ -54,9 +59,30 @@ public:
     /// 1 スレッドを可能な限り進める。
     void stepThread(Thread& thread);
     /// stack.size() > minDepth の間だけ進める（JIT compat 入力評価用）
-    void stepThreadBound(Thread& thread, size_t minDepth);
+    // Optional top-level checkpoint stops *before* the selected block.
+    // yielded is set when an interpreter scheduling checkpoint was reached,
+    // even when its status is normalized back to STATUS_RUNNING.
+    void stepThreadBound(Thread& thread, size_t minDepth,
+                         const std::string* stopAt = nullptr,
+                         bool* yielded = nullptr);
+    // Called only from execute() after the interpreter has resolved its
+    // BlockCached. Avoid a second block lookup on every interpreted opcode.
+    bool tryNestedWasm(Thread& thread, const BlockCached& cached,
+                       std::string& pastEndId);
+    bool nestedWarpOnly() const noexcept { return nestedWarpOnly_; }
     /// コンパイル済みスレッドを fiber 経由で進める
     void jitStepThread(Thread& thread);
+    // Transfer a suspended native LLVM CallFrame, its immutable source-PC
+    // decoder and independently rooted arguments to the scheduler. The
+    // result is data only; arbitrary SSA/effect resumption is unsupported.
+    std::unique_ptr<NativeSourceHandoff> captureNativeSourceHandoff(
+        const Thread& thread) const;
+    // Strict opt-in conversion from a validated native repeat yield to an
+    // interpreter loop frame. On rejection the native Fiber is untouched.
+    bool adoptSimpleNativeSourceHandoff(
+        Thread& thread, const NativeSourceHandoff& handoff);
+    // Explicitly attached shared-IR numeric continuation, experimental.
+    void numericStepThread(Thread& thread);
     void stepToBranch(Thread& thread, int branchNum, bool isLoop);
     void stepToProcedure(Thread& thread, const std::string& procedureCode);
     void retireThread(Thread& thread);
@@ -86,6 +112,11 @@ public:
     const ParallelStats& parallelStats() const { return parStats_; }
 
 private:
+    // Nested interpreter statements can be compiled independently of the
+    // event hat while the interpreter retains exact loop/procedure/yield
+    // frames. No native JIT backend uses this cache.
+    std::unique_ptr<wasm::NestedJitCache> nestedJit_;
+    bool nestedWarpOnly_ = false;
     std::unique_ptr<WarpClockWatchdog> warpWatchdog_;
     const AccessSet* parallelAccessFor(Thread& t) const;
     std::unique_ptr<WorkerPool> parPool_;
@@ -96,6 +127,8 @@ private:
     int depGraphSeq_ = 0;
     uint64_t eventSkippedPasses_ = 0;
     uint64_t eventWakeups_ = 0;
+    std::unordered_map<const Block*, bool> idleSoundPollCache_;
+    bool idleSoundPollFor(const Thread& thread);
 };
 
 } // namespace xyo

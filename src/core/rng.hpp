@@ -13,6 +13,15 @@ public:
     Rng() { seed(std::random_device{}() * 0x9E3779B97F4A7C15ull + 1); }
     explicit Rng(uint64_t s) { seed(s); }
 
+    // Checkpoint is only valid on the main runtime thread. Parallel worker
+    // streams cannot be snapshotted without a scheduling barrier.
+    uint64_t state() const { return state_; }
+    uint64_t increment() const { return inc_; }
+    void restore(uint64_t state, uint64_t increment) {
+        state_ = state;
+        inc_ = increment | 1u;
+    }
+
     void seed(uint64_t s) {
         state_ = 0;
         inc_ = (s << 1) | 1;

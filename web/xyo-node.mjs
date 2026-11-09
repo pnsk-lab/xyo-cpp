@@ -23,8 +23,55 @@ const createXyo = require(resolve(process.cwd(), jsPath));
 // -sMAXIMUM_MEMORY=2147483648 に合わせる（32768 ページ = 2GiB）。
 const memory = new WebAssembly.Memory({ initial: 256, maximum: 32768 });
 
+const options = { wasmMemory: memory, arguments: args };
+
+// Optional Binaryen optimization for generated HotSpot WASM.
+// Use either Binaryen's npm module or the local N-API adapter built from
+// web/binaryen-node. Both run synchronously and return actual optimized bytes.
+if (process.env.XYO_BINARYEN_JS === '1' &&
+    process.env.XYO_BINARYEN_NODE_ADDON) {
+  throw new Error('Choose either XYO_BINARYEN_JS or XYO_BINARYEN_NODE_ADDON');
+}
+if (process.env.XYO_BINARYEN_NODE_ADDON) {
+  const addon = require(resolve(
+    process.cwd(), process.env.XYO_BINARYEN_NODE_ADDON));
+  if (!addon.available()) {
+    throw new Error('Binaryen N-API adapter could not load libbinaryen.so');
+  }
+  const levelText = process.env.XYO_BINARYEN_OPT_LEVEL || '2';
+  if (!/^[0-3]$/.test(levelText))
+    throw new Error('XYO_BINARYEN_OPT_LEVEL must be 0..3');
+  let count = 0;
+  options.xyoOptimizeWasm = bytes => {
+    if (!WebAssembly.validate(bytes)) {
+      throw new Error('refusing to optimize invalid WebAssembly');
+    }
+    const result = addon.optimize(Buffer.from(bytes), Number(levelText));
+    if (!WebAssembly.validate(result)) {
+      throw new Error('Binaryen N-API produced invalid WebAssembly');
+    }
+    ++count;
+    if (process.env.XYO_BINARYEN_DIAGNOSTICS === '1') {
+      console.error('[binaryen-native] optimized #' + count +
+        ': ' + bytes.byteLength + ' -> ' + result.byteLength + ' bytes');
+    }
+    return result;
+  };
+}
+if (process.env.XYO_BINARYEN_JS === '1') {
+  const { default: binaryen } = await import('binaryen');
+  options.xyoOptimizeWasm = (bytes) => {
+    const module = binaryen.readBinary(bytes);
+    try {
+      module.optimize();
+      return module.emitBinary();
+    } finally {
+      module.dispose();
+    }
+  };
+}
 try {
-  await createXyo({ wasmMemory: memory, arguments: args });
+  await createXyo(options);
 } catch (e) {
   // -sEXIT_RUNTIME=1 では main 復帰時に ExitStatus が throw される。
   if (e && e.name === 'ExitStatus') {

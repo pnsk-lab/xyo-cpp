@@ -1,6 +1,10 @@
 // xyo-cpp: ECMAScript 準拠の数値↔文字列変換。
 #include "jsnum.hpp"
 
+#if defined(XYO_NUM_TO_STR_DRAGONBOX)
+#include "v8_decimal.hpp"
+#endif
+
 #include <bit>
 #include <cstdint>
 #include <charconv>
@@ -31,7 +35,64 @@ static double strtodC(const char* s) {
 
 // --- ES String(x) ---
 
+#if defined(XYO_ASM_NUM_TO_STR)
+// System V AMD64: writes signed decimal digits to buffer[32].
+extern "C" size_t xyo_i64_to_ascii_asm(int64_t value, char* buffer);
+#endif
+#if defined(XYO_ASM_ECMA_FORMAT)
+// Input is the shortest positive decimal significand and decimal point
+// position. Writes ECMAScript's fixed/scientific representation to buffer.
+extern "C" size_t xyo_ecma_format_asm(
+    const char* digits, uint32_t length, int32_t point, char* buffer);
+extern "C" size_t xyo_ecma_from_scientific_asm(
+    const char* scientific, uint32_t length, char* buffer);
+#endif
+
+#if defined(XYO_NUM_TO_STR_DRAGONBOX)
+size_t toChars(double v, char* output) {
+    if (std::isnan(v)) {
+        std::memcpy(output, "NaN", 3);
+        return 3;
+    }
+    if (v == 0) {
+        output[0] = '0';  // ECMAScript String(-0) == "0".
+        return 1;
+    }
+
+    char* cursor = output;
+    if (v < 0) {
+        *cursor++ = '-';
+        v = -v;
+    }
+    if (std::isinf(v)) {
+        std::memcpy(cursor, "Infinity", 8);
+        return static_cast<size_t>(cursor + 8 - output);
+    }
+    constexpr double kMaxExactInt = 9007199254740992.0;
+    if (v <= kMaxExactInt) {
+        const long long integer = static_cast<long long>(v);
+        if (static_cast<double>(integer) == v) {
+#if defined(XYO_ASM_NUM_TO_STR)
+            if (integer >= 10 && integer <= 99) {
+                return static_cast<size_t>(cursor - output) +
+                       xyo_i64_to_ascii_asm(integer, cursor);
+            }
+#endif
+            const auto result = std::to_chars(cursor, output + 64, integer);
+            return static_cast<size_t>(result.ptr - output);
+        }
+    }
+    return static_cast<size_t>(cursor - output) +
+           v8_decimal::toCharsPositive(v, cursor);
+}
+#endif
+
 std::string toString(double v) {
+#if defined(XYO_NUM_TO_STR_DIRECT_BUFFER)
+    char buffer[64];
+    const size_t count = toChars(v, buffer);
+    return std::string(buffer, count);
+#endif
     if (std::isnan(v)) return "NaN";
     if (v == 0) return "0";                     // -0 もここ
     // 整数 fast path: |v| <= 2^53 の整数は正確に表現でき、その十進整数が
@@ -41,13 +102,28 @@ std::string toString(double v) {
     if (v >= -kMaxExactInt && v <= kMaxExactInt) {
         long long iv = static_cast<long long>(v);
         if (static_cast<double>(iv) == v) {
-            char buf[24];
+            char buf[32];
+#if defined(XYO_ASM_NUM_TO_STR)
+            // Assembly is faster for 1-2 digit numbers, but our measured
+            // system std::to_chars outperforms it on larger integers.
+            // Keep the native implementation for those inputs.
+            if ((iv >= 10 && iv <= 99) || (iv <= -10 && iv >= -99)) {
+                const size_t len = xyo_i64_to_ascii_asm(iv, buf);
+                return std::string(buf, len);
+            }
+#endif
             auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), iv);
             if (ec == std::errc()) return std::string(buf, ptr);
         }
     }
     if (v < 0) return "-" + toString(-v);
     if (std::isinf(v)) return "Infinity";
+
+#if defined(XYO_NUM_TO_STR_DRAGONBOX)
+    // V8 Dragonbox gives decimal significand and exponent directly.
+    // V8's SignificandToChars emits digits without scientific text parsing.
+    return v8_decimal::toStringPositive(v);
+#endif
 
     // 最短往復表現。**std::to_chars(scientific) は Ryu で最短桁を返す**
     // ので、それを桁の生成に使う（ビット一致は 40 万件のサンプル +
@@ -76,6 +152,14 @@ std::string toString(double v) {
         }
     }
 
+#if defined(XYO_ASM_ECMA_FORMAT)
+    // Shortest-roundtrip digits are computed by std::to_chars; hand-written
+    // ASM parses the scientific decimal and lays it out as ECMAScript text.
+    char text[64];
+    const size_t length = xyo_ecma_from_scientific_asm(
+        sv.data(), static_cast<uint32_t>(sv.size()), text);
+    return std::string(text, length);
+#else
     int e = 0;
     size_t epos = sv.find('e');
     if (epos == std::string_view::npos) epos = sv.find('E');
@@ -107,8 +191,7 @@ std::string toString(double v) {
     digits[k] = '\0';
     int n = e - fracLen + k;
 
-    // Keep short decimal results in the string's inline buffer. Reserving 32
-    // forced a heap allocation even for the common "0.25"/"1234.5" cases.
+    // Legacy C++ formatter: reference path and non-ASM platforms.
     std::string out;
     if (k <= n && n <= 21) {
         // s の後に n-k 個の 0
@@ -134,6 +217,7 @@ std::string toString(double v) {
         out.append(eb, ep);
     }
     return out;
+#endif
 }
 
 std::u16string toString16(double v) {
@@ -170,6 +254,17 @@ double toNumber(std::u16string_view sv) {
     if (lo == hi) return 0;                     // 空 or 空白のみ → +0
     sv = sv.substr(lo, hi - lo);
 
+    // One-character numeric strings ("0".."9") are common after
+    // joins and list access. They do not need sign/radix detection,
+    // integer overflow checks, or the general decimal parser.
+    if (sv.size() == 1) {
+        // Whitespace was already stripped, and no other single UTF-16
+        // code unit is a valid ECMAScript NumericLiteral.
+        return isDigit(sv[0])
+            ? static_cast<double>(sv[0] - u'0')
+            : std::numeric_limits<double>::quiet_NaN();
+    }
+
     // 0x / 0o / 0b 接頭辞は符号を取らない（ES: 符号は StrDecimalLiteral のみ）
     if (sv.size() >= 2 && sv[0] == u'0') {
         char16_t p = sv[1];
@@ -177,6 +272,27 @@ double toNumber(std::u16string_view sv) {
             int base = (p == u'x' || p == u'X') ? 16 : (p == u'o' || p == u'O') ? 8 : 2;
             auto rest = sv.substr(2);
             if (rest.empty()) return std::numeric_limits<double>::quiet_NaN();
+            // Short binary/octal/hexadecimal values fit exactly in the
+            // IEEE-754 significand. Select the integer decoder ONCE based on
+            // the digit count, not per digit. Larger inputs retain the
+            // original FP recurrence (and therefore the original rounding).
+            const unsigned maxExactDigits =
+                base == 16 ? 13u : base == 8 ? 17u : 53u;
+            if (rest.size() <= maxExactDigits) {
+                uint64_t exact = 0;
+                const unsigned shift = base == 16 ? 4u :
+                                       base == 8 ? 3u : 1u;
+                for (char16_t c : rest) {
+                    int d;
+                    if (isDigit(c)) d = c - u'0';
+                    else if (c >= u'a' && c <= u'f') d = c - u'a' + 10;
+                    else if (c >= u'A' && c <= u'F') d = c - u'A' + 10;
+                    else return std::numeric_limits<double>::quiet_NaN();
+                    if (d >= base) return std::numeric_limits<double>::quiet_NaN();
+                    exact = (exact << shift) | unsigned(d);
+                }
+                return static_cast<double>(exact);
+            }
             double v = 0;
             for (char16_t c : rest) {
                 int d;
@@ -196,6 +312,12 @@ double toNumber(std::u16string_view sv) {
         neg = sv[0] == u'-';
         sv.remove_prefix(1);
         if (sv.empty()) return std::numeric_limits<double>::quiet_NaN();
+        // A sign followed by exactly one digit is an exact conversion.
+        // Unary minus on zero must retain the IEEE-754 negative-zero bit.
+        if (sv.size() == 1 && isDigit(sv[0])) {
+            const double d = static_cast<double>(sv[0] - u'0');
+            return neg ? -d : d;
+        }
     }
 
     // Infinity
@@ -204,6 +326,62 @@ double toNumber(std::u16string_view sv) {
                    : std::numeric_limits<double>::infinity();
     }
 
+    // Most first-use Scratch numeric strings are small decimal integers.
+    // Parse them without locale setup, a temporary ASCII buffer, or strtod.
+    // Only return directly while the integer is exactly representable as a
+    // double; larger values must use the correctly-rounded decimal parser.
+    constexpr uint64_t kMaxExactInteger = 9007199254740992ull; // 2^53
+    if (sv.size() <= 18 && isDigit(sv[0])) {
+        uint64_t integer = 0;
+        bool integral = true;
+        for (char16_t c : sv) {
+            if (!isDigit(c)) {
+                integral = false;
+                break;
+            }
+            unsigned digit = static_cast<unsigned>(c - u'0');
+            if (integer > (kMaxExactInteger - digit) / 10) {
+                integral = false;
+                break;
+            }
+            integer = integer * 10 + digit;
+        }
+        if (integral) {
+            double value = static_cast<double>(integer);
+            return neg ? -value : value; // Also preserves -0.
+        }
+    }
+
+    // Most decimal strings in Scratch are short. From_chars is a full
+    // consumer of the decimal grammar once the leading sign is removed;
+    // require complete consumption and an ASCII numeric starting character
+    // to reject extensions such as "nan", "inf", or trailing junk. This
+    // avoids the separate UTF-16 grammar scan for typical decimals.
+    // Overflow/underflow are delegated to the existing C-locale fallback.
+    if (sv.size() < 64 && (isDigit(sv[0]) || sv[0] == u'.')) {
+        char ascii[64];
+        const size_t length = sv.size();
+        for (size_t j = 0; j < length; ++j) {
+            if (sv[j] > 0x7f)
+                return std::numeric_limits<double>::quiet_NaN();
+            ascii[j] = static_cast<char>(sv[j]);
+        }
+        double result = 0;
+        auto parsed = std::from_chars(
+            ascii, ascii + length, result, std::chars_format::general);
+        if (parsed.ptr == ascii + length) {
+            if (parsed.ec == std::errc())
+                return neg ? -result : result;
+            if (parsed.ec == std::errc::result_out_of_range) {
+                ascii[length] = '\0';
+                result = strtodC(ascii);
+                return neg ? -result : result;
+            }
+        }
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+
+    // Long decimal literals use the existing full grammar validation.
     // 10 進リテラルの形状検証: [0-9]* (. [0-9]*)? ([eE][+-]?[0-9]+)? で少なくとも1桁
     size_t i = 0, n = sv.size();
     bool anyDigit = false;
@@ -231,7 +409,15 @@ double toNumber(std::u16string_view sv) {
     }
     for (size_t j = 0; j < n; ++j) dst[j] = static_cast<char>(sv[j]);
     dst[n] = '\0';
-    double v = strtodC(dst);
+    // from_chars is locale-independent and ordinarily uses a fast
+    // correctly-rounded decimal converter. We have already validated the
+    // ECMAScript grammar. Preserve strtod_l for out-of-range values,
+    // including overflow to Infinity and underflow to signed zero.
+    double v;
+    auto parsed = std::from_chars(dst, dst + n, v,
+                                  std::chars_format::general);
+    if (parsed.ec != std::errc() || parsed.ptr != dst + n)
+        v = strtodC(dst);
     return neg ? -v : v;
 }
 

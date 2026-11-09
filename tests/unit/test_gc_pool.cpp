@@ -132,6 +132,8 @@ void rootedGraphAndReentrantAllocation() {
     SStr* large = flat(gc, 200, u'z');
     auto* list = static_cast<SList*>(gc.alloc(GcType::List, sizeof(SList)));
     list->len = list->cap = 2;
+    list->extra = nullptr; // Manually constructed GC list uses flat storage.
+    list->storageEpoch = 1;
     list->monitorDirty = false;
     list->items = static_cast<Value*>(std::malloc(2 * sizeof(Value)));
     list->items[0] = Value::string(c);

@@ -219,6 +219,17 @@ node web/xyo-node.mjs build-wasm-jit/xyo.js wasm-selftest
 4. **ブラウザでの通し確認**: `XYO_WASM_BROWSER` + `XYO_WASM_JIT` の組み合わせ
    （MODULARIZE 形のシェル対応）と、ブラウザでの instantiate 検証。
 
+### 2026-11: WASM HotSpot 統合
+
+Emscripten の \`XYO_JIT_BACKEND=wasm\` では、既存 HotSpot が数値中心の
+非 yield スクリプトを選んで WebAssembly を生成し、JS WebAssembly
+エンジンにインスタンス化させて実行できる。通常の repeat/手続きなどは
+yield 継続位置を表現できないため Interpreter に残す。実行失敗時は
+変更前の値を保持したまま Interpreter にフォールバックする。
+
+ビルド、Binaryen.js の任意連携、Node.js での比較テストは
+[WASM HotSpot JIT](wasm-hotspot.md) を参照。
+
 ## 6. 決定的な手続き解決（Phase A で修正した実バグ）
 
 TurboWarp は `blocks` を JS オブジェクトとして**挿入順**にイテレートするため、

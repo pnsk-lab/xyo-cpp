@@ -1,416 +1,32 @@
-// xyo-cpp: LLJIT 基盤 — design.md §7.6。
+// Backend-neutral JIT scheduler and compiled-script cache.
 #include "jit.hpp"
-
-#include "llvm_compat.hpp"
-
-#include <llvm/ExecutionEngine/Orc/LLJIT.h>
-#include <llvm/ExecutionEngine/Orc/IRTransformLayer.h>
-#include <llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h>
-#include <llvm/ExecutionEngine/Orc/ObjectTransformLayer.h>
-#include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
-#include <llvm/IR/LLVMContext.h>
-#include <llvm/IR/Module.h>
-#include <llvm/IR/PassInstrumentation.h>
-#include <llvm/Support/DynamicLibrary.h>
-#include <llvm/Support/MemoryBuffer.h>
-#include <llvm/Support/TargetSelect.h>
-#include <llvm/Passes/PassBuilder.h>
-
+#include "backend.hpp"
+#include "aot_emit.hpp"
 #include <algorithm>
-#include <atomic>
 #include <chrono>
-#include <cmath>
-#include <cstdlib>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
-#include <map>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <memory>
+#include <string>
+#include <unordered_set>
 #include <vector>
-
-#include "../blocks/pen_api.hpp"
 #include "../core/gc.hpp"
 #include "../core/json.hpp"
-#include "../core/jsnum.hpp"
-#include "../core/v8math.hpp"
 #include "../core/sstr.hpp"
 #include "../engine/runtime.hpp"
 #include "../engine/sequencer.hpp"
 #include "../engine/thread.hpp"
+#include "../engine/numeric_thread.hpp"
+#include "../ir/scratch_pipeline.hpp"
 #include "../model/blocks.hpp"
 #include "../model/target.hpp"
-#include "aot_emit.hpp"
-
+#include "../blocks/pen_api.hpp"
 namespace xyo {
-
-bool jitEmitScript(llvm::Module&, llvm::LLVMContext&, Runtime&, Target*,
-                   Blocks*, const std::string&, const std::string&,
-                   CompiledScript&, JitPinned&,
-                   std::vector<std::string>&,
-                   std::map<std::string, std::string>&, AotEmit* = nullptr);
-
-// 生成コードが参照する extern "C" ヘルパ（rt.cpp 定義）
-extern "C" {
-void xyo_yield(JitCtx*);
-void xyo_yield_fast(xyo::Fiber*);
-int32_t xyo_is_stuck(JitCtx*);
-int32_t xyo_wait_should_yield(JitCtx*);
-void xyo_wait_yield(JitCtx*);
-void xyo_wait_event_yield(JitCtx*, uint64_t);
-void xyo_wait_event_done(JitCtx*);
-void xyo_loop_yield(JitCtx*);
-int32_t xyo_warp_yield_due(JitCtx*);
-void xyo_empty_repeat_warp(JitCtx*, double);
-double xyo_to_num(uint64_t);
-int32_t xyo_truthy(uint64_t);
-uint64_t xyo_num(double);
-uint64_t xyo_undefined();
-uint64_t xyo_to_str(uint64_t);
-uint64_t xyo_add(uint64_t, uint64_t);
-uint64_t xyo_sub(uint64_t, uint64_t);
-uint64_t xyo_mul(uint64_t, uint64_t);
-uint64_t xyo_div(uint64_t, uint64_t);
-uint64_t xyo_mod(uint64_t, uint64_t);
-double xyo_log(double);
-double xyo_asin(double);
-double xyo_acos(double);
-double xyo_atan(double);
-double xyo_exp(double);
-int32_t xyo_lt(uint64_t, uint64_t);
-int32_t xyo_gt(uint64_t, uint64_t);
-int32_t xyo_eq(uint64_t, uint64_t);
-int32_t xyo_not(uint64_t);
-int32_t xyo_and(uint64_t, uint64_t);
-int32_t xyo_or(uint64_t, uint64_t);
-uint64_t xyo_random(JitCtx*, uint64_t, uint64_t);
-double xyo_mathop(JitCtx*, int32_t, double);
-double xyo_round(double);
-uint64_t xyo_var_get(JitCtx*, const char*);
-void xyo_var_set(JitCtx*, const char*, uint64_t);
-void xyo_var_change(JitCtx*, const char*, uint64_t);
-uint64_t xyo_arg_get(JitCtx*, uint64_t);
-void xyo_rt_wait(JitCtx*, double);
-void xyo_stop_all(JitCtx*);
-void xyo_stop_others(JitCtx*);
-void xyo_stop_script(JitCtx*);
-void xyo_broadcast_v(JitCtx*, uint64_t);
-void xyo_broadcast_wait_v(JitCtx*, uint64_t);
-double xyo_timer(JitCtx*);
-uint64_t xyo_rt_compat(JitCtx*, const void*);
-uint64_t xyo_rt_reporter(JitCtx*, const char*);
-void xyo_proc_push(JitCtx*, const char*, const void*, int32_t,
-                   const char*, int32_t, int32_t);
-void xyo_proc_pop(JitCtx*);
-void xyo_rt_setarg(const void*, const char*, uint64_t);
-
-// --- rt_blocks.cpp: ブロック直接ヘルパ ---
-uint64_t xyo_join(uint64_t, uint64_t);
-uint64_t xyo_join_suffix(uint64_t, uint64_t);
-void* xyo_transient_begin(uint64_t, uint64_t*);
-void xyo_transient_append(void*, uint64_t);
-void xyo_transient_append_value(void*, uint64_t);
-void xyo_transient_append_packed(void*, uint64_t, uint32_t);
-void xyo_transient_append_repeat_packed(void*, uint64_t, uint64_t);
-void xyo_transient_append_repeat_string(void*, uint64_t, uint32_t);
-void xyo_transient_append_repeat_value(void*, uint64_t, uint32_t);
-void xyo_transient_flush(void*, uint64_t*);
-void xyo_transient_finish(void*, uint64_t*);
-void* xyo_transient_resume(void*, uint64_t*);
-
-#if defined(XYO_STRING_JOIN_SPECIALIZED)
-uint64_t xyo_join_strings(uint64_t, uint64_t);
-#endif
-uint64_t xyo_letterof(uint64_t, uint64_t);
-uint64_t xyo_strlen(uint64_t);
-uint64_t xyo_strcontains(uint64_t, uint64_t);
-void xyo_list_add(JitCtx*, const char*, const char16_t*, uint64_t);
-void xyo_list_delete(JitCtx*, const char*, const char16_t*, uint64_t);
-void xyo_list_deleteall(JitCtx*, const char*, const char16_t*);
-void xyo_list_insert(JitCtx*, const char*, const char16_t*, uint64_t, uint64_t);
-void xyo_list_replace(JitCtx*, const char*, const char16_t*, uint64_t, uint64_t);
-uint64_t xyo_list_item(JitCtx*, const char*, const char16_t*, uint64_t);
-uint64_t xyo_list_itemnum(JitCtx*, const char*, const char16_t*, uint64_t);
-uint64_t xyo_list_length(JitCtx*, const char*, const char16_t*);
-uint64_t xyo_list_contains(JitCtx*, const char*, const char16_t*, uint64_t);
-uint64_t xyo_list_contents(JitCtx*, const char*, const char16_t*);
-void xyo_var_monitor(JitCtx*, const char*, int32_t);
-void xyo_mot_movesteps(JitCtx*, uint64_t);
-void xyo_mot_gotoxy(JitCtx*, uint64_t, uint64_t);
-void xyo_mot_setxy_num(JitCtx*, double, double);
-void xyo_mot_goto(JitCtx*, uint64_t);
-void xyo_mot_turnright(JitCtx*, uint64_t);
-void xyo_mot_turnleft(JitCtx*, uint64_t);
-void xyo_mot_pointdir(JitCtx*, uint64_t);
-void xyo_mot_pointtowards(JitCtx*, uint64_t);
-void xyo_mot_glidexy(JitCtx*, uint64_t, uint64_t, uint64_t);
-void xyo_mot_glideto(JitCtx*, uint64_t, uint64_t);
-void xyo_mot_edgebounce(JitCtx*);
-void xyo_mot_setrotstyle(JitCtx*, uint64_t);
-void xyo_mot_changex(JitCtx*, uint64_t);
-void xyo_mot_setx(JitCtx*, uint64_t);
-void xyo_mot_changey(JitCtx*, uint64_t);
-void xyo_mot_sety(JitCtx*, uint64_t);
-uint64_t xyo_mot_getx(JitCtx*);
-uint64_t xyo_mot_gety(JitCtx*);
-uint64_t xyo_mot_getdir(JitCtx*);
-void xyo_looks_say(JitCtx*, uint64_t);
-void xyo_looks_think(JitCtx*, uint64_t);
-void xyo_looks_saysecs(JitCtx*, uint64_t, uint64_t);
-void xyo_looks_thinksecs(JitCtx*, uint64_t, uint64_t);
-void xyo_looks_show(JitCtx*);
-void xyo_looks_hide(JitCtx*);
-void xyo_looks_switchcostume(JitCtx*, uint64_t);
-void xyo_looks_nextcostume(JitCtx*);
-void xyo_looks_switchbackdrop(JitCtx*, uint64_t);
-void xyo_looks_nextbackdrop(JitCtx*);
-void xyo_looks_switchbackdropwait(JitCtx*, uint64_t);
-void xyo_looks_changeeffect(JitCtx*, uint64_t, uint64_t);
-void xyo_looks_seteffect(JitCtx*, uint64_t, uint64_t);
-void xyo_looks_cleareffects(JitCtx*);
-void xyo_looks_changesize(JitCtx*, uint64_t);
-void xyo_looks_setsize(JitCtx*, uint64_t);
-void xyo_looks_frontback(JitCtx*, uint64_t);
-void xyo_looks_fwdbacklayers(JitCtx*, uint64_t, uint64_t);
-uint64_t xyo_looks_size(JitCtx*);
-uint64_t xyo_looks_costumenumname(JitCtx*, uint64_t);
-uint64_t xyo_looks_backdropnumname(JitCtx*, uint64_t);
-uint64_t xyo_sns_touchingobj(JitCtx*, uint64_t);
-uint64_t xyo_sns_touchingcolor(JitCtx*, uint64_t);
-uint64_t xyo_sns_coloristouching(JitCtx*, uint64_t, uint64_t);
-uint64_t xyo_sns_distanceto(JitCtx*, uint64_t);
-uint64_t xyo_sns_mousex(JitCtx*);
-uint64_t xyo_sns_mousey(JitCtx*);
-uint64_t xyo_sns_mousedown(JitCtx*);
-uint64_t xyo_sns_keypressed(JitCtx*, uint64_t);
-void xyo_sns_setdragmode(JitCtx*, uint64_t);
-void xyo_sns_resettimer(JitCtx*);
-uint64_t xyo_sns_current(JitCtx*, uint64_t);
-uint64_t xyo_sns_dayssince2000(JitCtx*);
-uint64_t xyo_sns_loudness(JitCtx*);
-uint64_t xyo_sns_loud(JitCtx*);
-uint64_t xyo_sns_answer(JitCtx*);
-void xyo_sns_askwait(JitCtx*, uint64_t);
-uint64_t xyo_sns_of(JitCtx*, uint64_t, uint64_t);
-uint64_t xyo_sns_username(JitCtx*);
-uint64_t xyo_sns_online(JitCtx*);
-uint64_t xyo_ctl_getcounter(JitCtx*);
-void xyo_ctl_incrcounter(JitCtx*);
-void xyo_ctl_clearcounter(JitCtx*);
-void xyo_ctl_createclone(JitCtx*, uint64_t);
-void xyo_ctl_deleteclone(JitCtx*);
-void xyo_snd_play(JitCtx*, uint64_t);
-void xyo_snd_playwait(JitCtx*, uint64_t);
-void xyo_snd_stopall(JitCtx*);
-void xyo_snd_seteffect(JitCtx*, uint64_t, uint64_t);
-void xyo_snd_changeeffect(JitCtx*, uint64_t, uint64_t);
-void xyo_snd_cleareffects(JitCtx*);
-void xyo_snd_setvolume(JitCtx*, uint64_t);
-void xyo_snd_changevolume(JitCtx*, uint64_t);
-uint64_t xyo_snd_getvolume(JitCtx*);
-Variable* xyo_jitVar(JitCtx*, const char*, const char16_t*, int);
-void xyo_pen_up(JitCtx*);
-void xyo_pen_down(JitCtx*);
-void xyo_pen_clear(JitCtx*);
-void xyo_pen_stamp(JitCtx*);
-void xyo_pen_setcolor(JitCtx*, uint64_t);
-void xyo_pen_setcolor_ps(void*, uint64_t);
-void xyo_pen_changeparam(JitCtx*, uint64_t, uint64_t);
-void xyo_pen_setparam(JitCtx*, uint64_t, uint64_t);
-void xyo_pen_setsize(JitCtx*, uint64_t);
-void xyo_pen_changesize(JitCtx*, uint64_t);
-void xyo_pen_recolor(JitCtx*);
-void xyo_pen_paramnum(JitCtx*, int32_t, int32_t, double);
-int32_t xyo_gpu_repeat(JitCtx*, const void*, double);
-// par-for（並列 append ループ）— parfor_rt.cpp
-void xyo_list_reserve(void* list, int64_t newLen);
-void xyo_par_slot(void* list, int64_t idx, int64_t bits);
-int xyo_par_for(JitCtx*, int64_t trip, double init, double delta,
-                void** lists, int64_t* bases, int64_t nl,
-                void (*body)(JitCtx*, int64_t, double, void**, int64_t*));
-}
-
-namespace {
-
-// 生成コードが直接参照する extern "C" シンボル
-const std::pair<const char*, void*> kRtSymbols[] = {
-    // リスト長上限（データシンボル: 生成コードが直接ロードする）
-    {"xyo_list_limit", (void*)&xyo::xyo_list_limit},
-    {"xyo_yield", (void*)&xyo_yield},
-    {"xyo_yield_fast", (void*)&xyo_yield_fast},
-    {"xyo_is_stuck", (void*)&xyo_is_stuck},
-    {"xyo_wait_should_yield", (void*)&xyo_wait_should_yield},
-    {"xyo_wait_yield", (void*)&xyo_wait_yield},
-    {"xyo_wait_event_yield", (void*)&xyo_wait_event_yield},
-    {"xyo_wait_event_done", (void*)&xyo_wait_event_done},
-    {"xyo_loop_yield", (void*)&xyo_loop_yield},
-    {"xyo_warp_yield_due", (void*)&xyo_warp_yield_due},
-    {"xyo_empty_repeat_warp", (void*)&xyo_empty_repeat_warp},
-    {"xyo_to_num", (void*)&xyo_to_num},
-    {"xyo_truthy", (void*)&xyo_truthy},
-    {"xyo_num", (void*)&xyo_num},
-    {"xyo_undefined", (void*)&xyo_undefined},
-    {"xyo_to_str", (void*)&xyo_to_str},
-    {"xyo_add", (void*)&xyo_add},
-    {"xyo_sub", (void*)&xyo_sub},
-    {"xyo_mul", (void*)&xyo_mul},
-    {"xyo_div", (void*)&xyo_div},
-    {"xyo_mod", (void*)&xyo_mod},
-    {"xyo_lt", (void*)&xyo_lt},
-    {"xyo_gt", (void*)&xyo_gt},
-    {"xyo_eq", (void*)&xyo_eq},
-    {"xyo_not", (void*)&xyo_not},
-    {"xyo_and", (void*)&xyo_and},
-    {"xyo_or", (void*)&xyo_or},
-    {"xyo_random", (void*)&xyo_random},
-    {"xyo_mathop", (void*)&xyo_mathop},
-    {"xyo_round", (void*)&xyo_round},
-    {"xyo_log", (void*)&xyo_log},
-        {"xyo_asin", (void*)&xyo_asin},
-        {"xyo_acos", (void*)&xyo_acos},
-        {"xyo_atan", (void*)&xyo_atan},
-        {"xyo_exp", (void*)&xyo_exp},
-    {"xyo_var_get", (void*)&xyo_var_get},
-    {"xyo_var_set", (void*)&xyo_var_set},
-    {"xyo_var_change", (void*)&xyo_var_change},
-    {"xyo_jitVar", (void*)&xyo_jitVar},
-    {"xyo_varslot_init", (void*)&xyo_varslot_init},
-    {"xyo_pen_up", (void*)&xyo_pen_up},
-    {"xyo_pen_down", (void*)&xyo_pen_down},
-    {"xyo_pen_clear", (void*)&xyo_pen_clear},
-    {"xyo_pen_stamp", (void*)&xyo_pen_stamp},
-    {"xyo_pen_setcolor", (void*)&xyo_pen_setcolor},
-    {"xyo_pen_setcolor_ps", (void*)&xyo_pen_setcolor_ps},
-    {"xyo_pen_changeparam", (void*)&xyo_pen_changeparam},
-    {"xyo_pen_setparam", (void*)&xyo_pen_setparam},
-    {"xyo_pen_setsize", (void*)&xyo_pen_setsize},
-    {"xyo_pen_changesize", (void*)&xyo_pen_changesize},
-    {"xyo_pen_recolor", (void*)&xyo_pen_recolor},
-    {"xyo_pen_paramnum", (void*)&xyo_pen_paramnum},
-    {"xyo_gpu_repeat", (void*)&xyo_gpu_repeat},
-    {"xyo_list_reserve", (void*)&xyo_list_reserve},
-    {"xyo_par_slot", (void*)&xyo_par_slot},
-    {"xyo_par_for", (void*)&xyo_par_for},
-    {"xyo_arg_get", (void*)&xyo_arg_get},
-    {"xyo_rt_wait", (void*)&xyo_rt_wait},
-    {"xyo_stop_all", (void*)&xyo_stop_all},
-    {"xyo_stop_others", (void*)&xyo_stop_others},
-    {"xyo_stop_script", (void*)&xyo_stop_script},
-    {"xyo_broadcast_v", (void*)&xyo_broadcast_v},
-    {"xyo_broadcast_wait_v", (void*)&xyo_broadcast_wait_v},
-    {"xyo_timer", (void*)&xyo_timer},
-    {"xyo_rt_compat", (void*)&xyo_rt_compat},
-    {"xyo_rt_reporter", (void*)&xyo_rt_reporter},
-    {"xyo_proc_push", (void*)&xyo_proc_push},
-    {"xyo_proc_pop", (void*)&xyo_proc_pop},
-    {"xyo_rt_setarg", (void*)&xyo_rt_setarg},
-    {"xyo_join", (void*)&xyo_join},
-    {"xyo_join_suffix", (void*)&xyo_join_suffix},
-    {"xyo_transient_begin", (void*)&xyo_transient_begin},
-    {"xyo_transient_append", (void*)&xyo_transient_append},
-    {"xyo_transient_append_value", (void*)&xyo_transient_append_value},
-    {"xyo_transient_append_packed", (void*)&xyo_transient_append_packed},
-    {"xyo_transient_append_repeat_packed",
-        (void*)&xyo_transient_append_repeat_packed},
-    {"xyo_transient_append_repeat_string",
-        (void*)&xyo_transient_append_repeat_string},
-    {"xyo_transient_append_repeat_value",
-        (void*)&xyo_transient_append_repeat_value},
-    {"xyo_transient_flush", (void*)&xyo_transient_flush},
-    {"xyo_transient_finish", (void*)&xyo_transient_finish},
-    {"xyo_transient_resume", (void*)&xyo_transient_resume},
-
-#if defined(XYO_STRING_JOIN_SPECIALIZED)
-    {"xyo_join_strings", (void*)&xyo_join_strings},
-#endif
-    {"xyo_letterof", (void*)&xyo_letterof},
-    {"xyo_strlen", (void*)&xyo_strlen},
-    {"xyo_strcontains", (void*)&xyo_strcontains},
-    {"xyo_list_add", (void*)&xyo_list_add},
-    {"xyo_list_delete", (void*)&xyo_list_delete},
-    {"xyo_list_deleteall", (void*)&xyo_list_deleteall},
-    {"xyo_list_insert", (void*)&xyo_list_insert},
-    {"xyo_list_replace", (void*)&xyo_list_replace},
-    {"xyo_list_item", (void*)&xyo_list_item},
-    {"xyo_list_itemnum", (void*)&xyo_list_itemnum},
-    {"xyo_list_length", (void*)&xyo_list_length},
-    {"xyo_list_contains", (void*)&xyo_list_contains},
-    {"xyo_list_contents", (void*)&xyo_list_contents},
-    {"xyo_var_monitor", (void*)&xyo_var_monitor},
-    {"xyo_mot_movesteps", (void*)&xyo_mot_movesteps},
-    {"xyo_mot_gotoxy", (void*)&xyo_mot_gotoxy},
-    {"xyo_mot_setxy_num", (void*)&xyo_mot_setxy_num},
-    {"xyo_mot_goto", (void*)&xyo_mot_goto},
-    {"xyo_mot_turnright", (void*)&xyo_mot_turnright},
-    {"xyo_mot_turnleft", (void*)&xyo_mot_turnleft},
-    {"xyo_mot_pointdir", (void*)&xyo_mot_pointdir},
-    {"xyo_mot_pointtowards", (void*)&xyo_mot_pointtowards},
-    {"xyo_mot_glidexy", (void*)&xyo_mot_glidexy},
-    {"xyo_mot_glideto", (void*)&xyo_mot_glideto},
-    {"xyo_mot_edgebounce", (void*)&xyo_mot_edgebounce},
-    {"xyo_mot_setrotstyle", (void*)&xyo_mot_setrotstyle},
-    {"xyo_mot_changex", (void*)&xyo_mot_changex},
-    {"xyo_mot_setx", (void*)&xyo_mot_setx},
-    {"xyo_mot_changey", (void*)&xyo_mot_changey},
-    {"xyo_mot_sety", (void*)&xyo_mot_sety},
-    {"xyo_mot_getx", (void*)&xyo_mot_getx},
-    {"xyo_mot_gety", (void*)&xyo_mot_gety},
-    {"xyo_mot_getdir", (void*)&xyo_mot_getdir},
-    {"xyo_looks_say", (void*)&xyo_looks_say},
-    {"xyo_looks_think", (void*)&xyo_looks_think},
-    {"xyo_looks_saysecs", (void*)&xyo_looks_saysecs},
-    {"xyo_looks_thinksecs", (void*)&xyo_looks_thinksecs},
-    {"xyo_looks_show", (void*)&xyo_looks_show},
-    {"xyo_looks_hide", (void*)&xyo_looks_hide},
-    {"xyo_looks_switchcostume", (void*)&xyo_looks_switchcostume},
-    {"xyo_looks_nextcostume", (void*)&xyo_looks_nextcostume},
-    {"xyo_looks_switchbackdrop", (void*)&xyo_looks_switchbackdrop},
-    {"xyo_looks_nextbackdrop", (void*)&xyo_looks_nextbackdrop},
-    {"xyo_looks_switchbackdropwait", (void*)&xyo_looks_switchbackdropwait},
-    {"xyo_looks_changeeffect", (void*)&xyo_looks_changeeffect},
-    {"xyo_looks_seteffect", (void*)&xyo_looks_seteffect},
-    {"xyo_looks_cleareffects", (void*)&xyo_looks_cleareffects},
-    {"xyo_looks_changesize", (void*)&xyo_looks_changesize},
-    {"xyo_looks_setsize", (void*)&xyo_looks_setsize},
-    {"xyo_looks_frontback", (void*)&xyo_looks_frontback},
-    {"xyo_looks_fwdbacklayers", (void*)&xyo_looks_fwdbacklayers},
-    {"xyo_looks_size", (void*)&xyo_looks_size},
-    {"xyo_looks_costumenumname", (void*)&xyo_looks_costumenumname},
-    {"xyo_looks_backdropnumname", (void*)&xyo_looks_backdropnumname},
-    {"xyo_sns_touchingobj", (void*)&xyo_sns_touchingobj},
-    {"xyo_sns_touchingcolor", (void*)&xyo_sns_touchingcolor},
-    {"xyo_sns_coloristouching", (void*)&xyo_sns_coloristouching},
-    {"xyo_sns_distanceto", (void*)&xyo_sns_distanceto},
-    {"xyo_sns_mousex", (void*)&xyo_sns_mousex},
-    {"xyo_sns_mousey", (void*)&xyo_sns_mousey},
-    {"xyo_sns_mousedown", (void*)&xyo_sns_mousedown},
-    {"xyo_sns_keypressed", (void*)&xyo_sns_keypressed},
-    {"xyo_sns_setdragmode", (void*)&xyo_sns_setdragmode},
-    {"xyo_sns_resettimer", (void*)&xyo_sns_resettimer},
-    {"xyo_sns_current", (void*)&xyo_sns_current},
-    {"xyo_sns_dayssince2000", (void*)&xyo_sns_dayssince2000},
-    {"xyo_sns_loudness", (void*)&xyo_sns_loudness},
-    {"xyo_sns_loud", (void*)&xyo_sns_loud},
-    {"xyo_sns_answer", (void*)&xyo_sns_answer},
-    {"xyo_sns_askwait", (void*)&xyo_sns_askwait},
-    {"xyo_sns_of", (void*)&xyo_sns_of},
-    {"xyo_sns_username", (void*)&xyo_sns_username},
-    {"xyo_sns_online", (void*)&xyo_sns_online},
-    {"xyo_ctl_getcounter", (void*)&xyo_ctl_getcounter},
-    {"xyo_ctl_incrcounter", (void*)&xyo_ctl_incrcounter},
-    {"xyo_ctl_clearcounter", (void*)&xyo_ctl_clearcounter},
-    {"xyo_ctl_createclone", (void*)&xyo_ctl_createclone},
-    {"xyo_ctl_deleteclone", (void*)&xyo_ctl_deleteclone},
-    {"xyo_snd_play", (void*)&xyo_snd_play},
-    {"xyo_snd_playwait", (void*)&xyo_snd_playwait},
-    {"xyo_snd_stopall", (void*)&xyo_snd_stopall},
-    {"xyo_snd_seteffect", (void*)&xyo_snd_seteffect},
-    {"xyo_snd_changeeffect", (void*)&xyo_snd_changeeffect},
-    {"xyo_snd_cleareffects", (void*)&xyo_snd_cleareffects},
-    {"xyo_snd_setvolume", (void*)&xyo_snd_setvolume},
-    {"xyo_snd_changevolume", (void*)&xyo_snd_changevolume},
-    {"xyo_snd_getvolume", (void*)&xyo_snd_getvolume},
-};
-
-} // namespace
 
 namespace {
 /// AOT メタの hex 文字列（UTF-16 生バイト）をデコードする。
@@ -436,306 +52,71 @@ std::string hexDecode(const std::string& h) {
 /// runtime_helpers.cpp の ASCII 1 文字キャッシュ（AOT slot 束縛用）。
 extern "C" SStr* const* xyo_ascii_cache();
 
-namespace {
-
-/// バックエンドが libcall として生成する libc/libm シンボル。
-///
-/// `frem` は x86-64 で `fmod` 呼び出しへ、`llvm.log` は `log`、memcmp は
-/// `bcmp` へ降格される。動的リンクなら ORC の
-/// `DynamicLibrarySearchGenerator`（dlsym）が解決できるが、**完全静的
-/// リンク（-static）では dlsym が自プロセスの静的シンボルを見ない**ため
-/// `JIT session error: Symbols not found` になる。kRtSymbols と同じく
-/// 絶対シンボルとして JITDylib へ define しておく（ジェネレータより優先）。
-const std::vector<std::pair<const char*, void*>>& hostLibcallSymbols() {
-    static const std::vector<std::pair<const char*, void*>> k = {
-        {"fmod", (void*)(double (*)(double, double))std::fmod},
-        {"fmodf", (void*)(float (*)(float, float))std::fmod},
-        {"pow", (void*)(double (*)(double, double))std::pow},
-        {"powf", (void*)(float (*)(float, float))std::pow},
-        {"log", (void*)(double (*)(double))xyo::jsnum::jsLog},
-        {"asin", (void*)(double (*)(double))xyo::v8math::asin},
-        {"acos", (void*)(double (*)(double))xyo::v8math::acos},
-        {"atan", (void*)(double (*)(double))xyo::v8math::atan},
-        {"exp", (void*)(double (*)(double))xyo::v8math::exp},
-        {"logf", (void*)(float (*)(float))std::log},
-        {"log2", (void*)(double (*)(double))std::log2},
-        {"log10", (void*)(double (*)(double))std::log10},
-        {"exp", (void*)(double (*)(double))std::exp},
-        {"exp2", (void*)(double (*)(double))std::exp2},
-        {"sqrt", (void*)(double (*)(double))std::sqrt},
-        {"sqrtf", (void*)(float (*)(float))std::sqrt},
-        {"sin", (void*)(double (*)(double))xyo::v8math::sin},
-        {"cos", (void*)(double (*)(double))xyo::v8math::cos},
-        {"tan", (void*)(double (*)(double))std::tan},
-        {"asin", (void*)(double (*)(double))std::asin},
-        {"acos", (void*)(double (*)(double))std::acos},
-        {"atan", (void*)(double (*)(double))std::atan},
-        {"atan2", (void*)(double (*)(double, double))xyo::v8math::atan2},
-        {"sinh", (void*)(double (*)(double))std::sinh},
-        {"cosh", (void*)(double (*)(double))std::cosh},
-        {"tanh", (void*)(double (*)(double))std::tanh},
-        {"floor", (void*)(double (*)(double))std::floor},
-        {"ceil", (void*)(double (*)(double))std::ceil},
-        {"trunc", (void*)(double (*)(double))std::trunc},
-        {"round", (void*)(double (*)(double))std::round},
-        {"rint", (void*)(double (*)(double))std::rint},
-        {"nearbyint", (void*)(double (*)(double))std::nearbyint},
-        {"fabs", (void*)(double (*)(double))std::fabs},
-        {"copysign", (void*)(double (*)(double, double))std::copysign},
-        {"ldexp", (void*)(double (*)(double, int))std::ldexp},
-        {"fma", (void*)(double (*)(double, double, double))std::fma},
-        {"memcpy", (void*)(void* (*)(void*, const void*, size_t))std::memcpy},
-        {"memmove",
-         (void*)(void* (*)(void*, const void*, size_t))std::memmove},
-        {"memset", (void*)(void* (*)(void*, int, size_t))std::memset},
-        {"memcmp",
-         (void*)(int (*)(const void*, const void*, size_t))std::memcmp},
-        {"bcmp", (void*)(int (*)(const void*, const void*, size_t))std::memcmp},
-        {"strlen", (void*)(size_t (*)(const char*))std::strlen},
-        {"abort", (void*)(void (*)(void))std::abort},
-    };
-    return k;
-}
-
-} // namespace
 
 struct JitEngine::Impl {
-    llvm::orc::ThreadSafeContext tsc;
-    std::unique_ptr<llvm::orc::LLJIT> jit;
-    std::unique_ptr<llvm::orc::LLLazyJIT> lazyJit;
-    bool lazyProcedures = false;
-    JitPinned pinned;
-    /// AOT: 文字列 c_str の安定置き場（deque は push_back で
-    /// 既存要素のアドレスを変えない）
+    std::unique_ptr<JitBackend> backend;
     std::deque<std::string> aotStrings;
-    /// AOT: slot のアドレス（GC ルート走査対象）
     std::vector<void**> aotSlots;
-    /// AOT: ロード時に再コンパイルした GPU 並列ループの Program の
-    /// 実体（slot は &program を指す。エンジンと同寿命）。
     std::vector<std::unique_ptr<gpu::ParallelLoop>> aotGpuProgs;
+
+    struct Work {
+        const void* top = nullptr;
+        uint64_t generation = 0;
+        std::unique_ptr<PendingJitCompilation> task;
+    };
+    struct Result {
+        const void* top = nullptr;
+        uint64_t generation = 0;
+        std::unique_ptr<CompiledScript> code;
+    };
+    std::mutex mutex;
+    std::condition_variable available;
+    std::deque<Work> waiting;
+    std::deque<Result> completed;
+    std::thread worker;
+    bool stopping = false;
+
+    void enqueue(Work work) {
+        {
+            std::lock_guard lock(mutex);
+            waiting.push_back(std::move(work));
+            if (!worker.joinable())
+                worker = std::thread([this] { runWorker(); });
+        }
+        available.notify_one();
+    }
+    void runWorker() {
+        for (;;) {
+            Work work;
+            {
+                std::unique_lock lock(mutex);
+                available.wait(lock, [&] { return stopping || !waiting.empty(); });
+                if (stopping) return;
+                work = std::move(waiting.front());
+                waiting.pop_front();
+            }
+            std::unique_ptr<CompiledScript> code = work.task->finish();
+            work.task.reset();
+            {
+                std::lock_guard lock(mutex);
+                completed.push_back({
+                    work.top, work.generation, std::move(code)});
+            }
+        }
+    }
+    ~Impl() {
+        {
+            std::lock_guard lock(mutex);
+            stopping = true;
+            waiting.clear();
+        }
+        available.notify_all();
+        if (worker.joinable()) worker.join();
+    }
 };
 
-// Keep eager and on-demand LLVM pipelines on the same optimization tier.
-static llvm::OptimizationLevel jitIrOptimizationLevel() {
-    if (const char* setting = std::getenv("XYO_JIT_OPT_LEVEL")) {
-        if (std::strcmp(setting, "1") == 0)
-            return llvm::OptimizationLevel::O1;
-        if (std::strcmp(setting, "2") == 0)
-            return llvm::OptimizationLevel::O2;
-        if (std::strcmp(setting, "3") == 0)
-            return llvm::OptimizationLevel::O3;
-    }
-    return std::getenv("XYO_JIT_O2")
-        ? llvm::OptimizationLevel::O2
-        : llvm::OptimizationLevel::O3;
-}
-
-// A conservative static estimate of likely procedure calls. Follow only
-// the script's main sequence, not conditional substack inputs. Count call
-// sites rather than unique callees: a long test/dispatch sequence is likely
-// to use a large fraction of its procedures even if names repeat.
-static size_t countDirectProcedureCalls(const Blocks* blocks,
-                                        const Block* top) {
-    size_t calls = 0;
-    std::unordered_set<const Block*> seen;
-    while (top && seen.insert(top).second && seen.size() <= 200000) {
-        calls += top->opcode == "procedures_call";
-        top = top->next.empty() ? nullptr : blocks->getBlock(top->next);
-    }
-    return calls;
-}
-
-// On-demand materialization pays a trampoline and first-call compile cost.
-// Use it automatically only for scripts with substantial cold-procedure
-// potential. A script with many direct call sites is treated as eager.
-// "on" is an explicit choice, independent of the HotSpot heuristic.
-static bool chooseLazyCompile(JitLazyMode policy, JitMode mode,
-                              size_t functions, size_t directCallSites) {
-    if (policy == JitLazyMode::Off || mode == JitMode::Off)
-        return false;
-    if (policy == JitLazyMode::On)
-        return functions >= 2;
-    return mode == JitMode::HotSpot && functions >= 32 &&
-           directCallSites * 4 <= functions;
-}
-
-// The eager and on-demand engines use the same host calls and diagnostics.
-static void configureLazyIR(llvm::orc::LLJIT& jit) {
-    jit.getIRTransformLayer().setTransform(
-        [](llvm::orc::ThreadSafeModule tsm,
-           llvm::orc::MaterializationResponsibility&)
-            -> llvm::Expected<llvm::orc::ThreadSafeModule> {
-            tsm.withModuleDo([](llvm::Module& module) {
-                if (!module.getModuleFlag("xyo.lazy.optimize"))
-                    return;
-                const auto began = std::chrono::steady_clock::now();
-                llvm::PassBuilder pb;
-                llvm::LoopAnalysisManager lam;
-                llvm::FunctionAnalysisManager fam;
-                llvm::CGSCCAnalysisManager cgam;
-                llvm::ModuleAnalysisManager mam;
-                pb.registerModuleAnalyses(mam);
-                pb.registerCGSCCAnalyses(cgam);
-                pb.registerFunctionAnalyses(fam);
-                pb.registerLoopAnalyses(lam);
-                pb.crossRegisterProxies(lam, fam, cgam, mam);
-                auto mpm = pb.buildPerModuleDefaultPipeline(
-                    jitIrOptimizationLevel());
-                mpm.run(module, mam);
-                if (std::getenv("XYO_JIT_TIMING")) {
-                    const double elapsed =
-                        std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() - began)
-                            .count();
-                    std::fprintf(stderr, "[jit-lazy-ir] %.3fms\n",
-                                 elapsed);
-                }
-            });
-            return std::move(tsm);
-        });
-}
-
-static void configureObjectDump(llvm::orc::LLJIT& jit) {
-    // Inspect the exact JIT machine code, not an AOT approximation. Disabled
-    // by default; prefix-N.o files contain the objects before linking.
-    if (const char* p = std::getenv("XYO_JIT_DUMP_OBJECT")) {
-        if (p[0]) jit.getObjTransformLayer().setTransform(
-            [prefix = std::string(p)](std::unique_ptr<llvm::MemoryBuffer> object)
-                -> llvm::Expected<std::unique_ptr<llvm::MemoryBuffer>> {
-                static std::atomic<uint64_t> serial{0};
-                const std::string path = prefix + "-" +
-                    std::to_string(serial.fetch_add(1, std::memory_order_relaxed)) + ".o";
-                if (FILE* out = std::fopen(path.c_str(), "wb")) {
-                    const auto bytes = object->getBuffer();
-                    const size_t written = std::fwrite(bytes.data(), 1, bytes.size(), out);
-                    const int closed = std::fclose(out);
-                    if (written != bytes.size() || closed != 0)
-                        std::fprintf(stderr, "xyo-jit: incomplete object dump %s\n", path.c_str());
-                } else {
-                    std::fprintf(stderr, "xyo-jit: cannot dump object %s\n", path.c_str());
-                }
-                return std::move(object);
-            });
-    }
-
-}
-
-static void registerRuntimeSymbols(llvm::orc::LLJIT& jit) {
-    auto& es = jit.getExecutionSession();
-    llvm::orc::SymbolMap symbols;
-    for (auto& [name, addr] : kRtSymbols) {
-        symbols[es.intern(name)] = llvm::orc::ExecutorSymbolDef(
-            llvm::orc::ExecutorAddr::fromPtr(addr),
-            llvm::JITSymbolFlags::Exported);
-    }
-    // バックエンドの libcall（fmod/log/bcmp 等）— 静的リンクでも解決できる
-    for (auto& [name, addr] : hostLibcallSymbols()) {
-        symbols[es.intern(name)] = llvm::orc::ExecutorSymbolDef(
-            llvm::orc::ExecutorAddr::fromPtr(addr),
-            llvm::JITSymbolFlags::Exported);
-    }
-    auto& jd = jit.getMainJITDylib();
-    if (auto err =
-            jd.define(llvm::orc::absoluteSymbols(std::move(symbols)))) {
-        std::fprintf(stderr, "xyo-jit: symbol define failed\n");
-        llvm::consumeError(std::move(err));
-    }
-    if (auto gen =
-            llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
-                jit.getDataLayout().getGlobalPrefix())) {
-        jd.addGenerator(std::move(*gen));
-    }
-}
-
-JitEngine::JitEngine() {
-    llvm::InitializeNativeTarget();
-    llvm::InitializeNativeTargetAsmPrinter();
-
-    impl_ = std::make_unique<Impl>();
-    impl_->tsc = llvm::orc::ThreadSafeContext(
-        std::make_unique<llvm::LLVMContext>());
-
-    llvm::orc::LLJITBuilder builder;
-    // Experimental backend-only compilation tiers. The IR optimization
-    // pipeline stays unchanged; this isolates machine-code lowering cost
-    // from O3's middle-end work when investigating large Scratch scripts.
-    // The default target/code-generation settings are entirely unchanged.
-    if (const char* level = std::getenv("XYO_JIT_CODEGEN_OPT")) {
-        llvm::CodeGenOptLevel opt;
-        if (std::strcmp(level, "less") == 0)
-            opt = llvm::CodeGenOptLevel::Less;
-        else if (std::strcmp(level, "none") == 0)
-            opt = llvm::CodeGenOptLevel::None;
-        else
-            opt = llvm::CodeGenOptLevel::Default;
-        if (auto host = llvm::orc::JITTargetMachineBuilder::detectHost()) {
-            host->setCodeGenOptLevel(opt);
-            builder.setJITTargetMachineBuilder(std::move(*host));
-        } else {
-            std::fprintf(stderr, "xyo-jit: cannot configure JIT codegen level\n");
-            llvm::consumeError(host.takeError());
-        }
-    }
-    // HotSpot automatically selects an eager or on-demand compilation tier
-    // per script. Eager tests remain fully precompiled unless requested.
-    impl_->lazyProcedures =
-        jitMode() != JitMode::Off &&
-        (jitLazyMode() == JitLazyMode::On ||
-         (jitLazyMode() == JitLazyMode::Auto &&
-          jitMode() == JitMode::HotSpot));
-    auto result = builder.create();
-    if (!result) {
-        std::fprintf(stderr, "xyo-jit: LLJIT init failed\n");
-        llvm::consumeError(result.takeError());
-        impl_.reset();
-        return;
-    }
-    auto jit = std::move(*result);
-    configureObjectDump(*jit);
-    registerRuntimeSymbols(*jit);
-    impl_->jit = std::move(jit);
-
-    // pinned 文字列を GC ルート化（JitEngine 単位でプロバイダ登録）
-    Gc::get().addRootProvider(this, [this](Gc& g) {
-        if (impl_)
-            for (SStr* s : impl_->pinned.strings) g.markPtr(s);
-    });
-}
-
-bool JitEngine::ensureLazyJit() {
-    if (!impl_ || !impl_->lazyProcedures) return false;
-    if (impl_->lazyJit) return true;
-
-    llvm::orc::LLLazyJITBuilder builder;
-    if (const char* level = std::getenv("XYO_JIT_CODEGEN_OPT")) {
-        llvm::CodeGenOptLevel opt = llvm::CodeGenOptLevel::Default;
-        if (std::strcmp(level, "less") == 0)
-            opt = llvm::CodeGenOptLevel::Less;
-        else if (std::strcmp(level, "none") == 0)
-            opt = llvm::CodeGenOptLevel::None;
-        if (auto host = llvm::orc::JITTargetMachineBuilder::detectHost()) {
-            host->setCodeGenOptLevel(opt);
-            builder.setJITTargetMachineBuilder(std::move(*host));
-        } else {
-            std::fprintf(stderr, "xyo-jit: cannot configure lazy codegen level\n");
-            llvm::consumeError(host.takeError());
-        }
-    }
-    // Lazy resolution may happen on different scheduler workers.
-    // Separate code-generation contexts are required for concurrent LLVM.
-    builder.setNumCompileThreads(2);
-    auto result = builder.create();
-    if (!result) {
-        std::fprintf(stderr, "xyo-jit: lazy engine unavailable; using eager\n");
-        llvm::consumeError(result.takeError());
-        return false;
-    }
-    auto lazy = std::move(*result);
-    configureLazyIR(*lazy);
-    configureObjectDump(*lazy);
-    registerRuntimeSymbols(*lazy);
-    impl_->lazyJit = std::move(lazy);
-    return true;
+JitEngine::JitEngine() : impl_(std::make_unique<Impl>()) {
+    impl_->backend = createJitBackend();
 }
 
 namespace {
@@ -807,12 +188,11 @@ JitEngine::~JitEngine() {
                          r.jit ? "yes" : "-", r.lazy ? "yes" : "-",
                          int(r.aot), int(r.loop));
     }
-    Gc::get().removeRootProvider(this);
     if (impl_) Gc::get().removeRootProvider(impl_.get());
     impl_.reset();
 }
 
-bool JitEngine::ok() const { return impl_ && impl_->jit; }
+bool JitEngine::ok() const { return impl_ && impl_->backend && impl_->backend->ok(); }
 
 uint8_t JitEngine::scanScriptLoop(Blocks& blocks, const Block* top,
                                   uint32_t* nodes) {
@@ -876,8 +256,9 @@ bool JitEngine::decideCompile(Thread& thread, const Block* top) {
         p.hasLoop = scanScriptLoop(*thread.blockContainer, top,
                                    &p.nodeCount);
 
-    // ループを含むスクリプトは単発でも長時間走り得る。OSR を持たない
-    // 以上あとから昇格できないため、初回から JIT する
+    // ループを含むスクリプトは単発でも長時間走り得る。
+    // OSR は明示有効な top-level repeat/条件付きループのみに限定
+    // されるため、それ以外は従来通り初回 JIT する
     // （XYO_HOT_LOOP=0 で無効化できる）。巨大な直線スクリプトも
     // 解釈のまま一度だけ走らせると高くつくので同様に初回 JIT。
     const bool loopCompile = hotParams().loopCompile && p.hasLoop == 2;
@@ -917,26 +298,237 @@ bool JitEngine::scriptStats(const void* top, ScriptStats* out) const {
     return true;
 }
 
+
+const CompiledScript* JitEngine::readyScript(const Block* top) const {
+    if (!top) return nullptr;
+    auto it = cache_.find(top);
+    return it == cache_.end() ? nullptr : it->second.code.get();
+}
+
+void JitEngine::prefetchWarpBroadcasts(Runtime& runtime) {
+    // Unlike startup holdback, prefetch never postpones an observable
+    // Scratch thread. The worker only compiles immutable, already captured
+    // source. Opt-in pending cross-project performance verification.
+    const char* flag = std::getenv("XYO_JIT_ASYNC_PREFETCH");
+    if (!flag || (flag[0] != '1' && flag[0] != '2') ||
+        jitMode() != JitMode::HotSpot || !runtime.renderer || !ok() ||
+        jitLazyMode() == JitLazyMode::On)
+        return;
+    // 1: enqueue on the worker (fully interactive).
+    // 2: compile the single highest-scoring receiver before starting any
+    // Scratch scripts (a bounded *blocking* startup experiment).
+    const bool synchronous = flag[0] == '2';
+    const char* asyncFlag = std::getenv("XYO_JIT_ASYNC");
+    if (asyncFlag && asyncFlag[0] == '0') return;
+
+    struct Candidate {
+        Target* target;
+        const Block* top;
+        std::string id;
+        unsigned score;
+    };
+    std::vector<Candidate> candidates;
+
+    // A one-shot, manually bounded scan. No walking dynamic reporters or
+    // executing procedures, and no recursion into procedure call graphs.
+    // We only prefetch scripts with an explicit warp procedure containing
+    // BOTH a counted loop and a list mutation. A prime example is a CPU
+    // emulator that initializes an entire list-backed RAM image.
+    for (Target* target : runtime.targets) {
+        if (!target || !target->blocks) continue;
+        Blocks* blocks = target->blocks;
+        for (const auto& script :
+             blocks->getRuntimeScripts("event_whenbroadcastreceived")) {
+            const Block* top = script.block;
+            if (!top || cache_.count(top) || compiling_.count(top) ||
+                failed_.count(top))
+                continue;
+            unsigned score = 0;
+            const Block* call = blocks->getBlock(top->next);
+            for (size_t chain = 0; call && chain < 128;
+                 ++chain, call = blocks->getBlock(call->next)) {
+                if (call->opcode != "procedures_call" || !call->mutation)
+                    continue;
+                const std::string& name = call->mutation->attr("proccode");
+                const Mutation* prototype =
+                    blocks->getProcedurePrototype(name);
+                if (!prototype || !prototype->warp()) continue;
+                const std::string definition =
+                    blocks->getProcedureDefinition(name);
+                const Block* def = blocks->getBlock(definition);
+                if (!def) continue;
+                std::vector<std::string> pending{def->next};
+                std::unordered_set<std::string> seen;
+                unsigned loops = 0, lists = 0;
+                while (!pending.empty() && seen.size() < 256) {
+                    std::string id = std::move(pending.back());
+                    pending.pop_back();
+                    if (id.empty() || !seen.insert(id).second) continue;
+                    const Block* node = blocks->getBlock(id);
+                    if (!node) continue;
+                    loops += (node->opcode == "control_repeat");
+                    lists += (node->opcode == "data_replaceitemoflist" ||
+                              node->opcode == "data_addtolist");
+                    if (!node->next.empty())
+                        pending.push_back(node->next);
+                    for (const auto& [_, input] : node->inputs.items) {
+                        if (!input.block.empty())
+                            pending.push_back(input.block);
+                        if (!input.shadow.empty())
+                            pending.push_back(input.shadow);
+                    }
+                }
+                if (loops && lists)
+                    score += loops * 2 + lists;
+            }
+            if (score)
+                candidates.push_back({target, top, script.blockId, score});
+        }
+    }
+    std::stable_sort(candidates.begin(), candidates.end(),
+        [](const Candidate& a, const Candidate& b) {
+            return a.score > b.score;
+        });
+    // Cap CPU and memory footprint. Other scripts retain normal JIT policy.
+    size_t queued = 0;
+    for (const Candidate& candidate : candidates) {
+        if (queued == (synchronous ? 1u : 2u) ||
+            compiling_.size() >= 32) break;
+        if (cache_.count(candidate.top) ||
+            compiling_.count(candidate.top)) continue;
+        Thread temporary(candidate.id);
+        temporary.target = candidate.target;
+        temporary.blockContainer = candidate.target->blocks;
+        temporary.topBlockPtr = candidate.top;
+        const auto started = std::chrono::steady_clock::now();
+        if (auto task = impl_->backend->prepareAsync(
+                temporary, runtime, candidate.top, scriptCounter_++)) {
+            if (synchronous) {
+                // The prepared task contains a private ThreadSafeModule.
+                // finish() runs only on the runtime thread in this mode.
+                // Publish before greenFlag launches any Scratch thread:
+                // no active Fiber, local argument or effect can be replayed.
+                if (auto code = task->finish()) {
+                    cache_[candidate.top].code = std::move(code);
+                    ++queued;
+                }
+            } else {
+                compiling_.insert(candidate.top);
+                impl_->enqueue({candidate.top, asyncGeneration_,
+                                std::move(task)});
+                ++queued;
+            }
+            if (std::getenv("XYO_JIT_ASYNC_PREFETCH_LOG")) {
+                const auto took = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - started).count();
+                std::fprintf(stderr,
+                    "[jit-prefetch] %s script=%s score=%u time=%.3fms\n",
+                    synchronous ? "compiled" : "queued",
+                    candidate.id.c_str(), candidate.score, took);
+            }
+        }
+    }
+}
+
+void JitEngine::pollAsync() {
+    if (!impl_) return;
+    std::deque<Impl::Result> completed;
+    {
+        std::lock_guard lock(impl_->mutex);
+        completed.swap(impl_->completed);
+    }
+    for (auto& item : completed) {
+        // Never publish an object compiled for an invalidated block graph.
+        if (item.generation != asyncGeneration_) continue;
+        compiling_.erase(item.top);
+        if (!item.code) {
+            failed_.insert(item.top);
+            continue;
+        }
+        const auto it = profiles_.find(item.top);
+        item.code->shortSync =
+            !item.code->mayYield && !item.code->mainThread &&
+            it != profiles_.end() && it->second.hasLoop == 1 &&
+            it->second.nodeCount > 0 && it->second.nodeCount <= 8;
+        cache_[item.top].code = std::move(item.code);
+        if (std::getenv("XYO_JIT_ASYNC_TIMING"))
+            std::fprintf(stderr, "[jit-async] published %p\n", item.top);
+    }
+}
+
+bool JitEngine::tryAttachNumeric(Thread& thread, const Block* top) {
+    // Explicit experimentation flag. Avoid an additional source scan,
+    // compilation, or code-cache lookup on the default JIT hot path.
+    static const bool enabled = [] {
+        const char* env = std::getenv("XYO_JIT_COMMON_CFG");
+        return env && env[0] == '1' && env[1] == '\0';
+    }();
+    if (!enabled || (thread.target && thread.target->runtime &&
+                     thread.target->runtime->blockCountEnabled) ||
+        !ok() || !top || !thread.target ||
+        !thread.blockContainer || thread.isCompiled ||
+        thread.interpreterStarted || thread.numericSession ||
+        thread.stackClick || thread.updateMonitor)
+        return false;
+
+    const auto* key = static_cast<const void*>(top);
+    // An explicitly loaded native AOT artifact takes precedence over the
+    // experimental source-to-common-CFG route.
+    const auto existing = cache_.find(key);
+    if (existing != cache_.end() && existing->second.aot)
+        return false;
+    auto cached = numericCache_.find(key);
+    if (cached == numericCache_.end()) {
+        if (numericRejected_.count(key)) return false;
+        const ir::ScratchCompilationUnit source =
+            ir::ScratchCompilationUnit::capture(*thread.blockContainer, top);
+        auto lowered = ir::lowerNumericF64Script(
+            source, ir::NumericF64LoweringOptions{false, true});
+        if (!lowered || !lowered->requiresLoopScheduler ||
+            lowered->executable.yieldBoundaries.empty() ||
+            lowered->executable.yieldBoundaries.size() > 16) {
+            if (std::getenv("XYO_JIT_VERBOSE"))
+                std::fprintf(stderr, "xyo-common-cfg: source rejected script=%s valid=%d lowered=%d\n",
+                    top->id.c_str(), int(source.valid()), int(bool(lowered)));
+            numericRejected_.insert(key);
+            return false;
+        }
+        auto kernel = std::make_shared<const ir::ScratchNumericKernel>(
+            std::move(*lowered));
+        if (!ir::NumericThreadSession::safeToAttach(thread, *kernel)) {
+            if (std::getenv("XYO_JIT_VERBOSE"))
+                std::fprintf(stderr, "xyo-common-cfg: slot guard rejected script=%s\n", top->id.c_str());
+            // A failing variable-type guard may be target-specific: do not
+            // poison the shared Blocks cache for its other clones.
+            return false;
+        }
+        auto code = impl_->backend->compileNumeric(
+            kernel, scriptCounter_++);
+        if (!code || !code->run) {
+            if (std::getenv("XYO_JIT_VERBOSE"))
+                std::fprintf(stderr, "xyo-common-cfg: backend rejected script=%s\n", top->id.c_str());
+            numericRejected_.insert(key);
+            return false;
+        }
+        cached = numericCache_.emplace(key, std::move(code)).first;
+    }
+    // Each Scratch thread owns a separate continuation frame. The runner
+    // points into backend-owned executable code (same contract as normal JIT).
+    return ir::attachNumericThread(
+        thread, cached->second->kernel, cached->second->run, false);
+}
+
 const CompiledScript* JitEngine::compile(Thread& thread, Runtime& runtime,
                                          Sequencer& sequencer,
                                          const Block* topHint) {
-    static const bool verbose = std::getenv("XYO_JIT_VERBOSE") != nullptr;
+    (void)sequencer;
     if (!ok() || !thread.target) return nullptr;
     Blocks* blocks = thread.blockContainer;
     if (!blocks) return nullptr;
-    const std::string& topId = thread.topBlock;
-
-    // キャッシュヒット経路を最短化（broadcast/clone の大量 spawn 対策）
-    const Block* top = topHint ? topHint : blocks->getBlock(topId);
-    if (!top) {
-        if (verbose) std::fprintf(stderr,
-            "xyo-jit: no top block %s\n", topId.c_str());
-        return nullptr;
-    }
-    // edge-activated hat はコンパイルしない（ハット評価は interpreter 側）
+    const Block* top = topHint ? topHint : blocks->getBlock(thread.topBlock);
+    if (!top) return nullptr;
+    pollAsync();
     if (runtime.getIsEdgeActivatedHat(top->opcode)) {
-        if (verbose) std::fprintf(stderr,
-            "xyo-jit: skip edge hat %s\n", top->opcode.c_str());
         failed_.insert(top);
         return nullptr;
     }
@@ -945,212 +537,59 @@ const CompiledScript* JitEngine::compile(Thread& thread, Runtime& runtime,
     if (entry.code) return entry.code.get();
     if (failed_.count(top)) return nullptr;
 
-    using Clock = std::chrono::steady_clock;
-    const auto tStart = Clock::now();
-    const bool timing = std::getenv("XYO_JIT_TIMING") != nullptr;
-    double emitMs = 0, optMs = 0, submitMs = 0;
-    size_t irFunctions = 0, irInstructions = 0;
-    bool lazyThisScript = false;
-    auto msBetween = [](Clock::time_point begin, Clock::time_point end) {
-        return std::chrono::duration<double, std::milli>(end - begin).count();
-    };
-    auto cs = std::make_unique<CompiledScript>();
-    std::vector<std::string> fnNames;
-    std::map<std::string, std::string> procNameMap;
-    const std::string entryName =
-        "xyo_script_" + std::to_string(scriptCounter_++);
-    bool emitOk = false;
-
-    // Each script owns its IR context when requested. A global context can
-    // retain uniqued types and metadata long after individual JIT modules
-    // have been materialized. In the isolated mode, ORC can release the
-    // context together with the script's IR.
-    const char* contextSetting = std::getenv("XYO_JIT_ISOLATED_CONTEXT");
-    const bool isolatedContext = contextSetting
-        ? contextSetting[0] != '0'
-        : impl_->lazyProcedures;
-    llvm::orc::ThreadSafeContext scriptContext =
-        isolatedContext
-            ? llvm::orc::ThreadSafeContext(
-                  std::make_unique<llvm::LLVMContext>())
-            : impl_->tsc;
-    llvmc::withContext(scriptContext, [&](llvm::LLVMContext* lc) {
-        // Names for temporary SSA values are never used by native code.
-        // LLVM otherwise allocates and uniques a string for each one.
-        // Preserve them explicitly for IR diagnostics and inspection.
-        if (!std::getenv("XYO_JIT_KEEP_VALUE_NAMES") &&
-            !std::getenv("XYO_JIT_DUMP") &&
-            !std::getenv("XYO_JIT_DUMP2"))
-            lc->setDiscardValueNames(true);
-        auto mod = std::make_unique<llvm::Module>("xyo_script", *lc);
-        mod->setDataLayout(impl_->jit->getDataLayout());
-        mod->setTargetTriple(
-            llvmc::tripleArg(impl_->jit->getTargetTriple()));
-        const auto tEmit = Clock::now();
-        emitOk = jitEmitScript(*mod, *lc, runtime, thread.target, blocks,
-                               topId, entryName, *cs, impl_->pinned, fnNames,
-                               procNameMap, nullptr);
-        if (timing) emitMs = msBetween(tEmit, Clock::now());
-        if (emitOk) {
-            if (timing || impl_->lazyProcedures) {
-                for (const llvm::Function& generated : *mod) {
-                    if (generated.isDeclaration()) continue;
-                    ++irFunctions;
-                    for (const llvm::BasicBlock& bb : generated)
-                        irInstructions += bb.size();
-                }
-            }
-            // O3 by default (XYO_JIT_O2=1 to revert) — varSlotData/alloca
-            // タグチェック除去・式共有を行わないと生成コードが数倍遅い
-            struct PassFrame { std::string name; Clock::time_point started; double childMs = 0; };
-            std::vector<PassFrame> passFrames;
-            std::map<std::string, std::pair<double, uint64_t>> passTimes;
-            const bool profilePasses = std::getenv("XYO_JIT_PASS_TIMING") != nullptr;
-            llvm::PassInstrumentationCallbacks pic;
-            if (profilePasses) {
-                pic.registerBeforeNonSkippedPassCallback(
-                    [&](llvm::StringRef name, llvm::Any) {
-                        passFrames.push_back({name.str(), Clock::now(), 0});
-                    });
-                auto finish = [&](llvm::StringRef) {
-                    if (passFrames.empty()) return;
-                    PassFrame frame = std::move(passFrames.back());
-                    passFrames.pop_back();
-                    double ms = msBetween(frame.started, Clock::now());
-                    if (!passFrames.empty()) passFrames.back().childMs += ms;
-                    auto& entry = passTimes[frame.name];
-                    entry.first += std::max(0.0, ms - frame.childMs);
-                    ++entry.second;
-                };
-                pic.registerAfterPassCallback(
-                    [finish](llvm::StringRef name, llvm::Any,
-                             const llvm::PreservedAnalyses&) { finish(name); });
-                pic.registerAfterPassInvalidatedCallback(
-                    [finish](llvm::StringRef name,
-                             const llvm::PreservedAnalyses&) { finish(name); });
-            }
-            llvm::PassBuilder pb(nullptr, llvm::PipelineTuningOptions(), std::nullopt, profilePasses ? &pic : nullptr);
-            llvm::LoopAnalysisManager lam;
-            llvm::FunctionAnalysisManager fam;
-            llvm::CGSCCAnalysisManager cgam;
-            llvm::ModuleAnalysisManager mam;
-            pb.registerModuleAnalyses(mam);
-            pb.registerCGSCCAnalyses(cgam);
-            pb.registerFunctionAnalyses(fam);
-            pb.registerLoopAnalyses(lam);
-            pb.crossRegisterProxies(lam, fam, cgam, mam);
-            // Optional IR optimization tier for compile-time experiments.
-            // Preserve the original O3 default and legacy O2 override.
-            llvm::ModulePassManager mpm =
-                pb.buildPerModuleDefaultPipeline(jitIrOptimizationLevel());
-            const auto tOptimize = Clock::now();
-            // JIT modes can be changed by API clients after construction.
-            // The requested tier still needs a matching ORC engine.
-            const bool deferredCandidate = impl_->lazyProcedures &&
-                chooseLazyCompile(
-                    jitLazyMode(), jitMode(), irFunctions,
-                    countDirectProcedureCalls(blocks, top));
-            // Failure to initialize the secondary ORC engine must not
-            // prevent Scratch from running: fall back to normal O3.
-            const bool deferIR =
-                deferredCandidate && ensureLazyJit();
-            if (deferIR) {
-                mod->addModuleFlag(llvm::Module::Warning,
-                                   "xyo.lazy.optimize", 1);
-            } else {
-                mpm.run(*mod, mam);
-            }
-            if (timing) optMs = msBetween(tOptimize, Clock::now());
-            if (profilePasses) {
-                for (const auto& [name, data] : passTimes) {
-                    if (data.first > 5.0)
-                        std::fprintf(stderr, "[jit-pass] %s %.3fms %llu %s\n", topId.c_str(), data.first, (unsigned long long)data.second, name.c_str());
-                }
-            }
-            if (const char* d = std::getenv("XYO_JIT_DUMP2"))
-                if (d[0] != '\0') mod->print(llvm::errs(), nullptr);
-            const auto tSubmit = Clock::now();
-            // Lazy compilation is worthwhile only when a top-level script
-            // has substantial distinct procedure bodies. Small scripts use
-            // the normal ORC layer and avoid call-through trampoline cost.
-            lazyThisScript = deferIR;
-            llvm::orc::ThreadSafeModule tsm(
-                std::move(mod), scriptContext);
-            llvm::Error err = lazyThisScript
-                ? impl_->lazyJit->addLazyIRModule(std::move(tsm))
-                : impl_->jit->addIRModule(std::move(tsm));
-            if (err) {
-                llvm::consumeError(std::move(err));
-                emitOk = false;
-            }
-            if (timing) submitMs = msBetween(tSubmit, Clock::now());
-        }
-    });
-    if (!emitOk) {
-        if (verbose) std::fprintf(stderr,
-            "xyo-jit: emit failed for %s (%s)\n",
-            topId.c_str(), top->opcode.c_str());
-        failed_.insert(top);
-        return nullptr;
-    }
-
-    const auto tLookup = Clock::now();
-    auto& owningJit = lazyThisScript
-        ? static_cast<llvm::orc::LLJIT&>(*impl_->lazyJit)
-        : *impl_->jit;
-    auto addrOr = owningJit.lookup(entryName);
-    if (!addrOr) {
-        llvm::consumeError(addrOr.takeError());
-        failed_.insert(top);
-        return nullptr;
-    }
-    cs->entry = reinterpret_cast<ScriptFn>(addrOr->getValue());
-    cs->lazy = lazyThisScript;
-    // Compiling a script does not imply its scheduler should launch worker
-    // batches. A very small script that never suspends is best executed
-    // immediately in Scratch order. Keep long/looping code parallelizable.
-    const auto profileIt = profiles_.find(top);
-    cs->shortSync = !cs->mayYield && !cs->mainThread &&
-        profileIt != profiles_.end() && profileIt->second.hasLoop == 1 &&
-        profileIt->second.nodeCount > 0 && profileIt->second.nodeCount <= 8;
-    // Looking up every procedure in lazy mode defeats on-demand function
-    // materialization. Generated Scratch code calls via ORC trampolines;
-    // no runtime consumer reads CompiledScript::procedures in this path.
-    if (!lazyThisScript) {
-        for (auto& [vkey, fname] : procNameMap) {
-            auto a = impl_->jit->lookup(fname);
-            if (!a) { llvm::consumeError(a.takeError()); continue; }
-            cs->procedures[vkey] = reinterpret_cast<ScriptFn>(a->getValue());
+    // HotSpot can execute in the interpreter while LLVM optimizes and
+    // materializes the immutable IR in a worker. Never let the worker
+    // touch Thread/Runtime/Blocks or publish into the live code cache.
+    // Interactive playback cannot block the render thread for hundreds
+    // of milliseconds on the first appearance of a new script. Default to
+    // background code generation when a renderer is attached. Keep explicit
+    // XYO_JIT_ASYNC=0/1 overrides and retain synchronous behavior for CLI
+    // benchmark/test runs without a renderer. OSR remains separately opt-in.
+    const char* asyncSetting = std::getenv("XYO_JIT_ASYNC");
+    const bool wantAsync = asyncSetting
+        ? asyncSetting[0] == '1' : runtime.renderer != nullptr;
+    const bool asyncEnabled = jitMode() == JitMode::HotSpot &&
+        jitLazyMode() != JitLazyMode::On && wantAsync;
+    if (asyncEnabled) {
+        if (compiling_.count(top)) return nullptr;
+        // Backpressure: do not retain an unbounded number of LLVM modules
+        // when a project starts thousands of distinct event scripts.
+        // The interpreter keeps running and a later spawn may retry.
+        if (compiling_.size() >= 32) return nullptr;
+        if (auto task = impl_->backend->prepareAsync(
+                thread, runtime, top, scriptCounter_++)) {
+            compiling_.insert(top);
+            impl_->enqueue({top, asyncGeneration_, std::move(task)});
+            return nullptr;
         }
     }
 
-    CompiledScript* raw = cs.get();
-    entry.code = std::move(cs);
-    if (timing) {
-        const auto tDone = Clock::now();
-        std::fprintf(stderr,
-            "[jit-timing] %s emit=%.3fms opt=%.3fms submit=%.3fms "
-            "lookup=%.3fms total=%.3fms funcs=%zu ir=%zu tier=%s\n",
-            topId.c_str(), emitMs, optMs, submitMs,
-            msBetween(tLookup, tDone), msBetween(tStart, tDone),
-            irFunctions, irInstructions,
-            lazyThisScript ? "lazy" : "eager");
+    const auto source = ir::ScratchCompilationUnit::capture(*blocks, top);
+    if (!source.valid()) {
+        failed_.insert(top);
+        return nullptr;
     }
-    if (verbose) {
-        const double ms = std::chrono::duration<double, std::milli>(
-                              std::chrono::steady_clock::now() - tStart)
-                              .count();
-        std::fprintf(stderr, "xyo-jit: compiled %s (%s, %.1fms)\n",
-                     topId.c_str(), top->opcode.c_str(), ms);
+    auto code = impl_->backend->compile(
+        thread, runtime, top, scriptCounter_++, source);
+    if (!code) {
+        failed_.insert(top);
+        return nullptr;
     }
-    return raw;
+    // Scheduling policy is independent from the native code generator.
+    const auto it = profiles_.find(top);
+    code->shortSync = !code->mayYield && !code->mainThread &&
+        it != profiles_.end() && it->second.hasLoop == 1 &&
+        it->second.nodeCount > 0 && it->second.nodeCount <= 8;
+    entry.code = std::move(code);
+    return entry.code.get();
 }
 
 /// AOT オブジェクトをロードしてスクリプトをキャッシュへ登録する。
 /// 生成コードは slot（xyo_aot_slot_N）経由でホスト資源を参照するため、
 /// ここで実アドレスを書き込んでからルート登録する。
 bool JitEngine::loadAot(Runtime& runtime, const void* object, size_t size,
-                        uint64_t projectHash, std::string* why) {
+                        uint64_t projectHash, std::string* why,
+                        const aot::ProgressCallback& progress) {
     auto fail = [&](const char* m) {
         if (why) *why = m;
         return false;
@@ -1159,18 +598,12 @@ bool JitEngine::loadAot(Runtime& runtime, const void* object, size_t size,
     if (!object || size == 0) return fail("empty object");
     if (!impl_->aotSlots.empty()) return fail("AOT already loaded");
 
-    auto mb = llvm::MemoryBuffer::getMemBufferCopy(
-        llvm::StringRef(static_cast<const char*>(object), size));
-    if (auto err = impl_->jit->addObjectFile(std::move(mb))) {
-        llvm::consumeError(std::move(err));
+    aot::reportProgress(progress, aot::ProgressStage::LoadObject);
+    if (!impl_->backend->addObjectFile(object, size))
         return fail("addObjectFile failed");
-    }
-    auto metaSym = impl_->jit->lookup("xyo_aot_meta");
-    if (!metaSym) {
-        llvm::consumeError(metaSym.takeError());
-        return fail("xyo_aot_meta missing");
-    }
-    const JsonValue meta = jsonParse(metaSym->toPtr<const char*>());
+    auto* metaSym = static_cast<const char*>(impl_->backend->lookupSymbol("xyo_aot_meta"));
+    if (!metaSym) return fail("xyo_aot_meta missing");
+    const JsonValue meta = jsonParse(metaSym);
     if (!meta.isObject()) return fail("invalid AOT metadata");
 
     char hb[32];
@@ -1186,15 +619,15 @@ bool JitEngine::loadAot(Runtime& runtime, const void* object, size_t size,
         for (void** a : impl_->aotSlots) g.markPtr(*a);
     });
 
-    for (const JsonValue& sv : meta.get("slots").asArray()) {
+    const auto& slotEntries = meta.get("slots").asArray();
+    size_t boundSlots = 0;
+    aot::reportProgress(progress, aot::ProgressStage::BindSlots,
+                        0, slotEntries.size());
+    for (const JsonValue& sv : slotEntries) {
         const int kind = int(sv.get("k").asNumber());
         const std::string g = sv.get("g").asString();
-        auto sym = impl_->jit->lookup(g);
-        if (!sym) {
-            llvm::consumeError(sym.takeError());
-            return fail("AOT slot symbol missing");
-        }
-        void** addr = sym->toPtr<void**>();
+        void** addr = static_cast<void**>(impl_->backend->lookupSymbol(g));
+        if (!addr) return fail("AOT slot symbol missing");
         void* p = nullptr;
         switch (static_cast<AotSlotKind>(kind)) {
         case AotSlotKind::VarId:
@@ -1274,43 +707,54 @@ bool JitEngine::loadAot(Runtime& runtime, const void* object, size_t size,
         }
         *addr = p;
         impl_->aotSlots.push_back(addr);
+        aot::reportProgress(progress, aot::ProgressStage::BindSlots,
+                            ++boundSlots, slotEntries.size());
     }
 
+    const auto& scriptEntries = meta.get("scripts").asArray();
+    size_t scannedScripts = 0;
+    aot::reportProgress(progress, aot::ProgressStage::RegisterScripts,
+                        0, scriptEntries.size());
     int nScripts = 0;
-    for (const JsonValue& sj : meta.get("scripts").asArray()) {
+    for (const JsonValue& sj : scriptEntries) {
+        const auto scanned = [&] {
+            aot::reportProgress(progress, aot::ProgressStage::RegisterScripts,
+                                ++scannedScripts, scriptEntries.size());
+        };
         const std::string topId = sj.get("top").asString();
-        auto es = impl_->jit->lookup(sj.get("entry").asString());
-        if (!es) {
-            llvm::consumeError(es.takeError());
-            return fail("AOT script symbol missing");
-        }
+        auto* es = impl_->backend->lookupSymbol(sj.get("entry").asString());
+        if (!es) return fail("AOT script symbol missing");
         auto cs = std::make_unique<CompiledScript>();
-        cs->entry = es->toPtr<ScriptFn>();
+        cs->entry = reinterpret_cast<ScriptFn>(es);
         cs->mayYield = sj.get("mayYield").asBool();
         // Older objects lack affinity metadata (and may contain plain string
         // cache loads). Keep them serial; new objects also pin compat/GPU work.
         cs->mainThread = !sj.has("mainThread") ||
             sj.get("mainThread").asBool() || !impl_->aotGpuProgs.empty();
         for (const JsonValue& pj : sj.get("procs").asArray()) {
-            auto ps = impl_->jit->lookup(pj.at(1).asString());
-            if (!ps) {
-                llvm::consumeError(ps.takeError());
-                continue;
-            }
-            cs->procedures[pj.at(0).asString()] = ps->toPtr<ScriptFn>();
+            auto* ps = impl_->backend->lookupSymbol(pj.at(1).asString());
+            if (!ps) continue;
+            cs->procedures[pj.at(0).asString()] = reinterpret_cast<ScriptFn>(ps);
         }
         const size_t ti = size_t(sj.get("ti").asNumber());
-        if (ti >= runtime.targets.size()) continue;
+        if (ti >= runtime.targets.size()) {
+            scanned();
+            continue;
+        }
         Target* owner = runtime.targets[ti];
         const Block* top = owner->blocks ? owner->blocks->getBlock(topId)
                                          : nullptr;
-        if (!top) continue;   // 実行されないスクリプト — 登録不要
+        if (!top) {
+            scanned();       // skipped scripts still advance the denominator
+            continue;
+        }
         // AOT は全スクリプトを最適化済みで事前コンパイルしたもの —
         // 通常のコンパイルキャッシュへ登録し、再コンパイルしない。
         ScriptEntry& entry = cache_[top];
         entry.code = std::move(cs);
         entry.aot = true;
         ++nScripts;
+        scanned();
     }
 
     std::fprintf(stderr, "aot: %d scripts precompiled (%zu slots)\n",
@@ -1318,11 +762,24 @@ bool JitEngine::loadAot(Runtime& runtime, const void* object, size_t size,
     if (std::getenv("XYO_AOT_VERBOSE"))
         std::fprintf(stderr, "xyo-jit: AOT loaded (%zu slots)\n",
                      impl_->aotSlots.size());
+    aot::reportProgress(progress, aot::ProgressStage::Loaded);
     return true;
 }
 
 void JitEngine::invalidate() {
+    ++asyncGeneration_;
+    compiling_.clear();
+    // Prepared jobs in the previous graph generation are safe to finish
+    // (they own immutable IR) but must never be published to the new graph.
+    // Pending, unstarted work can be dropped without waiting for LLVM.
+    if (impl_) {
+        std::lock_guard lock(impl_->mutex);
+        impl_->waiting.clear();
+        impl_->completed.clear();
+    }
     cache_.clear();
+    numericCache_.clear();
+    numericRejected_.clear();
     profiles_.clear();
     failed_.clear();
     accessCache_.clear();

@@ -83,8 +83,8 @@ export XYO_BENCH_WARMUP_FRAMES=60
 unset XYO_PROF XYO_PENPROF XYO_PENLOG XYO_PENTRACE
 unset XYO_JIT_EQ_GENERIC XYO_JIT_MOTION_BOXED XYO_JIT_SLOT_RELOAD
 unset XYO_JIT_LITERAL_NUM_GENERIC
-build/tests/xyo-pen-bench --project 3D2.sb3 --frames 30
-XYO_JIT_LITERAL_NUM_GENERIC=1 build/tests/xyo-pen-bench --project 3D2.sb3 --frames 30
+build/tests/xyo-pen-bench --project debug/projects/3D2.sb3 --frames 30
+XYO_JIT_LITERAL_NUM_GENERIC=1 build/tests/xyo-pen-bench --project debug/projects/3D2.sb3 --frames 30
 
 # セッション内の最終計測を再実行。XYO_*を整理し、交互5組とRes=4を実行する。
 python3 build/literal-num-ab/final_bench.py

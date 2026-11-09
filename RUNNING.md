@@ -36,6 +36,25 @@ Linux 版は 2 種類あります。どちらも **LLVM は静的リンク**な�
   `wait` / `wait until` / `broadcast and wait` などの待機は danger でも他
   スレッドへ譲るので停止します）。`run`/`play`/`test`/`edit` と AOT 実行
   ファイル（`./app run --danger`）で使えます。
+- `XYO_LIST_STORAGE=flat|sbo4|sbo8|flat15|deque|gap|chunked|adaptive` で SList の格納方式を選択できます。
+  既定は `flat`（従来の malloc/realloc、容量 2 倍）。
+  `sbo4` / `sbo8` は 4 / 8 要素まで SList の GC オブジェクト末尾に
+  インライン格納し、拡張時に従来の連続配列へ移行します。
+  `flat15` は連続配列の成長率を 1.5 倍にします。
+  実験的な非連続方式 `deque`（std::deque）、`gap`（gap buffer）、
+  `chunked`（128要素ブロック + 累積要素数による rank 検索）も選べます。
+  これらの方式は JIT の `items` 直接参照を無効にし、既存の helper
+  を通すため、連続配列の JIT fast path に比べて遅くなる場合があります。
+  連続配列の4方式は従来どおり JIT/AOT の直接アクセスと互換です。
+  `adaptive` は平常時に連続配列の JIT fast path を使い、長いリストへの
+  途中挿入・削除が続けば `gap` または `chunked` に移ります。読取りが
+  優勢になった場合や `delete all` で連続配列へ戻ります。切替え時は
+  元の要素順・文字列の GC 参照・数値特化フラグを保持します。
+  JIT のループ内ヘッダキャッシュは、yield 後と非連続格納からの復帰時に
+  格納領域の世代番号を使って更新します。ループ内の通常の連続配列参照は、
+  再配置を行う操作が存在しないことを確認したうえでキャッシュを利用します。
+  環境変数はプロセス起動前に設定してください。
+
 - `--list-limit N`（環境変数 `XYO_LIST_LIMIT=N`）は **リスト長の上限**です。
   既定は 0 = 無制限（TurboWarp と同じ）。Scratch の 200000 を再現するなら
   `--list-limit 200000`。上限に達すると `add` は追加を落とし、`insert` は
@@ -168,3 +187,65 @@ python3 -m http.server -d build-wasm-web 8000
 - `XYO_WASM_BROWSER=ON` で HTML シェル（`web/shell.html`）を出力。
 - JIT 無効 / GPU compute・GPU ペン層は CPU フォールバック / SVG コスチュームは
   nanosvg でラスタ化（図形のみ。<text> は描かれない）。
+
+### String storage A/B selection
+
+Scratch string joins can be compared without rebuilding the runtime:
+
+```sh
+XYO_STRING_STORAGE=rope       ./build/xyo run project.sb3
+XYO_STRING_STORAGE=flat       ./build/xyo run project.sb3
+XYO_STRING_STORAGE=append-log ./build/xyo run project.sb3
+
+./build/xyo run project.sb3 --string-storage=flat
+./build/xyo test project.sb3 --string-storage append-log
+```
+
+- `rope` (default): flat for short joins (<16 UTF-16 code units), otherwise
+  immutable cons nodes with lazy flattening.
+- `flat`: eagerly copies every join into a contiguous UTF-16 allocation.
+- `append-log`: flat for short joins; long joins with a suffix of at most 256
+  UTF-16 units use immutable snapshots of chunked append logs. Larger suffixes
+  fall back to rope. A fork from an earlier snapshot preserves immutability.
+
+The setting is process-wide. Existing strings keep their representation when
+the setting changes. All representations use the same `SStr`/JIT ABI, and the
+setting affects both interpreter and JIT join helpers. Flat mode also disables
+the JIT's specialized transient append-log loop optimization to keep actual
+flat storage for A/B tests. Rope mode retains the existing specialized JIT
+transient optimization where its escape proof applies; to compare strictly
+Rope-only joins, also set `XYO_JIT_TRANSIENT_STRINGS=0`.
+`XYO_STRING_APPEND_LOG=1` is retained as a legacy alias when
+`XYO_STRING_STORAGE` is unset.
+
+
+### Experimental 8-bit string leaves (Latin-1)
+
+`XYO_STRING_LEAF=latin1` (or `--string-leaf latin1`) packs individual
+non-composite leaves with all UTF-16 code units <= U+00FF into **one byte
+per code unit**. Any higher code unit keeps the existing UTF-16 leaf.
+
+```sh
+./build/xyo run project.sb3 --string-storage rope --string-leaf latin1
+XYO_STRING_LEAF=utf16 ./build/xyo run project.sb3
+```
+
+This switch is independent from `XYO_STRING_STORAGE`. The default is
+`utf16`. All lengths and indices remain UTF-16 code units, and the unchanged
+`SStr` ABI exposes a lazily widened UTF-16 buffer through `data()/view()`
+for legacy consumers. `unitAt()` and Rope flattening read compact bytes
+without materializing each leaf. A materialized UTF-16 buffer is freed with the
+GC object. JIT paths that directly load inline UTF-16 now fall back to helpers
+for compact leaves. Compact storage can reduce GC bytes but may increase
+latency if code frequently requests `view()`; compare workloads before
+changing the default.
+
+
+### Experimental short-string interning
+
+XYO_STRING_SHORT_INTERN=1 (or --string-short-intern=on) enables a bounded
+strongly rooted cache for 2..4-unit ASCII strings created during runtime.
+The default is off: repeated tiny joins save GC allocations, whereas
+high-cardinality strings pay hashing overhead without reuse. The option
+is independent of string storage and leaf encoding. Results and caveats:
+docs/scratch-string-short-intern-study-2026-11-07.md.

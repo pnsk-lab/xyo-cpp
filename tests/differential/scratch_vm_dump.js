@@ -3,6 +3,9 @@
 //
 //   node tests/differential/scratch_vm_dump.js <project.sb3> [maxSteps]
 //
+// Optional fourth argument 'compiled' enables TurboWarp's compiler.
+// The default 'interp' preserves the original reference behavior.
+//
 // String(value) is exactly the representation Scratch uses for join/say/list
 // display, so the output is directly comparable with xyo's XYO_DUMPVARS dump.
 //
@@ -24,16 +27,19 @@ const FakeRenderer = require(path.join(ROOT, 'test/fixtures/fake-renderer.js'));
 async function main () {
     const file = process.argv[2];
     const maxSteps = parseInt(process.argv[3] || '2000', 10);
+    const mode = process.argv[4] || 'interp';
+    if (!['interp', 'compiled'].includes(mode)) {
+        throw new Error('mode must be interp or compiled');
+    }
     if (!file) {
-        console.error('usage: node scratch_vm_dump.js <project.sb3> [maxSteps]');
+        console.error('usage: node scratch_vm_dump.js <project.sb3> [maxSteps] [interp|compiled]');
         process.exit(2);
     }
 
     const vm = new VM();
-    // Official Scratch semantics: run scratch-vm's interpreter, not
-    // TurboWarp's optional compiler (they intentionally differ in a few
-    // places, e.g. data_listcontents' single-character test).
-    vm.setCompilerOptions({enabled: false});
+    // Default: scratch-vm reference interpreter. Optional compiled mode:
+    // TurboWarp's native JavaScript compiler, with the same project/input.
+    vm.setCompilerOptions({enabled: mode === 'compiled'});
     vm.attachStorage(new ScratchStorage());
     const renderer = new FakeRenderer();
     // RenderedTarget.dispose() calls these when a clone is deleted.
@@ -57,6 +63,26 @@ async function main () {
         vm.runtime._step();
         const active = vm.runtime.threads.filter(t => !t.updateMonitor);
         if (active.length === 0) break;
+    }
+
+    // A flag being enabled does not prove compilation succeeded. Verify at
+    // least one green-flag script compiled successfully in compiled mode.
+    if (mode === 'compiled') {
+        let compiledScripts = 0;
+        let compileFailures = 0;
+        for (const target of vm.runtime.targets) {
+            for (const script of target.blocks.getScripts()) {
+                const result = target.blocks.getCachedCompileResult(script);
+                if (result) {
+                    if (result.success) compiledScripts++;
+                    else compileFailures++;
+                }
+            }
+        }
+        if (compiledScripts < 1 || compileFailures > 0) {
+            throw new Error('TurboWarp compiled mode not exercised: ' +
+                JSON.stringify({compiledScripts, compileFailures}));
+        }
     }
 
     const out = {};

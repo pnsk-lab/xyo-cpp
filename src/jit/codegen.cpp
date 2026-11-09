@@ -6,6 +6,17 @@
 #include "llvm_compat.hpp"
 #include "aot_emit.hpp"
 #include "parfor.hpp"
+#include "../ir/numeric.hpp"
+#include "../ir/diamond.hpp"
+#include "../ir/loop.hpp"
+#include "../ir/guard.hpp"
+#include "../ir/slot_access.hpp"
+#include "../ir/list_access.hpp"
+#include "../ir/scratch_script.hpp"
+#include "../ir/scratch_effect.hpp"
+#include "../ir/scratch_pipeline.hpp"
+#include "../ir/source_resume_phase.hpp"
+#include "../ir/scratch_source_digest.hpp"
 
 #include <llvm/IR/IRBuilder.h>
 #if defined(__x86_64__) || defined(_M_X64)
@@ -26,13 +37,17 @@
 #include <set>
 #include <unordered_map>
 
+#include "../analysis/type_sites.hpp"
+#include "../analysis/type_flow.hpp"
 #include "../blocks/pen_api.hpp"
 #include "../core/cast.hpp"
 #include "../core/jsnum.hpp"
+#include "../core/v8math.hpp"
 #include "../core/slist.hpp"
 #include "../core/sstr.hpp"
 #include "../gpu/gpu_compile.hpp"
 #include "../engine/runtime.hpp"
+#include "../engine/event_wait_dependency.hpp"
 #include "../engine/thread.hpp"
 #include "../model/blocks.hpp"
 #include "../model/target.hpp"
@@ -55,17 +70,61 @@ bool bbDone(BasicBlock* bb) {
 }
 
 struct Codegen {
+    // The new portable CallFrame is opt-in while the native Fiber remains
+    // the authority for machine-instruction resumption. This experiment
+    // must not slow down normal JIT code generation or remove GC roots.
+    static bool portableCallFrames() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("XYO_JIT_CALLFRAME");
+            return value && *value && std::strcmp(value, "0") != 0;
+        }();
+        return enabled;
+    }
+
     LLVMContext& lc;
     Module& mod;
     IRBuilder<> b;
     Runtime& runtime;
     JitPinned& pinned;
+    // Persisted before lowering: codegen must not silently overwrite the
+    // source revision with a newer live Blocks revision during a delayed
+    // asynchronous compile.
+    uint64_t compiledSourceRevision = 0;
+    ir::ScratchSourceDigest compiledSourceDigest;
+
+    // Compile-time only counters. They describe opportunities before LLVM's
+    // middle-end; the optimized-IR/native-code counters are measured
+    // independently by tests/bench/phi_demand_metrics.py.
+    uint64_t phiMergeBlocks = 0;
+    uint64_t phiDemandScans = 0;
+    uint64_t phiCandidates = 0;
+    uint64_t phiBoxedEmitted = 0;
+    uint64_t phiBoxedSkipped = 0;
+    uint64_t phiNumericEmitted = 0;
+    uint64_t phiNumericSkipped = 0;
 
     Target* target;
     Blocks* blocks;
     /// AOT モード: ホストポインタを slot load に置き換える（null なら JIT）。
     AotEmit* aot = nullptr;
     bool fail = false;
+    // Emit a plain local increment. LLVM can fold adjacent increments and
+    // preserve them across SSA optimizations. Atomic synchronization is
+    // needed only at fiber yields / completion, not per Scratch primitive.
+    // Without counting enabled no instrumentation is emitted.
+    void emitBlockCount(uint64_t amount = 1) {
+        if (!runtime.blockCountEnabled || !amount) return;
+        llvm::Value* slot = b.CreateConstGEP1_32(
+            i8t, ctxArg, uint32_t(offsetof(JitCtx, pendingBlockCount)));
+        llvm::Value* counter = b.CreateLoad(i64t, slot);
+        b.CreateStore(b.CreateAdd(counter, ci64(amount)), slot);
+    }
+
+    struct ReporterCountGuard {
+        Codegen& cg;
+        bool active;
+        ~ReporterCountGuard() { if (active) cg.emitBlockCount(); }
+    };
     const bool verbose = std::getenv("XYO_JIT_VERBOSE") != nullptr;
     // Compile-time A/B switch; no branch is added to generated hot loops.
     const bool boxedMotion = std::getenv("XYO_JIT_MOTION_BOXED") != nullptr;
@@ -87,6 +146,10 @@ struct Codegen {
     const bool sharedDaysClock = [] {
         const char* env = std::getenv("XYO_JIT_DAYS_SHARED_CLOCK");
         return env && env[0] != '0' && !std::getenv("XYO_PROF");
+    }();
+    const bool boxedDaysClock = [] {
+        const char* env = std::getenv("XYO_JIT_DAYS_BOXED_CLOCK");
+        return env && env[0] == '1';
     }();
     const bool safeArithCanon = [] {
         const char* mode = std::getenv("XYO_JIT_SAFE_ARITH_CANON");
@@ -189,6 +252,19 @@ struct Codegen {
     // 実行ガード（repeat なら trip>=1）の中に置く。
     std::unordered_set<Block*> hoistedSetters;
     bool curFnWarp = false;
+    // Only the first top-level control_repeat of an OSR continuation.
+    // TIMES must not be re-evaluated after interpreter initialization.
+    const Block* osrStartLoop = nullptr;
+    // Standalone native loop may read its still-live interpreter caller's
+    // GC-rooted procedure arguments without evaluating a reporter block.
+    bool directNestedOsrArgs = false;
+    // Entry-only, read-only argument values. The interpreter procedure frame
+    // remains the GC root even while these NaN-boxed SSA bits cross a yield.
+    // An undefined value must take the original reporter path at each read.
+    bool hoistNestedOsrArgs = false;
+    // Optional bounded deopt only at a fully completed counted-loop body.
+    bool nestedOsrInFlightGuard = false;
+    std::map<std::u16string, llvm::Value*> hoistedNestedOsrArgs;
     /// ループ本体で書き込まれる変数/リスト（不変性判定用）
     struct LoopWriteScan {
         std::unordered_set<std::string> vars, lists;
@@ -229,7 +305,7 @@ struct Codegen {
     /// gpuProgs へ積み、所有付きポインタを返す（失敗 nullptr）。
     /// while/until では limitParent/limitInput に境界式が入る。
     const gpu::ParallelLoop* tryGpuLoopEx(Block* blk) {
-        if (!gpuProgs || gpuDisabled) return nullptr;
+        if (!gpuProgs || gpuDisabled || runtime.blockCountEnabled) return nullptr;
         const BlockInput* sub = blk->inputs.find("SUBSTACK");
         if (!sub || sub->block.empty()) return nullptr;
         std::string why;
@@ -323,7 +399,7 @@ struct Codegen {
             const char* v = std::getenv("XYO_PENHOIST");
             return v && v[0] == '0';
         }();
-        if (disabled || !curFnWarp || !blocks) return out;
+        if (disabled || runtime.blockCountEnabled || !curFnWarp || !blocks) return out;
         const BlockInput* sub = loop->inputs.find("SUBSTACK");
         if (!sub || sub->block.empty()) return out;
         LoopWriteScan w;
@@ -348,7 +424,7 @@ struct Codegen {
     /// ホイストした setter を、本体が 1 回以上実行されるガード内で emit する
     /// （guard が null なら無条件 — forever 用）。
     void emitHoistedSetters(const std::vector<Block*>& hs, llvm::Value* guard) {
-        if (hs.empty()) return;
+        if (hs.empty() || runtime.blockCountEnabled) return;
         BasicBlock* runBB = nullptr, *afterBB = nullptr;
         if (guard) {
             runBB = BasicBlock::Create(lc, "", fn);
@@ -370,6 +446,10 @@ struct Codegen {
     }
 
     /// par-for の最小反復数（これ未満は逐次ループの方が速い）
+    // Minimum trip count for the fused append batch path. The runtime uses
+    // a separate, higher XYO_PARFOR_PARALLEL_MIN threshold for *workers*;
+    // short eligible batches run locally without task dispatch. This retains
+    // the faster fast-path for 1000-item Scratch append loops.
     static int64_t parForMinTrip() {
         static const int64_t v = [] {
             const char* s = std::getenv("XYO_PARFOR_MIN");
@@ -384,7 +464,7 @@ struct Codegen {
     /// リストは反復順に slot を書くので、最終内容は逐次と完全に一致する。
     bool tryEmitParFor(Block* blk, llvm::Value* n, BasicBlock* fallback,
                        BasicBlock* merge) {
-        if (parForDisabled || aot || !blocks) return false;
+        if (parForDisabled || runtime.blockCountEnabled || aot || !blocks) return false;
         std::string why;
         auto planOpt = jit::analyzeParFor(*blocks, blk, &why);
         if (!planOpt) {
@@ -603,6 +683,22 @@ struct Codegen {
         // Compat/reporters may mutate shared execution caches or invoke
         // registered primitives that static opcode memory keys cannot model.
         if (std::string_view(name).starts_with("xyo_rt_")) mainThread = true;
+        // Clone creation and deletion mutate the live scheduler/Target
+        // arrays. The dependency analyzer already rejects parallel
+        // execution for these opcodes (AccessSet::spawn), but it would
+        // otherwise analyze and cache the same invalid plan separately
+        // for every short-lived clone Target. Marking caller affinity at
+        // compile time avoids those O(clones) analyses/cache entries.
+        // Enabled by default after parity and paired benchmark validation.
+        // Set XYO_CLONE_SERIAL_CODEGEN=0 for the historical analysis path.
+        static const bool cloneSerialHint = [] {
+            const char* v = std::getenv("XYO_CLONE_SERIAL_CODEGEN");
+            return !v || v[0] != '0';
+        }();
+        if (cloneSerialHint &&
+            (std::string_view(name) == "xyo_ctl_createclone" ||
+             std::string_view(name) == "xyo_ctl_deleteclone"))
+            mainThread = true;
         return mod.getOrInsertFunction(
             name, FunctionType::get(ret, args, false));
     }
@@ -625,7 +721,8 @@ struct Codegen {
             "xyo_yield", "xyo_yield_fast", "xyo_loop_yield",
             "xyo_wait_yield", "xyo_wait_event_yield", "xyo_rt_wait", "xyo_stop_all",
             "xyo_stop_script", "xyo_broadcast_wait_v", "xyo_rt_compat",
-            "xyo_rt_reporter", "xyo_mot_glidexy", "xyo_mot_glideto",
+            "xyo_rt_reporter", "xyo_rt_nested_osr_arg_get",
+            "xyo_mot_glidexy", "xyo_mot_glideto",
             "xyo_looks_saysecs", "xyo_looks_thinksecs",
             "xyo_looks_switchbackdropwait", "xyo_sns_askwait",
             "xyo_ctl_deleteclone", "xyo_snd_playwait",
@@ -773,8 +870,12 @@ struct Codegen {
     /// warp は 500ms stuck 窓の時計読みを 64 回に 1 回へ間引く
     /// （判定遅延 << 500ms）。xyo_loop_yield 内で isWarp/isStuck を
     /// 再確認するので意味論は不変。
-    void beginLoopYieldScope() {
-        yieldStack.push_back({curYieldCnt, curYieldWarp});
+    void beginLoopYieldScope(const Block* sourceLoop) {
+        yieldStack.push_back({curYieldCnt, curYieldWarp, curYieldSourceLoop,
+                              curYieldRemainingF64, curYieldRemainingI32});
+        curYieldSourceLoop = sourceLoop;
+        curYieldRemainingF64 = nullptr;
+        curYieldRemainingI32 = nullptr;
         curYieldCnt = entryAlloca(i64t, 1, "ycnt");
         b.CreateStore(
             b.CreateLoad(i64t,
@@ -791,6 +892,9 @@ struct Codegen {
         yieldStack.pop_back();
         curYieldCnt = s.cnt;
         curYieldWarp = s.warp;
+        curYieldSourceLoop = s.sourceLoop;
+        curYieldRemainingF64 = s.remainingF64;
+        curYieldRemainingI32 = s.remainingI32;
     }
     // Only active while lowering a proven self-append-only warp repeat.
     // The log remains GC-rooted by the immutable prefix snapshot in var.
@@ -821,6 +925,80 @@ struct Codegen {
             b.CreateStore(changed, extra.first);
         }
     }
+    struct PortableLoopCapture {
+        llvm::Value* ids = nullptr;
+        llvm::Value* counters = nullptr;
+        uint32_t count = 0;
+    };
+    std::optional<PortableLoopCapture>
+    emitPortableLoopCheckpoint(bool bodyComplete = true) {
+        // Only the opt-in native LLVM mirror records portable state.
+        if (!portableCallFrames() || aot || !curYieldSourceLoop)
+            return std::nullopt;
+        struct Snapshot {
+            const Block* source;
+            llvm::AllocaInst* f64;
+            llvm::AllocaInst* i32;
+        };
+        std::vector<Snapshot> path;
+        path.reserve(yieldStack.size() + 1);
+        for (const auto& scope : yieldStack) {
+            if (scope.sourceLoop)
+                path.push_back({scope.sourceLoop, scope.remainingF64,
+                                scope.remainingI32});
+        }
+        path.push_back({curYieldSourceLoop, curYieldRemainingF64,
+                        curYieldRemainingI32});
+        // The experimental frame layout is capped at 32 lexical loops.
+        // Its observer is already disabled for scripts exceeding that bound.
+        if (path.size() > 32) return std::nullopt;
+
+        // Allocate once in the LLVM function entry, not inside a loop.
+        // A source-level path is unique per lexical yield site. Runtime
+        // receives outer and inner loop counters as one atomic checkpoint.
+        auto* ids = entryAlloca(ptrt, uint32_t(path.size()), "loop.path.ids");
+        auto* values = entryAlloca(i64t, uint32_t(path.size()),
+                                   "loop.path.counters");
+        for (uint32_t i = 0; i < path.size(); ++i) {
+            const auto& scope = path[i];
+            b.CreateStore(b.CreateGlobalString(scope.source->id),
+                          b.CreateConstGEP1_32(ptrt, ids, i));
+            llvm::Value* bits = ci64(UINT64_MAX);
+            if (scope.i32) {
+                bits = b.CreateBitCast(
+                    b.CreateSIToFP(b.CreateLoad(i32t, scope.i32), f64t),
+                    i64t);
+            } else if (scope.f64) {
+                bits = b.CreateBitCast(b.CreateLoad(f64t, scope.f64), i64t);
+            }
+            b.CreateStore(bits, b.CreateConstGEP1_32(i64t, values, i));
+        }
+        callN("xyo_proc_frame_checkpoint_path_phase", voidt,
+              {ctxArg, ids, values, ci32(uint32_t(path.size())),
+               ci32(uint32_t(bodyComplete
+                   ? ir::SourceResumePhase::AfterLoopBody
+                   : ir::SourceResumePhase::InsideLoopBody))});
+        return PortableLoopCapture{ids, values, uint32_t(path.size())};
+    }
+
+    void emitNestedOsrYieldCheckpoint() {
+        if (!nestedOsrInFlightGuard || !osrStartLoop ||
+            curYieldSourceLoop != osrStartLoop ||
+            (!curYieldRemainingF64 && !curYieldRemainingI32))
+            return;
+        llvm::Value* remaining = curYieldRemainingI32
+            ? b.CreateSIToFP(
+                b.CreateLoad(i32t, curYieldRemainingI32), f64t)
+            : b.CreateLoad(f64t, curYieldRemainingF64);
+        // emitLoopYield is called at the END of a completed Scratch body
+        // but the private LLVM counter is decremented only AFTER yield.
+        // Convert to the exact count expected at the next Interpreter
+        // repeat latch. Source edits can then discard the suspended Fiber
+        // without running any more LLVM or replaying prior effects.
+        call2("xyo_rt_nested_osr_yield_checkpoint", voidt, ctxArg,
+              b.CreateFSub(remaining, cf64(1.0)));
+    }
+
     // The deadline poll is shared by ordinary Scratch loops and SSA
     // chunks. Neither path calls the scheduler unless the deadline is
     // actually exceeded (or the sampled-clock fallback is needed).
@@ -829,6 +1007,8 @@ struct Codegen {
         if (!sharedWarpClock && promoted.empty() &&
             promotedLists.empty() && !activeTransient) {
             transientBeforeHandoff();
+            emitPortableLoopCheckpoint();
+            emitNestedOsrYieldCheckpoint();
             call1("xyo_loop_yield", voidt, ctxArg);
             transientAfterHandoff();
             b.CreateBr(done);
@@ -878,6 +1058,8 @@ struct Codegen {
             b.SetInsertPoint(handoff);
             transientBeforeHandoff();
             spillPromoted();
+            emitPortableLoopCheckpoint();
+            emitNestedOsrYieldCheckpoint();
             call1("xyo_yield", voidt, ctxArg);
             reloadPromoted();
             transientAfterHandoff();
@@ -905,7 +1087,13 @@ struct Codegen {
         b.SetInsertPoint(normalBB);
         transientBeforeHandoff();
         spillPromoted();
-        if (std::getenv("XYO_PROF"))
+        emitPortableLoopCheckpoint();
+        // Native CallFrame tracking must observe EVERY real yield, even
+        // those that normally bypass the full helper via xyo_yield_fast.
+        // Do not change the default fast-yield path when the experiment
+        // is disabled.
+        if ((portableCallFrames() && !aot) ||
+            runtime.blockCountEnabled || std::getenv("XYO_PROF"))
             call1("xyo_yield", voidt, ctxArg);
         else
             call1("xyo_yield_fast", voidt, ctxPtr(4));
@@ -977,11 +1165,20 @@ struct Codegen {
         b.CreateBr(done);
         b.SetInsertPoint(poll);
         b.CreateStore(b.CreateSub(remaining, toPoll), left);
-        // emitLoopYield increments once and samples the deadline on the
-        // exact same iteration as the original C++ empty-repeat helper.
-        b.CreateStore(b.CreateAdd(
-            ticks, b.CreateSub(toPoll, ci64(1))), tickPtr);
-        emitLoopYield();
+        // The warp-only guard dominates this scheduler. Publish the
+        // completed 64-tick boundary and poll directly instead of emitting
+        // another warp-mode branch, increment and mask check. The actual
+        // yield (and all state synchronization) remains unchanged.
+        const char* direct = std::getenv("XYO_JIT_INLINE_EMPTY_DIRECT");
+        if (direct && direct[0] == '1') {
+            b.CreateStore(b.CreateAdd(ticks, toPoll), tickPtr);
+            BasicBlock* afterPoll = newBB("empty.scheduler.after.poll");
+            emitWarpDeadlineCheck(poll, afterPoll);
+        } else {
+            b.CreateStore(b.CreateAdd(
+                ticks, b.CreateSub(toPoll, ci64(1))), tickPtr);
+            emitLoopYield();
+        }
         b.CreateBr(head);
         b.SetInsertPoint(done);
     }
@@ -1000,10 +1197,17 @@ struct Codegen {
 
     /// NaN ボックスの number 判定（Value::isNumber と同型）
     llvm::Value* emitIsNum(llvm::Value* bits) {
-        llvm::Value* tag = b.CreateAnd(b.CreateLShr(bits, ci64(48)),
-                                       ci64(0xFFF8));
-        return b.CreateOr(b.CreateICmpNE(tag, ci64(0x7FF8)),
-                          b.CreateICmpEQ(bits, ci64(val::kNan)));
+        struct NumericLowerer {
+            Codegen& cg;
+            llvm::Value* isNumericBits(llvm::Value* raw) {
+                llvm::Value* tag = cg.b.CreateAnd(
+                    cg.b.CreateLShr(raw, cg.ci64(48)), cg.ci64(0xFFF8));
+                return cg.b.CreateOr(
+                    cg.b.CreateICmpNE(tag, cg.ci64(0x7FF8)),
+                    cg.b.CreateICmpEQ(raw, cg.ci64(val::kNan)));
+            }
+        } backend{*this};
+        return ir::lowerNumericSlotGuard(backend, bits);
     }
     llvm::Value* emitAsF64(llvm::Value* bits) {
         return b.CreateBitCast(bits, f64t);
@@ -1100,10 +1304,169 @@ struct Codegen {
         AllocaInst* len;    // i32 shadow, refreshed after yield
         AllocaInst* items;  // ptr shadow, refreshed after yield
         AllocaInst* numericOnly; // i8 shadow, refreshed after yield
+        AllocaInst* storageEpoch; // i64 shadow, adaptive mode only
     };
     std::vector<PromotedVar> promoted;
     std::vector<PromotedList> promotedLists;
     std::unordered_map<llvm::Value*, const BlockField*> lazyNumericLoads;
+    // Local typed value forwarding: a store to a promoted scalar followed
+    // by a read in the same IR basic block can reuse the SSA producer (and
+    // its numeric/string fact) directly. No fact crosses a control-flow
+    // edge, yield, or write through another operation.
+    struct LocalVarFact {
+        llvm::BasicBlock* block;
+        llvm::Value* bits;
+        bool fromLoad = false;
+    };
+    std::unordered_map<std::string, LocalVarFact> localVarFacts;
+    // Opt-in load-to-load forwarding: two reads in the same LLVM basic block
+    // may reuse an immutable boxed SSA producer. Only promotable lazy-typed
+    // scalars are eligible; branch/yield/write invalidation is unchanged.
+    // Read the experimental parser selection once per compiled script,
+    // rather than querying the process environment for every numeric input.
+    const bool coldStringNumberHelperEnabled = [] {
+        const char* option = std::getenv("XYO_JIT_TO_NUM_COLD_HELPER");
+        return option && option[0] == '1';
+    }();
+    const bool localReadForwardEnabled = [] {
+        const char* option = std::getenv("XYO_JIT_LOCAL_READ_FORWARD");
+        return option && option[0] == '1';
+    }();
+    uint64_t localReadReuses = 0;
+    bool localFactsAliasSafe = false;
+    const bool localForwardEnabled = [] {
+        const char* setting = std::getenv("XYO_JIT_LOCAL_VAR_FORWARD");
+        return !setting || setting[0] != '0';
+    }();
+    // A condition may lower into several LLVM BBs even if it cannot write a
+    // Scratch variable (for example, comparing numeric strings). Accept
+    // incoming SSA values across those BBs ONLY when every reporter in the
+    // expression is on this explicit read-only whitelist. Unknown extensions,
+    // procedures and malformed cyclic graphs are barriers.
+    bool readonlyCondition(const BlockInput* input) const {
+        if (!blocks || !input) return false;
+        static const std::unordered_set<std::string_view> kReadOnly = {
+            "math_number", "math_integer", "math_whole_number",
+            "math_positive_number", "math_angle", "math_boolean",
+            "text", "colour_picker", "data_variable", "data_itemoflist",
+            "data_lengthoflist", "data_listcontainsitem",
+            "operator_add", "operator_subtract", "operator_multiply",
+            "operator_divide", "operator_mod", "operator_round",
+            "operator_mathop", "operator_lt", "operator_gt",
+            "operator_equals", "operator_and", "operator_or",
+            "operator_not", "operator_join", "operator_letter_of",
+            "operator_length", "operator_contains",
+        };
+        std::unordered_set<std::string> active;
+        std::function<bool(const BlockInput&, unsigned)> walk =
+            [&](const BlockInput& in, unsigned depth) -> bool {
+                if (depth > 64) return false;
+                const std::string& id =
+                    in.block.empty() ? in.shadow : in.block;
+                const Block* source = blocks->getBlock(id);
+                if (!source || !kReadOnly.contains(source->opcode) ||
+                    !active.insert(id).second) return false;
+                for (const auto& [name, child] : source->inputs.items) {
+                    (void)name;
+                    if (!walk(child, depth + 1)) {
+                        active.erase(id);
+                        return false;
+                    }
+                }
+                active.erase(id);
+                return true;
+            };
+        return walk(*input, 0);
+    }
+    struct PhiDemand {
+        bool boxed = false;
+        bool numeric = false;
+    };
+
+    // Local, bounded profitability analysis for a branch join. The
+    // forwarded SSA value is available only until the first subsequent
+    // assignment/control boundary. We therefore inspect the same linear
+    // Scratch stack sequence, evaluating each statement's input reporters
+    // BEFORE its write (as the normal lowerer does). This is NOT a type
+    // proof: skipping a PHI only falls back to canonical promoted loads.
+    std::unordered_map<std::string, PhiDemand> phiDemandAfter(
+            const Block* branch) const {
+        std::unordered_map<std::string, PhiDemand> demand;
+        if (!blocks || !branch) return demand;
+        static const std::unordered_set<std::string_view> kNumericParents = {
+            "operator_add", "operator_subtract", "operator_multiply",
+            "operator_divide", "operator_mod", "operator_round",
+            "operator_mathop", "operator_lt", "operator_gt",
+            "operator_equals", "data_changevariableby",
+        };
+        std::unordered_set<std::string> killed;
+        std::unordered_set<std::string> stackSeen;
+        unsigned visitedReporters = 0;
+        std::function<void(const BlockInput&, std::string_view, unsigned)>
+            visitInput = [&](const BlockInput& in, std::string_view parent,
+                             unsigned depth) {
+                if (depth >= 32 || visitedReporters >= 256) return;
+                const std::string& id =
+                    in.block.empty() ? in.shadow : in.block;
+                const Block* source = blocks->getBlock(id);
+                if (!source || !stackSeen.insert(id).second) return;
+                ++visitedReporters;
+                if (source->opcode == "data_variable") {
+                    auto field = source->fields.find("VARIABLE");
+                    if (field != source->fields.end() &&
+                        !killed.contains(field->second.id)) {
+                        auto& use = demand[field->second.id];
+                        use.boxed = true;
+                        use.numeric |= kNumericParents.contains(parent);
+                    }
+                }
+                for (const auto& [name, child] : source->inputs.items) {
+                    (void)name;
+                    visitInput(child, source->opcode, depth + 1);
+                }
+                stackSeen.erase(id);
+            };
+        std::unordered_set<std::string> seenBlocks;
+        std::string id = branch->next;
+        for (unsigned i = 0; !id.empty() && i < 32; ++i) {
+            if (!seenBlocks.insert(id).second) break;
+            const Block* node = blocks->getBlock(id);
+            if (!node) break;
+            // An opaque call, loop, branch or scheduler boundary can change
+            // the insertion BB and the variable without a visible write.
+            // Never forecast SSA consumers across one.
+            if (node->opcode.rfind("control_", 0) == 0 ||
+                node->opcode == "procedures_call" ||
+                node->opcode == "event_broadcast" ||
+                node->opcode == "event_broadcastandwait" ||
+                (!promotableOpcode(node->opcode) &&
+                 node->opcode != "data_setvariableto"))
+                break;
+            stackSeen.clear();
+            for (const auto& [name, input] : node->inputs.items) {
+                if (name.rfind("SUBSTACK", 0) == 0) continue;
+                visitInput(input, node->opcode, 0);
+            }
+            if (node->opcode == "data_setvariableto" ||
+                node->opcode == "data_changevariableby") {
+                auto field = node->fields.find("VARIABLE");
+                if (field == node->fields.end()) break;
+                killed.insert(field->second.id);
+            }
+            id = node->next;
+        }
+        return demand;
+    }
+
+    void rememberLocalVar(const BlockField* f, llvm::Value* bits) {
+        // The normal numeric shadow already forwards numeric values.
+        // Local forwarding is most useful for a mixed-type lazy shadow,
+        // where it also preserves the producer's known storage-type fact.
+        PromotedVar* promotedVar = findPromoted(f);
+        if (localForwardEnabled && localFactsAliasSafe &&
+            promotedVar && promotedVar->lazyValid)
+            localVarFacts[f->id] = {b.GetInsertBlock(), bits};
+    }
     const bool lazyTypedSSA = [] {
         const char* mode = std::getenv("XYO_JIT_LAZY_TYPED_SSA");
         return mode && mode[0] == '1';
@@ -1140,10 +1503,17 @@ struct Codegen {
     struct YieldScope {
         llvm::AllocaInst* cnt;
         llvm::Value* warp;
+        const Block* sourceLoop;
+        llvm::AllocaInst* remainingF64;
+        llvm::AllocaInst* remainingI32;
     };
     std::vector<YieldScope> yieldStack;
     llvm::AllocaInst* curYieldCnt = nullptr;
     llvm::Value* curYieldWarp = nullptr;
+    // Source-level loop checkpoint; distinct from the machine Fiber PC.
+    const Block* curYieldSourceLoop = nullptr;
+    llvm::AllocaInst* curYieldRemainingF64 = nullptr;
+    llvm::AllocaInst* curYieldRemainingI32 = nullptr;
     bool promotingLoop = false;   // このループが write-back を持つ（最外）
     // Resume-epoch guard: compare the actual boxed value after a yield,
     // reusing its numeric shadow when unchanged. A GC collection invalidates
@@ -1461,7 +1831,12 @@ struct Codegen {
                                          cf64(0.0), nc);
         b.CreateBr(merge);
         b.SetInsertPoint(missBB);
-        llvm::Value* hv = call1("xyo_to_num", f64t, bits);
+        // The predecessor proved this is an SStr and numState == 0.
+        // The experimental cold-only helper avoids rechecking both facts
+        // in the general xyo_to_num entry.
+        llvm::Value* hv = coldStringNumberHelperEnabled
+            ? call1("xyo_to_num_uncached", f64t, sp)
+            : call1("xyo_to_num", f64t, bits);
         b.CreateBr(merge);
         b.SetInsertPoint(zeroBB);
         b.CreateBr(merge);
@@ -1524,13 +1899,16 @@ struct Codegen {
         uint32_t(sizeof(SStr));
     static constexpr uint32_t kSStrFlagsOff =
         uint32_t(offsetof(SStr, flags));
-    /// 連結ノード（cons string）は本文が構造体直後に無い — inline の
-    /// 文字列 fast path は必ず helper へ落とす。
+    /// Cons/append-log/Latin-1 have no inlined UTF-16 body. Any direct
+    /// UTF-16 load must use the helper for these representations.
     llvm::Value* emitIsConsStr(llvm::Value* sp) {
-        llvm::Value* f = b.CreateLoad(
+        auto* flags = b.CreateLoad(
             i32t, b.CreateConstGEP1_32(i8t, sp, kSStrFlagsOff));
+        flags->setAtomic(AtomicOrdering::Monotonic);
+        llvm::Value* f = flags;
         return b.CreateICmpNE(
-            b.CreateAnd(f, ci32(SStr::kConsFlag | SStr::kAppendFlag)), ci32(0));
+            b.CreateAnd(f, ci32(SStr::kConsFlag | SStr::kAppendFlag |
+                                  SStr::kLatin1Flag)), ci32(0));
     }
     static constexpr uint32_t kSStrRgbStateOff =
         uint32_t(offsetof(SStr, rgbState));
@@ -1621,26 +1999,59 @@ struct Codegen {
     /// しまい、連結ループが O(n²) に戻る）。影は最適化なので、疑わしければ
     /// 付けない（意味論は tagged 経路で常に正しい）。
     std::unordered_set<std::string> nonNumericVars;
+    // Unknown-typed set-variable writes, keyed by the exact block ID.
+    // The CFG type-flow pass may prove an entire set of writes numeric.
+    // This controls only numeric-shadow profitability, not guard elision.
+    std::unordered_map<std::string, std::vector<std::string>> dynamicWriteSites;
+    // Read/demand facts are scoped to a single promotable loop. They never
+    // prove a runtime type or survive a scheduler handoff.
+    std::unordered_set<std::string> promotionReads;
+    std::unordered_map<std::string, unsigned> numericDemand;
 
     /// 代入値が数値を生むと静的に言えるか（保守的）。
+    // Shared, conservative storage-kind inference used by xyo analyze.
+    // In particular, a variable reporter and a list item are NOT necessarily
+    // numeric merely because a surrounding Scratch operator coerces them.
     bool valueIsNumeric(Block* blk, const char* input) {
-        const BlockInput* in = blk->inputs.find(input);
-        if (!in) return false;
-        const std::string& id = in->block.empty() ? in->shadow : in->block;
-        if (id.empty()) return false;   // 圧縮プリミティブ
-        Block* v = blocks->getBlock(id);
-        if (!v) return false;
-        static const std::unordered_set<std::string> kNum = {
-            "math_number", "operator_add", "operator_subtract",
-            "operator_multiply", "operator_divide", "operator_mod",
-            "operator_round", "operator_mathop", "data_variable",
-            "data_itemoflist", "data_lengthoflist",
-            "sensing_timer", "sensing_dayssince2000", "sensing_answer",
-            "sensing_loudness", "motion_xposition", "motion_yposition",
-            "motion_direction", "looks_size", "control_get_counter",
-            "sensing_mousex", "sensing_mousey",
+        if (!blocks || !blk) return false;
+        // Opt-out for comparing against the original permissive classifier.
+        if (const char* flag = std::getenv("XYO_JIT_STATIC_TYPE_SITES");
+            flag && flag[0] == '0') {
+            const BlockInput* in = blk->inputs.find(input);
+            if (!in) return false;
+            const std::string& id = in->block.empty() ? in->shadow : in->block;
+            Block* source = blocks->getBlock(id);
+            if (!source) return false;
+            static const std::unordered_set<std::string> originalNumeric = {
+                "math_number", "operator_add", "operator_subtract",
+                "operator_multiply", "operator_divide", "operator_mod",
+                "operator_round", "operator_mathop", "data_variable",
+                "data_itemoflist", "data_lengthoflist",
+                "sensing_timer", "sensing_dayssince2000", "sensing_answer",
+                "sensing_loudness", "motion_xposition", "motion_yposition",
+                "motion_direction", "looks_size", "control_get_counter",
+                "sensing_mousex", "sensing_mousey",
+            };
+            return originalNumeric.count(source->opcode) != 0;
+        }
+        const BlockInput* sourceInput = blk->inputs.find(input);
+        const uint32_t kinds =
+            analysis::inferInputStorageKinds(*blocks, sourceInput);
+        if (kinds == Variable::kObservedNumber) return true;
+        // Scratch's [4, "123"] numeric shadow is stored as a string.
+        // Nonetheless, its numeric coercion is constant and cheap. Numeric
+        // shadow profitability is distinct from the actual storage kind.
+        const std::string sourceId = sourceInput
+            ? (sourceInput->block.empty() ? sourceInput->shadow
+                                          : sourceInput->block)
+            : std::string();
+        const Block* source = blocks->getBlock(sourceId);
+        if (!source || source->fields.size() != 1) return false;
+        static const std::unordered_set<std::string_view> numericLiterals = {
+            "math_number", "math_integer", "math_whole_number",
+            "math_positive_number", "math_angle",
         };
-        return kNum.count(v->opcode) != 0;
+        return numericLiterals.count(source->opcode) != 0;
     }
 
     bool scanPromotable(const std::string& firstId,
@@ -1679,10 +2090,39 @@ struct Codegen {
                 const BlockField* f = findField(b2, "VARIABLE");
                 if (!f) return false;
                 if (varIds.insert(f->id).second) vars.push_back(f);
+                if (b2->opcode == "data_variable" ||
+                    b2->opcode == "data_changevariableby")
+                    promotionReads.insert(f->id);
+                if (b2->opcode == "data_changevariableby")
+                    ++numericDemand[f->id];
                 if (b2->opcode != "data_variable") {
                     promotionWrites.insert(f->id);
-                    if (!valueIsNumeric(b2, "VALUE"))
+                    // Change-by is always a numeric *write*, regardless
+                    // of the storage type of its input/delta expression.
+                    if (b2->opcode == "data_setvariableto" &&
+                        !valueIsNumeric(b2, "VALUE")) {
                         nonNumericVars.insert(f->id);
+                        dynamicWriteSites[f->id].push_back(b2->id);
+                    }
+                }
+            }
+            // A variable reporter is consumed numerically only when it is
+            // a direct operand of a coercing operator. A join/text consumer
+            // must not activate a number cache (flattening can be expensive).
+            static const std::unordered_set<std::string_view> kNumericParents = {
+                "operator_add", "operator_subtract", "operator_multiply",
+                "operator_divide", "operator_mod", "operator_round",
+                "operator_mathop", "operator_lt", "operator_gt",
+                "operator_equals", "data_changevariableby",
+            };
+            if (kNumericParents.count(b2->opcode)) {
+                for (const auto& [name, input] : b2->inputs.items) {
+                    (void)name;
+                    const auto& childId = input.block.empty() ? input.shadow : input.block;
+                    Block* child = blocks->getBlock(childId);
+                    if (!child || child->opcode != "data_variable") continue;
+                    if (const BlockField* field = findField(child, "VARIABLE"))
+                        ++numericDemand[field->id];
                 }
             }
             if (b2->opcode == "data_itemoflist" ||
@@ -1710,6 +2150,10 @@ struct Codegen {
         std::vector<const BlockField*> vars;
         std::vector<const BlockField*> lists;
         nonNumericVars.clear();
+        dynamicWriteSites.clear();
+        localVarFacts.clear();
+        promotionReads.clear();
+        numericDemand.clear();
         promotionWrites.clear();
         trigHoists.clear();
         trigHoistAllowed = std::getenv("XYO_JIT_TRIG_HOIST") &&
@@ -1753,6 +2197,61 @@ struct Codegen {
         for (const BlockField* f : vars)
             if (!f->id.empty() && seenVar.insert(f->id).second)
                 uniq.push_back(f);
+        // A malformed/name-aliased project may address the same Variable
+        // through different IDs. Never forward local SSA values in that
+        // case: a store through an alternate ID can invalidate the fact.
+        localFactsAliasSafe = target != nullptr;
+        std::unordered_set<const Variable*> resolvedVars;
+        for (const BlockField* f : uniq) {
+            const Variable* v = target ? target->lookupVariableById(f->id)
+                                       : nullptr;
+            if (!v || !resolvedVars.insert(v).second) {
+                localFactsAliasSafe = false;
+                break;
+            }
+        }
+        // Optional CFG-aware profitability hint. This requires every
+        // uncertain write to have a Number-only post-state at every reachable
+        // occurrence, with no unresolved/aliased variable IDs. No dynamic
+        // type check is removed: the numeric shadow always maintains
+        // toNumber(boxed) plus Scratch comparison eligibility.
+        const char* cfgTypeHints = std::getenv("XYO_JIT_CFG_TYPE_HINTS");
+        if (cfgTypeHints && cfgTypeHints[0] == '1' &&
+            localFactsAliasSafe && !dynamicWriteSites.empty()) {
+            const auto flow = analysis::analyzeTypeFlow(*blocks, loopBlk->id,
+                                                         8192, target);
+            if (!flow.cfg.truncated) {
+                for (const auto& [variableId, writes] : dynamicWriteSites) {
+                    bool numericAtAllWrites = !writes.empty();
+                    for (const std::string& write : writes) {
+                        auto positions = flow.cfg.blockNodes.find(write);
+                        if (positions == flow.cfg.blockNodes.end()) {
+                            numericAtAllWrites = false;
+                            break;
+                        }
+                        bool sawReachable = false;
+                        for (size_t index : positions->second) {
+                            if (!flow.reachable[index]) continue;
+                            sawReachable = true;
+                            if (flow.kindAfter(index, variableId) !=
+                                Variable::kObservedNumber) {
+                                numericAtAllWrites = false;
+                                break;
+                            }
+                        }
+                        if (!sawReachable) numericAtAllWrites = false;
+                        if (!numericAtAllWrites) break;
+                    }
+                    if (numericAtAllWrites) {
+                        nonNumericVars.erase(variableId);
+                        if (verbose)
+                            std::fprintf(stderr,
+                                "xyo-jit: cfg numeric-shadow %s\n",
+                                variableId.c_str());
+                    }
+                }
+            }
+        }
         // 数値影の可否は**変数ごと**に決める: ループ内の書き込みがすべて
         // 数値を生むと分かる変数だけ f64 の影を持つ。文字列を受ける変数に
         // 影を持たせると、代入のたびに toNum（= view = flatten）が走る。
@@ -1765,10 +2264,22 @@ struct Codegen {
             b.CreateStore(init, slot);
             AllocaInst* ds = nullptr;
             AllocaInst* oks = nullptr;
-            const bool numeric = !nonNumericVars.count(f->id);
-            // Mixed-type writes keep boxed SSA; numeric conversion is lazy.
+            // Write-only variables do not need a numeric shadow at all:
+            // writes still update the canonical i64 slot and are published at
+            // yield/exit. The old path eagerly coerced their initial values
+            // and every subsequent assignment despite no numeric consumer.
+            const bool read = promotionReads.count(f->id) != 0;
+            const bool numeric = read && !nonNumericVars.count(f->id);
+            const char* typeFlowEnv = std::getenv("XYO_JIT_TYPE_FLOW");
+            const bool typeFlow = !typeFlowEnv || typeFlowEnv[0] != '0';
+            // Reuse the existing guarded lazy SSA for genuinely mixed
+            // variables with repeated static numeric consumption. Its
+            // validity bit is cleared on every unknown write and yield.
+            const bool lazy = read && !numeric &&
+                (lazyTypedSSA ||
+                 (typeFlow && numericDemand[f->id] >= 2));
             AllocaInst* lazyValid = nullptr;
-            if (!numeric && lazyTypedSSA) {
+            if (lazy) {
                 ds = entryAlloca(f64t, 1, "pv.lazy.number");
                 oks = entryAlloca(b.getInt1Ty(), 1, "pv.lazy.cmp");
                 lazyValid = entryAlloca(b.getInt1Ty(), 1, "pv.lazy.valid");
@@ -1812,6 +2323,10 @@ struct Codegen {
                 b.CreateLoad(ptrt, b.CreateConstGEP1_32(i8t, l, kListItemsOff));
             llvm::Value* numericValue = b.CreateLoad(b.getInt8Ty(),
                 b.CreateConstGEP1_32(i8t, l, kListNumericOnlyOff));
+            llvm::Value* epoch = xyo_list_storage_mode == 7
+                ? b.CreateLoad(i64t, b.CreateConstGEP1_32(
+                      i8t, l, uint32_t(offsetof(SList, storageEpoch))))
+                : nullptr;
             b.CreateBr(mergeBB);
             b.SetInsertPoint(zeroBB);
             b.CreateBr(mergeBB);
@@ -1827,13 +2342,22 @@ struct Codegen {
             PHINode* numericPhi = b.CreatePHI(b.getInt8Ty(), 2);
             numericPhi->addIncoming(b.getInt8(0), zeroBB);
             numericPhi->addIncoming(numericValue, loadBB);
+            PHINode* epochPhi = nullptr;
+            if (xyo_list_storage_mode == 7) {
+                epochPhi = b.CreatePHI(i64t, 2);
+                epochPhi->addIncoming(ci64(0), zeroBB);
+                epochPhi->addIncoming(epoch, loadBB);
+            }
             AllocaInst* lenSlot = entryAlloca(i32t, 1, "list.len");
             AllocaInst* itemsSlot = entryAlloca(ptrt, 1, "list.items");
+            AllocaInst* numberSlot = entryAlloca(b.getInt8Ty(), 1, "list.numeric");
+            AllocaInst* epochSlot = xyo_list_storage_mode == 7
+                ? entryAlloca(i64t, 1, "list.storage.epoch") : nullptr;
             b.CreateStore(lenPhi, lenSlot);
             b.CreateStore(itemsPhi, itemsSlot);
-            AllocaInst* numberSlot = entryAlloca(b.getInt8Ty(), 1, "list.numeric");
             b.CreateStore(numericPhi, numberSlot);
-            promotedLists.push_back({f, lenSlot, itemsSlot, numberSlot});
+            if (epochSlot) b.CreateStore(epochPhi, epochSlot);
+            promotedLists.push_back({f, lenSlot, itemsSlot, numberSlot, epochSlot});
         }
         promotingLoop = !promoted.empty() || !promotedLists.empty();
         if (std::any_of(promoted.begin(), promoted.end(),
@@ -1982,6 +2506,7 @@ struct Codegen {
             b.CreateStore(callN("xyo_gc_epoch", i64t, {}), promotedGcEpoch);
     }
     void reloadPromoted() {
+        localVarFacts.clear(); // external scripts may have changed any type
         // Stop-the-world collection cannot advance during a non-yielding reload.
         llvm::Value* resumeGcEpoch = promotedGcEpoch
             ? callN("xyo_gc_epoch", i64t, {})
@@ -2062,11 +2587,17 @@ struct Codegen {
             b.CreateStore(b.CreateLoad(b.getInt8Ty(),
                 b.CreateConstGEP1_32(i8t, l, kListNumericOnlyOff)),
                 list.numericOnly);
+            if (list.storageEpoch)
+                b.CreateStore(b.CreateLoad(i64t, b.CreateConstGEP1_32(
+                    i8t, l, uint32_t(offsetof(SList, storageEpoch)))),
+                    list.storageEpoch);
             b.CreateBr(done);
             b.SetInsertPoint(empty);
             b.CreateStore(ci32(0), list.len);
             b.CreateStore(ConstantPointerNull::get(llvm::cast<PointerType>(ptrt)), list.items);
             b.CreateStore(b.getInt8(0), list.numericOnly);
+            if (list.storageEpoch)
+                b.CreateStore(ci64(0), list.storageEpoch);
             b.CreateBr(done);
             b.SetInsertPoint(done);
         }
@@ -2178,9 +2709,28 @@ struct Codegen {
     }
 
     llvm::Value* emitVarGet(const BlockField* f) {
+        // A fact is usable only in the block where the corresponding store
+        // was emitted. This avoids a compiler-side CFG merge or stale value.
+        if (localForwardEnabled && localFactsAliasSafe &&
+            f && findPromoted(f) && findPromoted(f)->lazyValid) {
+            auto it = localVarFacts.find(f->id);
+            if (it != localVarFacts.end() &&
+                it->second.block == b.GetInsertBlock()) {
+                if (localReadForwardEnabled && it->second.fromLoad)
+                    ++localReadReuses;
+                return it->second.bits;
+            }
+        }
         // jitVar（lookupOrCreate）は常に非 null — helper の v? ガードと等価
         llvm::Value* vp = varValuePtr(f);
-        llvm::Value* bits = b.CreateLoad(i64t, vp);
+        struct SlotLowerer {
+            IRBuilder<>& builder;
+            llvm::Type* bitsType;
+            llvm::Value* loadSlot(llvm::Value* address) {
+                return builder.CreateLoad(bitsType, address);
+            }
+        } slotLowerer{b, i64t};
+        llvm::Value* bits = ir::lowerSlotLoad(slotLowerer, vp);
         if (f && finiteInductionVars.count(f->id))
             knownFiniteDeltas.insert(bits);
         if (f && inductionRangesEnabled) {
@@ -2202,6 +2752,13 @@ struct Codegen {
                 knownNumOk[bits] = b.CreateLoad(b.getInt1Ty(), p->okslot);
             } else if (p->lazyValid) {
                 lazyNumericLoads[bits] = f;
+                // A straight-line repeated reporter read (e.g. x + x)
+                // reuses the boxed SSA load rather than generating another
+                // independent load and guarded numeric conversion.
+                // No fact survives a BB change or the existing spill/reload.
+                if (localReadForwardEnabled && localFactsAliasSafe &&
+                    f && b.GetInsertBlock())
+                    localVarFacts[f->id] = {b.GetInsertBlock(), bits, true};
             }
         } else if (profiledNumber(f)) {
             likelyNumLoads.insert(bits);
@@ -2214,10 +2771,18 @@ struct Codegen {
                 // 影の不変条件: d == toNum(bits)。bits は代入された値そのもの
                 // （"0" のような文字列リテラルでもよい）。
                 storeNumericPair(*p, val, emitToNumF64(val));
+                rememberLocalVar(f, val);
                 return;
             }
         }
-        b.CreateStore(val, varValuePtr(f));
+        struct SlotLowerer {
+            IRBuilder<>& builder;
+            void storeSlot(llvm::Value* address, llvm::Value* bits) {
+                builder.CreateStore(bits, address);
+            }
+        } slotLowerer{b};
+        ir::lowerSlotStore(slotLowerer, varValuePtr(f), val);
+        rememberLocalVar(f, val);
         if (PromotedVar* p = findPromoted(f); p && p->lazyValid) {
             // Generic producer-to-consumer forwarding: when the producer
             // already carries a proven numeric SSA value and comparison
@@ -2234,9 +2799,13 @@ struct Codegen {
             }
         }
     }
-    void emitVarChange(const BlockField* f, llvm::Value* delta) {
+    void emitVarChange(const BlockField* f, llvm::Value* delta,
+                       bool sameScalarDelta = false) {
+        if (f) localVarFacts.erase(f->id);
         llvm::Value* vp = varValuePtr(f);
-        llvm::Value* cur = b.CreateLoad(i64t, vp);
+        // A direct reporter reading this exact scalar was evaluated before
+        // the change-by stack operation; it is the previous boxed value.
+        llvm::Value* cur = sameScalarDelta ? delta : b.CreateLoad(i64t, vp);
         if (!findPromoted(f) && profiledNumber(f))
             likelyNumLoads.insert(cur);
         // xyo_var_change と同型: numCanonical(toNum(cur)+toNum(delta)).
@@ -2313,7 +2882,8 @@ struct Codegen {
             }
             return;
         }
-        llvm::Value* s = b.CreateFAdd(emitToNumF64(cur), fb);
+        llvm::Value* s = b.CreateFAdd(
+            sameScalarDelta ? fb : emitToNumF64(cur), fb);
         bool finiteDelta = false;
         if (auto* cf = llvm::dyn_cast<llvm::ConstantFP>(fb)) {
             const llvm::APFloat& ap = cf->getValueAPF();
@@ -2422,10 +2992,34 @@ struct Codegen {
         // cold fmod path pays for an unordered FP comparison.
         llvm::Value* modNan = nullptr;
         switch (aop) {
-        case AOp::Add: r = b.CreateFAdd(fa, fb); break;
-        case AOp::Sub: r = b.CreateFSub(fa, fb); break;
-        case AOp::Mul: r = b.CreateFMul(fa, fb); break;
-        case AOp::Div: r = b.CreateFDiv(fa, fb); break;
+        case AOp::Add:
+        case AOp::Sub:
+        case AOp::Mul:
+        case AOp::Div: {
+            // Both native LLVM and WASM lower the same typed numeric SSA.
+            const auto opcode = aop == AOp::Add ? ir::Op::Add :
+                                aop == AOp::Sub ? ir::Op::Sub :
+                                aop == AOp::Mul ? ir::Op::Mul : ir::Op::Div;
+            const ir::Function& graph = ir::binaryFunction(opcode);
+            struct Lowerer {
+                IRBuilder<>& builder;
+                llvm::Value* inputs[2];
+                llvm::Value* parameter(uint32_t index) {
+                    return inputs[index];
+                }
+                llvm::Value* binary(ir::Op op, llvm::Value* a, llvm::Value* b) {
+                    switch (op) {
+                    case ir::Op::Add: return builder.CreateFAdd(a, b);
+                    case ir::Op::Sub: return builder.CreateFSub(a, b);
+                    case ir::Op::Mul: return builder.CreateFMul(a, b);
+                    case ir::Op::Div: return builder.CreateFDiv(a, b);
+                    default: return nullptr;
+                    }
+                }
+            } lowerer{b, {fa, fb}};
+            r = ir::lower(graph, lowerer, 2);
+            break;
+        }
         case AOp::Mod: {
             // Scratch: rem = fmod(n,m); rem/m < 0 ? rem+m : rem.
             // For an integral positive constant divisor, use integer srem
@@ -2761,8 +3355,72 @@ struct Codegen {
         return result;
     }
 
+    // Exact scalar reporter CSE, not algebraic simplification of arbitrary
+    // Scratch expressions. Resolving the ID in the current target ensures
+    // that the two reporters denote one Variable (never name-only aliases).
+    // No reporter or helper call may interleave the two plain reads.
+    bool sameScalarReporters(Block* parent, const char* left,
+                             const char* right) const {
+        const char* option = std::getenv("XYO_JIT_DUPLICATE_SCALAR_NUM");
+        if (!option || option[0] != '1' || !blocks || !target || !parent)
+            return false;
+        const BlockInput* a = parent->inputs.find(left);
+        const BlockInput* bInput = parent->inputs.find(right);
+        if (!a || !bInput) return false;
+        const std::string& aId = a->block.empty() ? a->shadow : a->block;
+        const std::string& bId = bInput->block.empty()
+            ? bInput->shadow : bInput->block;
+        const Block* aBlock = blocks->getBlock(aId);
+        const Block* bBlock = blocks->getBlock(bId);
+        if (!aBlock || !bBlock ||
+            aBlock->opcode != "data_variable" ||
+            bBlock->opcode != "data_variable")
+            return false;
+        const auto fa = aBlock->fields.find("VARIABLE");
+        const auto fb = bBlock->fields.find("VARIABLE");
+        if (fa == aBlock->fields.end() || fb == bBlock->fields.end() ||
+            fa->second.id.empty() || fa->second.id != fb->second.id)
+            return false;
+        const Variable* v = target->lookupVariableById(fa->second.id);
+        return v && v->type == Variable::kScalarType;
+    }
+
+    bool sameScalarChangeInput(Block* parent,
+                               const BlockField* variable) const {
+        const char* option = std::getenv("XYO_JIT_DUPLICATE_SCALAR_NUM");
+        if (!option || option[0] != '1' ||
+            !blocks || !target || !parent || !variable ||
+            variable->id.empty())
+            return false;
+        const BlockInput* input = parent->inputs.find("VALUE");
+        if (!input) return false;
+        const std::string& id = input->block.empty()
+            ? input->shadow : input->block;
+        const Block* source = blocks->getBlock(id);
+        if (!source || source->opcode != "data_variable") return false;
+        const auto field = source->fields.find("VARIABLE");
+        if (field == source->fields.end() ||
+            field->second.id != variable->id)
+            return false;
+        const Variable* resolved = target->lookupVariableById(variable->id);
+        return resolved && resolved->type == Variable::kScalarType;
+    }
+
+    uint64_t duplicateScalarNumericReads = 0;
+    uint64_t duplicateScalarChanges = 0;
+
     llvm::Value* emitArith(Block* blk, const char* in1, const char* in2,
                            AOp aop) {
+        if (sameScalarReporters(blk, in1, in2)) {
+            // The two direct variable reporters are pure and read the same
+            // resolved slot with no scheduler handoff. Preserve Scratch
+            // number coercion exactly (numeric strings, booleans and NaN);
+            // only share the immutable boxed load and its conversion.
+            llvm::Value* bits = emitInputOf(blk, in1);
+            llvm::Value* number = emitToNumF64(bits);
+            ++duplicateScalarNumericReads;
+            return emitArithNumeric(number, number, aop);
+        }
         llvm::Value* a = emitInputOf(blk, in1);
         llvm::Value* bv = emitInputOf(blk, in2);
         // C++ function argument evaluation order is unspecified. Emit both
@@ -3491,7 +4149,8 @@ struct Codegen {
         // Reuse the proven numeric-shadow fast path even when the immutable
         // numeric literal is the *left* operand (previously only RHS worked).
         auto emitNumericLiteralEq = [&](llvm::Value* candidate,
-                                        double literal) -> llvm::Value* {
+                                        double literal,
+                                        const char* inputName) -> llvm::Value* {
             auto di = knownNumD.find(candidate);
             auto oi = knownNumOk.find(candidate);
             if (di == knownNumD.end() || oi == knownNumOk.end())
@@ -3499,7 +4158,19 @@ struct Codegen {
             llvm::Value* valid = oi->second;
             llvm::Value* numeric = di->second;
             const char* setting = std::getenv("XYO_JIT_EQ_STRING_CACHE");
-            if (!knownNum.count(candidate) &&
+            const char* profileSetting =
+                std::getenv("XYO_JIT_EQ_NUMERIC_PROFILE_CACHE");
+            // An observed-number-only direct scalar is unlikely to benefit
+            // from dynamically reading an SStr numeric-cache state. Skipping
+            // that *optimization* is always safe: any later string value
+            // still falls back to the exact generic xyo_eq comparison.
+            // It does not assume that a Scratch variable stays numeric.
+            // Default on. AOT, unprofiled or mixed-type variables retain
+            // the original lookup. =0 is a strict legacy-path opt-out.
+            const bool skipStringProbe =
+                (!profileSetting || profileSetting[0] != '0') &&
+                profiledNumber(directVariableInput(blk, inputName));
+            if (!knownNum.count(candidate) && !skipStringProbe &&
                 (!setting || setting[0] != '0')) {
                 // The promoted value's numeric-compare shadow can be stale:
                 // an immutable numeric string is parsed by an equality
@@ -3560,13 +4231,13 @@ struct Codegen {
         };
         if (!std::getenv("XYO_JIT_DISABLE_EQ_NUMERIC")) {
             if (auto c = numericLiteral(bv)) {
-                if (llvm::Value* result = emitNumericLiteralEq(a, *c))
+                if (llvm::Value* result = emitNumericLiteralEq(a, *c, "OPERAND1"))
                     return result;
             }
             // A/B diagnostic switch; default behavior is symmetric.
             if (!std::getenv("XYO_JIT_DISABLE_EQ_SYMMETRIC")) {
                 if (auto c = numericLiteral(a)) {
-                    if (llvm::Value* result = emitNumericLiteralEq(bv, *c))
+                    if (llvm::Value* result = emitNumericLiteralEq(bv, *c, "OPERAND2"))
                         return result;
                 }
             }
@@ -3932,6 +4603,25 @@ struct Codegen {
             Block* source = id.empty() ? nullptr : getBlock(id);
             return source && source->opcode == "data_itemoflist";
         };
+        // Only the already type-guarded numeric comparison may use the
+        // portable typed SSA. The fallback retains Scratch string ordering.
+        auto emitSharedOrdered = [&](llvm::Value* lhs, llvm::Value* rhs) {
+            const ir::Op opcode = pred == CmpInst::FCMP_OLT
+                ? ir::Op::LessThan : ir::Op::GreaterThan;
+            const ir::Function& graph = ir::binaryFunction(opcode);
+            struct Lowerer {
+                IRBuilder<>& builder;
+                llvm::Value* args[2];
+                llvm::Value* parameter(uint32_t i) { return args[i]; }
+                llvm::Value* binary(ir::Op op, llvm::Value* a,
+                                    llvm::Value* b) {
+                    return op == ir::Op::LessThan
+                        ? builder.CreateFCmpOLT(a, b)
+                        : builder.CreateFCmpOGT(a, b);
+                }
+            } lowerer{b, {lhs, rhs}};
+            return ir::lower(graph, lowerer, 2);
+        };
         const bool listPair = isListItemInput(in1) && isListItemInput(in2);
         const bool fastCmp = plainCmp ? plainCmp[0] == '1' : listPair;
         if (fastCmp && !isNumericOperand(a) && !isNumericOperand(bv)) {
@@ -3960,19 +4650,46 @@ struct Codegen {
             llvm::Value* bothNumber = useOrdered
                 ? b.CreateFCmpORD(fa, fb)
                 : b.CreateAnd(plainNumber(a), plainNumber(bv));
-            hotBr(bothNumber, numberBB, fallbackBB, 1000, 1);
-            b.SetInsertPoint(numberBB);
-            llvm::Value* direct = b.CreateZExt(
-                b.CreateFCmp(pred, fa, fb), i32t);
-            b.CreateBr(doneBB);
-            b.SetInsertPoint(fallbackBB);
-            llvm::Value* scratch = call2(helper, i32t, a, bv);
-            b.CreateBr(doneBB);
-            b.SetInsertPoint(doneBB);
-            llvm::PHINode* result = b.CreatePHI(i32t, 2);
-            result->addIncoming(direct, numberBB);
-            result->addIncoming(scratch, fallbackBB);
-            return result;
+            // A common CFG diamond drives both the LLVM and WASM lowerers.
+            // This native case materializes actual LLVM basic blocks + Phi.
+            static const ir::Diamond diamond(true, ir::Type::I32);
+            struct DiamondLowerer {
+                Codegen& cg;
+                BasicBlock* yes;
+                BasicBlock* no;
+                BasicBlock* merge;
+                BasicBlock* yesEnd = nullptr;
+                BasicBlock* noEnd = nullptr;
+                void branch(llvm::Value* cond, ir::BlockId,
+                            ir::BlockId, ir::BlockId) {
+                    cg.hotBr(cond, yes, no, 1000, 1);
+                    cg.b.SetInsertPoint(yes);
+                }
+                void otherwise(ir::BlockId) {
+                    yesEnd = cg.b.GetInsertBlock();
+                    cg.b.CreateBr(merge);
+                    cg.b.SetInsertPoint(no);
+                }
+                void finish(ir::BlockId) {
+                    noEnd = cg.b.GetInsertBlock();
+                    cg.b.CreateBr(merge);
+                    cg.b.SetInsertPoint(merge);
+                }
+                llvm::Value* phi(ir::BlockId, ir::BlockId,
+                                 llvm::Value* yesValue, ir::BlockId,
+                                 llvm::Value* noValue) {
+                    auto* result = cg.b.CreatePHI(cg.i32t, 2);
+                    result->addIncoming(yesValue, yesEnd);
+                    result->addIncoming(noValue, noEnd);
+                    return result;
+                }
+            } lowered{*this, numberBB, fallbackBB, doneBB};
+            return ir::lowerDiamondValue(
+                diamond, lowered, bothNumber,
+                [&]() -> llvm::Value* {
+                    return b.CreateZExt(emitSharedOrdered(fa, fb), i32t);
+                },
+                [&]() -> llvm::Value* { return call2(helper, i32t, a, bv); });
         }
         // 相手が数値と分かっていれば、リテラル側を数値へ畳める。
         const bool aNum = isNumericOperand(a);
@@ -3986,7 +4703,7 @@ struct Codegen {
         BasicBlock* merge = BasicBlock::Create(lc, "", fn);
         b.CreateCondBr(both, fastBB, slowBB);
         b.SetInsertPoint(fastBB);
-        llvm::Value* c1 = b.CreateFCmp(pred, fa, fb);
+        llvm::Value* c1 = emitSharedOrdered(fa, fb);
         llvm::Value* z = b.CreateZExt(c1, i32t);
         b.CreateBr(merge);
         b.SetInsertPoint(slowBB);
@@ -4090,21 +4807,107 @@ struct Codegen {
 
     // --- リストの fast path -----------------------------------------------
     // SList: {u32 len; u32 cap; bool monitorDirty; pad; Value* items}
-    static constexpr uint32_t kListLenOff = uint32_t(offsetof(SList, len));
+    static constexpr uint32_t kListLenOff = ir::kListLengthOffset;
     static constexpr uint32_t kListCapOff = uint32_t(offsetof(SList, cap));
     static constexpr uint32_t kListDirtyOff =
         uint32_t(offsetof(SList, monitorDirty));
     static constexpr uint32_t kListNumericOnlyOff =
-        uint32_t(offsetof(SList, numericOnly));
-    void invalidateNumericList(llvm::Value* list, llvm::Value* item) {
+        ir::kListNumericOnlyOffset;
+    void invalidateNumericList(llvm::Value* list, llvm::Value* item,
+                               bool replacement = false) {
         llvm::Value* flag = b.CreateConstGEP1_32(
             i8t, list, kListNumericOnlyOff);
+        static const bool lazyInvalidation = [] {
+            // Default on for list replacement only. Keep add/append on its
+            // established fast path; =0 restores unconditional read/AND/store.
+            const char* env = std::getenv("XYO_JIT_LIST_MONOTONE_FLAG");
+            return !env || env[0] != '0';
+        }();
+        if (replacement && lazyInvalidation) {
+            // SList::numericOnly is monotonic for push/replace: writing
+            // a numeric Value cannot change it. In the nonnumeric case
+            // clear the flag exactly once (idempotent if already false).
+            // No list code or synchronization rule is otherwise changed.
+            if (knownNum.count(item)) return;
+            BasicBlock* nonNumeric = newBB("list.numflag.invalidate");
+            BasicBlock* done = newBB("list.numflag.done");
+            hotBr(emitIsNum(item), done, nonNumeric, 500, 1);
+            b.SetInsertPoint(nonNumeric);
+            b.CreateStore(b.getInt1(false), flag);
+            b.CreateBr(done);
+            b.SetInsertPoint(done);
+            return;
+        }
         llvm::Value* prior = b.CreateLoad(b.getInt1Ty(), flag);
         llvm::Value* valid = b.CreateAnd(prior, emitIsNum(item));
         b.CreateStore(valid, flag);
     }
     static constexpr uint32_t kListItemsOff =
-        uint32_t(offsetof(SList, items));
+        ir::kListItemsOffset;
+    static constexpr uint32_t kListExtraOff =
+        uint32_t(offsetof(SList, extra));
+    static constexpr uint32_t kListStorageEpochOff =
+        uint32_t(offsetof(SList, storageEpoch));
+
+    // In an uninterrupted promotable loop, no operation can relocate an
+    // already-contiguous list. Cache items in the loop preheader, refreshing
+    // after each scheduler yield. A null cached items pointer means either
+    // that the list was absent or that it used a non-contiguous backend.
+    // Only this cold state needs to check the storage epoch for transitions.
+    void guardAdaptiveContiguous(llvm::Value* list,
+                                 const PromotedList* pl,
+                                 BasicBlock* fallback) {
+        if (xyo_list_storage_mode != 7) return;
+        auto* contiguous = BasicBlock::Create(lc, "list.flat", fn);
+        if (pl && pl->storageEpoch) {
+            auto* cold = BasicBlock::Create(lc, "list.nonflat.cache", fn);
+            llvm::Value* cachedItems = b.CreateLoad(ptrt, pl->items);
+            hotBr(b.CreateICmpNE(
+                      cachedItems,
+                      ConstantPointerNull::get(llvm::cast<PointerType>(ptrt))),
+                  contiguous, cold);
+            b.SetInsertPoint(cold);
+            // A list field can be absent. Never access its epoch before
+            // validating the actual SList pointer.
+            auto* checkEpoch = BasicBlock::Create(lc, "list.epoch.check", fn);
+            hotBr(b.CreateICmpNE(
+                      list,
+                      ConstantPointerNull::get(llvm::cast<PointerType>(ptrt))),
+                  checkEpoch, fallback);
+            b.SetInsertPoint(checkEpoch);
+            llvm::Value* current = b.CreateLoad(
+                i64t, b.CreateConstGEP1_32(
+                    i8t, list, kListStorageEpochOff));
+            llvm::Value* cached = b.CreateLoad(i64t, pl->storageEpoch);
+            auto* reload = BasicBlock::Create(lc, "list.epoch.reload", fn);
+            // If the cached representation is non-flat and its epoch has
+            // not changed, we already know the helper is required.
+            hotBr(b.CreateICmpEQ(current, cached), fallback, reload);
+            b.SetInsertPoint(reload);
+            llvm::Value* items = b.CreateLoad(
+                ptrt, b.CreateConstGEP1_32(i8t, list, kListItemsOff));
+            b.CreateStore(b.CreateLoad(
+                i32t, b.CreateConstGEP1_32(i8t, list, kListLenOff)),
+                pl->len);
+            b.CreateStore(items, pl->items);
+            b.CreateStore(b.CreateLoad(
+                b.getInt8Ty(), b.CreateConstGEP1_32(
+                    i8t, list, kListNumericOnlyOff)), pl->numericOnly);
+            b.CreateStore(current, pl->storageEpoch);
+            hotBr(b.CreateICmpNE(
+                      items,
+                      ConstantPointerNull::get(llvm::cast<PointerType>(ptrt))),
+                  contiguous, fallback);
+        } else {
+            llvm::Value* extra = b.CreateLoad(
+                ptrt, b.CreateConstGEP1_32(i8t, list, kListExtraOff));
+            hotBr(b.CreateICmpEQ(
+                      extra,
+                      ConstantPointerNull::get(llvm::cast<PointerType>(ptrt))),
+                  contiguous, fallback);
+        }
+        b.SetInsertPoint(contiguous);
+    }
 
     /// idx(Value) → idx 由来の double を dBB へ feed する分岐を emit。
     /// num → asF64、numState∈{1,3,4} の heap str → numCache を使う。
@@ -4214,6 +5017,11 @@ struct Codegen {
     }
 
     llvm::Value* emitListItem(Block* blk, const BlockField* f) {
+        if (xyo_list_storage_mode >= 4 && xyo_list_storage_mode <= 6) {
+            llvm::Value* idx = emitInputOf(blk, "INDEX");
+            return callN("xyo_list_item", i64t,
+                         {ctxArg, varSlot(f, true), idx});
+        }
         llvm::Value* idx = emitInputOf(blk, "INDEX");
         const PromotedList* pl = findPromotedList(f->id);
         llvm::Value* l = varListPtr(f);   // null 可（list 非保有）
@@ -4226,9 +5034,12 @@ struct Codegen {
         BasicBlock* merge = BasicBlock::Create(lc, "", fn);
         // Null promoted lists have len=0/items=null. The bounds check rejects
         // every numeric index before loading items, so no second null test.
-        if (pl && !std::getenv("XYO_LIST_READ_NULL_CHECK")) b.CreateBr(haveBB);
+        if (pl && (xyo_list_storage_mode == 7 ||
+                   !std::getenv("XYO_LIST_READ_NULL_CHECK")))
+            b.CreateBr(haveBB);
         else b.CreateCondBr(nonNull, haveBB, slowBB);
         b.SetInsertPoint(haveBB);
+        guardAdaptiveContiguous(l, pl, slowBB);
         auto [dBB, d] = emitListIdxAsF64(idx, slowBB);
         b.SetInsertPoint(dBB);
         llvm::Value* len = pl ? b.CreateLoad(i32t, pl->len) : b.CreateLoad(
@@ -4240,12 +5051,24 @@ struct Codegen {
         llvm::Value* items = pl ? b.CreateLoad(ptrt, pl->items) : b.CreateLoad(
             ptrt, b.CreateConstGEP1_32(i8t, l, kListItemsOff));
         llvm::Value* v = b.CreateLoad(i64t, b.CreateGEP(i64t, items, i0));
-        llvm::Value* numeric = b.CreateICmpNE(
-            pl && readMemoAllowed
-                ? b.CreateLoad(b.getInt8Ty(), pl->numericOnly)
-                : b.CreateLoad(b.getInt8Ty(),
-                    b.CreateConstGEP1_32(i8t, l, kListNumericOnlyOff)),
-            b.getInt8(0));
+        struct ListLowerer {
+            IRBuilder<>& builder;
+            llvm::Type* i8Type;
+            llvm::Value* shadowFlag;
+            bool useShadow;
+            llvm::Value* numericListGuard(llvm::Value* list) {
+                llvm::Value* ptr = useShadow
+                    ? shadowFlag
+                    : builder.CreateConstGEP1_32(
+                          builder.getInt8Ty(), list, ir::kListNumericOnlyOffset);
+                return builder.CreateICmpNE(
+                    builder.CreateLoad(i8Type, ptr),
+                    llvm::ConstantInt::get(i8Type, 0));
+            }
+        } listBackend{b, b.getInt8Ty(),
+                      pl ? pl->numericOnly : nullptr,
+                      pl && readMemoAllowed};
+        llvm::Value* numeric = ir::lowerNumericListGuard(listBackend, l);
         b.CreateBr(merge);
         b.SetInsertPoint(emptyBB);
         b.CreateBr(merge);
@@ -4268,12 +5091,22 @@ struct Codegen {
             numericGuard->addIncoming(b.getFalse(), slowBB);
             numericListReadGuards.emplace(phi, numericGuard);
         }
+        // A storage transition moves Value slots but never changes the
+        // values in this read-only promotable loop. Numeric coercion memo
+        // remains valid even when adaptive storage is demoted to flat.
         if (promotingLoop && readMemoAllowed && readMemoPreheader)
             memoizableListReads.insert(phi);
         return phi;
     }
 
     void emitListReplace(Block* blk, const BlockField* f) {
+        if (xyo_list_storage_mode >= 4 && xyo_list_storage_mode <= 6) {
+            llvm::Value* idx = emitInputOf(blk, "INDEX");
+            llvm::Value* item = emitInputOf(blk, "ITEM");
+            callN("xyo_list_replace", voidt,
+                  {ctxArg, varSlot(f, true), idx, item});
+            return;
+        }
         llvm::Value* idx = emitInputOf(blk, "INDEX");
         llvm::Value* item = emitInputOf(blk, "ITEM");
         llvm::Value* l = varListPtr(f);
@@ -4284,11 +5117,23 @@ struct Codegen {
         BasicBlock* fastBB = BasicBlock::Create(lc, "", fn);
         BasicBlock* slowBB = BasicBlock::Create(lc, "", fn);
         BasicBlock* merge = BasicBlock::Create(lc, "", fn);
-        // A promoted list caches len=0 when null. A numeric index will
-        // fail its bounds check; special string indices still use slowBB.
-        // This removes the redundant SList* null test for each replacement.
+        // For a promoted, existing list, the preheader and yield reloads
+        // cache len=0/items=null on a missing SList*. Numeric indices then
+        // fail the bounds check; special string indices use the helper.
+        //
+        // A malformed Scratch project may reuse a scalar variable ID for a
+        // list field. lookupOrCreateList() then returns the scalar and the
+        // slow helper must create its missing SList on first access. Do not
+        // eliminate this observable lazy initialization in that case.
+        const Variable* knownList = target && !f->id.empty()
+            ? target->lookupVariableById(f->id) : nullptr;
+        const bool alreadyList = knownList &&
+            knownList->type == Variable::kListType && knownList->list;
+        // XYO_JIT_REPLACE_NO_NULL=0 restores the historical null branch.
         const char* noNull = std::getenv("XYO_JIT_REPLACE_NO_NULL");
-        if (pl && noNull && noNull[0] == '1')
+        const bool noNullFast = !noNull || noNull[0] != '0';
+        if (pl && (xyo_list_storage_mode == 7 ||
+                   (noNullFast && alreadyList)))
             b.CreateBr(haveBB);
         else if (const char* likely = std::getenv("XYO_JIT_REPLACE_LIKELY_NONNULL");
                  likely && likely[0] == '1')
@@ -4296,6 +5141,7 @@ struct Codegen {
         else
             b.CreateCondBr(nonNull, haveBB, slowBB);
         b.SetInsertPoint(haveBB);
+        guardAdaptiveContiguous(l, pl, slowBB);
         auto [dBB, d] = emitListIdxAsF64(idx, slowBB);
         b.SetInsertPoint(dBB);
         llvm::Value* len = pl ? b.CreateLoad(i32t, pl->len) : b.CreateLoad(
@@ -4307,7 +5153,7 @@ struct Codegen {
         if (!i0) i0 = b.CreateSub(b.CreateFPToSI(d, i64t), ci64(1));
         llvm::Value* items = pl ? b.CreateLoad(ptrt, pl->items) : b.CreateLoad(
             ptrt, b.CreateConstGEP1_32(i8t, l, kListItemsOff));
-        invalidateNumericList(l, item);
+        invalidateNumericList(l, item, true);
         b.CreateStore(item, b.CreateGEP(i64t, items, i0));
         b.CreateStore(b.getInt8(1),
                       b.CreateConstGEP1_32(i8t, l, kListDirtyOff));
@@ -4331,6 +5177,12 @@ struct Codegen {
     /// par-for の本体では「base+iter 番目のスロット書き込み」に置き換える
     /// （len は並列領域の前に確保済み）。
     void emitListAdd(Block* blk, const BlockField* f) {
+        if (xyo_list_storage_mode >= 4 && xyo_list_storage_mode <= 6) {
+            llvm::Value* item = emitInputOf(blk, "ITEM");
+            callN("xyo_list_add", voidt,
+                  {ctxArg, varSlot(f, true), item});
+            return;
+        }
         if (parFor) {
             auto k = parFor->index.find(f->id);
             if (k != parFor->index.end()) {
@@ -4340,7 +5192,24 @@ struct Codegen {
                 llvm::Value* base = b.CreateLoad(
                     i64t, b.CreateGEP(i64t, parFor->bases, ci64(k->second)));
                 llvm::Value* idx = b.CreateAdd(base, parFor->iter);
-                callN("xyo_par_slot", voidt, {l, idx, item});
+                // The par-for runtime has already checked bounds and
+                // reserved [base, base+trip) before invoking this body.
+                // Its Gc::DeferCollect pins the list and items storage for
+                // the duration of the batch. Skip a C ABI call per element.
+                // Storage mode >=4 never enters this body (runtime fallback).
+                // Default on after parity and paired A/B validation;
+                // XYO_PARFOR_INLINE_SLOT=0 keeps the original checked helper.
+                static const bool inlineParSlot = [] {
+                    const char* env = std::getenv("XYO_PARFOR_INLINE_SLOT");
+                    return !env || env[0] != '0';
+                }();
+                if (inlineParSlot) {
+                    llvm::Value* items = b.CreateLoad(
+                        ptrt, b.CreateConstGEP1_32(i8t, l, kListItemsOff));
+                    b.CreateStore(item, b.CreateGEP(i64t, items, idx));
+                } else {
+                    callN("xyo_par_slot", voidt, {l, idx, item});
+                }
                 return;
             }
         }
@@ -4354,6 +5223,7 @@ struct Codegen {
         BasicBlock* merge = BasicBlock::Create(lc, "", fn);
         b.CreateCondBr(nonNull, haveBB, slowBB);
         b.SetInsertPoint(haveBB);
+        guardAdaptiveContiguous(l, nullptr, slowBB);
         llvm::Value* len = b.CreateLoad(
             i32t, b.CreateConstGEP1_32(i8t, l, kListLenOff));
         llvm::Value* cap = b.CreateLoad(
@@ -4594,9 +5464,33 @@ struct Codegen {
         return emitInputBlock(childId);
     }
 
+    llvm::Value* hoistedNestedOsrArg(const std::u16string& name) {
+        if (auto it = hoistedNestedOsrArgs.find(name);
+            it != hoistedNestedOsrArgs.end())
+            return it->second;
+
+        // Insert into the standalone entry, never inside the repeat body:
+        // procedure arguments cannot mutate within the selected safe region.
+        // No Scratch reporter is evaluated and no block is counted here.
+        auto& entry = entryFn->getEntryBlock();
+        IRBuilder<> init(&entry, entry.begin());
+        auto* peek = init.CreateCall(
+            decl("xyo_rt_nested_osr_arg_peek",
+                 i64t, {ptrt, ptrt, i32t}),
+            {ctxArg, u16g(name), ci32(uint32_t(name.size()))},
+            "osr.arg.rooted");
+        hoistedNestedOsrArgs.emplace(name, peek);
+        return peek;
+    }
+
     llvm::Value* emitInputBlock(const std::string& id) {
         Block* blk = getBlock(id);
         if (!blk) return ci64(Value::undefined().bits);
+        // Count at the end of the generated expression, after its children.
+        // The interpreter owns counting when we delegate a reporter to it.
+        const auto* cached = runtime.blockCountEnabled
+            ? blocks->getCachedExecute(id) : nullptr;
+        ReporterCountGuard countGuard{*this, cached && cached->blockFunction};
         // data_variable は shadow 位置でもライブ評価（JS blocks-execute-cache
         // と同じ — ドロップダウン内変数は実行時に値を返す）
         if (blk->opcode == "data_variable") {
@@ -4611,6 +5505,16 @@ struct Codegen {
             return ci64(Value::emptyStr().bits);
         }
         const std::string& op = blk->opcode;
+        // Blocks::getCachedExecute treats field-only primitive reporters as
+        // constant shadow values even when their JSON shadow bit is false.
+        // Mirror that rule: falling back to xyo_rt_reporter here can return
+        // undefined, notably for a connected non-shadow colour_picker.
+        if (blk->inputs.empty() && blk->fields.size() == 1 &&
+            (op == "colour_picker" || op == "text" ||
+             op == "math_number" || op == "math_integer" ||
+             op == "math_whole_number" || op == "math_positive_number" ||
+             op == "math_angle" || op == "math_boolean"))
+            return constValue(blk->fields.begin()->second.value);
 
         if (op == "argument_reporter_string_number" ||
             op == "argument_reporter_boolean" ||
@@ -4624,7 +5528,43 @@ struct Codegen {
                 pname = f->value.asStrPtr()->view();
             auto it = argIndex.find(pname);
             if (it == argIndex.end()) {
-                // 手続き外/未知引数 — インタプリタ評価へフォールバック
+                // Only an independently validated standalone OSR loop can
+                // read the original interpreter procedure frame directly.
+                // Missing/undefined arguments fall back to the exact normal
+                // reporter implementation (including special names).
+                countGuard.active = false;
+                if (directNestedOsrArgs &&
+                    (op == "argument_reporter_string_number" ||
+                     op == "argument_reporter_boolean")) {
+                    if (hoistNestedOsrArgs) {
+                        llvm::Value* rooted = hoistedNestedOsrArg(pname);
+                        // Undefined arguments (including special built-in
+                        // names) must be re-evaluated at their actual reporter
+                        // PC, not at native entry or once per entire loop.
+                        auto* fast = BasicBlock::Create(lc, "osr.arg.fast", fn);
+                        auto* slow = BasicBlock::Create(lc, "osr.arg.slow", fn);
+                        auto* done = BasicBlock::Create(lc, "osr.arg.done", fn);
+                        b.CreateCondBr(b.CreateICmpNE(
+                            rooted, ci64(Value::undefined().bits)), fast, slow);
+                        b.SetInsertPoint(fast);
+                        if (cached && cached->blockFunction)
+                            emitBlockCount();
+                        b.CreateBr(done);
+                        b.SetInsertPoint(slow);
+                        llvm::Value* dynamic = call2(
+                            "xyo_rt_reporter", i64t, ctxArg,
+                            b.CreateGlobalString(id));
+                        b.CreateBr(done);
+                        b.SetInsertPoint(done);
+                        auto* value = b.CreatePHI(i64t, 2, "osr.arg.value");
+                        value->addIncoming(rooted, fast);
+                        value->addIncoming(dynamic, slow);
+                        return value;
+                    }
+                    return callN("xyo_rt_nested_osr_arg_get", i64t,
+                        {ctxArg, b.CreateGlobalString(id), u16g(pname),
+                         ci32(uint32_t(pname.size()))});
+                }
                 return call2("xyo_rt_reporter", i64t, ctxArg,
                              b.CreateGlobalString(id));
             }
@@ -4774,21 +5714,30 @@ struct Codegen {
         }
         if (op == "sensing_dayssince2000" && sharedDaysClock) {
             auto* slot = b.CreateConstGEP1_32(
-                i8t, ctxArg, uint32_t(offsetof(JitCtx, sampledUnixMs)));
+                i8t, ctxArg, uint32_t(boxedDaysClock
+                    ? offsetof(JitCtx, sampledUnixDaysBits)
+                    : offsetof(JitCtx, sampledUnixMs)));
             auto* clock = b.CreateLoad(ptrt, slot);
             BasicBlock* sampled = newBB("days.sampled");
             BasicBlock* fallback = newBB("days.fallback");
             BasicBlock* merge = newBB("days.merge");
             hotBr(b.CreateICmpNE(clock, cnull()), sampled, fallback, 1000, 1);
             b.SetInsertPoint(sampled);
-            auto* millis = b.CreateLoad(i64t, clock);
-            millis->setAtomic(AtomicOrdering::Monotonic);
-            // Match rt::daysSince2000's operation order and Date.now's
-            // integer-ms precision, including an OS wall-clock adjustment.
-            auto* delta = b.CreateFSub(
-                b.CreateSIToFP(millis, f64t), cf64(946684800000.0));
-            auto* days = b.CreateFDiv(delta, cf64(86400000.0));
-            auto* cachedBits = emitCanonKnownNonNaN(days);
+            auto* sample = b.CreateLoad(i64t, clock);
+            sample->setAtomic(AtomicOrdering::Monotonic);
+            llvm::Value* cachedBits = nullptr;
+            if (boxedDaysClock) {
+                // The watchdog already performed the exact integer-ms
+                // Scratch conversion and NaN-boxing for this sample.
+                cachedBits = sample;
+            } else {
+                // Match rt::daysSince2000's operation order and Date.now's
+                // millisecond precision, including OS wall-clock changes.
+                auto* delta = b.CreateFSub(
+                    b.CreateSIToFP(sample, f64t), cf64(946684800000.0));
+                auto* days = b.CreateFDiv(delta, cf64(86400000.0));
+                cachedBits = emitCanonKnownNonNaN(days);
+            }
             b.CreateBr(merge);
             b.SetInsertPoint(fallback);
             auto* freshBits = call1("xyo_sns_dayssince2000", i64t, ctxArg);
@@ -4880,7 +5829,7 @@ struct Codegen {
                 if (lhsInput->block.empty()) break;
                 inner = getBlock(lhsInput->block);
             }
-            if (suffixes.size() >= 2) {
+            if (suffixes.size() >= 2 && !runtime.blockCountEnabled) {
                 std::u16string combined;
                 combined.reserve(totalSuffixUnits);
                 for (auto it = suffixes.rbegin(); it != suffixes.rend(); ++it)
@@ -5062,6 +6011,7 @@ struct Codegen {
         }
 
         // --- compat 層（インタプリタ評価）---
+        countGuard.active = false;
         return call2("xyo_rt_reporter", i64t, ctxArg,
                      b.CreateGlobalString(id));
     }
@@ -5269,7 +6219,7 @@ struct Codegen {
         unrollCodeBudget -= plan.factor * unsigned(plan.body.size());
         const uint64_t groups = plan.trips / plan.factor;
         const uint64_t tail = plan.trips % plan.factor;
-        beginLoopYieldScope();
+        beginLoopYieldScope(loop);
         const bool promotedLoop = beginLoopPromotion(loop, false);
         // Repeated body evaluation uses the ordinary stack lowerer, so all
         // variable type, reporter-order, and spill/reload rules are shared.
@@ -5470,7 +6420,11 @@ struct Codegen {
     }
 
     std::optional<TransientRepeat> transientRepeatPattern(Block* loop) {
+        // Strict flat storage must not be bypassed by the transient
+        // append-log loop optimization. Keep the existing rope/default
+        // optimization unchanged for normal production workloads.
         if (aot || !curFnWarp || activeTransient ||
+            stringStorageMode() == StringStorageMode::Flat ||
             (std::getenv("XYO_JIT_TRANSIENT_STRINGS") &&
              std::getenv("XYO_JIT_TRANSIENT_STRINGS")[0] == '0'))
             return std::nullopt;
@@ -5603,7 +6557,7 @@ struct Codegen {
         const bool until = loop->opcode == "control_repeat_until";
         llvm::Value* count = counted
             ? emitToNumF64(emitInputOf(loop, "TIMES")) : nullptr;
-        beginLoopYieldScope();
+        beginLoopYieldScope(loop);
         AllocaInst* remaining = counted
             ? entryAlloca(f64t, 1, "str.rep.left") : nullptr;
         if (counted) b.CreateStore(count, remaining);
@@ -5771,7 +6725,11 @@ struct Codegen {
     };
     std::optional<std::vector<MultiTransientVar>>
     multiTransientPattern(Block* loop) {
+        // Strict flat storage must not be bypassed by the transient
+        // append-log loop optimization. Keep the existing rope/default
+        // optimization unchanged for normal production workloads.
         if (aot || !curFnWarp || activeTransient ||
+            stringStorageMode() == StringStorageMode::Flat ||
             (std::getenv("XYO_JIT_TRANSIENT_STRINGS") &&
              std::getenv("XYO_JIT_TRANSIENT_STRINGS")[0] == '0') ||
             (std::getenv("XYO_JIT_TRANSIENT_MULTI") &&
@@ -5838,7 +6796,7 @@ struct Codegen {
             std::fprintf(stderr, "xyo-jit: transient MULTI %s vars=%zu\n",
                          loop->id.c_str(), vars.size());
         llvm::Value* count = emitToNumF64(emitInputOf(loop, "TIMES"));
-        beginLoopYieldScope();
+        beginLoopYieldScope(loop);
         AllocaInst* remaining = entryAlloca(f64t, 1, "str.multi.left");
         b.CreateStore(count, remaining);
         std::vector<AllocaInst*> logs;
@@ -6134,6 +7092,7 @@ struct Codegen {
     // chunk ends at exactly the next original 64-iteration warp poll; after
     // yielding, we reread BOTH index and dynamic bound/accumulator variables.
     void emitWarpInduction(const WarpInductionPlan& plan,
+                           const Block* sourceLoop,
                            BasicBlock* fallback, BasicBlock* fastDone) {
         BasicBlock* prepare = newBB("induction.prepare");
         BasicBlock* head = newBB("induction.head");
@@ -6144,7 +7103,7 @@ struct Codegen {
         BasicBlock* finish = newBB("induction.finish");
         b.CreateCondBr(b.CreateICmpNE(loadIsWarp(), ci32(0)), prepare, fallback);
         b.SetInsertPoint(prepare);
-        beginLoopYieldScope();
+        beginLoopYieldScope(sourceLoop);
         llvm::Value* real = realVarValuePtr(plan.index);
         llvm::Value* boundPtr = plan.boundVariable
             ? realVarValuePtr(plan.boundVariable) : nullptr;
@@ -6396,8 +7355,19 @@ struct Codegen {
             starts.push_back(b.CreateFPToSI(
                 b.CreateSelect(inRange, value, cf64(0.0)), i64t));
         }
-        b.CreateCondBr(valid, fast, slow);
-        b.SetInsertPoint(fast);
+        struct GuardLowerer {
+            IRBuilder<>& builder;
+            BasicBlock* success;
+            BasicBlock* failure;
+            void require(llvm::Value* condition, const ir::Guard& guard) {
+                assert(guard.failure == ir::GuardFailure::Fallback);
+                builder.CreateCondBr(condition, success, failure);
+                builder.SetInsertPoint(success);
+            }
+        } guardLowerer{b, fast, slow};
+        ir::lowerGuard(guardLowerer,
+                       {ir::GuardReason::IntegralRange,
+                        ir::GuardFailure::Fallback}, valid);
         llvm::Value* ticks = b.CreateLoad(i64t, curYieldCnt);
         llvm::Value* toPoll = b.CreateSub(
             ci64(64), b.CreateAnd(ticks, ci64(63)));
@@ -6535,18 +7505,34 @@ struct Codegen {
         BasicBlock* preheader = b.GetInsertBlock();
         BasicBlock* ssaHead = newBB("rep.ssa.header");
         BasicBlock* ssaExit = newBB("rep.ssa.exit");
-        b.CreateBr(ssaHead);
-        b.SetInsertPoint(ssaHead);
-        auto* iteration = b.CreatePHI(i64t, 2, "rep.ssa.iter");
-        auto* accumulator = b.CreatePHI(i64t, 2, "rep.ssa.value");
-        iteration->addIncoming(ci64(0), preheader);
-        accumulator->addIncoming(initial, preheader);
-        llvm::Value* next = b.CreateNSWAdd(accumulator, ci64(plan.delta));
-        llvm::Value* nextIteration = b.CreateAdd(iteration, ci64(1));
-        iteration->addIncoming(nextIteration, ssaHead);
-        accumulator->addIncoming(next, ssaHead);
-        b.CreateCondBr(b.CreateICmpULT(nextIteration, chunk), ssaHead, ssaExit);
-        b.SetInsertPoint(ssaExit);
+        // Both native LLVM and WASM consume the same loop/backedge contract.
+        // Native values stay in SSA: no load/store is inserted for the Phi.
+        struct LoopLowerer {
+            IRBuilder<>& builder;
+            BasicBlock* head;
+            BasicBlock* exit;
+            void begin(ir::BlockId) {
+                builder.CreateBr(head);
+                builder.SetInsertPoint(head);
+            }
+            void latch(llvm::Value* condition, ir::BlockId, ir::BlockId) {
+                builder.CreateCondBr(condition, head, exit);
+            }
+            void finish(ir::BlockId) { builder.SetInsertPoint(exit); }
+        } lowerer{b, ssaHead, ssaExit};
+        static const ir::BackedgeLoop loop(ir::Type::I64, 2);
+        llvm::Value* next = nullptr;
+        ir::lowerBackedgeLoop(loop, lowerer, [&]() -> llvm::Value* {
+            auto* iteration = b.CreatePHI(i64t, 2, "rep.ssa.iter");
+            auto* accumulator = b.CreatePHI(i64t, 2, "rep.ssa.value");
+            iteration->addIncoming(ci64(0), preheader);
+            accumulator->addIncoming(initial, preheader);
+            next = b.CreateNSWAdd(accumulator, ci64(plan.delta));
+            llvm::Value* nextIteration = b.CreateAdd(iteration, ci64(1));
+            iteration->addIncoming(nextIteration, ssaHead);
+            accumulator->addIncoming(next, ssaHead);
+            return b.CreateICmpULT(nextIteration, chunk);
+        });
         auto* finalValue = b.CreatePHI(i64t, 1, "rep.ssa.result");
         finalValue->addIncoming(next, ssaHead);
         llvm::Value* result = b.CreateSIToFP(finalValue, f64t);
@@ -6711,15 +7697,66 @@ struct Codegen {
         b.SetInsertPoint(slow);
     }
 
+#include "conditional_ssa.inc"
+
     void emitStackBlock(Block* blk) {
+        if (portableCallFrames() && !aot) {
+            // Expire any completed source checkpoint BEFORE this statement
+            // can run reporter inputs, side effects, or a new yield. This
+            // executes only in opt-in CallFrame mode, not normal JIT.
+            callN("xyo_proc_frame_statement_started", voidt,
+                  {ctxArg, b.CreateGlobalString(blk->id)});
+        }
+        if (localReadForwardEnabled) {
+            // Load-derived facts are an expression-local optimization. A
+            // separate Scratch stack statement may call helpers (including
+            // allocation/GC paths), so never carry a read cache between
+            // statements even when LLVM keeps them in the same basic block.
+            // Store-forwarding and branch-PHI facts are separate and stay.
+            std::erase_if(localVarFacts,
+                          [](const auto& entry) {
+                              return entry.second.fromLoad;
+                          });
+        }
         const std::string& op = blk->opcode;
+        const bool repeatedControl =
+            op == "control_repeat" || op == "control_forever" ||
+            op == "control_while" || op == "control_repeat_until" ||
+            op == "control_for_each" || op == "control_wait_until";
+        if (!repeatedControl && runtime.blockCountEnabled) {
+            const BlockCached* cached = blocks->getCachedExecute(blk->id);
+            if (cached && cached->blockFunction) emitBlockCount();
+        }
 
         if (op == "control_if" || op == "control_if_else") {
+            const char* ifPhiSetting = std::getenv("XYO_JIT_IF_PHI");
+            // Keep this optional until an independent workload corpus
+            // establishes a speedup beyond startup/compile-time noise.
+            const bool ifPhi = op == "control_if" &&
+                ifPhiSetting && ifPhiSetting[0] == '1' &&
+                localForwardEnabled && localFactsAliasSafe && promotingLoop &&
+                readonlyCondition(blk->inputs.find("CONDITION"));
+            // The fact is defined BEFORE evaluating the condition. A
+            // read-only condition can split into arbitrarily many BBs without
+            // invalidating the incoming SSA value or its dominance.
+            BasicBlock* conditionStart = b.GetInsertBlock();
+            const auto priorFacts = ifPhi ? localVarFacts
+                                         : decltype(localVarFacts){};
             llvm::Value* cond = emitInputOf(blk, "CONDITION");
             llvm::Value* isT = emitTruthyV(cond);
             BasicBlock* thenBB = BasicBlock::Create(lc, "", fn);
             BasicBlock* elseBB = BasicBlock::Create(lc, "", fn);
             BasicBlock* merge = BasicBlock::Create(lc, "", fn);
+            // Only merge values known to originate in both successor paths.
+            // The incoming typed values are SSA producers; PHIs below do not
+            // make any global claims about a mutable Scratch variable's type.
+            const bool mergeFacts = localForwardEnabled &&
+                                    localFactsAliasSafe && promotingLoop;
+            // In a plain IF, the false edge is a pass-through. A previous
+            // same-basic-block store can be carried along that edge without
+            // reloading the variable. Capture it only AFTER evaluating the
+            // condition: all its reporter side effects have happened.
+            if (mergeFacts) localVarFacts.clear();
             b.CreateCondBr(isT, thenBB, elseBB);
             b.SetInsertPoint(thenBB);
             if (op == "control_if" && promotingLoop) {
@@ -6734,38 +7771,159 @@ struct Codegen {
                 const BlockInput* in = blk->inputs.find("SUBSTACK");
                 if (in) emitChainBlocks(chainOf(in->block), true);
             }
-            if (!bbDone(b.GetInsertBlock())) b.CreateBr(merge);
+            BasicBlock* thenEnd = b.GetInsertBlock();
+            auto thenFacts = mergeFacts ? std::move(localVarFacts)
+                                        : decltype(localVarFacts){};
+            localVarFacts.clear();
+            const bool thenReachesMerge = !bbDone(thenEnd);
+            if (thenReachesMerge) b.CreateBr(merge);
             b.SetInsertPoint(elseBB);
             if (op == "control_if_else") {
                 const BlockInput* in = blk->inputs.find("SUBSTACK2");
                 if (in) emitChainBlocks(chainOf(in->block), true);
             }
-            if (!bbDone(b.GetInsertBlock())) b.CreateBr(merge);
+            BasicBlock* elseEnd = b.GetInsertBlock();
+            auto elseFacts = mergeFacts ? std::move(localVarFacts)
+                                        : decltype(localVarFacts){};
+            if (ifPhi && op == "control_if") {
+                // This false edge preserves the value from before the IF.
+                // No unknown effects exist along the condition's lowering;
+                // its SSA producer dominates this edge, even if the
+                // expression itself created intermediate basic blocks.
+                for (const auto& [id, prior] : priorFacts) {
+                    if (prior.block == conditionStart)
+                        elseFacts[id] = {elseEnd, prior.bits};
+                }
+            }
+            localVarFacts.clear();
+            const bool elseReachesMerge = !bbDone(elseEnd);
+            if (elseReachesMerge) b.CreateBr(merge);
             b.SetInsertPoint(merge);
+            const char* demandSetting = std::getenv("XYO_JIT_PHI_DEMAND");
+            const bool hasMerge = mergeFacts && thenReachesMerge &&
+                                  elseReachesMerge;
+            // Do not run the bounded Scratch reporter walk when there is
+            // no eligible PHI to filter. Most script branches never enter
+            // loop promotion, and this analysis is strictly a cost hint.
+            bool hasCandidate = false;
+            const bool demandRequested =
+                demandSetting && demandSetting[0] == '1';
+            if (demandRequested && hasMerge && !thenFacts.empty() &&
+                !elseFacts.empty()) {
+                for (const auto& [id, fromThen] : thenFacts) {
+                    const auto other = elseFacts.find(id);
+                    if (other != elseFacts.end() &&
+                        fromThen.block == thenEnd &&
+                        other->second.block == elseEnd) {
+                        hasCandidate = true;
+                        break;
+                    }
+                }
+            }
+            const bool demandEnabled = demandRequested && hasCandidate;
+            const auto postUses = demandEnabled
+                ? phiDemandAfter(blk)
+                : std::unordered_map<std::string, PhiDemand>{};
+            if (hasMerge) {
+                ++phiMergeBlocks;
+                if (demandEnabled) ++phiDemandScans;
+                for (const auto& [variableId, fromThen] : thenFacts) {
+                    auto fromElse = elseFacts.find(variableId);
+                    if (fromElse == elseFacts.end() ||
+                        fromThen.block != thenEnd ||
+                        fromElse->second.block != elseEnd)
+                        continue;
+                    ++phiCandidates;
+                    if (demandEnabled &&
+                        (!postUses.contains(variableId) ||
+                         !postUses.at(variableId).boxed)) {
+                        ++phiBoxedSkipped;
+                        continue;
+                    }
+                    ++phiBoxedEmitted;
+                    // Both incoming SSA values are already materialized;
+                    // casting/number conversion at the join would change
+                    // Scratch's string/number comparison semantics.
+                    auto* phi = b.CreatePHI(
+                        i64t, 2, ifPhi ? "typed.if.bits" : "typed.merge.bits");
+                    phi->addIncoming(fromThen.bits, thenEnd);
+                    phi->addIncoming(fromElse->second.bits, elseEnd);
+                    localVarFacts[variableId] = {merge, phi};
+                    // Only forward the numeric shadow when *both* incoming
+                    // SSA producers already carry an exact Scratch toNumber
+                    // result AND its numeric-comparison eligibility. Mixing
+                    // these independently would mis-handle whitespace
+                    // strings, NaN and boolean coercion.
+                    auto tn = knownNumD.find(fromThen.bits);
+                    auto en = knownNumD.find(fromElse->second.bits);
+                    auto tc = knownNumOk.find(fromThen.bits);
+                    auto ec = knownNumOk.find(fromElse->second.bits);
+                    const bool provenNumeric =
+                        tn != knownNumD.end() && en != knownNumD.end() &&
+                        tc != knownNumOk.end() && ec != knownNumOk.end();
+                    if (provenNumeric && demandEnabled &&
+                        !postUses.at(variableId).numeric)
+                        ++phiNumericSkipped;
+                    if (provenNumeric &&
+                        (!demandEnabled || postUses.at(variableId).numeric)) {
+                        ++phiNumericEmitted;
+                        auto* numeric = b.CreatePHI(
+                            f64t, 2,
+                            ifPhi ? "typed.if.number" : "typed.merge.number");
+                        numeric->addIncoming(tn->second, thenEnd);
+                        numeric->addIncoming(en->second, elseEnd);
+                        llvm::Value* eligible = tc->second;
+                        if (tc->second != ec->second) {
+                            // If both paths already proved the SAME
+                            // comparison eligibility, no per-read type tag
+                            // guard or PHI is needed. Otherwise preserve
+                            // the full dynamic result from each edge.
+                            auto* ok = b.CreatePHI(
+                                b.getInt1Ty(), 2,
+                                ifPhi ? "typed.if.cmpok" : "typed.merge.cmpok");
+                            ok->addIncoming(tc->second, thenEnd);
+                            ok->addIncoming(ec->second, elseEnd);
+                            eligible = ok;
+                        }
+                        knownNumD[phi] = numeric;
+                        knownNumOk[phi] = eligible;
+                    }
+                }
+            }
             return;
         }
 
         if (op == "control_repeat") {
-            const auto repeatCopies = repeatCopyPlan(blk);
+            const bool osrFirstLoop = blk == osrStartLoop;
+            const auto conditionalRepeat = (osrFirstLoop || runtime.blockCountEnabled)
+                ? std::optional<ConditionalRepeatPlan>{}
+                : conditionalRepeatPlan(blk);
+            const auto repeatCopies = (osrFirstLoop || runtime.blockCountEnabled)
+                ? std::nullopt : repeatCopyPlan(blk);
             if (verbose && repeatCopies)
                 std::fprintf(stderr, "xyo-jit: repeat SSA copies %s\n",
                              blk->id.c_str());
-            const auto repeatAffine = repeatAffinePlan(blk);
+            const auto repeatAffine = (osrFirstLoop || runtime.blockCountEnabled)
+                ? std::nullopt : repeatAffinePlan(blk);
             if (verbose && repeatAffine)
                 std::fprintf(stderr, "xyo-jit: repeat SSA affine %s\n",
                              blk->id.c_str());
-            if (auto plan = multiTransientPattern(blk)) {
-                emitTransientMultiRepeat(blk, *plan);
-                return;
-            }
-            if (auto plan = transientRepeatPattern(blk)) {
-                emitTransientRepeat(blk, *plan);
-                return;
+            if (!osrFirstLoop && !runtime.blockCountEnabled) {
+                if (auto plan = multiTransientPattern(blk)) {
+                    emitTransientMultiRepeat(blk, *plan);
+                    return;
+                }
+                if (auto plan = transientRepeatPattern(blk)) {
+                    emitTransientRepeat(blk, *plan);
+                    return;
+                }
             }
             // for (i = toNum(TIMES); i >= 0.5; i--) { body; loopYield }
             // Fixed-count straight-line bodies are eligible for bounded
             // strip-mining into groups of at most 512 logical iterations.
-            if (auto plan = repeatUnrollPlan(blk)) {
+            if (auto plan = (osrFirstLoop || runtime.blockCountEnabled)
+                    ? std::optional<RepeatUnrollPlan>{}
+                    : repeatUnrollPlan(blk)) {
                 // Evaluate TIMES once, exactly as in the ordinary lowering.
                 (void)emitToNumF64(emitInputOf(blk, "TIMES"));
                 if (verbose)
@@ -6776,13 +7934,26 @@ struct Codegen {
                 emitUnrolledRepeat(blk, *plan);
                 return;
             }
-            llvm::Value* n = emitToNumF64(emitInputOf(blk, "TIMES"));
+            llvm::Value* n = nullptr;
+            // Scratch evaluates TIMES on every control check, even though
+            // only the first result initializes the private repeat counter.
+            // In count mode, evaluate later checks at the loop header too.
+            // This counts the real reporters and preserves their side effects.
+            if (osrFirstLoop) {
+                auto* pointer = b.CreateConstGEP1_32(
+                    i8t, ctxArg, uint32_t(offsetof(JitCtx, osrRepeatRemaining)));
+                n = b.CreateLoad(f64t, pointer, "osr.remaining");
+            } else {
+                n = emitToNumF64(emitInputOf(blk, "TIMES"));
+            }
             // An empty warp repeat is just a sequence of loop-yield checks.
             // Advance the 64-iteration sampling counter in bulk, retaining
             // the 500 ms warp budget checks and the non-warp fallback.
             BasicBlock* emptyDone = nullptr;
             const BlockInput* repeatBody = blk->inputs.find("SUBSTACK");
-            if (!repeatBody || repeatBody->block.empty()) {
+            if ((!repeatBody || repeatBody->block.empty()) &&
+                !runtime.blockCountEnabled &&
+                !(osrFirstLoop && nestedOsrInFlightGuard)) {
                 BasicBlock* emptyFast = BasicBlock::Create(lc, "rep.empty.fast", fn);
                 BasicBlock* emptySlow = BasicBlock::Create(lc, "rep.empty.slow", fn);
                 emptyDone = BasicBlock::Create(lc, "rep.empty.done", fn);
@@ -6798,11 +7969,16 @@ struct Codegen {
                 b.SetInsertPoint(emptyFast);
                 const char* inlineScheduler = std::getenv(
                     "XYO_JIT_INLINE_EMPTY_SCHED");
-                // The outer loop's private yield counter must not be
-                // bypassed. Keep the original helper in nested scopes.
-                if (!curYieldCnt &&
+                // Nested loops use the global counter in the original
+                // helper. Only the direct deadline-poll lowering may be
+                // used there: emitLoopYield() would mistakenly advance the
+                // enclosing loop's private counter instead.
+                const char* directPoll = std::getenv(
+                    "XYO_JIT_INLINE_EMPTY_DIRECT");
+                const bool directNested = directPoll && directPoll[0] == '1';
+                if ((!curYieldCnt || directNested) &&
                     (!inlineScheduler || inlineScheduler[0] != '0') &&
-                    !std::getenv("XYO_PROF"))
+                    !runtime.blockCountEnabled && !std::getenv("XYO_PROF"))
                     emitInlineEmptyWarpRepeat(n);
                 else
                     call2("xyo_empty_repeat_warp", voidt, ctxArg, n);
@@ -6812,12 +7988,13 @@ struct Codegen {
             // ループ内スカラー変数をレジスタへ昇格する（可能なら）。
             // 昇格中は GPU 委譲しない（GPU 側はメモリを直接更新するため、
             // 戻り値の shadow と二重になる）。
-            beginLoopYieldScope();
+            beginLoopYieldScope(blk);
             const bool promotedLoop = beginLoopPromotion(blk, false);
             // 本体が GPU 並列実行可能なら xyo_gpu_repeat へ委譲し、
             // 失敗時のみ従来の CPU ループへ進む分岐を emit する。
             const gpu::Program* gp =
-                promotedLoop ? nullptr : tryGpuLoop(blk);
+                (osrFirstLoop && nestedOsrInFlightGuard) || promotedLoop
+                    ? nullptr : tryGpuLoop(blk);
             // With a compile-time fixed nonnegative count <= INT32_MAX, the
             // existing IEEE test i >= 0.5 followed by i -= 1 performs exactly
             // round-to-nearest with half ties upward. Replacing the private
@@ -6848,6 +8025,14 @@ struct Codegen {
                 b.CreateStore(ci32(*exactTrips), intIv);
             else
                 b.CreateStore(n, iv);
+            // The only counted-loop form that has a directly recoverable
+            // private scalar at this checkpoint. Keep it in the lexical
+            // scope so nested loops never overwrite the outer snapshot.
+            curYieldRemainingF64 = iv;
+            curYieldRemainingI32 = intIv;
+            auto* repeatFirst = runtime.blockCountEnabled && !osrFirstLoop
+                ? entryAlloca(i8t, 1, "repeat.count.first") : nullptr;
+            if (repeatFirst) b.CreateStore(ci8(1), repeatFirst);
             // 本体先頭の不変 pen setter をループ外へ（本体が 0 回なら実行しない）
             emitHoistedSetters(hoistableSetters(blk),
                                b.CreateFCmpOGE(n, cf64(0.5)));
@@ -6856,7 +8041,9 @@ struct Codegen {
             BasicBlock* merge = BasicBlock::Create(lc, "", fn);
             // 「カウンタ + append」ループなら par-for を試す（warp 実行中のみ）。
             // 失敗（0 返却）時は従来の CPU ループへ落ちる。
-            const bool triedParFor = tryEmitParFor(blk, n, head, merge);
+            const bool triedParFor =
+                osrFirstLoop && nestedOsrInFlightGuard
+                    ? false : tryEmitParFor(blk, n, head, merge);
             if (!triedParFor) {
                 if (gp) {
                     llvm::Value* done =
@@ -6872,6 +8059,19 @@ struct Codegen {
                 b.SetInsertPoint(head);
             }
             b.SetInsertPoint(head);
+            if (repeatFirst) {
+                BasicBlock* recheck = newBB("repeat.count.input");
+                BasicBlock* evaluated = newBB("repeat.count.evaluated");
+                llvm::Value* first = b.CreateLoad(i8t, repeatFirst);
+                b.CreateCondBr(b.CreateICmpNE(first, ci8(0)), evaluated, recheck);
+                b.SetInsertPoint(recheck);
+                // Actual second-and-later TIMES reporter evaluation.
+                (void)emitInputOf(blk, "TIMES");
+                if (!bbDone(b.GetInsertBlock())) b.CreateBr(evaluated);
+                b.SetInsertPoint(evaluated);
+                b.CreateStore(ci8(0), repeatFirst);
+            }
+            emitBlockCount();  // one repeat primitive per control check
             llvm::Value* go;
             if (intIv) {
                 llvm::Value* count = b.CreateLoad(i32t, intIv);
@@ -6882,6 +8082,9 @@ struct Codegen {
             }
             b.CreateCondBr(go, bodyBB, merge);
             b.SetInsertPoint(bodyBB);
+            if (conditionalRepeat && intIv)
+                emitConditionalRepeatChunk(*conditionalRepeat,
+                    b.CreateLoad(i32t, intIv), intIv, head);
             if (repeatCopies && intIv)
                 emitRepeatCopyChunk(*repeatCopies,
                     b.CreateLoad(i32t, intIv), intIv, head);
@@ -6916,12 +8119,13 @@ struct Codegen {
         if (op == "control_forever") {
             // forever の本体は必ず 1 回は走るのでガード不要
             emitHoistedSetters(hoistableSetters(blk), nullptr);
-            beginLoopYieldScope();
+            beginLoopYieldScope(blk);
             const bool promotedLoop = beginLoopPromotion(blk, false);
             BasicBlock* bodyBB = BasicBlock::Create(lc, "", fn);
             BasicBlock* merge = BasicBlock::Create(lc, "", fn);
             b.CreateBr(bodyBB);
             b.SetInsertPoint(bodyBB);
+            emitBlockCount();  // control_forever repeats every body entry
             {
                 const BlockInput* in = blk->inputs.find("SUBSTACK");
                 if (in) emitChainBlocks(chainOf(in->block), true);
@@ -6939,14 +8143,16 @@ struct Codegen {
 
         if (op == "control_while" || op == "control_repeat_until") {
             BasicBlock* inductionDone = nullptr;
+            if (!runtime.blockCountEnabled)
             if (auto plan = warpInductionPlan(blk)) {
                 BasicBlock* fallback = newBB("induction.fallback");
                 inductionDone = newBB("induction.done");
-                emitWarpInduction(*plan, fallback, inductionDone);
+                emitWarpInduction(*plan, blk, fallback, inductionDone);
                 if (verbose)
                     std::fprintf(stderr,
                         "xyo-jit: guarded warp induction %s\n", blk->id.c_str());
             }
+            if (!runtime.blockCountEnabled)
             if (auto plan = transientRepeatPattern(blk)) {
                 if (safeTransientReporter(
                         transientChild(blk, "CONDITION"),
@@ -6962,7 +8168,7 @@ struct Codegen {
             // 境界は limitParent/limitInput が指す不変オペランドを
             // ループ前に一度だけ評価する。元の条件は CPU パスで
             // 変更なく再評価される。
-            beginLoopYieldScope();
+            beginLoopYieldScope(blk);
             const bool promotedLoop = beginLoopPromotion(blk, false);
             const gpu::ParallelLoop* pl =
                 promotedLoop ? nullptr : tryGpuLoopEx(blk);
@@ -6989,12 +8195,21 @@ struct Codegen {
                 b.CreateBr(head);
             }
             b.SetInsertPoint(head);
+            emitBlockCount();  // while / repeat-until predicate checks
             llvm::Value* cond = emitInputOf(blk, "CONDITION");
             llvm::Value* t = emitTruthyV(cond);
             llvm::Value* go = op == "control_while"
                 ? t : b.CreateNot(t);
             b.CreateCondBr(go, bodyBB, merge);
             b.SetInsertPoint(bodyBB);
+            // MATH-004: guarded side-effect-free until loops; the slow
+            // successor retains the entire original Scratch body.
+            if (op == "control_repeat_until") {
+                if (auto affine = affineUntilPlan(blk))
+                    emitAffineUntilChunk(*affine, head);
+                if (auto numeric = numericUntilPlan(blk))
+                    emitNumericUntilChunk(*numeric, head);
+            }
             {
                 const BlockInput* in = blk->inputs.find("SUBSTACK");
                 if (in) emitChainBlocks(chainOf(in->block), true);
@@ -7014,6 +8229,7 @@ struct Codegen {
         }
 
         if (op == "control_for_each") {
+            if (!runtime.blockCountEnabled)
             if (auto plan = transientRepeatPattern(blk)) {
                 const BlockField* indexVar = findField(blk, "VARIABLE");
                 if (indexVar && !indexVar->id.empty() &&
@@ -7024,7 +8240,8 @@ struct Codegen {
                     return;
                 }
             }
-            const auto ssaSum = forEachSumPlan(blk);
+            const auto ssaSum = runtime.blockCountEnabled
+                ? std::nullopt : forEachSumPlan(blk);
             if (verbose && ssaSum)
                 std::fprintf(stderr, "xyo-jit: foreach SSA sum %s\n",
                              blk->id.c_str());
@@ -7033,7 +8250,7 @@ struct Codegen {
             // ceil 回になるので i=1..<=n では合わない（2.5 → 3 回）。
             // scratch3_control.forEach re-evaluates VALUE at every iteration.
             // Hoisting the reporter breaks loops that change a list's length.
-            beginLoopYieldScope();
+            beginLoopYieldScope(blk);
             const bool promotedLoop = beginLoopPromotion(blk, false);
             const gpu::Program* gp =
                 promotedLoop ? nullptr : tryGpuLoop(blk);
@@ -7085,6 +8302,7 @@ struct Codegen {
                 b.CreateBr(head);
             }
             b.SetInsertPoint(head);
+            emitBlockCount();  // for-each loop check
             llvm::Value* integralIndex = iv32
                 ? b.CreateLoad(i32t, iv32) : nullptr;
             llvm::Value* i = iv32
@@ -7180,6 +8398,7 @@ struct Codegen {
             BasicBlock* done = BasicBlock::Create(lc, "", fn);
             b.CreateBr(head);
             b.SetInsertPoint(head);
+            emitBlockCount();  // wait-until retry
             llvm::Value* cond = emitInputOf(blk, "CONDITION");
             llvm::Value* t = emitTruthyV(cond);
             b.CreateCondBr(t, done, waitBB);
@@ -7188,8 +8407,14 @@ struct Codegen {
             // 条件が変わらないため、通常のループ yield ではなく
             // 「待機なら譲る」専用ヘルパを使う。
             const char* eventEnv = std::getenv("XYO_EVENT_SCHED");
-            const bool eventPureWait = eventEnv && eventEnv[0] == '1' &&
-                                       blocks->isPureWaitCondition(blk);
+            // Native JIT source tokens are real in-memory Block addresses.
+            // AOT object files can hold obsolete addresses and must keep
+            // ordinary polling. Instrumented block counting also retains
+            // every retry rather than eliding logically executed blocks.
+            const bool eventPureWait = !aot && !runtime.blockCountEnabled &&
+                ((eventEnv && eventEnv[0] == '1') ||
+                 isolatedEventWaitDependencyEnabled()) &&
+                blocks->isPureWaitCondition(blk);
             if (eventPureWait)
                 call2("xyo_wait_event_yield", voidt, ctxArg,
                       ci64(reinterpret_cast<uintptr_t>(blk)));
@@ -7238,7 +8463,10 @@ struct Codegen {
         if (op == "data_changevariableby") {
             const BlockField* f = findField(blk, "VARIABLE");
             if (f) {
-                emitVarChange(f, emitInputOf(blk, "VALUE"));
+                const bool selfDelta = sameScalarChangeInput(blk, f);
+                llvm::Value* delta = emitInputOf(blk, "VALUE");
+                if (selfDelta) ++duplicateScalarChanges;
+                emitVarChange(f, delta, selfDelta);
             }
             return;
         }
@@ -7462,6 +8690,54 @@ struct Codegen {
         // 手続き自身が yield/compat なヘルパを持たず呼出し循環にも
         // 属さない場合はフレームが観測不能 — elideLeafProcFrames で
         // push/pop を後から削る。
+        if (portableCallFrames() && !aot) {
+            // Capture the caller's active loop path before entering a child.
+            // A recursive callee's yield otherwise sees stale parent state.
+            // The same SSA counter snapshot is passed to the verified
+            // enter helper: on the FIRST root call no session exists yet,
+            // so the ordinary checkpoint helper above cannot publish it.
+            const auto callerPath = emitPortableLoopCheckpoint(false);
+            // Capture the exact register arguments in the common 64-bit
+            // numeric ABI BEFORE xyo_proc_push can yield for recursive
+            // nonwarp calls. Real heap pointers are filtered out by
+            // the host mirror until a GC-safe Value ABI exists.
+            llvm::Value* argumentBits =
+                llvm::ConstantPointerNull::get(
+                    llvm::cast<llvm::PointerType>(ptrt));
+            if (nargs) {
+                // Must allocate exactly once per LLVM function activation.
+                // An alloca in a Scratch repeat loop would otherwise grow
+                // the native Fiber stack on EVERY iteration until overflow.
+                llvm::IRBuilder<> entryBuilder(
+                    &fn->getEntryBlock(),
+                    fn->getEntryBlock().getFirstInsertionPt());
+                auto* cells = entryBuilder.CreateAlloca(
+                    i64t, ci32(uint32_t(nargs)), "callframe.arguments");
+                for (size_t i = 0; i < nargs; ++i) {
+                    auto* cell = b.CreateInBoundsGEP(
+                        i64t, cells, ci64(i));
+                    b.CreateStore(argv[i + 1], cell);
+                }
+                argumentBits = cells;
+            }
+            auto sourceId = b.CreateGlobalString(blk->id);
+            auto sourceCode = b.CreateGlobalString(pc);
+            if (callerPath) {
+                callN("xyo_proc_frame_enter_verified_rootpath", voidt,
+                    {ctxArg, sourceId, sourceCode, argumentBits,
+                     ci32(uint32_t(nargs)), ci64(compiledSourceRevision),
+                     ci64(compiledSourceDigest.lo),
+                     ci64(compiledSourceDigest.hi),
+                     callerPath->ids, callerPath->counters,
+                     ci32(callerPath->count)});
+            } else {
+                callN("xyo_proc_frame_enter_verified", voidt,
+                    {ctxArg, sourceId, sourceCode, argumentBits,
+                     ci32(uint32_t(nargs)), ci64(compiledSourceRevision),
+                     ci64(compiledSourceDigest.lo),
+                     ci64(compiledSourceDigest.hi)});
+            }
+        }
         auto* pushI = llvm::cast<CallInst>(callN(
             "xyo_proc_push", voidt,
             {ctxArg, b.CreateGlobalString(blk->id),
@@ -7469,9 +8745,13 @@ struct Codegen {
                      blocks->getCachedExecute(blk->id)),
              ci32(warp ? 1 : 0), b.CreateGlobalString(pc),
              ci32(nestedBranchDepth), ci32(0)}));
+        if (portableCallFrames() && !aot)
+            call1("xyo_proc_frame_body_started", voidt, ctxArg);
         auto* callI = llvm::cast<CallInst>(b.CreateCall(pf, argv));
         auto* popI = llvm::cast<CallInst>(
             call1("xyo_proc_pop", voidt, ctxArg));
+        if (portableCallFrames() && !aot)
+            call1("xyo_proc_frame_leave", voidt, ctxArg);
         procCallSites.push_back({pushI, callI, popI, pf, pc});
     }
 
@@ -7565,6 +8845,7 @@ struct Codegen {
     /// six-ancestor recursion check and may yield on recursive entry.
     void elideLeafProcFrames() {
         if (procCallSites.empty()) return;
+        const bool preservePortableFrames = portableCallFrames() && !aot;
         std::unordered_set<Function*> cyclic;
         for (auto& [name, start] : procFns) {
             std::unordered_set<Function*> seen;
@@ -7590,6 +8871,15 @@ struct Codegen {
         }
 
         for (auto& s : procCallSites) {
+            if (preservePortableFrames) {
+                // Native recursion detection still depends on the old
+                // interpreter stack. Preserve that behavior even when the
+                // portable mirror is observing all procedure calls.
+                if (cyclic.contains(s.callee) &&
+                    !safeRecursive.contains(s.callee))
+                    s.push->setArgOperand(6, ci32(1));
+                continue;
+            }
             if (cyclic.contains(s.callee)) {
                 if (!safeRecursive.contains(s.callee)) {
                     s.push->setArgOperand(6, ci32(1));
@@ -7830,6 +9120,13 @@ struct Codegen {
             BasicBlock* entry = BasicBlock::Create(lc, "", pp.f);
             b.SetInsertPoint(entry);
             ctxArg = pp.f->getArg(0);
+            // Interpreter enters the executable procedures_definition block
+            // once per call. A native procedure entry must account for it,
+            // independently of the body's blocks and arguments.
+            if (runtime.blockCountEnabled) {
+                const BlockCached* def = blocks->getCachedExecute(pp.def->id);
+                if (def && def->blockFunction) emitBlockCount();
+            }
             llvm::Value* saved = loadIsWarp();
             // 手続きの warpMode は呼出し元フレームから継承し、定義が
             // warp のときのみ 1 へ昇格する（非 warp 定義で 0 に降格
@@ -7864,20 +9161,63 @@ bool jitEmitScript(llvm::Module& mod, llvm::LLVMContext& lc, Runtime& runtime,
                    CompiledScript& out, JitPinned& pinned,
                    std::vector<std::string>& pendingFnNames,
                    std::map<std::string, std::string>& procNameMap,
-                   AotEmit* aot) {
+                   AotEmit* aot,
+                   const Block* osrStart,
+                   const ir::ScratchCompilationUnit* source,
+                   bool standaloneOsrLoop) {
     Codegen cg{lc, mod, IRBuilder<>(lc), runtime, pinned};
     cg.target = target;
     cg.blocks = blocks;
     cg.gpuProgs = &out.gpuProgs;
     cg.aot = aot;
-
+    cg.osrStartLoop = osrStart;
+    if (const char* direct = std::getenv("XYO_JIT_OSR_NESTED_DIRECT_ARGS");
+        direct && direct[0] == '1' && standaloneOsrLoop)
+        cg.directNestedOsrArgs = true;
+    if (const char* hoist = std::getenv("XYO_JIT_OSR_NESTED_HOIST_ARGS");
+        cg.directNestedOsrArgs && hoist && hoist[0] == '1')
+        cg.hoistNestedOsrArgs = true;
+    if (const char* guard =
+            std::getenv("XYO_JIT_OSR_NESTED_INFLIGHT_DEOPT");
+        standaloneOsrLoop && !aot && guard && guard[0] == '1') {
+        const char* proof =
+            std::getenv("XYO_JIT_OSR_NESTED_SOURCE_PROOF");
+        cg.nestedOsrInFlightGuard = proof && proof[0] == '1';
+    }
+    // Validate a lossless snapshot of the selected source script. Capturing
+    // only this script avoids copying the entire Scratch project on every
+    // JIT invocation. Procedure definitions remain owned by the live Blocks.
+    // LLVM's scheduler, OSR and BlockCached still depend on live Block
+    // pointer identity; migrating those references requires further work.
     Block* top = blocks->getBlock(topBlockId);
+    if (!top) return false;
+    // Normal synchronous JIT receives the same captured source as WASM.
+    // AOT/async entrypoints capture locally until their callers are migrated.
+    const auto captured = source ? ir::ScratchCompilationUnit{}
+                                 : ir::ScratchCompilationUnit::capture(*blocks, top);
+    const auto& sharedUnit = source ? *source : captured;
+    if (!sharedUnit.valid() || sharedUnit.script.topId != topBlockId)
+        return false;
+    cg.compiledSourceRevision = sharedUnit.sourceRevision;
+    if (cg.portableCallFrames() && !aot) {
+        cg.compiledSourceDigest = ir::scratchSourceDigest(sharedUnit);
+        if (!cg.compiledSourceDigest) return false;
+    }
+    // Live Blocks are still consulted by the existing LLVM emitter.
+    // Reject an async compilation whose snapshot became stale before
+    // emission, rather than silently authorizing a newer revision.
+    if (blocks->revision() != sharedUnit.sourceRevision)
+        return false;
     if (!top) return false;
     // ハット本体は emit しない（startHats が評価する）。
     // edge-activated hat はコンパイル対象外。
     if (runtime.getIsEdgeActivatedHat(top->opcode)) return false;
 
-    std::vector<Block*> body = cg.chainOf(top->next);
+    // For a nested procedure OSR, emit only the currently active loop.
+    // The interpreter still owns the enclosing call stack and every suffix.
+    std::vector<Block*> body = standaloneOsrLoop && osrStart
+        ? std::vector<Block*>{blocks->getBlock(osrStart->id)}
+        : cg.chainOf(osrStart ? osrStart->id : top->next);
     if (std::getenv("XYO_JIT_DUMP")) {
         llvm::errs() << "emit: top=" << top->opcode << " next=" << top->next
                      << " body.size=" << body.size() << "\n";
@@ -7897,7 +9237,26 @@ bool jitEmitScript(llvm::Module& mod, llvm::LLVMContext& lc, Runtime& runtime,
     if (std::getenv("XYO_JIT_DUMP"))
         llvm::errs() << "entry=" << (void*)entry << " f=" << (void*)f
                      << " fsize=" << f->size() << "\n";
+    // RT-001 experiment: before the FIRST Scratch statement, attach a
+    // source-verified root CallFrame even when the script makes no
+    // procedure calls. The default and existing lazy procedure path
+    // remain unchanged. This must not initialize a standalone nested
+    // interpreter->LLVM OSR entry as a fresh top-level invocation.
+    const bool rootOnlyDeoptProducer = !aot && !osrStart &&
+        cg.portableCallFrames() && [] {
+            const char* v = std::getenv("XYO_RT_ROOT_ONLY_DEOPT");
+            return v && v[0] == '1';
+        }();
+    if (rootOnlyDeoptProducer)
+        cg.callN("xyo_proc_frame_init_root_verified", cg.voidt,
+                 {cg.ctxArg, cg.ci64(cg.compiledSourceRevision),
+                  cg.ci64(cg.compiledSourceDigest.lo),
+                  cg.ci64(cg.compiledSourceDigest.hi)});
     cg.emitChainBlocks(body);
+    if (cg.hoistNestedOsrArgs &&
+        std::getenv("XYO_JIT_OSR_NESTED_TRACE"))
+        std::fprintf(stderr, "[jit-osr-nested] hoisted-args=%zu\n",
+                     cg.hoistedNestedOsrArgs.size());
     if (std::getenv("XYO_JIT_DUMP")) {
         llvm::errs() << "after chain: ipbb=" << (void*)cg.b.GetInsertBlock()
                      << " term=" << (void*)(cg.b.GetInsertBlock()
@@ -7917,6 +9276,17 @@ bool jitEmitScript(llvm::Module& mod, llvm::LLVMContext& lc, Runtime& runtime,
     cg.emitPendingProcedures();
     cg.emitPendingParFors();
     if (cg.fail) return false;
+    // No editor update may occur during the live Blocks lowering
+    // interval. Source edits after publication are checked at every
+    // native CallFrame handoff, where the interpreter deoptimizer runs.
+    if (blocks->revision() != cg.compiledSourceRevision)
+        return false;
+    if (cg.compiledSourceDigest) {
+        auto current = ir::ScratchCompilationUnit::capture(*blocks, top);
+        if (!current.valid() ||
+            ir::scratchSourceDigest(current) != cg.compiledSourceDigest)
+            return false;
+    }
     cg.elideLeafProcFrames();
 
     // 到達不能になった合流点など、終端のない BB を unreachable で閉じる
@@ -7932,6 +9302,35 @@ bool jitEmitScript(llvm::Module& mod, llvm::LLVMContext& lc, Runtime& runtime,
     cg.inlineSmallProcCalls();
     cg.hoistVarSlotPointers();
     if (cg.fail) return false;
+
+    if (const char* stats = std::getenv("XYO_JIT_DUPLICATE_SCALAR_STATS");
+        stats && stats[0] == '1') {
+        std::fprintf(stderr, "[jit-duplicate-scalar] %s pairs=%llu self_changes=%llu\n",
+                     topBlockId.c_str(),
+                     (unsigned long long)cg.duplicateScalarNumericReads,
+                     (unsigned long long)cg.duplicateScalarChanges);
+    }
+    if (const char* stats = std::getenv("XYO_JIT_LOCAL_READ_STATS");
+        stats && stats[0] == '1') {
+        std::fprintf(stderr, "[jit-local-read] %s reuses=%llu\n",
+                     topBlockId.c_str(),
+                     (unsigned long long)cg.localReadReuses);
+    }
+    if (const char* stats = std::getenv("XYO_JIT_PHI_STATS");
+        stats && stats[0] == '1') {
+        std::fprintf(stderr,
+            "[jit-phi] %s merges=%llu demand_scans=%llu "
+            "candidates=%llu boxed=%llu boxed_skipped=%llu "
+            "numeric=%llu numeric_skipped=%llu\n",
+            topBlockId.c_str(),
+            (unsigned long long)cg.phiMergeBlocks,
+            (unsigned long long)cg.phiDemandScans,
+            (unsigned long long)cg.phiCandidates,
+            (unsigned long long)cg.phiBoxedEmitted,
+            (unsigned long long)cg.phiBoxedSkipped,
+            (unsigned long long)cg.phiNumericEmitted,
+            (unsigned long long)cg.phiNumericSkipped);
+    }
 
     if (std::getenv("XYO_JIT_DUMP")) {
         llvm::errs() << "--- module for " << f->getName() << " (bbs="

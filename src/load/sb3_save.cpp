@@ -128,7 +128,7 @@ JsonObject targetToJson(Runtime& rt, Target& t,
             JsonArray items;
             if (v.list)
                 for (uint32_t i = 0; i < v.list->len; ++i)
-                    items.push_back(valueToJson(v.list->items[i]));
+                    items.push_back(valueToJson(v.list->get0(i)));
             JsonArray a;
             a.push_back(JsonValue(SStr::toUtf8(v.name)));
             a.push_back(JsonValue(std::move(items)));

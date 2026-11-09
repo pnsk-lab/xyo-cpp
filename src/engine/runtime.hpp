@@ -1,6 +1,9 @@
 // xyo-cpp: engine/runtime.js 相当 — ランタイム中核。
 #pragma once
 
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <deque>
 #include <functional>
 #include <map>
@@ -23,9 +26,14 @@ namespace xyo {
 /// 環境変数 `XYO_DANGER` が真値（未設定・`0`・空以外）なら true。
 /// Runtime::dangerMode の既定値（`--danger` は構築後に上書きする）。
 bool dangerModeFromEnv();
+bool blockCountEnabledFromEnv();
 
 class Gc;
 class JitEngine;
+namespace ir {
+class CommitOnceEffects;
+enum class ObservableOp : uint8_t;
+}
 struct Sequencer;
 struct Sprite;
 struct Target;
@@ -87,6 +95,15 @@ struct RendererAPI {
     virtual void penPoint(int skin, const float rgba[4], double diameter,
                           double x, double y) {
         (void)skin; (void)rgba; (void)diameter; (void)x; (void)y;
+    }
+    // Hot-start pen layer. Store premultiplied RGBA at the renderer's
+    // fixed pen resolution; empty means the pen skin was never created.
+    virtual bool capturePen(std::vector<uint8_t>& pixels) {
+        pixels.clear();
+        return true;
+    }
+    virtual bool restorePen(const std::vector<uint8_t>& pixels) {
+        return pixels.empty();
     }
     virtual void penClear(int skin) { (void)skin; }
     /// drawableID の現在の表示をペンスタンプする。
@@ -157,6 +174,20 @@ public:
     std::unique_ptr<JitEngine> jit;   // XYO_JIT 時のみ非 null
     IoDevices ioDevices;
 
+    /// Exact count of interpreter primitive evaluations, including reporters
+    /// and repeated control-block checks. Literal/dropdown shadows are not
+    /// executable operations. Count mode deliberately bypasses JIT and
+    /// speculative/parallel lowering so optimized-away blocks cannot be lost.
+    /// Set before starting scripts. Read/reset via load()/exchange(0).
+    bool blockCountEnabled = blockCountEnabledFromEnv();
+    std::atomic<uint64_t> executedBlocks{0};
+
+    /// Wall-time interval starting at greenFlag, excluding project loading.
+    /// Finalize before post-run saving; destructor handles other entrypoints.
+    std::chrono::steady_clock::time_point blockCountStartedAt{};
+    std::chrono::steady_clock::time_point blockCountEndedAt{};
+    void finishBlockCount();
+
     std::vector<Target*> targets;            // 全ターゲット（非所有）
     std::vector<Target*> executableTargets;  // 実行対象（stage 最後）
     std::vector<std::unique_ptr<Sprite>> ownedSprites;   // sb3 ロード時の所有
@@ -175,7 +206,25 @@ public:
     std::unordered_map<std::u16string,
         std::shared_ptr<const std::vector<BroadcastReceiver>>> broadcastIndex;
     bool broadcastIndexDirty = true;
-    void invalidateBroadcastIndex() { broadcastIndexDirty = true; }
+    // Last lookup cache: repeated broadcasts usually share the same name.
+    // Shared snapshots stay alive across nested dispatch and target edits.
+    std::u16string lastBroadcastLookupName;
+    std::shared_ptr<const std::vector<BroadcastReceiver>>
+        lastBroadcastLookupReceivers;
+    bool lastBroadcastLookupValid = false;
+    // Scratch can canonicalize an ASCII broadcast input to a non-ASCII
+    // Stage variable (e.g. Kelvin sign lowercases to 'k'). Cache whether
+    // this namespace is ASCII-only once per scheduler tick, not per event.
+    uint64_t asciiBroadcastCacheStep = UINT64_MAX;
+    const Target* asciiBroadcastCacheStage = nullptr;
+    bool asciiBroadcastCacheValue = false;
+    bool stageBroadcastNamesAsciiOnly();
+    void invalidateBroadcastIndex() {
+        broadcastIndexDirty = true;
+        lastBroadcastLookupValid = false;
+        lastBroadcastLookupReceivers.reset();
+        asciiBroadcastCacheStep = UINT64_MAX;
+    }
     std::shared_ptr<const std::vector<BroadcastReceiver>>
     broadcastReceivers(std::u16string_view name);
     /// 回収（ownedThreads から解放）を次に試すサイズ。回収は O(n) なので
@@ -186,7 +235,6 @@ public:
     void reclaimThreads();
     std::vector<Thread*> threads;
     std::unordered_map<std::string, Thread*> threadMap;
-
     std::unique_ptr<Blocks> monitorBlocks;
     std::unique_ptr<Blocks> flyoutBlocks;
     std::unordered_map<std::string, HatMeta> hats;
@@ -371,6 +419,34 @@ public:
     // Fast non-waiting broadcast path: avoids constructing a transient
     // fields map and a returned thread vector for compiled receivers.
     void startBroadcast(std::u16string_view name);
+    // The dispatcher pointer remains borrowed for the duration of this
+    // synchronous call only. The journal GC-roots the broadcast name across
+    // publish and delivery. Never use this for broadcast-and-wait.
+    using BroadcastDelivery = void (*)(void*, std::u16string_view) noexcept;
+    void journalBroadcast(std::u16string_view name,
+                          BroadcastDelivery deliver, void* context);
+    // Non-yielding, non-transactional primitive that preserves the existing
+    // Scratch dispatch path. Used by the opt-in commit-once wrapper only
+    // after a journaled publication; never compiled speculatively.
+    void startBroadcastImmediate(std::u16string_view name);
+    // Broadcast-and-wait: journal the initial synchronous receiver launch
+    // while preserving the exact Thread* join set across scheduler yields.
+    // Waiting/continuation remains owned by interpreter ExecContext or
+    // the JIT Fiber; the journal only commits one initial start.
+    std::vector<Thread*> startBroadcastAndWait(std::u16string_view name);
+    // Exact tagged Value host effect at a *non-speculative* safe boundary.
+    // Renderer/looks/pen adapters provide a synchronous, non-yielding
+    // callback; no generated WASM/LLVM code can emit an effect before
+    // the host journal has committed it.
+    using ObservableDelivery = void (*)(void*, Value) noexcept;
+    void journalObservable(ir::ObservableOp op, Value payload,
+                           ObservableDelivery deliver, void* context);
+    std::unique_ptr<ir::CommitOnceEffects> observableJournal;
+    uint64_t observableSliceId = 0;
+    uint64_t observableCommittedBroadcasts = 0;
+    uint64_t observableImmediateBroadcasts = 0;
+    uint64_t observableCommittedEffects = 0;
+    uint64_t observableImmediateEffects = 0;
 
     void stopForTarget(Target* target, Thread* optException);
     void stopAll();
@@ -436,10 +512,15 @@ public:
     /// PROJECT_START — answer リセット + エフェクトクリア
     void emitProjectStart();
     void clearAllQuestions();
+    // Append after all existing members to avoid shifting compiled ABI
+    // offsets. Advanced only at a scheduler reclamation safe point.
+    uint64_t reclaimRetentionEpoch = 0;
 };
 
 /// execute.js — 1ブロック分の _ops を実行
-void execute(Sequencer& sequencer, Thread& thread);
+// Returns false when an interpreter-owned WASM range ran instead of the
+// current primitive (for accurate interpreted-block profiling).
+bool execute(Sequencer& sequencer, Thread& thread);
 /// 非同期プリミティブの完了報告（JS promise 解決相当）
 void resolveWait(Sequencer& sequencer, Thread& thread, Value resolvedValue);
 

@@ -11,6 +11,9 @@
 #include <vector>
 
 #include "analysis/project_analysis.hpp"
+#include "analysis/type_sites.hpp"
+#include "analysis/type_flow.hpp"
+#include "analysis/procedure_effects.hpp"
 #include "engine/deps.hpp"
 #include "engine/runtime.hpp"
 #include "load/sb3.hpp"
@@ -209,6 +212,285 @@ void testProject(const analysis::Report& r) {
     CHECK(dot.find("Sprite1:event_whenflagclicked") != std::string::npos);
 }
 
+void testProcedureEffects(Runtime& rt) {
+    Blocks blocks(&rt);
+    Target* stage = nullptr;
+    for (Target* t : rt.targets)
+        if (t->isStage) stage = t;
+    CHECK(stage != nullptr);
+    if (!stage) return;
+
+    auto add = [&](std::string id, std::string opcode,
+                   std::string next = {}, bool top = false) -> Block& {
+        Block b;
+        b.id = std::move(id);
+        b.opcode = std::move(opcode);
+        b.next = std::move(next);
+        b.topLevel = top;
+        const std::string key = b.id;
+        blocks.createBlock(std::move(b));
+        return *blocks.getBlock(key);
+    };
+    auto define = [&](const std::string& code, const std::string& body) {
+        Block& def = add("definition_" + code, "procedures_definition",
+                         body, true);
+        const std::string prototype = "prototype_" + code;
+        def.inputs.set("custom_block", BlockInput{prototype, {}});
+        Block& proto = add(prototype, "procedures_prototype");
+        proto.mutation.emplace();
+        proto.mutation->attrs["proccode"] = code;
+    };
+    auto call = [&](const std::string& id, const std::string& code,
+                    const std::string& next = {}) {
+        Block& b = add(id, "procedures_call", next);
+        b.mutation.emplace();
+        b.mutation->attrs["proccode"] = code;
+    };
+
+    define("simple", "simple_set");
+    Block& set = add("simple_set", "data_setvariableto");
+    set.fields["VARIABLE"].id = "a";
+    set.inputs.set("VALUE", BlockInput{"read_b", {}});
+    Block& reporter = add("read_b", "data_variable");
+    reporter.fields["VARIABLE"].id = "b";
+
+    const auto simple = analysis::summarizeProcedureEffects(
+        blocks, stage, "simple");
+    CHECK(simple.writtenScalarIds.count("a") == 1);
+    CHECK(simple.readScalarIds.count("b") == 1);
+    CHECK(!simple.unknownScalarWrites);
+    CHECK(!simple.bodyMayYield);
+    CHECK(simple.callMayYield); // potential warp-deadline handoff
+
+    define("nested", "nested_call");
+    call("nested_call", "simple", "nested_list");
+    add("nested_list", "data_addtolist");
+    const auto nested = analysis::summarizeProcedureEffects(
+        blocks, stage, "nested");
+    CHECK(nested.writtenScalarIds.count("a") == 1);
+    CHECK(nested.mayMutateLists);
+    CHECK(nested.bodyMayYield);
+    CHECK(!nested.unknownScalarWrites);
+
+    define("recursive", "recursive_call");
+    call("recursive_call", "recursive");
+    const auto recursive = analysis::summarizeProcedureEffects(
+        blocks, stage, "recursive");
+    CHECK(recursive.recursive);
+    CHECK(recursive.unknownScalarWrites);
+    CHECK(recursive.bodyMayYield);
+
+    define("spawner", "spawn_clone");
+    add("spawn_clone", "control_create_clone_of");
+    const auto spawner = analysis::summarizeProcedureEffects(
+        blocks, stage, "spawner");
+    CHECK(spawner.mayLaunchScripts);
+    CHECK(spawner.unknownScalarWrites);
+    CHECK(spawner.bodyMayYield);
+
+    define("opaque", "opaque_reporter");
+    add("opaque_reporter", "operator_extension_mutates");
+    const auto opaque = analysis::summarizeProcedureEffects(
+        blocks, stage, "opaque");
+    CHECK(opaque.unknownScalarWrites);
+    CHECK(opaque.bodyMayYield);
+
+    const auto truncated = analysis::summarizeProcedureEffects(
+        blocks, stage, "nested", 1);
+    CHECK(truncated.truncated);
+    CHECK(truncated.unknownScalarWrites);
+}
+
+void testControlFlowAndTypeFixedPoint(Runtime& rt) {
+    Blocks bs(&rt);
+    auto put = [&](std::string id, std::string opcode,
+                   std::string next = {}) -> Block& {
+        Block block;
+        block.id = id;
+        block.opcode = opcode;
+        block.next = std::move(next);
+        bs.createBlock(std::move(block));
+        return *bs.getBlock(id);
+    };
+    auto assign = [&](const std::string& id,
+                      const std::string& next,
+                      const std::string& variable,
+                      const std::string& reporter) {
+        Block& b = put(id, "data_setvariableto", next);
+        b.fields["VARIABLE"].id = variable;
+        b.inputs.set("VALUE", BlockInput{reporter, {}});
+    };
+    Block& number = put("num", "math_number");
+    number.shadow = true;
+    number.fields["NUM"].value = Value::num(1);
+    Block& string = put("str", "text");
+    string.shadow = true;
+    string.fields["TEXT"].value = Value::string(SStr::create(u"x"));
+    Block& variableReporter = put("get_v", "data_variable");
+    variableReporter.fields["VARIABLE"].id = "v";
+
+    assign("set_v", "branch", "v", "num");
+    Block& branch = put("branch", "control_if_else", "copy_v");
+    branch.inputs.set("SUBSTACK", BlockInput{"then_v", {}});
+    branch.inputs.set("SUBSTACK2", BlockInput{"else_v", {}});
+    assign("then_v", {}, "v", "str");
+    assign("else_v", {}, "v", "num");
+    assign("copy_v", "repeat", "w", "get_v");
+    Block& repeat = put("repeat", "control_repeat", "after_loop");
+    repeat.inputs.set("SUBSTACK", BlockInput{"loop_set", {}});
+    repeat.inputs.set("TIMES", BlockInput{"num", {}});
+    assign("loop_set", {}, "v", "num");
+    assign("after_loop", "opaque", "w", "get_v");
+    put("opaque", "procedures_call");
+
+    const auto result = analysis::analyzeTypeFlow(bs, "set_v");
+    const auto node = [&](const char* id) {
+        const auto& matches = result.cfg.blockNodes.at(id);
+        CHECK_EQ(matches.size(), 1u);
+        return matches.front();
+    };
+    const size_t first = node("set_v");
+    const size_t condition = node("branch");
+    const size_t thenNode = node("then_v");
+    const size_t elseNode = node("else_v");
+    const size_t copy = node("copy_v");
+    const size_t loop = node("repeat");
+    const size_t afterLoop = node("after_loop");
+    const size_t opaque = node("opaque");
+    constexpr uint32_t N = Variable::kObservedNumber;
+    constexpr uint32_t S = Variable::kObservedString;
+    constexpr uint32_t Any = N | S | Variable::kObservedBoolean |
+        Variable::kObservedColor | Variable::kObservedOther;
+
+    CHECK(!result.cfg.truncated);
+    CHECK_EQ(result.kindAfter(first, "v"), N);
+    CHECK_EQ(result.kindBefore(condition, "v"), N);
+    CHECK_EQ(result.kindAfter(thenNode, "v"), S);
+    CHECK_EQ(result.kindAfter(elseNode, "v"), N);
+    CHECK_EQ(result.kindBefore(copy, "v"), N | S);
+    CHECK_EQ(result.kindAfter(copy, "w"), N | S);
+    // A loop backedge can run a different Scratch thread and change v.
+    CHECK_EQ(result.kindBefore(loop, "v"), Any);
+    CHECK_EQ(result.kindBefore(afterLoop, "v"), Any);
+    CHECK_EQ(result.kindAfter(opaque, "w"), Any);
+
+    CHECK(result.cfg.dominates(first, copy));
+    CHECK(result.cfg.dominates(condition, thenNode));
+    CHECK(!result.cfg.dominates(thenNode, copy));
+    CHECK(!result.cfg.dominates(elseNode, copy));
+    CHECK(result.cfg.dominates(result.cfg.entry, result.cfg.exit));
+
+    // For-each implicitly assigns its counter at iteration entry. Keeping
+    // the previous String type would be unsound inside the loop body.
+    assign("foreach_preset", "foreach", "v", "str");
+    Block& foreach = put("foreach", "control_for_each", "foreach_end");
+    foreach.fields["VARIABLE"].id = "v";
+    foreach.inputs.set("VALUE", BlockInput{"num", {}});
+    foreach.inputs.set("SUBSTACK", BlockInput{"foreach_body", {}});
+    assign("foreach_body", {}, "w", "get_v");
+    assign("foreach_end", {}, "w", "get_v");
+    const auto foreachFlow = analysis::analyzeTypeFlow(bs, "foreach_preset");
+    const size_t foreachHeader =
+        foreachFlow.cfg.blockNodes.at("foreach").front();
+    const size_t foreachBody =
+        foreachFlow.cfg.blockNodes.at("foreach_body").front();
+    const size_t foreachEnd =
+        foreachFlow.cfg.blockNodes.at("foreach_end").front();
+    CHECK_EQ(foreachFlow.kindAfter(
+                 foreachFlow.cfg.blockNodes.at("foreach_preset").front(),
+                 "v"), S);
+    // The loop header includes an unknown backedge after a scheduler handoff.
+    CHECK_EQ(foreachFlow.kindBefore(foreachHeader, "v"), Any);
+    CHECK_EQ(foreachFlow.kindBefore(foreachBody, "v"), Any);
+    CHECK_EQ(foreachFlow.kindBefore(foreachEnd, "v"), Any);
+
+    // Unknown/malformed input must invalidate rather than invent a type.
+    auto truncated = analysis::analyzeTypeFlow(bs, "set_v", 3);
+    CHECK(truncated.cfg.truncated);
+    CHECK_EQ(truncated.kindBefore(truncated.cfg.exit, "v"), Any);
+
+    // Opcode appearance does not determine storage type. Scratch's JSON
+    // numeric primitive can carry a string ("7"), a NaN Value, etc.
+    auto literalKind = [&](const std::string& id, const std::string& op,
+                           Value value) {
+        Block& block = put(id, op);
+        block.shadow = true;
+        block.fields["LITERAL"].value = value;
+        BlockInput input{id, {}};
+        return analysis::inferInputStorageKinds(bs, &input);
+    };
+    CHECK_EQ(literalKind("numeric_str", "math_number",
+                         Value::string(SStr::create(u"7"))), S);
+    CHECK_EQ(literalKind("literal_nan", "math_number", Value::nan()), N);
+    CHECK_EQ(literalKind("literal_bool", "math_boolean",
+                         Value::boolean(true)), Variable::kObservedBoolean);
+    CHECK_EQ(literalKind("literal_color", "colour_picker",
+                         Value::color(1, 2, 3)), Variable::kObservedColor);
+    CHECK_EQ(literalKind("literal_undefined", "text",
+                         Value::undefined()), Variable::kObservedOther);
+
+    // A legacy Scratch block may have a missing ID but a matching variable
+    // name. Without canonicalization, the analysis can incorrectly keep the
+    // older type of the same variable under its canonical ID.
+    Target* stage = nullptr;
+    for (Target* t : rt.targets)
+        if (t->isStage) stage = t;
+    CHECK(stage != nullptr);
+    if (stage) {
+        Block& aliasReporter = put("alias_get", "data_variable");
+        aliasReporter.fields["VARIABLE"].id = "a";
+        assign("alias_set_first", "alias_set_name", "a", "num");
+        Block& aliasWrite = put("alias_set_name", "data_setvariableto",
+                                "alias_copy");
+        aliasWrite.fields["VARIABLE"].id = "stale_id";
+        aliasWrite.fields["VARIABLE"].value =
+            Value::string(SStr::create(u"shared"));
+        aliasWrite.inputs.set("VALUE", BlockInput{"str", {}});
+        assign("alias_copy", "alias_collision", "b", "alias_get");
+        Block& collision = put("alias_collision", "data_setvariableto",
+                               "alias_bad");
+        collision.fields["VARIABLE"].id = "L";  // list ID, not scalar
+        collision.fields["VARIABLE"].value =
+            Value::string(SStr::create(u"shared"));  // scalar name alias
+        collision.inputs.set("VALUE", BlockInput{"str", {}});
+        Block& invalid = put("alias_bad", "data_setvariableto",
+                             "alias_after");
+        invalid.fields["VARIABLE"].id = "unresolved";
+        invalid.fields["VARIABLE"].value =
+            Value::string(SStr::create(u"nonexistent"));
+        invalid.inputs.set("VALUE", BlockInput{"num", {}});
+        assign("alias_after", {}, "b", "alias_get");
+
+        const auto aliased = analysis::analyzeTypeFlow(
+            bs, "alias_set_first", 16384, stage);
+        const auto a = [&](const char* id) {
+            return aliased.cfg.blockNodes.at(id).front();
+        };
+        CHECK_EQ(aliased.kindAfter(a("alias_set_first"), "a"), N);
+        CHECK_EQ(aliased.kindAfter(a("alias_set_name"), "a"), S);
+        CHECK_EQ(aliased.kindAfter(a("alias_copy"), "b"), S);
+        // The stage list "L" must not resolve to scalar "shared", even
+        // though the field's name would otherwise match.
+        CHECK_EQ(aliased.kindBefore(a("alias_collision"), "a"), S);
+        CHECK_EQ(aliased.kindAfter(a("alias_collision"), "a"), Any);
+        // Unresolvable/unknown writes must invalidate all known kinds.
+        CHECK_EQ(aliased.kindAfter(a("alias_bad"), "a"), Any);
+        CHECK_EQ(aliased.kindAfter(a("alias_after"), "b"), Any);
+
+        // An extension can register an opcode with an operator_ prefix;
+        // that prefix alone must never grant "no side effects" status.
+        put("unknown_operator", "operator_custom_mutates");
+        assign("effect_numeric", "effect_unknown", "a", "num");
+        assign("effect_unknown", {}, "b", "unknown_operator");
+        const auto effects = analysis::analyzeTypeFlow(
+            bs, "effect_numeric", 16384, stage);
+        const auto root = effects.cfg.blockNodes.at("effect_numeric").front();
+        const auto unknown = effects.cfg.blockNodes.at("effect_unknown").front();
+        CHECK_EQ(effects.kindAfter(root, "a"), N);
+        CHECK_EQ(effects.kindAfter(unknown, "a"), Any);
+    }
+}
+
 }  // namespace
 
 int test_analysis_main() {
@@ -223,6 +505,15 @@ int test_analysis_main() {
     }
     const analysis::Report r = analysis::analyzeProject(rt, "test.sb3");
     testProject(r);
+    testControlFlowAndTypeFixedPoint(rt);
+    testProcedureEffects(rt);
+    // The shared static kind analysis supplies the loop-promotion gate.
+    const analysis::TypeSiteReport sites = analysis::analyzeTypeSites(rt);
+    CHECK_EQ(sites.sites.size(), 3u);
+    CHECK_EQ(sites.unknownSites, 0u);
+    CHECK(sites.sites[0].kinds != 0u);
+    const std::string typeText = analysis::formatTypeSites(sites);
+    CHECK(typeText.find("write sites 3") != std::string::npos);
 
     // 解析は Runtime を書き換えない（続けて greenFlag で実行できる）
     rt.greenFlag();

@@ -117,7 +117,7 @@ static void resolveThreadOps(Value resolvedValue, Sequencer& seq, Thread& thread
     }
 }
 
-void execute(Sequencer& sequencer, Thread& thread) {
+bool execute(Sequencer& sequencer, Thread& thread) {
     Runtime& runtime = sequencer.runtime;
     ScopedBlockUtility utilityScope(sequencer, thread);
 
@@ -132,12 +132,31 @@ void execute(Sequencer& sequencer, Thread& thread) {
         if (!blockCached) {
             sequencer.retireThread(thread);
             thread.recycleTrashFrames();
-            return;
+            return true;
         }
     }
 
     // The scheduler can advance to the cached successor without re-hashing the ID.
     currentStackFrame->currentBlock = blockCached;
+
+    // This is the *only* dispatch point for nested-WASM promotion. The
+    // interpreter already performed the BlockCached lookup; skip the JIT
+    // map entirely for opaque opcodes, reporter resumption and arbitrary
+    // external calls to execute() outside stepThreadBound().
+    const bool nestedEligible = thread.nestedWasmEligible;
+    thread.nestedWasmEligible = false;
+    if (nestedEligible &&
+        !blockCached->nestedWasmRejected.load(std::memory_order_relaxed) &&
+        (sequencer.nestedWarpOnly()
+            ? blockCached->nestedWasmWarpCandidate
+            : blockCached->nestedWasmCandidate)) {
+        std::string pastEnd;
+        if (sequencer.tryNestedWasm(thread, *blockCached, pastEnd)) {
+            thread.reuseStackForNextBlock(pastEnd);
+            thread.recycleTrashFrames();
+            return false;
+        }
+    }
 
     auto& ops = blockCached->ops;
     const size_t length = ops.size();
@@ -199,6 +218,9 @@ void execute(Sequencer& sequencer, Thread& thread) {
             thread.requestScriptGlowInFrame = true;
         }
 
+        if (runtime.blockCountEnabled && opCached->blockFunction)
+            runtime.executedBlocks.fetch_add(1, std::memory_order_relaxed);
+
         const Value rv = opCached->blockFunction
             ? opCached->blockFunction(opCached->argValues, g_util)
             : Value::undefined();
@@ -239,6 +261,7 @@ void execute(Sequencer& sequencer, Thread& thread) {
     // ポップ済みフレームは execute 内のポインタ生存期間を守るためだけに
     // 保持していた — ここで解放（JS の _StackFrame.release 相当）
     thread.recycleTrashFrames();
+    return true;
 }
 
 /// 非同期プリミティブ完了時の再開（JS promise .then 相当）。

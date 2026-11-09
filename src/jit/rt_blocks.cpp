@@ -36,6 +36,7 @@
 #include "../model/target.hpp"
 #include "../model/variable.hpp"
 #include "../rt/runtime_helpers.hpp"
+#include "../ir/host_effect_abi.hpp"
 
 using namespace xyo;
 
@@ -148,7 +149,10 @@ extern "C" {
 
 uint64_t xyo_join(uint64_t a, uint64_t b) {
     XYO_RT_PROF(kStr);
-    return toB(rt::join(toV(a), toV(b)));
+    uint64_t result = 0;
+    if (!ir::invokeHostEffect(ir::HostEffectOp::Join, a, b, 0, result))
+        return val::kUndefined;
+    return result;
 }
 // JIT uses this for join(dynamic, text shadow). The suffix is guaranteed
 // to be a string literal by the code generator. The dynamic value remains
@@ -163,7 +167,7 @@ uint64_t xyo_join_suffix(uint64_t a, uint64_t suffix) {
     if (!s2 || s2->len == 0) return a;
     if (size_t(s1->len) + s2->len >= 16)
         return toB(Value::string(sstrConsOrAppend(s1, s2)));
-    return toB(Value::string(sstrConcat(s1->view(), s2->view())));
+    return toB(Value::string(sstrConcatStrings(s1, s2)));
 }
 #if defined(XYO_STRING_JOIN_SPECIALIZED)
 uint64_t xyo_join_strings(uint64_t a, uint64_t b) {
@@ -173,15 +177,24 @@ uint64_t xyo_join_strings(uint64_t a, uint64_t b) {
 #endif
 uint64_t xyo_letterof(uint64_t letter, uint64_t s) {
     XYO_RT_PROF(kStr);
-    return toB(rt::letterOf(toV(letter), toV(s)));
+    uint64_t result = 0;
+    if (!ir::invokeHostEffect(ir::HostEffectOp::LetterOf, letter, s, 0, result))
+        return val::kUndefined;
+    return result;
 }
 uint64_t xyo_strlen(uint64_t s) {
     XYO_RT_PROF(kStr);
-    return toB(V(rt::strLength(toV(s))));
+    uint64_t result = 0;
+    if (!ir::invokeHostEffect(ir::HostEffectOp::StringLength, s, 0, 0, result))
+        return val::kUndefined;
+    return result;
 }
 uint64_t xyo_strcontains(uint64_t a, uint64_t b) {
     XYO_RT_PROF(kStr);
-    return toB(V(rt::strContains(toV(a), toV(b))));
+    uint64_t result = 0;
+    if (!ir::invokeHostEffect(ir::HostEffectOp::Contains, a, b, 0, result))
+        return val::kUndefined;
+    return result;
 }
 
 // ============================================================= リスト ====
@@ -745,11 +758,7 @@ void xyo_ctl_createclone(JitCtx* c, uint64_t opt) {
         cloneTarget = c->runtime->getSpriteTargetByName(o);
     }
     if (!cloneTarget) return;
-    Target* cl = cloneTarget->makeClone();
-    if (cl) {
-        c->runtime->addTarget(cl);
-        cl->goBehindOther(cloneTarget);
-    }
+    createCloneForTarget(cloneTarget, c->runtime);
 }
 void xyo_ctl_deleteclone(JitCtx* c) {
     XYO_RT_PROF(kBlocks);
@@ -771,7 +780,7 @@ void xyo_snd_play(JitCtx* c, uint64_t menu) {
     if (!t->sprite || !t->sprite->soundBank) return;
     int idx = getSoundIndex(toV(menu), t);
     if (idx >= 0)
-        t->sprite->soundBank->playSound(t, t->sprite->sounds[idx].soundId);
+        startSoundPlayback(t, t->sprite->sounds[idx].soundId, nullptr);
 }
 void xyo_snd_playwait(JitCtx* c, uint64_t menu) {
     XYO_RT_PROF(kBlocks);
@@ -780,8 +789,7 @@ void xyo_snd_playwait(JitCtx* c, uint64_t menu) {
     int idx = getSoundIndex(toV(menu), t);
     if (idx >= 0) {
         c->thread->status = STATUS_PROMISE_WAIT;
-        t->sprite->soundBank->playSoundAndWait(
-            t, t->sprite->sounds[idx].soundId, c->thread);
+        startSoundPlayback(t, t->sprite->sounds[idx].soundId, c->thread);
         xyo_yield(c);
     }
 }

@@ -7,6 +7,7 @@
 #include "core.hpp"
 
 #include "../core/v8math.hpp"
+#include "../ir/commit_once_effects.hpp"
 
 #include <cmath>
 #include <ctime>
@@ -58,7 +59,23 @@ std::u16string formatBubbleText(Value v) {
 }
 
 void updateBubble(Target* t, const char* type, Value message) {
-    t->setSay(type, formatBubbleText(message));
+    Runtime* runtime = t ? t->runtime : nullptr;
+    if (!runtime || !runtime->observableJournal) {
+        t->setSay(type, formatBubbleText(message));
+        return;
+    }
+    struct BubbleDispatch {
+        Target* target;
+        const char* type;
+    } dispatch{t, type};
+    // Both the interpreter and LLVM JIT call this shared entry point,
+    // including timed say/think. The message's precise tagged Scratch
+    // representation remains rooted until the bubble is updated.
+    runtime->journalObservable(ir::ObservableOp::Say, message,
+        [](void* context, Value value) noexcept {
+            auto& d = *static_cast<BubbleDispatch*>(context);
+            d.target->setSay(d.type, formatBubbleText(value));
+        }, &dispatch);
 }
 
 // _setCostume — Scratch 2.0 互換の型分岐
@@ -238,6 +255,75 @@ void bounceOffEdge(Target* t, Runtime* rt) {
     if (t->keepInFence(t->x, t->y, fx, fy)) t->setXY(fx, fy);
 }
 
+void startSoundPlayback(Target* target, int soundId,
+                        Thread* waitingThread) {
+    if (!target || !target->sprite || !target->sprite->soundBank)
+        return;
+    Runtime* runtime = target->runtime;
+    if (!runtime || !runtime->observableJournal) {
+        if (waitingThread)
+            target->sprite->soundBank->playSoundAndWait(
+                target, soundId, waitingThread);
+        else
+            target->sprite->soundBank->playSound(target, soundId);
+        return;
+    }
+    struct Playback {
+        Target* target;
+        Thread* wait;
+    } playback{target, waitingThread};
+    // Preserve the source sound ID as a scalar Scratch Value, avoiding
+    // stale SoundBank* or Target* pointers in the persistent journal.
+    // The context is borrowed only until synchronous dispatch returns.
+    runtime->journalObservable(ir::ObservableOp::SoundStart,
+        Value::num(double(soundId)),
+        [](void* context, Value soundIdValue) noexcept {
+            auto& play = *static_cast<Playback*>(context);
+            if (!soundIdValue.isNumber() ||
+                !play.target->sprite || !play.target->sprite->soundBank)
+                return;
+            const int id = int(soundIdValue.asNumberUnchecked());
+            if (play.wait)
+                play.target->sprite->soundBank->playSoundAndWait(
+                    play.target, id, play.wait);
+            else
+                play.target->sprite->soundBank->playSound(play.target, id);
+        }, &playback);
+}
+
+
+
+void createCloneForTarget(Target* source, Runtime* runtime) {
+    if (!source || !runtime) return;
+    const auto spawn = [](Target* original, Runtime* rt) {
+        Target* clone = original->makeClone();
+        if (clone) {
+            rt->addTarget(clone);
+            clone->goBehindOther(original);
+        }
+    };
+    if (!runtime->observableJournal) {
+        spawn(source, runtime);
+        return;
+    }
+    if (!source->sprite || source->isStage || !runtime->clonesAvailable())
+        return;
+    struct CloneContext {
+        Target* source;
+        Runtime* runtime;
+    } context{source, runtime};
+    runtime->journalObservable(ir::ObservableOp::CreateClone,
+        Value::undefined(),
+        [](void* state, Value) noexcept {
+            auto& ctx = *static_cast<CloneContext*>(state);
+            Target* clone = ctx.source->makeClone();
+            if (clone) {
+                ctx.runtime->addTarget(clone);
+                clone->goBehindOther(ctx.source);
+            }
+        }, &context);
+}
+
 namespace {
 
 Value V(double n) { return Value::num(n); }
@@ -336,25 +422,50 @@ Value opMod(const ArgValues& a, BlockUtility&) {
 Value opRound(const ArgValues& a, BlockUtility&) {
     return V(jsnum::jsRound(num(a, "NUM")));
 }
+// Most Scratch math menus are immutable ASCII strings. Avoid allocating a
+// lowercase std::u16string on every interpreted math reporter. Non-ASCII
+// menus retain Unicode case mapping (e.g. long-s can lowercase to ASCII 's').
+static bool equalsAsciiLower(std::u16string_view input,
+                             std::u16string_view lowercase) {
+    if (input.size() != lowercase.size()) return false;
+    for (size_t i = 0; i < input.size(); ++i) {
+        char16_t c = input[i];
+        if (c >= u'A' && c <= u'Z') c += 32;
+        if (c != lowercase[i]) return false;
+    }
+    return true;
+}
+
 Value opMathop(const ArgValues& a, BlockUtility&) {
-    std::u16string op = strLower(a, "OPERATOR");
-    double n = num(a, "NUM");
-    if (op == u"abs") return V(std::fabs(n));
-    if (op == u"floor") return V(std::floor(n));
-    if (op == u"ceiling") return V(std::ceil(n));
-    if (op == u"sqrt") return V(std::sqrt(n));
-    if (op == u"sin")
+    // Convert the numeric input first: conversion can allocate/collect when
+    // parsing a composite string, before taking a view of the menu string.
+    const double n = num(a, "NUM");
+    std::u16string_view op = cast::toString(v(a, "OPERATOR"))->view();
+    std::u16string unicodeLower;
+    // Case folding only needs allocation for non-ASCII menu input.
+    for (char16_t c : op) {
+        if (c > 0x7f) {
+            unicodeLower = u16ToLower(op);
+            op = unicodeLower;
+            break;
+        }
+    }
+    if (equalsAsciiLower(op, u"abs")) return V(std::fabs(n));
+    if (equalsAsciiLower(op, u"floor")) return V(std::floor(n));
+    if (equalsAsciiLower(op, u"ceiling")) return V(std::ceil(n));
+    if (equalsAsciiLower(op, u"sqrt")) return V(std::sqrt(n));
+    if (equalsAsciiLower(op, u"sin"))
         return V(jsnum::jsRound(v8math::sin((M_PI * n) / 180.0) * 1e10) / 1e10);
-    if (op == u"cos")
+    if (equalsAsciiLower(op, u"cos"))
         return V(jsnum::jsRound(v8math::cos((M_PI * n) / 180.0) * 1e10) / 1e10);
-    if (op == u"tan") return V(rt::tanDeg(n));
-    if (op == u"asin") return V((v8math::asin(n) * 180.0) / M_PI);
-    if (op == u"acos") return V((v8math::acos(n) * 180.0) / M_PI);
-    if (op == u"atan") return V((v8math::atan(n) * 180.0) / M_PI);
-    if (op == u"ln") return V(jsnum::jsLog(n));
-    if (op == u"log") return V(jsnum::jsLog(n) / M_LN10);
-    if (op == u"e ^") return V(v8math::exp(n));
-    if (op == u"10 ^") return V(std::pow(10.0, n));
+    if (equalsAsciiLower(op, u"tan")) return V(rt::tanDeg(n));
+    if (equalsAsciiLower(op, u"asin")) return V((v8math::asin(n) * 180.0) / M_PI);
+    if (equalsAsciiLower(op, u"acos")) return V((v8math::acos(n) * 180.0) / M_PI);
+    if (equalsAsciiLower(op, u"atan")) return V((v8math::atan(n) * 180.0) / M_PI);
+    if (equalsAsciiLower(op, u"ln")) return V(jsnum::jsLog(n));
+    if (equalsAsciiLower(op, u"log")) return V(jsnum::jsLog(n) / M_LN10);
+    if (equalsAsciiLower(op, u"e ^")) return V(v8math::exp(n));
+    if (equalsAsciiLower(op, u"10 ^")) return V(std::pow(10.0, n));
     return V(0.0);
 }
 
@@ -419,6 +530,10 @@ Value ctlWait(const ArgValues& a, BlockUtility& u) {
         double duration = std::max(0.0, 1000.0 * num(a, "DURATION"));
         u.startStackTimer(duration);
         u.runtime()->redrawRequested = true;
+        // The renderer already enforces a frame boundary through
+        // redrawRequested. STATUS_YIELD_TICK changes the state observed by
+        // the step-loop and breaks Scratch's wait/warp/interleaving order.
+        // Keep the original STATUS_YIELD semantics for CLI and GUI alike.
         u.yield();
     } else if (!u.stackTimerFinished()) {
         u.yield();
@@ -454,11 +569,7 @@ Value ctlCreateClone(const ArgValues& a, BlockUtility& u) {
         cloneTarget = u.runtime()->getSpriteTargetByName(opt);
     }
     if (!cloneTarget) return Value::undefined();
-    Target* c = cloneTarget->makeClone();
-    if (c) {
-        u.runtime()->addTarget(c);
-        c->goBehindOther(cloneTarget);
-    }
+    createCloneForTarget(cloneTarget, u.runtime());
     return Value::undefined();
 }
 Value ctlDeleteClone(const ArgValues&, BlockUtility& u) {
@@ -508,8 +619,23 @@ Value evBroadcast(const ArgValues& a, BlockUtility& u) {
     if (!stage) return Value::undefined();
     Variable* bv = stage->lookupBroadcastMsg(bo->id, bo->name);
     if (bv) {
-        std::map<std::string, std::u16string> m{{"BROADCAST_OPTION", bv->name}};
-        u.startHats("event_whenbroadcastreceived", &m, nullptr);
+        if (u.runtime()->observableJournal) {
+            // Preserve the interpreter's exact startHats behavior rather
+            // than substituting the JIT fast receiver-reuse path. The
+            // journal dispatches only after its host commit boundary.
+            u.runtime()->journalBroadcast(bv->name,
+                [](void* context, std::u16string_view message) noexcept {
+                    auto& utility = *static_cast<BlockUtility*>(context);
+                    std::map<std::string, std::u16string> fields{
+                        {"BROADCAST_OPTION", std::u16string(message)}};
+                    utility.startHats(
+                        "event_whenbroadcastreceived", &fields, nullptr);
+                }, &u);
+        } else {
+            std::map<std::string, std::u16string> m{
+                {"BROADCAST_OPTION", bv->name}};
+            u.startHats("event_whenbroadcastreceived", &m, nullptr);
+        }
     }
     return Value::undefined();
 }
@@ -524,10 +650,11 @@ Value evBroadcastAndWait(const ArgValues& a, BlockUtility& u) {
     }
     if (sf.broadcastVar) {
         if (!sf.hasStartedThreads) {
-            std::map<std::string, std::u16string> m{
-                {"BROADCAST_OPTION", sf.broadcastVar->name}};
-            sf.startedThreads = u.startHats(
-                "event_whenbroadcastreceived", &m, nullptr);
+            sf.startedThreads =
+                u.runtime()->startBroadcastAndWait(sf.broadcastVar->name);
+            // Start exactly once. On any subsequent tick, only the stable
+            // receiver Thread* set is polled; replaying the journal would
+            // accidentally duplicate side effects.
             sf.hasStartedThreads = true;
             if (sf.startedThreads.empty()) return Value::undefined();
         }
@@ -673,7 +800,7 @@ Value dtItemOfList(const ArgValues& a, BlockUtility& u) {
     SList* list = listOf(var);
     double i = cast::toListIndexD(v(a, "INDEX"), list->len, false);
     if (i == cast::LIST_INVALID || i < 1) return Value::emptyStr();
-    return list->items[static_cast<uint32_t>(i - 1)];
+    return list->get0(static_cast<uint32_t>(i - 1));
 }
 Value dtItemNumOfList(const ArgValues& a, BlockUtility& u) {
     Variable* var = lookupVar(a, u, "LIST", true);
@@ -1148,7 +1275,7 @@ Value sndPlay(const ArgValues& a, BlockUtility& u) {
     if (!t->sprite || !t->sprite->soundBank) return Value::undefined();
     int idx = getSoundIndex(v(a, "SOUND_MENU"), t);
     if (idx >= 0)
-        t->sprite->soundBank->playSound(t, t->sprite->sounds[idx].soundId);
+        startSoundPlayback(t, t->sprite->sounds[idx].soundId, nullptr);
     return Value::undefined();
 }
 Value sndPlayUntilDone(const ArgValues& a, BlockUtility& u) {
@@ -1157,8 +1284,7 @@ Value sndPlayUntilDone(const ArgValues& a, BlockUtility& u) {
     int idx = getSoundIndex(v(a, "SOUND_MENU"), t);
     if (idx >= 0) {
         u.thread->status = STATUS_PROMISE_WAIT;
-        t->sprite->soundBank->playSoundAndWait(
-            t, t->sprite->sounds[idx].soundId, u.thread);
+        startSoundPlayback(t, t->sprite->sounds[idx].soundId, u.thread);
     }
     return Value::undefined();
 }

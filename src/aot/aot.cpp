@@ -48,12 +48,14 @@
 #include "../model/target.hpp"
 
 namespace xyo {
+namespace ir { struct ScratchCompilationUnit; }
 
 /// codegen.cpp（JIT と共通の emit）。
 bool jitEmitScript(llvm::Module&, llvm::LLVMContext&, Runtime&, Target*,
                    Blocks*, const std::string&, const std::string&,
                    CompiledScript&, JitPinned&, std::vector<std::string>&,
-                   std::map<std::string, std::string>&, AotEmit*);
+                   std::map<std::string, std::string>&, AotEmit*,
+                   const Block*, const ir::ScratchCompilationUnit*, bool = false);
 
 namespace aot {
 namespace {
@@ -192,7 +194,8 @@ uint64_t hashBytes(const void* p, size_t n) {
 }
 
 bool compileProject(Runtime& rt, uint64_t projectHash, BuildResult& out,
-                    std::string* why) {
+                    std::string* why,
+                    const ProgressCallback& progress) {
     // GPU 並列ループは emit 時にホスト側ヒープの Program を指す定数を
     // 埋め込む（xyo_gpu_repeat へポインタを渡す）。別プロセスでは無効
     // なので AOT モードでは codegen 側が CPU ループへフォールバック
@@ -236,6 +239,12 @@ bool compileProject(Runtime& rt, uint64_t projectHash, BuildResult& out,
 
     AotEmit emit;
     std::vector<ScriptMeta> scripts;
+    size_t totalScripts = 0;
+    for (Target* t : rt.targets)
+        if (t && t->blocks && t->isOriginal)
+            totalScripts += t->blocks->getScripts().size();
+    size_t visitedScripts = 0;
+    reportProgress(progress, ProgressStage::Codegen, 0, totalScripts);
     int n = 0;
     int ti = -1;
     for (Target* t : rt.targets) {
@@ -249,9 +258,14 @@ bool compileProject(Runtime& rt, uint64_t projectHash, BuildResult& out,
             JitPinned pinned;
             std::vector<std::string> fns;
             std::map<std::string, std::string> procs;
-            if (!jitEmitScript(*mod, lc, rt, t, t->blocks, sid, entry, cs,
-                               pinned, fns, procs, &emit))
-                continue;
+            const bool compiled = jitEmitScript(
+                *mod, lc, rt, t, t->blocks, sid, entry, cs,
+                pinned, fns, procs, &emit, nullptr, nullptr);
+            // Report attempted scripts too, including unsupported ones.
+            // The denominator is fixed before codegen starts.
+            reportProgress(progress, ProgressStage::Codegen,
+                           ++visitedScripts, totalScripts);
+            if (!compiled) continue;
             ScriptMeta m;
             m.top = sid;
             m.entry = entry;
@@ -280,6 +294,7 @@ bool compileProject(Runtime& rt, uint64_t projectHash, BuildResult& out,
         return false;
     }
 
+    reportProgress(progress, ProgressStage::Optimize);
     {
         llvm::PassBuilder pb;
         llvm::LoopAnalysisManager lam;
@@ -295,6 +310,7 @@ bool compileProject(Runtime& rt, uint64_t projectHash, BuildResult& out,
             .run(*mod, mam);
     }
 
+    reportProgress(progress, ProgressStage::EmitObject);
     llvm::SmallVector<char, 0> buf;
     llvm::raw_svector_ostream os(buf);
     llvm::legacy::PassManager pm;
@@ -309,6 +325,7 @@ bool compileProject(Runtime& rt, uint64_t projectHash, BuildResult& out,
     out.meta = meta;
     out.scripts = n;
     out.slots = static_cast<int>(emit.slots.size());
+    reportProgress(progress, ProgressStage::Compiled);
     return true;
 }
 

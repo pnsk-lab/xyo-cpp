@@ -412,7 +412,7 @@ struct RealtimePlayer::Impl {
             listBits.push_back(l ? l->len : 0);
             if (l)
                 for (uint32_t i = 0; i < l->len; ++i)
-                    listBits.push_back(l->items[i].bits);
+                    listBits.push_back(l->get0(i).bits);
         }
         listBitsValid = true;
     }
@@ -425,8 +425,7 @@ struct RealtimePlayer::Impl {
             size_t n = l ? l->len : 0;
             if (pos + n + 1 > listBits.size() ||
                 listBits[pos] != n) { changed = true; break; }
-            if (l && std::memcmp(listBits.data() + pos + 1, l->items,
-                                 n * sizeof(Value)) != 0) {
+            if (l && !l->equalsBits(listBits.data() + pos + 1, uint32_t(n))) {
                 changed = true;
                 break;
             }
@@ -446,7 +445,7 @@ struct RealtimePlayer::Impl {
             accumBits.push_back(l ? l->len : 0);
             if (l)
                 for (uint32_t j = 0; j < l->len; ++j)
-                    accumBits.push_back(l->items[j].bits);
+                    accumBits.push_back(l->get0(j).bits);
         }
         accumBitsValid = true;
     }
@@ -459,8 +458,7 @@ struct RealtimePlayer::Impl {
             size_t n = l ? l->len : 0;
             if (pos + n + 1 > accumBits.size() ||
                 accumBits[pos] != n) { changed = true; break; }
-            if (l && std::memcmp(accumBits.data() + pos + 1, l->items,
-                                 n * sizeof(Value)) != 0) {
+            if (l && !l->equalsBits(accumBits.data() + pos + 1, uint32_t(n))) {
                 changed = true;
                 break;
             }
@@ -516,7 +514,7 @@ struct RealtimePlayer::Impl {
             listMeta.push_back(uint32_t(listData.size() / 2));
             listMeta.push_back(n);
             for (uint32_t i = 0; i < n; ++i) {
-                Value e = l->items[i];
+                Value e = l->get0(i);
                 double d = cast::toNumberOrNaN(e);
                 float none = 0.0f;
                 if (std::isnan(d)) {
@@ -555,7 +553,7 @@ struct RealtimePlayer::Impl {
             uint32_t n = std::min<uint32_t>(l->len, total);
             for (uint32_t i = 0; i < n; ++i)
                 accumData[size_t(i) * 4 + ch] =
-                    float(cast::toNumber(l->items[i]));
+                    float(cast::toNumber(l->get0(i)));
         }
     }
 
@@ -700,8 +698,8 @@ struct RealtimePlayer::Impl {
                 if (!l) continue;
                 uint32_t n = std::min(l->len, total);
                 for (uint32_t i = 0; i < n; ++i)
-                    l->items[i] = Value::numCanonical(
-                        double(req.accumOut[size_t(i) * 4 + ch]));
+                    l->write0(i, Value::numCanonical(
+                        double(req.accumOut[size_t(i) * 4 + ch])));
             }
             rt->monitorState.dirty = true;
             snapshotAccum();

@@ -12,10 +12,16 @@ namespace xyo::wasm {
 /// 生成した wasm バイト列を JS で instantiate し、ハンドルを返す。
 /// imports は env.memory（ランタイムの線形メモリ）と env.h（ヘルパ
 /// ディスパッチャ）。失敗時は -1。
-int instantiate(const void* bytes, int len);
+// A synchronous host optimizer may rewrite the module before instantiation.
+bool hasHostOptimizer();
+int instantiate(const void* bytes, int len, bool optimizeWithHost = false);
 
 /// 生成モジュールの entry `f(ctxPtr)` を呼ぶ。handle が無効なら何もしない。
-void invoke(int handle, int ctxPtr);
+int invoke(int handle, int ctxPtr);
+// Execute a shared CFG function f(slotsPtr, framePtr) -> i64 status.
+// Returns UINT64_MAX on a JS trap/invalid handle, never a valid status.
+uint64_t invokeNumeric(int handle, int slotsPtr, int framePtr);
+void release(int handle);
 
 } // namespace xyo::wasm
 
