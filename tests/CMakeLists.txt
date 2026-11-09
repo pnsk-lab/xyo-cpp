@@ -181,6 +181,13 @@ if(NOT EMSCRIPTEN)
   target_link_libraries(xyo-nested-warp-inflight-body-edit-smoke PRIVATE xyo)
   target_compile_options(xyo-nested-warp-inflight-body-edit-smoke
     PRIVATE -fno-exceptions -fno-rtti)
+  # OSR-010: a statically bounded inner repeat has a certified outer
+  # body checkpoint; the native inner loop itself must never yield.
+  add_executable(xyo-nested-warp-bounded-inner-deopt-smoke
+    platform/nested_warp_bounded_inner_deopt_smoke.cpp)
+  target_link_libraries(xyo-nested-warp-bounded-inner-deopt-smoke PRIVATE xyo)
+  target_compile_options(xyo-nested-warp-bounded-inner-deopt-smoke
+    PRIVATE -fno-exceptions -fno-rtti)
   # A headless Runtime::step test; do not nest in SDL-only tests.
   if(XYO_JIT AND Python3_Interpreter_FOUND)
     add_test(NAME xyo-nested-warp-silent-edit
@@ -203,6 +210,21 @@ if(NOT EMSCRIPTEN)
         --harness "$<TARGET_FILE:xyo-nested-warp-inflight-body-edit-smoke>"
         --out "${CMAKE_BINARY_DIR}/nested-warp-inflight-body-edit")
     set_tests_properties(xyo-nested-warp-inflight-body-edit
+      PROPERTIES TIMEOUT 600)
+    add_test(NAME xyo-nested-warp-bounded-inner-deopt
+      COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_nested_warp_bounded_inner_deopt.py"
+        --harness "$<TARGET_FILE:xyo-nested-warp-bounded-inner-deopt-smoke>"
+        --out "${CMAKE_BINARY_DIR}/nested-warp-bounded-inner-deopt")
+    set_tests_properties(xyo-nested-warp-bounded-inner-deopt
+      PROPERTIES TIMEOUT 600)
+    add_test(NAME xyo-nested-warp-bounded-inner-deopt-fast
+      COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_nested_warp_bounded_inner_deopt.py"
+        --harness "$<TARGET_FILE:xyo-nested-warp-bounded-inner-deopt-smoke>"
+        --out "${CMAKE_BINARY_DIR}/nested-warp-bounded-inner-deopt-fast"
+        --without-block-count)
+    set_tests_properties(xyo-nested-warp-bounded-inner-deopt-fast
       PROPERTIES TIMEOUT 600)
     # Keep the optimized, uninstrumented LLVM path under test too:
     # block counting disables some native scalar/loop optimizations.

@@ -264,6 +264,8 @@ struct Codegen {
     bool hoistNestedOsrArgs = false;
     // Optional bounded deopt only at a fully completed counted-loop body.
     bool nestedOsrInFlightGuard = false;
+    // OSR-010: a source-proven 1..8 inner repeat must complete atomically.
+    bool nestedOsrBoundedInner = false;
     std::map<std::u16string, llvm::Value*> hoistedNestedOsrArgs;
     /// ループ本体で書き込まれる変数/リスト（不変性判定用）
     struct LoopWriteScan {
@@ -7911,20 +7913,24 @@ struct Codegen {
 
         if (op == "control_repeat") {
             const bool osrFirstLoop = blk == osrStartLoop;
-            const auto conditionalRepeat = (osrFirstLoop || runtime.blockCountEnabled)
+            const bool boundedNativeInner =
+                nestedOsrInFlightGuard && nestedOsrBoundedInner &&
+                !osrFirstLoop;
+            const auto conditionalRepeat = (osrFirstLoop ||
+                boundedNativeInner || runtime.blockCountEnabled)
                 ? std::optional<ConditionalRepeatPlan>{}
                 : conditionalRepeatPlan(blk);
-            const auto repeatCopies = (osrFirstLoop || runtime.blockCountEnabled)
+            const auto repeatCopies = (osrFirstLoop || boundedNativeInner || runtime.blockCountEnabled)
                 ? std::nullopt : repeatCopyPlan(blk);
             if (verbose && repeatCopies)
                 std::fprintf(stderr, "xyo-jit: repeat SSA copies %s\n",
                              blk->id.c_str());
-            const auto repeatAffine = (osrFirstLoop || runtime.blockCountEnabled)
+            const auto repeatAffine = (osrFirstLoop || boundedNativeInner || runtime.blockCountEnabled)
                 ? std::nullopt : repeatAffinePlan(blk);
             if (verbose && repeatAffine)
                 std::fprintf(stderr, "xyo-jit: repeat SSA affine %s\n",
                              blk->id.c_str());
-            if (!osrFirstLoop && !runtime.blockCountEnabled) {
+            if (!osrFirstLoop && !boundedNativeInner && !runtime.blockCountEnabled) {
                 if (auto plan = multiTransientPattern(blk)) {
                     emitTransientMultiRepeat(blk, *plan);
                     return;
@@ -7937,7 +7943,7 @@ struct Codegen {
             // for (i = toNum(TIMES); i >= 0.5; i--) { body; loopYield }
             // Fixed-count straight-line bodies are eligible for bounded
             // strip-mining into groups of at most 512 logical iterations.
-            if (auto plan = (osrFirstLoop || runtime.blockCountEnabled)
+            if (auto plan = (osrFirstLoop || boundedNativeInner || runtime.blockCountEnabled)
                     ? std::optional<RepeatUnrollPlan>{}
                     : repeatUnrollPlan(blk)) {
                 // Evaluate TIMES once, exactly as in the ordinary lowering.
@@ -8009,7 +8015,8 @@ struct Codegen {
             // 本体が GPU 並列実行可能なら xyo_gpu_repeat へ委譲し、
             // 失敗時のみ従来の CPU ループへ進む分岐を emit する。
             const gpu::Program* gp =
-                (osrFirstLoop && nestedOsrInFlightGuard) || promotedLoop
+                (nestedOsrInFlightGuard && (osrFirstLoop || boundedNativeInner)) ||
+                promotedLoop
                     ? nullptr : tryGpuLoop(blk);
             // With a compile-time fixed nonnegative count <= INT32_MAX, the
             // existing IEEE test i >= 0.5 followed by i -= 1 performs exactly
@@ -8058,7 +8065,7 @@ struct Codegen {
             // 「カウンタ + append」ループなら par-for を試す（warp 実行中のみ）。
             // 失敗（0 返却）時は従来の CPU ループへ落ちる。
             const bool triedParFor =
-                osrFirstLoop && nestedOsrInFlightGuard
+                nestedOsrInFlightGuard && (osrFirstLoop || boundedNativeInner)
                     ? false : tryEmitParFor(blk, n, head, merge);
             if (!triedParFor) {
                 if (gp) {
@@ -8112,7 +8119,9 @@ struct Codegen {
                 if (in) emitChainBlocks(chainOf(in->block), true);
             }
             if (!bbDone(b.GetInsertBlock())) {
-                emitLoopYield();
+                // Only the PROVEN bounded inner-loop body's yield is
+                // suppressed; the enclosing outer latch stays observable.
+                if (!boundedNativeInner) emitLoopYield();
                 if (intIv) {
                     llvm::Value* remaining = b.CreateLoad(i32t, intIv);
                     b.CreateStore(b.CreateSub(remaining, ci32(1)), intIv);
@@ -9199,6 +9208,11 @@ bool jitEmitScript(llvm::Module& mod, llvm::LLVMContext& lc, Runtime& runtime,
         const char* proof =
             std::getenv("XYO_JIT_OSR_NESTED_SOURCE_PROOF");
         cg.nestedOsrInFlightGuard = proof && proof[0] == '1';
+        if (const char* bounded =
+                std::getenv("XYO_JIT_OSR_NESTED_INNER_BOUNDED");
+            cg.nestedOsrInFlightGuard && bounded &&
+            bounded[0] == '1')
+            cg.nestedOsrBoundedInner = true;
     }
     // Validate a lossless snapshot of the selected source script. Capturing
     // only this script avoids copying the entire Scratch project on every
