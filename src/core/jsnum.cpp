@@ -352,6 +352,10 @@ double toNumber(std::u16string_view sv) {
         }
     }
 
+#if !defined(__APPLE__)
+    // Apple libc++ (including Xcode 16.4) does not provide floating-point
+    // std::from_chars. On macOS, use the existing validated, correctly
+    // rounded C-locale strtod_l path below instead.
     // Most decimal strings in Scratch are short. From_chars is a full
     // consumer of the decimal grammar once the leading sign is removed;
     // require complete consumption and an ASCII numeric starting character
@@ -380,6 +384,7 @@ double toNumber(std::u16string_view sv) {
         }
         return std::numeric_limits<double>::quiet_NaN();
     }
+#endif
 
     // Long decimal literals use the existing full grammar validation.
     // 10 進リテラルの形状検証: [0-9]* (. [0-9]*)? ([eE][+-]?[0-9]+)? で少なくとも1桁
@@ -414,10 +419,14 @@ double toNumber(std::u16string_view sv) {
     // ECMAScript grammar. Preserve strtod_l for out-of-range values,
     // including overflow to Infinity and underflow to signed zero.
     double v;
+#if defined(__APPLE__)
+    v = strtodC(dst);
+#else
     auto parsed = std::from_chars(dst, dst + n, v,
                                   std::chars_format::general);
     if (parsed.ec != std::errc() || parsed.ptr != dst + n)
         v = strtodC(dst);
+#endif
     return neg ? -v : v;
 }
 

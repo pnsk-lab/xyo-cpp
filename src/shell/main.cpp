@@ -691,7 +691,7 @@ static int cmdAnalyze(int argc, char** argv) {
                 }
                 totalLatches += latches;
                 if (top->opcode == "procedures_definition") {
-                    const BlockInput* prototypeInput =
+                    const xyo::BlockInput* prototypeInput =
                         top->inputs.find("custom_block");
                     const Block* prototype = prototypeInput
                         ? target->blocks->getBlock(prototypeInput->block)
