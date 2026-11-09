@@ -5708,6 +5708,22 @@ struct Codegen {
         }
 
         // --- sensing 軽量 ---
+        // The original reporter samples the system clock for every read.
+        // Returning f64 directly avoids a redundant Value tag classification
+        // without caching/reordering clock reads (which would change Scratch).
+        // Set XYO_JIT_DAYS_F64=0 to restore the historical boxed slow path.
+        static const bool daysF64 = [] {
+            const char* env = std::getenv("XYO_JIT_DAYS_F64");
+            return !env || env[0] != '0';
+        }();
+        if (op == "sensing_dayssince2000" && daysF64 &&
+            !sharedDaysClock) {
+            // rt::daysSince2000 returns finite milliseconds-derived days.
+            // Keep IEEE-754 arithmetic exact; no fast-math assumptions.
+            llvm::Value* days = call1(
+                "xyo_sns_dayssince2000_f64", f64t, ctxArg);
+            return emitCanonKnownNonNaN(days);
+        }
         if (op == "sensing_timer") {
             llvm::Value* d = call1("xyo_timer", f64t, ctxArg);
             return call1("xyo_num", i64t, d);

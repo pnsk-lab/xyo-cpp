@@ -646,6 +646,12 @@ uint64_t xyo_sns_dayssince2000(JitCtx*) {
     XYO_RT_PROF(kBlocks);
     return toB(V(rt::daysSince2000()));
 }
+// Preserve the exact same clock sampling and conversion as the interpreter.
+// JIT boxes the finite numeric result without re-testing its Value tag.
+double xyo_sns_dayssince2000_f64(JitCtx*) {
+    XYO_RT_PROF(kBlocks);
+    return rt::daysSince2000();
+}
 uint64_t xyo_sns_loudness(JitCtx* c) {
     XYO_RT_PROF(kBlocks);
     Runtime* rt = c->runtime;

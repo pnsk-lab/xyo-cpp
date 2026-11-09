@@ -223,6 +223,7 @@ void xyo_sns_setdragmode(JitCtx*, uint64_t);
 void xyo_sns_resettimer(JitCtx*);
 uint64_t xyo_sns_current(JitCtx*, uint64_t);
 uint64_t xyo_sns_dayssince2000(JitCtx*);
+double xyo_sns_dayssince2000_f64(JitCtx*);
 uint64_t xyo_sns_loudness(JitCtx*);
 uint64_t xyo_sns_loud(JitCtx*);
 uint64_t xyo_sns_answer(JitCtx*);
@@ -447,6 +448,7 @@ const std::pair<const char*, void*> kRtSymbols[] = {
     {"xyo_sns_resettimer", (void*)&xyo_sns_resettimer},
     {"xyo_sns_current", (void*)&xyo_sns_current},
     {"xyo_sns_dayssince2000", (void*)&xyo_sns_dayssince2000},
+    {"xyo_sns_dayssince2000_f64", (void*)&xyo_sns_dayssince2000_f64},
     {"xyo_sns_loudness", (void*)&xyo_sns_loudness},
     {"xyo_sns_loud", (void*)&xyo_sns_loud},
     {"xyo_sns_answer", (void*)&xyo_sns_answer},
