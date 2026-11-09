@@ -835,7 +835,10 @@ if(TARGET xyo-cli)
       COMMAND "${Python3_EXECUTABLE}"
               "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_numeric_string_pair_cmp.py"
               "$<TARGET_FILE:xyo-cli>")
-    set_tests_properties(xyo-jit-string-pair-compare PROPERTIES TIMEOUT 180)
+    # This runs two generated projects across interpreter/JIT and multiple
+    # optimization settings. On GitHub-hosted LLVM 23 runners, the previous
+    # 180s budget timed out after valid partial results (15/24 cases).
+    set_tests_properties(xyo-jit-string-pair-compare PROPERTIES TIMEOUT 480)
   endif()
 endif()
 
