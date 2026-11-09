@@ -15,7 +15,7 @@ import re
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
-PROJECT = ROOT / "scratch-bench/parity/Scratch Parity Test.sb3"
+PROJECT = ROOT / "tests/fixtures/scratch-parity-test.sb3"
 SUMMARY = re.compile(
     r"\[(PASSED|FAILED)\] (?:All Tests Were Successful|"
     r"Some Tests Were Not Successful): (\d+)/(\d+)"

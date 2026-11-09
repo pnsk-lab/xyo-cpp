@@ -153,14 +153,26 @@ def main() -> int:
             assert expected["prefix"] == "2", expected
             assert expected["done"] == "1", expected
         for direct, hoist in ((False, False), (True, False), (True, True)):
-            actual, stderr = execute(
-                args.native, project, "hotspot", direct, hoist=hoist
-            )
-            assert actual == expected, (
-                project.name, direct, hoist, actual, expected, stderr[-2500:]
-            )
-            promoted = "[jit-osr-nested] promoted " in stderr
-            restored = "[jit-osr-nested] restored caller" in stderr
+            # OSR is asynchronous: on a shared CI host, LLVM may finish
+            # compiling after the interpreter exits its counted loop.
+            # Check semantics on each attempt and require a real promotion.
+            for attempt in range(3 if should_promote else 1):
+                actual, stderr = execute(
+                    args.native, project, "hotspot", direct, hoist=hoist
+                )
+                assert actual == expected, (
+                    project.name, direct, hoist, actual, expected,
+                    stderr[-2500:],
+                )
+                promoted = "[jit-osr-nested] promoted " in stderr
+                restored = "[jit-osr-nested] restored caller" in stderr
+                if not should_promote or promoted or restored:
+                    break
+                print(
+                    f"RETRY {project.name} direct={direct} hoist={hoist}: "
+                    f"no asynchronous OSR (attempt {attempt + 1}/3)",
+                    flush=True,
+                )
             assert promoted == should_promote, (
                 project.name, direct, hoist, promoted, stderr[-2500:]
             )
