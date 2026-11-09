@@ -1292,7 +1292,27 @@ std::unique_ptr<CompiledScript> LLVMBackend::compile(
             const auto tOptimize = Clock::now();
             // JIT modes can be changed by API clients after construction.
             // The requested tier still needs a matching ORC engine.
+            // A par-for loop passes the address of an internal LLVM function
+            // to the C++ xyo_par_for host callback. LLLazyJIT may split the
+            // module into independently materialized functions, leaving this
+            // address-taken body pointing at unmaterialized executable memory.
+            // This can SIGSEGV on the *first* iteration, including the
+            // sequential (trip < worker threshold) path. Materialize the
+            // entire containing script through ordinary LLJIT instead.
+            //
+            // Keep the normal on-demand tier for scripts without callbacks;
+            // an explicit --jit-lazy on must not override this safety guard.
+            const llvm::Function* parForDispatch =
+                mod->getFunction("xyo_par_for");
+            const bool hasParForCallback =
+                parForDispatch && !parForDispatch->use_empty();
+            if (hasParForCallback &&
+                std::getenv("XYO_JIT_LAZY_CALLBACK_TRACE"))
+                std::fprintf(stderr,
+                    "[jit-lazy-guard] script=%s reason=parfor-callback\n",
+                    topId.c_str());
             const bool deferredCandidate = lazyProcedures &&
+                !hasParForCallback &&
                 chooseLazyCompile(
                     jitLazyMode(), jitMode(), irFunctions, irInstructions,
                     countDirectProcedureCalls(blocks, top));

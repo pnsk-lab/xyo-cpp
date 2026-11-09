@@ -608,6 +608,15 @@ if(TARGET xyo-cli)
               "$<TARGET_FILE:xyo-cli>")
     set_tests_properties(xyo-jit-lazy-integration PROPERTIES TIMEOUT 180)
 
+    # BUG-001: address-taken internal par-for functions must be fully
+    # materialized before the C++ callback invokes their native pointer.
+    add_test(NAME xyo-jit-lazy-parfor-callback
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_lazy_parfor_callback.py"
+              --native "$<TARGET_FILE:xyo-cli>"
+              --out "${CMAKE_CURRENT_BINARY_DIR}/jit-lazy-parfor-fixtures")
+    set_tests_properties(xyo-jit-lazy-parfor-callback PROPERTIES TIMEOUT 120)
+
     # Preserve Scratch semantics with dynamic limits, fractional bounds, or
     # index mutation when optional static induction analysis is enabled.
     add_test(NAME xyo-jit-induction-ranges
