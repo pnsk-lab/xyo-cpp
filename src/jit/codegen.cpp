@@ -269,6 +269,8 @@ struct Codegen {
     // OSR-011: a source-proven 1..8192 inner repeat preserves real yields
     // and captures the two private counters at every handoff.
     bool nestedOsrInFlightInnerYield = false;
+    // Strict opt-in: selected outer -> middle -> leaf source counters.
+    bool nestedOsrInFlightTripleYield = false;
     std::map<std::u16string, llvm::Value*> hoistedNestedOsrArgs;
     /// ループ本体で書き込まれる変数/リスト（不変性判定用）
     struct LoopWriteScan {
@@ -1006,15 +1008,33 @@ struct Codegen {
             return;
         }
         if (!nestedOsrInFlightInnerYield || yieldStack.empty()) return;
-        const auto& outer = yieldStack.back();
+        const auto& enclosing = yieldStack.back();
+        if (!enclosing.sourceLoop ||
+            (!enclosing.remainingF64 && !enclosing.remainingI32))
+            return;
+        llvm::Value* enclosingCurrent =
+            remaining(enclosing.remainingI32, enclosing.remainingF64);
+        llvm::Value* enclosingAfterBody =
+            b.CreateFSub(enclosingCurrent, cf64(1.0));
+        if (enclosing.sourceLoop == osrStartLoop) {
+            // Phase 2: middle body complete, selected outer unfinished.
+            callN("xyo_rt_nested_osr_inner_yield_checkpoint", voidt,
+                  {ctxArg, enclosingAfterBody, afterBody});
+            return;
+        }
+        if (!nestedOsrInFlightTripleYield || yieldStack.size() < 2)
+            return;
+        const auto& outer = yieldStack[yieldStack.size() - 2];
         if (outer.sourceLoop != osrStartLoop ||
-            (!outer.remainingF64 && !outer.remainingI32)) return;
-        // Phase 2: inner body completed, outer body remains incomplete.
+            (!outer.remainingF64 && !outer.remainingI32))
+            return;
         llvm::Value* outerCurrent =
             remaining(outer.remainingI32, outer.remainingF64);
-        callN("xyo_rt_nested_osr_inner_yield_checkpoint", voidt,
+        // Phase 3: deepest source body complete; neither enclosing
+        // lexical body has completed. Keep all private counters.
+        callN("xyo_rt_nested_osr_triple_yield_checkpoint", voidt,
               {ctxArg, b.CreateFSub(outerCurrent, cf64(1.0)),
-               afterBody});
+               enclosingAfterBody, afterBody});
     }
 
     // The deadline poll is shared by ordinary Scratch loops and SSA
@@ -9234,6 +9254,11 @@ bool jitEmitScript(llvm::Module& mod, llvm::LLVMContext& lc, Runtime& runtime,
             "XYO_JIT_OSR_NESTED_INNER_YIELD_DEOPT");
         cg.nestedOsrInFlightInnerYield = cg.nestedOsrInFlightGuard &&
             innerYield && innerYield[0] == '1';
+        const char* triple = std::getenv(
+            "XYO_JIT_OSR_NESTED_TRIPLE_YIELD");
+        cg.nestedOsrInFlightTripleYield =
+            cg.nestedOsrInFlightInnerYield &&
+            triple && triple[0] == '1';
         if (const char* bounded =
                 std::getenv("XYO_JIT_OSR_NESTED_INNER_BOUNDED");
             cg.nestedOsrInFlightGuard &&

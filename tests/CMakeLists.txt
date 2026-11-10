@@ -198,6 +198,11 @@ if(NOT EMSCRIPTEN)
   target_link_libraries(xyo-nested-warp-dynamic-inner-deopt-smoke PRIVATE xyo)
   target_compile_options(xyo-nested-warp-dynamic-inner-deopt-smoke
     PRIVATE -fno-exceptions -fno-rtti)
+  add_executable(xyo-nested-warp-triple-yield-deopt-smoke
+    platform/nested_warp_triple_yield_deopt_smoke.cpp)
+  target_link_libraries(xyo-nested-warp-triple-yield-deopt-smoke PRIVATE xyo)
+  target_compile_options(xyo-nested-warp-triple-yield-deopt-smoke
+    PRIVATE -fno-exceptions -fno-rtti)
   # A headless Runtime::step test; do not nest in SDL-only tests.
   if(XYO_JIT AND Python3_Interpreter_FOUND)
     add_test(NAME xyo-nested-warp-silent-edit
@@ -271,6 +276,29 @@ if(NOT EMSCRIPTEN)
             ${dynamic_args})
         set_tests_properties("${dynamic_name}"
           PROPERTIES TIMEOUT 600)
+      endforeach()
+    endforeach()
+    foreach(triple_fraction IN ITEMS off on)
+      foreach(triple_fast IN ITEMS off on)
+        set(triple_name "xyo-nested-warp-triple-yield")
+        set(triple_args)
+        if(triple_fraction STREQUAL "on")
+          string(APPEND triple_name "-fractional")
+          list(APPEND triple_args --fractional)
+        else()
+          string(APPEND triple_name "-deopt")
+        endif()
+        if(triple_fast STREQUAL "on")
+          string(APPEND triple_name "-fast")
+          list(APPEND triple_args --without-block-count)
+        endif()
+        add_test(NAME "${triple_name}"
+          COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_nested_warp_triple_yield_deopt.py"
+            --harness "$<TARGET_FILE:xyo-nested-warp-triple-yield-deopt-smoke>"
+            --out "${CMAKE_BINARY_DIR}/${triple_name}"
+            ${triple_args})
+        set_tests_properties("${triple_name}" PROPERTIES TIMEOUT 600)
       endforeach()
     endforeach()
     # Keep the optimized, uninstrumented LLVM path under test too:

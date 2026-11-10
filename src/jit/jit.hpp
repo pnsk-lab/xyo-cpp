@@ -222,6 +222,8 @@ struct JitCtx {
     // OSR-011 snapshots are valid only after an actual Fiber yield.
     int32_t nestedOsrDeoptPhase = 0;
     double nestedOsrDeoptInnerRemaining = 0.0;
+    // OSR-013: the deepest completed body in three lexical repeats.
+    double nestedOsrDeoptDeepRemaining = 0.0;
 };
 
 /// Publish an entire execution slice with one atomic RMW, including when a
@@ -302,6 +304,7 @@ struct CompiledScript {
     // Frozen source id; never select an inner loop from edited Blocks.
     bool nestedOsrInnerYieldGuard = false;
     std::string nestedOsrInnerLoopId;
+    std::string nestedOsrDeepInnerLoopId;
 };
 
 class JitEngine {

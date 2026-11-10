@@ -101,13 +101,15 @@ static bool safeDynamicInnerTimes(const Blocks& blocks,
 // reporters that could hide suspension or observable intermediate effects.
 static bool safeBoundedNativeInnerRepeat(
     const Blocks& blocks, const Block& outer, bool allowInnerYield = false,
-    std::string* innerId = nullptr, bool allowDynamicTimes = false) {
+    std::string* innerId = nullptr, bool allowDynamicTimes = false,
+    bool allowTripleYield = false, std::string* deepId = nullptr) {
     if (outer.opcode != "control_repeat") return false;
     const auto* sub = outer.inputs.find("SUBSTACK");
     if (!sub || sub->block.empty()) return false;
     std::unordered_set<std::string> seen;
     size_t nodes = 0;
     size_t nested = 0;
+    const size_t maxNested = allowTripleYield ? 2 : 1;
     // Even a primitive setter may contain an asynchronous VALUE reporter.
     // Accept only bounded, pure, acyclic expression graphs at the source
     // boundary; never infer that an arbitrary extension/compat call is safe.
@@ -146,7 +148,7 @@ static bool safeBoundedNativeInnerRepeat(
         return check(check, value, 0);
     };
     const auto scan = [&](auto&& self, std::string id,
-                          bool innerBody) -> bool {
+                          size_t depth) -> bool {
         size_t inChain = 0;
         while (!id.empty()) {
             if (++nodes > 16 || ++inChain > 16 ||
@@ -154,7 +156,8 @@ static bool safeBoundedNativeInnerRepeat(
             const Block* blk = blocks.getBlock(id);
             if (!blk) return false;
             if (blk->opcode == "control_repeat") {
-                if (innerBody || ++nested > 1) return false;
+                if (depth >= maxNested || nested != depth) return false;
+                ++nested;
                 const auto* times = blk->inputs.find("TIMES");
                 const auto* body = blk->inputs.find("SUBSTACK");
                 if (!times || !body || body->block.empty()) return false;
@@ -179,24 +182,25 @@ static bool safeBoundedNativeInnerRepeat(
                              safeDynamicInnerTimes(blocks, timesId))) {
                     return false;
                 }
-                if (innerId) *innerId = blk->id;
-                if (!self(self, body->block, true)) return false;
+                if (depth == 0 && innerId) *innerId = blk->id;
+                if (depth == 1 && deepId) *deepId = blk->id;
+                if (!self(self, body->block, depth + 1)) return false;
             } else {
                 if (blk->opcode != "data_changevariableby" &&
                     !(blk->opcode == "data_setvariableto" &&
-                      (!innerBody || allowDynamicTimes)))
+                      (depth == 0 || allowDynamicTimes)))
                     return false;
                 const auto field = blk->fields.find("VARIABLE");
                 if (field == blk->fields.end() ||
                     field->second.id.empty() || !safeValue(blk))
                     return false;
             }
-            if (innerBody && inChain > 4) return false;
+            if (depth > 0 && inChain > 4) return false;
             id = blk->next;
         }
         return true;
     };
-    return scan(scan, sub->block, false) && nested == 1;
+    return scan(scan, sub->block, 0) && nested == maxNested;
 }
 
 bool jitEmitScript(llvm::Module&, llvm::LLVMContext&, Runtime&, Target*,
@@ -264,6 +268,8 @@ uint64_t xyo_rt_nested_osr_arg_get(JitCtx*, const char*,
 uint64_t xyo_rt_nested_osr_arg_peek(JitCtx*, const char16_t*, uint32_t);
 void xyo_rt_nested_osr_yield_checkpoint(JitCtx*, double);
 void xyo_rt_nested_osr_inner_yield_checkpoint(JitCtx*, double, double);
+void xyo_rt_nested_osr_triple_yield_checkpoint(
+    JitCtx*, double, double, double);
 void xyo_proc_push(JitCtx*, const char*, const void*, int32_t,
                    const char*, int32_t, int32_t);
 void xyo_proc_pop(JitCtx*);
@@ -512,6 +518,8 @@ const std::pair<const char*, void*> kRtSymbols[] = {
      (void*)&xyo_rt_nested_osr_yield_checkpoint},
     {"xyo_rt_nested_osr_inner_yield_checkpoint",
      (void*)&xyo_rt_nested_osr_inner_yield_checkpoint},
+    {"xyo_rt_nested_osr_triple_yield_checkpoint",
+     (void*)&xyo_rt_nested_osr_triple_yield_checkpoint},
     {"xyo_proc_push", (void*)&xyo_proc_push},
     {"xyo_proc_pop", (void*)&xyo_proc_pop},
     {"xyo_rt_setarg", (void*)&xyo_rt_setarg},
@@ -1253,11 +1261,17 @@ std::unique_ptr<PendingJitCompilation> LLVMBackend::prepareAsync(
             "XYO_JIT_OSR_NESTED_INNER_DYNAMIC");
         const bool allowDynamic = innerYield && dynamic &&
             dynamic[0] == '1';
+        const char* triple = std::getenv(
+            "XYO_JIT_OSR_NESTED_TRIPLE_YIELD");
+        const bool allowTriple = allowDynamic && triple &&
+            triple[0] == '1';
         std::string frozenInnerId;
+        std::string frozenDeepId;
         const bool safeInner = !flat && proof && proof[0] == '1' &&
             innerYield && safeBoundedNativeInnerRepeat(
                 *thread.blockContainer, *nested.loop, true,
-                &frozenInnerId, allowDynamic);
+                &frozenInnerId, allowDynamic, allowTriple,
+                &frozenDeepId);
         const bool safeBounded = !innerYield && !flat && bounded &&
             bounded[0] == '1' && proof && proof[0] == '1' &&
             safeBoundedNativeInnerRepeat(
@@ -1265,6 +1279,7 @@ std::unique_ptr<PendingJitCompilation> LLVMBackend::prepareAsync(
         if (safeInner) {
             code->nestedOsrInnerYieldGuard = true;
             code->nestedOsrInnerLoopId = std::move(frozenInnerId);
+            code->nestedOsrDeepInnerLoopId = std::move(frozenDeepId);
         }
         if ((safeInner || safeBounded) &&
             std::getenv("XYO_JIT_OSR_NESTED_TRACE"))

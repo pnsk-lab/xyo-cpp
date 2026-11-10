@@ -1014,6 +1014,42 @@ void xyo_rt_nested_osr_inner_yield_checkpoint(
     c->nestedOsrDeoptReady = 1;
 }
 
+// OSR-013: real deepest source-body yield (three counted repeats).
+// A prior phase-1/2 snapshot cannot authorize replay after malformed input.
+void xyo_rt_nested_osr_triple_yield_checkpoint(
+    JitCtx* c, double outerAfterBody, double middleAfterBody,
+    double deepAfterBody) {
+    if (!c || !c->thread || !c->thread->nestedOsrActive ||
+        !c->thread->compiled) return;
+    const auto* compiled =
+        static_cast<const CompiledScript*>(c->thread->compiled);
+    c->nestedOsrDeoptReady = 0;
+    c->nestedOsrDeoptPhase = 0;
+    if (!compiled->nestedOsrInFlightGuard ||
+        !compiled->nestedOsrInnerYieldGuard ||
+        compiled->nestedOsrInnerLoopId.empty() ||
+        compiled->nestedOsrDeepInnerLoopId.empty()) return;
+    const auto validOuter = [](double v) {
+        return std::isfinite(v) && v >= 0.0 &&
+               v <= 1099511627776.0 && std::floor(v) == v;
+    };
+    const auto validNative = [](double v) {
+        return std::isfinite(v) && v >= -0.5 &&
+               v <= 1099511627776.0;
+    };
+    if (!validOuter(outerAfterBody) ||
+        !validNative(middleAfterBody) ||
+        !validNative(deepAfterBody)) return;
+    const double middle = std::floor(middleAfterBody + 0.5);
+    const double deepest = std::floor(deepAfterBody + 0.5);
+    if (!validOuter(middle) || !validOuter(deepest)) return;
+    c->nestedOsrDeoptRemaining = outerAfterBody;
+    c->nestedOsrDeoptInnerRemaining = middle;
+    c->nestedOsrDeoptDeepRemaining = deepest;
+    c->nestedOsrDeoptPhase = 3;
+    c->nestedOsrDeoptReady = 1;
+}
+
 uint64_t xyo_rt_nested_osr_arg_peek(
     JitCtx* c, const char16_t* name, uint32_t length) {
     Thread* t = c ? c->thread : nullptr;
