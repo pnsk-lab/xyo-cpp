@@ -312,6 +312,9 @@ if(NOT EMSCRIPTEN)
         set_tests_properties("${triple_name}" PROPERTIES TIMEOUT 600)
       endforeach()
     endforeach()
+    # OSR-016: independent half-integer rounding boundary tests
+    # reuse the source-frozen real phase-3 native-yield harness.
+    include("${CMAKE_CURRENT_SOURCE_DIR}/differential/osr016_fractional_boundary_tests.cmake")
     foreach(quad_fraction IN ITEMS off on)
       foreach(quad_fast IN ITEMS off on)
         set(quad_name "xyo-nested-warp-quad-yield")
