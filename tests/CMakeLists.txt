@@ -208,6 +208,12 @@ if(NOT EMSCRIPTEN)
   target_link_libraries(xyo-nested-warp-quad-yield-deopt-smoke PRIVATE xyo)
   target_compile_options(xyo-nested-warp-quad-yield-deopt-smoke
     PRIVATE -fno-exceptions -fno-rtti)
+  # OSR-015: Source topology edit must fail closed after phase-4 yield.
+  add_executable(xyo-nested-warp-topology-failclosed-smoke
+    platform/nested_warp_topology_edit_failclosed_smoke.cpp)
+  target_link_libraries(xyo-nested-warp-topology-failclosed-smoke PRIVATE xyo)
+  target_compile_options(xyo-nested-warp-topology-failclosed-smoke
+    PRIVATE -fno-exceptions -fno-rtti)
   # A headless Runtime::step test; do not nest in SDL-only tests.
   if(XYO_JIT AND Python3_Interpreter_FOUND)
     add_test(NAME xyo-nested-warp-silent-edit
@@ -329,6 +335,22 @@ if(NOT EMSCRIPTEN)
         set_tests_properties("${quad_name}"
           PROPERTIES TIMEOUT 600)
       endforeach()
+    endforeach()
+    foreach(topology_fast IN ITEMS off on)
+      set(topology_name "xyo-nested-warp-topology-failclosed")
+      set(topology_args --outer-count 100000)
+      if(topology_fast STREQUAL "on")
+        string(APPEND topology_name "-fast")
+        list(APPEND topology_args --without-block-count)
+      endif()
+      add_test(NAME "${topology_name}"
+        COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_nested_warp_topology_failclosed.py"
+          --harness "$<TARGET_FILE:xyo-nested-warp-topology-failclosed-smoke>"
+          --out "${CMAKE_BINARY_DIR}/${topology_name}"
+          ${topology_args})
+      set_tests_properties("${topology_name}"
+        PROPERTIES TIMEOUT 600)
     endforeach()
     # Keep the optimized, uninstrumented LLVM path under test too:
     # block counting disables some native scalar/loop optimizations.
