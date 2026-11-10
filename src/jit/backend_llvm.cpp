@@ -26,6 +26,8 @@
 #include <cstring>
 #include <deque>
 #include <map>
+#include <mutex>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -703,7 +705,43 @@ const std::vector<std::pair<const char*, void*>>& hostLibcallSymbols() {
 
 } // namespace
 
+// Optional lookup timing: LLVM has produced a native object when the ORC
+// object-transform callback fires. JITLink still has work after this point.
+// Shared ownership keeps callbacks safe through LLJIT teardown.
+struct JitObjectPhaseCounters {
+    struct Snapshot {
+        uint64_t count = 0;
+        uint64_t bytes = 0;
+        int64_t latestReadyNs = 0;
+        std::thread::id latestThread;
+    };
+
+    // Only active for XYO_JIT_OBJECT_TIMING. Use a consistent snapshot
+    // across concurrent ORC materializations; otherwise a callback from
+    // another thread can be misattributed to this lookup.
+    std::mutex mutex;
+    Snapshot state;
+
+    void noteObject(size_t size) {
+        const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        std::lock_guard lock(mutex);
+        ++state.count;
+        state.bytes += size;
+        if (state.latestReadyNs < now) {
+            state.latestReadyNs = now;
+            state.latestThread = std::this_thread::get_id();
+        }
+    }
+
+    Snapshot snapshot() {
+        std::lock_guard lock(mutex);
+        return state;
+    }
+};
+
 struct LLVMBackend final : JitBackend {
+    std::shared_ptr<JitObjectPhaseCounters> objectPhase;
     llvm::orc::ThreadSafeContext tsc;
     std::unique_ptr<llvm::orc::LLJIT> jit;
     std::unique_ptr<llvm::orc::LLLazyJIT> lazyJit;
@@ -949,29 +987,43 @@ static void configureLazyIR(llvm::orc::LLJIT& jit) {
         });
 }
 
-static void configureObjectDump(llvm::orc::LLJIT& jit) {
-    // Inspect the exact JIT machine code, not an AOT approximation. Disabled
-    // by default; prefix-N.o files contain the objects before linking.
-    if (const char* p = std::getenv("XYO_JIT_DUMP_OBJECT")) {
-        if (p[0]) jit.getObjTransformLayer().setTransform(
-            [prefix = std::string(p)](std::unique_ptr<llvm::MemoryBuffer> object)
-                -> llvm::Expected<std::unique_ptr<llvm::MemoryBuffer>> {
+static void configureObjectDump(
+    llvm::orc::LLJIT& jit,
+    std::shared_ptr<JitObjectPhaseCounters> timing) {
+    // The same ORC layer can both dump the exact machine object (opt-in)
+    // and record the object-ready boundary before relocation/linking.
+    // Avoid installing a transform for normal, uninstrumented execution.
+    const char* dumpSetting = std::getenv("XYO_JIT_DUMP_OBJECT");
+    const std::string prefix = dumpSetting ? dumpSetting : "";
+    if (prefix.empty() && !timing) return;
+
+    jit.getObjTransformLayer().setTransform(
+        [prefix, timing = std::move(timing)](
+            std::unique_ptr<llvm::MemoryBuffer> object)
+            -> llvm::Expected<std::unique_ptr<llvm::MemoryBuffer>> {
+            if (timing) timing->noteObject(object->getBufferSize());
+            if (!prefix.empty()) {
                 static std::atomic<uint64_t> serial{0};
                 const std::string path = prefix + "-" +
-                    std::to_string(serial.fetch_add(1, std::memory_order_relaxed)) + ".o";
+                    std::to_string(serial.fetch_add(
+                        1, std::memory_order_relaxed)) + ".o";
                 if (FILE* out = std::fopen(path.c_str(), "wb")) {
                     const auto bytes = object->getBuffer();
-                    const size_t written = std::fwrite(bytes.data(), 1, bytes.size(), out);
+                    const size_t written = std::fwrite(
+                        bytes.data(), 1, bytes.size(), out);
                     const int closed = std::fclose(out);
                     if (written != bytes.size() || closed != 0)
-                        std::fprintf(stderr, "xyo-jit: incomplete object dump %s\n", path.c_str());
+                        std::fprintf(stderr,
+                            "xyo-jit: incomplete object dump %s\n",
+                            path.c_str());
                 } else {
-                    std::fprintf(stderr, "xyo-jit: cannot dump object %s\n", path.c_str());
+                    std::fprintf(stderr,
+                        "xyo-jit: cannot dump object %s\n",
+                        path.c_str());
                 }
-                return std::move(object);
-            });
-    }
-
+            }
+            return std::move(object);
+        });
 }
 
 static void registerRuntimeSymbols(llvm::orc::LLJIT& jit) {
@@ -1002,8 +1054,14 @@ static void registerRuntimeSymbols(llvm::orc::LLJIT& jit) {
 }
 
 LLVMBackend::LLVMBackend() {
+    using Clock = std::chrono::steady_clock;
+    const bool timing = std::getenv("XYO_JIT_OBJECT_TIMING") != nullptr;
+    const auto began = timing ? Clock::now() : Clock::time_point{};
+    if (timing)
+        objectPhase = std::make_shared<JitObjectPhaseCounters>();
     llvm::InitializeNativeTarget();
     llvm::InitializeNativeTargetAsmPrinter();
+    const auto nativeReady = timing ? Clock::now() : Clock::time_point{};
 
     tsc = llvm::orc::ThreadSafeContext(
         std::make_unique<llvm::LLVMContext>());
@@ -1043,9 +1101,23 @@ LLVMBackend::LLVMBackend() {
         return;
     }
     auto jit = std::move(*result);
-    configureObjectDump(*jit);
+    const auto lljitReady = timing ? Clock::now() : Clock::time_point{};
+    configureObjectDump(*jit, objectPhase);
     registerRuntimeSymbols(*jit);
     this->jit = std::move(jit);
+    if (timing) {
+        const auto done = Clock::now();
+        const auto ms = [](Clock::duration elapsed) {
+            return std::chrono::duration<double, std::milli>(
+                elapsed).count();
+        };
+        std::fprintf(stderr,
+            "[jit-object-timing] backend-init target=%.3fms "
+            "lljit=%.3fms symbols=%.3fms total=%.3fms\n",
+            ms(nativeReady - began),
+            ms(lljitReady - nativeReady),
+            ms(done - lljitReady), ms(done - began));
+    }
 
     // The backend keeps its emitted string constants alive until disposal.
     Gc::get().addRootProvider(this, [this](Gc& g) {
@@ -1083,7 +1155,7 @@ bool LLVMBackend::ensureLazyJit() {
     }
     auto lazy = std::move(*result);
     configureLazyIR(*lazy);
-    configureObjectDump(*lazy);
+    configureObjectDump(*lazy, objectPhase);
     registerRuntimeSymbols(*lazy);
     lazyJit = std::move(lazy);
     return true;
@@ -1576,6 +1648,8 @@ std::unique_ptr<CompiledScript> LLVMBackend::compile(
     }
 
     const auto tLookup = Clock::now();
+    const auto objectsBefore = objectPhase
+        ? objectPhase->snapshot() : JitObjectPhaseCounters::Snapshot{};
     auto& owningJit = lazyThisScript
         ? static_cast<llvm::orc::LLJIT&>(*lazyJit)
         : *jit;
@@ -1597,15 +1671,51 @@ std::unique_ptr<CompiledScript> LLVMBackend::compile(
         }
     }
 
-    if (timing) {
+    if (timing || objectPhase) {
         const auto tDone = Clock::now();
-        std::fprintf(stderr,
-            "[jit-timing] %s emit=%.3fms opt=%.3fms submit=%.3fms "
-            "lookup=%.3fms total=%.3fms funcs=%zu ir=%zu tier=%s\n",
-            topId.c_str(), emitMs, optMs, submitMs,
-            msBetween(tLookup, tDone), msBetween(tStart, tDone),
-            irFunctions, irInstructions,
-            lazyThisScript ? "lazy" : "eager");
+        if (objectPhase) {
+            const auto objectsAfter = objectPhase->snapshot();
+            const uint64_t objectCount =
+                objectsAfter.count - objectsBefore.count;
+            const uint64_t objectBytes =
+                objectsAfter.bytes - objectsBefore.bytes;
+            const int64_t readyNs = objectsAfter.latestReadyNs;
+            const int64_t beginNs =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    tLookup.time_since_epoch()).count();
+            const int64_t endNs =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    tDone.time_since_epoch()).count();
+            // A single object has an unambiguous pre/post-object boundary.
+            // Multi-object lookups can interleave JITLink work, so do not
+            // incorrectly attribute their timings to "codegen" and "link".
+            if (objectCount == 1 && beginNs <= readyNs &&
+                readyNs <= endNs &&
+                objectsAfter.latestThread == std::this_thread::get_id()) {
+                std::fprintf(stderr,
+                    "[jit-object-timing] %s objects=1 bytes=%llu "
+                    "pre-object=%.3fms post-object=%.3fms\n",
+                    topId.c_str(),
+                    static_cast<unsigned long long>(objectBytes),
+                    double(readyNs - beginNs) / 1e6,
+                    double(endNs - readyNs) / 1e6);
+            } else {
+                std::fprintf(stderr,
+                    "[jit-object-timing] %s objects=%llu bytes=%llu "
+                    "split=unavailable\n",
+                    topId.c_str(),
+                    static_cast<unsigned long long>(objectCount),
+                    static_cast<unsigned long long>(objectBytes));
+            }
+        }
+        if (timing)
+            std::fprintf(stderr,
+                "[jit-timing] %s emit=%.3fms opt=%.3fms submit=%.3fms "
+                "lookup=%.3fms total=%.3fms funcs=%zu ir=%zu tier=%s\n",
+                topId.c_str(), emitMs, optMs, submitMs,
+                msBetween(tLookup, tDone), msBetween(tStart, tDone),
+                irFunctions, irInstructions,
+                lazyThisScript ? "lazy" : "eager");
     }
     if (verbose) {
         const double ms = std::chrono::duration<double, std::milli>(

@@ -754,6 +754,13 @@ set_tests_properties(xyo-interpreter-parity-regressions PROPERTIES
 if(TARGET xyo-cli)
   find_package(Python3 QUIET COMPONENTS Interpreter)
   if(Python3_Interpreter_FOUND)
+    # Lightweight, platform-independent validation of JIT phase-log parsing
+    # and Scratch script topology. Timing measurements remain opt-in.
+    add_test(NAME xyo-jit-phase-profile-parser
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/bench/test_jit_compile_phase_bench.py")
+    set_tests_properties(xyo-jit-phase-profile-parser PROPERTIES TIMEOUT 30)
+
     add_test(NAME xyo-jit-lazy-integration
       COMMAND "${Python3_EXECUTABLE}"
               "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_lazy_integration.py"
