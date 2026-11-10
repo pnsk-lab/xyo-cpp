@@ -3,6 +3,7 @@
 #include "backend.hpp"
 
 #include "llvm_compat.hpp"
+#include "parfor_lazy_partition.hpp"
 
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/ExecutionEngine/Orc/IRTransformLayer.h>
@@ -1130,7 +1131,7 @@ LLVMBackend::LLVMBackend() {
 // address of an internal par-for callback to native C++, materialize both
 // functions in one ORC partition. Do not assume that a function pointer
 // referring to an unmaterialized private definition is callable.
-static std::optional<llvm::orc::IRPartitionLayer::GlobalValueSet>
+std::optional<llvm::orc::IRPartitionLayer::GlobalValueSet>
 partitionParForCallbacks(llvm::orc::IRPartitionLayer::GlobalValueSet requested) {
     auto together = requested;
     for (const llvm::GlobalValue* requestedValue : requested) {
@@ -1167,23 +1168,27 @@ partitionParForCallbacks(llvm::orc::IRPartitionLayer::GlobalValueSet requested) 
 // The opt-in is allowed only for a completely direct, locally defined
 // callback. If future lowering introduces an indirect call, preserve the
 // full-eager safety guard instead of using unproven pointer materialization.
-static bool supportsLazyParForPartition(const llvm::Module& module) {
+bool supportsLazyParForPartition(const llvm::Module& module) {
     const llvm::Function* dispatch = module.getFunction("xyo_par_for");
     if (!dispatch || dispatch->use_empty()) return false;
-    for (const llvm::User* user : dispatch->users()) {
-        const auto* call = llvm::dyn_cast<llvm::CallBase>(user);
-        if (!call || call->getCalledOperand()->stripPointerCasts() != dispatch ||
-            call->arg_size() != 8)
+    for (const llvm::Use& dispatchUse : dispatch->uses()) {
+        const auto* call =
+            llvm::dyn_cast<llvm::CallBase>(dispatchUse.getUser());
+        // Inspect individual LLVM Use edges, not just User* owners:
+        // the same call can also pass xyo_par_for as an unrelated argument.
+        if (!call || !call->isCallee(&dispatchUse) ||
+            call->getCalledOperand() != dispatch || call->arg_size() != 8)
             return false;
         const auto* body = llvm::dyn_cast<llvm::Function>(
             call->getArgOperand(7)->stripPointerCasts());
         if (!body || body->isDeclaration() ||
             body->getParent() != &module || !body->hasInternalLinkage())
             return false;
-        // If another consumer captures this private function address, the
-        // direct caller+callback partition is no longer a complete proof.
-        for (const llvm::User* use : body->users())
-            if (use != call) return false;
+        // Likewise, a callback passed as argument #7 AND another argument
+        // has one User* but multiple Use edges. It is not a private pointer.
+        if (!body->hasOneUse() ||
+            &*body->use_begin() != &call->getArgOperandUse(7))
+            return false;
     }
     return true;
 }

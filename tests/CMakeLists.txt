@@ -749,6 +749,20 @@ add_test(NAME xyo-interpreter-parity-regressions
 set_tests_properties(xyo-interpreter-parity-regressions PROPERTIES
   ENVIRONMENT "XYO_JIT_MODE=off")
 
+# The ORC par-for co-materialization policy must reject pointer escapes,
+# indirect callbacks and address sharing before an experimental lazy tier.
+if(XYO_JIT AND XYO_JIT_BACKEND STREQUAL "llvm" AND NOT EMSCRIPTEN)
+  add_executable(xyo-jit-parfor-partition-policy
+    platform/jit_parfor_partition_policy_smoke.cpp)
+  target_include_directories(xyo-jit-parfor-partition-policy PRIVATE
+    ${LLVM_INCLUDE_DIRS})
+  target_link_libraries(xyo-jit-parfor-partition-policy PRIVATE
+    xyo ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS})
+  add_test(NAME xyo-jit-parfor-partition-policy
+    COMMAND xyo-jit-parfor-partition-policy)
+  set_tests_properties(xyo-jit-parfor-partition-policy PROPERTIES TIMEOUT 30)
+endif()
+
 # Production HotSpot chooses per script whether to compile procedures
 # on first use. Verify the CLI policy, selected tier and Scratch output.
 if(TARGET xyo-cli)
@@ -785,6 +799,18 @@ if(TARGET xyo-cli)
               --native "$<TARGET_FILE:xyo-cli>"
               --out "${CMAKE_CURRENT_BINARY_DIR}/jit-lazy-parfor-partition-fixtures")
     set_tests_properties(xyo-jit-lazy-parfor-partition PROPERTIES TIMEOUT 180)
+
+    # Multiple fresh processes exercise native worker completion and
+    # JIT teardown repeatedly. This does not claim safety for concurrent
+    # external destruction of an active Runtime.
+    add_test(NAME xyo-jit-lazy-parfor-partition-stress
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_lazy_parfor_partition.py"
+              --native "$<TARGET_FILE:xyo-cli>"
+              --out "${CMAKE_CURRENT_BINARY_DIR}/jit-lazy-parfor-stress-fixtures"
+              --stress-runs 64)
+    set_tests_properties(xyo-jit-lazy-parfor-partition-stress
+      PROPERTIES TIMEOUT 180)
 
     # Preserve Scratch semantics with dynamic limits, fractional bounds, or
     # index mutation when optional static induction analysis is enabled.

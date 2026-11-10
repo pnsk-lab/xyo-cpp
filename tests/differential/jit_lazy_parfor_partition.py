@@ -77,7 +77,11 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--native", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--stress-runs", type=int, default=8,
+                    help="fresh-process worker-pool runs after base checks")
     args = ap.parse_args()
+    if args.stress_runs < 0:
+        ap.error("--stress-runs must be non-negative")
     binary = args.native.resolve(strict=True)
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -111,10 +115,17 @@ def main() -> int:
             if mode == "hotspot" and partition and parallel:
                 # Repeated fresh processes exercise real worker-pool execution,
                 # callback pointer validity and teardown without warm JIT state.
-                for _ in range(8):
+                for index in range(args.stress_runs):
                     repeated, again = run(binary, project, mode, partition)
-                    assert repeated == state, "parallel state changed between runs"
-                    assert "parfor: parallel" in again
+                    assert repeated == state, (
+                        "parallel state changed between runs", index
+                    )
+                    assert again.count("parfor: parallel trip=8192") == 2, (
+                        "both callbacks must finish before process teardown",
+                        index, again[-1200:]
+                    )
+                print(f"PASS fresh-process worker stress {args.stress_runs} runs",
+                      flush=True)
             print(f"PASS {mode=} {partition=} {trip=} {parallel=}", flush=True)
     return 0
 
