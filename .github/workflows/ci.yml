@@ -92,8 +92,11 @@ jobs:
       - name: Build
         run: cmake --build build -j"$(nproc)"
 
-      - name: Test (ctest)
-        run: ctest --test-dir build --output-on-failure
+      # The costly native continuation suite runs in a second job.
+      - name: Test (ctest, excluding dedicated native OSR)
+        run: |
+          ctest --test-dir build --output-on-failure --parallel 2 \
+            -E '^(xyo-nested-warp-|xyo-native-simple-deopt-parity$)'
 
       - name: Smoke（run / AOT / play）
         run: |
@@ -116,6 +119,61 @@ jobs:
         with:
           name: linux-test-log
           path: build/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+
+  # An independent, complete checkout validates phase1..4 native yields
+  # and source-edit deoptimization without consuming the main Linux timeout.
+  linux-nested-osr:
+    name: Linux / LLVM native continuation + OSR (38 CTests)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/linux-deps
+        with:
+          llvm: ${{ env.LLVM_LATEST }}
+          llvm_apt: "true"
+          extra: libsdl2-dev libgl-dev glslc
+
+      - name: Configure (LLVM JIT + SDL2, full test registration)
+        run: |
+          cmake -B build-osr -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_CONFIG="/usr/lib/llvm-${LLVM_LATEST}/bin/llvm-config" \
+            -DXYO_JIT=ON -DXYO_JIT_BACKEND=llvm \
+            -DXYO_SDL2=ON -DXYO_REQUIRE_SDL2=ON -DXYO_RSVG=OFF \
+            -DXYO_BUILD_SHELL=ON -DXYO_BUILD_TESTS=ON
+
+      - name: Build CLI and all nine native OSR harnesses
+        run: |
+          cmake --build build-osr --parallel 2 --target \
+            xyo-cli \
+            xyo-nested-warp-silent-edit-smoke \
+            xyo-nested-warp-inflight-deopt-smoke \
+            xyo-nested-warp-inflight-body-edit-smoke \
+            xyo-nested-warp-bounded-inner-deopt-smoke \
+            xyo-nested-warp-inner-yield-deopt-smoke \
+            xyo-nested-warp-dynamic-inner-deopt-smoke \
+            xyo-nested-warp-triple-yield-deopt-smoke \
+            xyo-nested-warp-quad-yield-deopt-smoke \
+            xyo-nested-warp-topology-failclosed-smoke
+
+      - name: Verify complete 38-test inventory and dependencies
+        run: |
+          python3 tools/ci/check_native_osr_suite.py --self-test
+          python3 tools/ci/check_native_osr_suite.py --build-dir build-osr
+
+      - name: Native continuation and nested warp regressions
+        run: |
+          ctest --test-dir build-osr --output-on-failure --parallel 2 \
+            -R '^(xyo-nested-warp-|xyo-native-simple-deopt-parity$)'
+
+      - name: Failure logs (native OSR)
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: linux-nested-osr-test-log
+          path: build-osr/Testing/Temporary/LastTest.log
           if-no-files-found: ignore
 
   # 動的依存ゼロのバイナリ（LLVM 18 の静的アーカイブ + 静的 libstdc++）。

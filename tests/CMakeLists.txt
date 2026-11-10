@@ -509,8 +509,9 @@ if(Python3_Interpreter_FOUND AND XYO_JIT AND XYO_JIT_BACKEND STREQUAL "llvm"
             "${CMAKE_CURRENT_SOURCE_DIR}/differential/native_simple_resume.py"
             --native "$<TARGET_FILE:xyo-cli>"
             --out "${CMAKE_CURRENT_BINARY_DIR}/native-simple-resume")
+  # Native/GC stress on shared runners can exceed two minutes even if valid.
   set_tests_properties(xyo-native-simple-deopt-parity
-    PROPERTIES TIMEOUT 120)
+    PROPERTIES TIMEOUT 600)
 endif()
 
 # Opt-in native allocation benchmark; not part of CTest.
