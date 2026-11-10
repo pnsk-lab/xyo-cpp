@@ -1,8 +1,9 @@
 name: CI
 
 on:
+  # Native OSR integration branches run CI without requiring a PR token.
   push:
-    branches: [main]
+    branches: [main, 'work/osr-ci-v123']
   pull_request:
   workflow_dispatch:
 
