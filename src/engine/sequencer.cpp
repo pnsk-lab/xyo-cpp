@@ -1473,7 +1473,47 @@ void Sequencer::jitStepThread(Thread& thread) {
             ExecContext* ec = inner && inner->executionContext
                 ? inner->executionContext.get() : nullptr;
             const double remaining = c->nestedOsrDeoptRemaining;
+            const bool innerPhase =
+                c->nestedOsrDeoptPhase == 2 &&
+                compiled->nestedOsrInnerYieldGuard;
+            const bool outerPhase = c->nestedOsrDeoptPhase == 1;
+            // The inner source id is frozen by compile-time proof.
+            // Check the current edited source still attaches it to the
+            // selected outer repeat before resuming from a source latch.
+            const bool innerTopology = [&] {
+                if (!innerPhase ||
+                    compiled->nestedOsrInnerLoopId.empty()) return false;
+                const Block* outer =
+                    blocks->getBlock(compiled->nestedOsrLoopId);
+                const Block* nested =
+                    blocks->getBlock(compiled->nestedOsrInnerLoopId);
+                if (!outer || outer->opcode != "control_repeat" ||
+                    !nested || nested->opcode != "control_repeat")
+                    return false;
+                const auto* sub = outer->inputs.find("SUBSTACK");
+                if (!sub || sub->block.empty()) return false;
+                std::unordered_set<std::string> seen;
+                std::string id = sub->block;
+                for (size_t budget = 16; !id.empty() && budget--;) {
+                    if (!seen.insert(id).second) return false;
+                    if (id == compiled->nestedOsrInnerLoopId) return true;
+                    const Block* stmt = blocks->getBlock(id);
+                    if (!stmt) return false;
+                    id = stmt->next;
+                }
+                return false;
+            }();
+            const auto validCounter = [](double n) {
+                return std::isfinite(n) && n >= 0.0 &&
+                       n <= 1099511627776.0 &&
+                       std::floor(n) == n;
+            };
+            const double innerRemaining =
+                c->nestedOsrDeoptInnerRemaining;
             const bool safe = c->nestedOsrDeoptReady == 1 &&
+                (outerPhase ||
+                 (innerPhase && innerTopology &&
+                  validCounter(innerRemaining))) &&
                 !thread.isKilled &&
                 runtime.isActiveThread(&thread) &&
                 thread.peekStack() == compiled->nestedOsrLoopId &&
@@ -1500,12 +1540,30 @@ void Sequencer::jitStepThread(Thread& thread) {
                 return;
             }
             ec->loopCounter = remaining;
+            if (innerPhase) {
+                // Preserve the original caller/outer GC-rooted frames and
+                // their arguments. Resume the completed inner-body latch
+                // with the exact native countdown at the real Fiber yield.
+                thread.pushStack(compiled->nestedOsrInnerLoopId);
+                StackFrame* frame = thread.peekStackFrame();
+                frame->isLoop = true;
+                frame->executionContext = std::make_unique<ExecContext>();
+                frame->executionContext->hasLoopCounter = true;
+                frame->executionContext->loopCounter = innerRemaining;
+            }
             thread.status = STATUS_RUNNING;
-            if (std::getenv("XYO_JIT_OSR_NESTED_TRACE"))
-                std::fprintf(stderr,
-                    "[jit-osr-inflight] deopt remaining=%.0f "
-                    "source-changed=1; interpreter owns original loop\\n",
-                    remaining);
+            if (std::getenv("XYO_JIT_OSR_NESTED_TRACE")) {
+                if (innerPhase)
+                    std::fprintf(stderr,
+                        "[jit-osr-inflight] deopt inner outer=%.0f "
+                        "inner=%.0f source-changed=1\n",
+                        remaining, innerRemaining);
+                else
+                    std::fprintf(stderr,
+                        "[jit-osr-inflight] deopt remaining=%.0f "
+                        "source-changed=1; interpreter owns original loop\n",
+                        remaining);
+            }
             return;
         }
     }

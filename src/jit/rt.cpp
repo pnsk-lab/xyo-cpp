@@ -975,6 +975,34 @@ void xyo_rt_nested_osr_yield_checkpoint(
         std::floor(remainingAfterBody) != remainingAfterBody)
         return;
     c->nestedOsrDeoptRemaining = remainingAfterBody;
+    c->nestedOsrDeoptInnerRemaining = 0.0;
+    c->nestedOsrDeoptPhase = 1;
+    c->nestedOsrDeoptReady = 1;
+}
+
+// OSR-011: called after scalar spills at a genuine inner-body scheduler
+// handoff. LLVM's private counters have not yet run their decrements.
+// The enclosing outer body has not completed. Both after-body counts
+// must be preserved with their exact source loop phase.
+void xyo_rt_nested_osr_inner_yield_checkpoint(
+    JitCtx* c, double outerAfterBody, double innerAfterBody) {
+    if (!c || !c->thread || !c->thread->nestedOsrActive ||
+        !c->thread->compiled) return;
+    const auto* compiled =
+        static_cast<const CompiledScript*>(c->thread->compiled);
+    c->nestedOsrDeoptReady = 0;
+    c->nestedOsrDeoptPhase = 0;
+    const auto valid = [](double v) {
+        return std::isfinite(v) && v >= 0.0 &&
+               v <= 1099511627776.0 && std::floor(v) == v;
+    };
+    if (!compiled->nestedOsrInFlightGuard ||
+        !compiled->nestedOsrInnerYieldGuard ||
+        compiled->nestedOsrInnerLoopId.empty() ||
+        !valid(outerAfterBody) || !valid(innerAfterBody)) return;
+    c->nestedOsrDeoptRemaining = outerAfterBody;
+    c->nestedOsrDeoptInnerRemaining = innerAfterBody;
+    c->nestedOsrDeoptPhase = 2;
     c->nestedOsrDeoptReady = 1;
 }
 

@@ -188,6 +188,11 @@ if(NOT EMSCRIPTEN)
   target_link_libraries(xyo-nested-warp-bounded-inner-deopt-smoke PRIVATE xyo)
   target_compile_options(xyo-nested-warp-bounded-inner-deopt-smoke
     PRIVATE -fno-exceptions -fno-rtti)
+  add_executable(xyo-nested-warp-inner-yield-deopt-smoke
+    platform/nested_warp_inner_yield_deopt_smoke.cpp)
+  target_link_libraries(xyo-nested-warp-inner-yield-deopt-smoke PRIVATE xyo)
+  target_compile_options(xyo-nested-warp-inner-yield-deopt-smoke
+    PRIVATE -fno-exceptions -fno-rtti)
   # A headless Runtime::step test; do not nest in SDL-only tests.
   if(XYO_JIT AND Python3_Interpreter_FOUND)
     add_test(NAME xyo-nested-warp-silent-edit
@@ -225,6 +230,21 @@ if(NOT EMSCRIPTEN)
         --out "${CMAKE_BINARY_DIR}/nested-warp-bounded-inner-deopt-fast"
         --without-block-count)
     set_tests_properties(xyo-nested-warp-bounded-inner-deopt-fast
+      PROPERTIES TIMEOUT 600)
+    add_test(NAME xyo-nested-warp-inner-yield-deopt
+      COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_nested_warp_inner_yield_deopt.py"
+        --harness "$<TARGET_FILE:xyo-nested-warp-inner-yield-deopt-smoke>"
+        --out "${CMAKE_BINARY_DIR}/nested-warp-inner-yield-deopt")
+    set_tests_properties(xyo-nested-warp-inner-yield-deopt
+      PROPERTIES TIMEOUT 600)
+    add_test(NAME xyo-nested-warp-inner-yield-deopt-fast
+      COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_nested_warp_inner_yield_deopt.py"
+        --harness "$<TARGET_FILE:xyo-nested-warp-inner-yield-deopt-smoke>"
+        --out "${CMAKE_BINARY_DIR}/nested-warp-inner-yield-deopt-fast"
+        --without-block-count)
+    set_tests_properties(xyo-nested-warp-inner-yield-deopt-fast
       PROPERTIES TIMEOUT 600)
     # Keep the optimized, uninstrumented LLVM path under test too:
     # block counting disables some native scalar/loop optimizations.

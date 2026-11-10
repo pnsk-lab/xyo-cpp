@@ -266,6 +266,9 @@ struct Codegen {
     bool nestedOsrInFlightGuard = false;
     // OSR-010: a source-proven 1..8 inner repeat must complete atomically.
     bool nestedOsrBoundedInner = false;
+    // OSR-011: a source-proven 1..8192 inner repeat preserves real yields
+    // and captures the two private counters at every handoff.
+    bool nestedOsrInFlightInnerYield = false;
     std::map<std::u16string, llvm::Value*> hoistedNestedOsrArgs;
     /// ループ本体で書き込まれる変数/リスト（不変性判定用）
     struct LoopWriteScan {
@@ -985,20 +988,33 @@ struct Codegen {
 
     void emitNestedOsrYieldCheckpoint() {
         if (!nestedOsrInFlightGuard || !osrStartLoop ||
-            curYieldSourceLoop != osrStartLoop ||
+            !curYieldSourceLoop ||
             (!curYieldRemainingF64 && !curYieldRemainingI32))
             return;
-        llvm::Value* remaining = curYieldRemainingI32
-            ? b.CreateSIToFP(
-                b.CreateLoad(i32t, curYieldRemainingI32), f64t)
-            : b.CreateLoad(f64t, curYieldRemainingF64);
-        // emitLoopYield is called at the END of a completed Scratch body
-        // but the private LLVM counter is decremented only AFTER yield.
-        // Convert to the exact count expected at the next Interpreter
-        // repeat latch. Source edits can then discard the suspended Fiber
-        // without running any more LLVM or replaying prior effects.
-        call2("xyo_rt_nested_osr_yield_checkpoint", voidt, ctxArg,
-              b.CreateFSub(remaining, cf64(1.0)));
+        const auto remaining = [&](AllocaInst* integer, AllocaInst* real) {
+            return integer
+                ? b.CreateSIToFP(b.CreateLoad(i32t, integer), f64t)
+                : b.CreateLoad(f64t, real);
+        };
+        llvm::Value* current =
+            remaining(curYieldRemainingI32, curYieldRemainingF64);
+        llvm::Value* afterBody = b.CreateFSub(current, cf64(1.0));
+        if (curYieldSourceLoop == osrStartLoop) {
+            // Phase 1: the selected outer source body has completed.
+            call2("xyo_rt_nested_osr_yield_checkpoint", voidt, ctxArg,
+                  afterBody);
+            return;
+        }
+        if (!nestedOsrInFlightInnerYield || yieldStack.empty()) return;
+        const auto& outer = yieldStack.back();
+        if (outer.sourceLoop != osrStartLoop ||
+            (!outer.remainingF64 && !outer.remainingI32)) return;
+        // Phase 2: inner body completed, outer body remains incomplete.
+        llvm::Value* outerCurrent =
+            remaining(outer.remainingI32, outer.remainingF64);
+        callN("xyo_rt_nested_osr_inner_yield_checkpoint", voidt,
+              {ctxArg, b.CreateFSub(outerCurrent, cf64(1.0)),
+               afterBody});
     }
 
     // The deadline poll is shared by ordinary Scratch loops and SSA
@@ -7915,22 +7931,27 @@ struct Codegen {
             const bool osrFirstLoop = blk == osrStartLoop;
             const bool boundedNativeInner =
                 nestedOsrInFlightGuard && nestedOsrBoundedInner &&
-                !osrFirstLoop;
+                !nestedOsrInFlightInnerYield && !osrFirstLoop;
+            // Real inner yields must not be hidden by repeat batching,
+            // GPU/par-for delegation, or scalar strip mining.
+            const bool protectedNativeInner = boundedNativeInner ||
+                (nestedOsrInFlightGuard &&
+                 nestedOsrInFlightInnerYield && !osrFirstLoop);
             const auto conditionalRepeat = (osrFirstLoop ||
-                boundedNativeInner || runtime.blockCountEnabled)
+                protectedNativeInner || runtime.blockCountEnabled)
                 ? std::optional<ConditionalRepeatPlan>{}
                 : conditionalRepeatPlan(blk);
-            const auto repeatCopies = (osrFirstLoop || boundedNativeInner || runtime.blockCountEnabled)
+            const auto repeatCopies = (osrFirstLoop || protectedNativeInner || runtime.blockCountEnabled)
                 ? std::nullopt : repeatCopyPlan(blk);
             if (verbose && repeatCopies)
                 std::fprintf(stderr, "xyo-jit: repeat SSA copies %s\n",
                              blk->id.c_str());
-            const auto repeatAffine = (osrFirstLoop || boundedNativeInner || runtime.blockCountEnabled)
+            const auto repeatAffine = (osrFirstLoop || protectedNativeInner || runtime.blockCountEnabled)
                 ? std::nullopt : repeatAffinePlan(blk);
             if (verbose && repeatAffine)
                 std::fprintf(stderr, "xyo-jit: repeat SSA affine %s\n",
                              blk->id.c_str());
-            if (!osrFirstLoop && !boundedNativeInner && !runtime.blockCountEnabled) {
+            if (!osrFirstLoop && !protectedNativeInner && !runtime.blockCountEnabled) {
                 if (auto plan = multiTransientPattern(blk)) {
                     emitTransientMultiRepeat(blk, *plan);
                     return;
@@ -7943,7 +7964,7 @@ struct Codegen {
             // for (i = toNum(TIMES); i >= 0.5; i--) { body; loopYield }
             // Fixed-count straight-line bodies are eligible for bounded
             // strip-mining into groups of at most 512 logical iterations.
-            if (auto plan = (osrFirstLoop || boundedNativeInner || runtime.blockCountEnabled)
+            if (auto plan = (osrFirstLoop || protectedNativeInner || runtime.blockCountEnabled)
                     ? std::optional<RepeatUnrollPlan>{}
                     : repeatUnrollPlan(blk)) {
                 // Evaluate TIMES once, exactly as in the ordinary lowering.
@@ -8015,7 +8036,7 @@ struct Codegen {
             // 本体が GPU 並列実行可能なら xyo_gpu_repeat へ委譲し、
             // 失敗時のみ従来の CPU ループへ進む分岐を emit する。
             const gpu::Program* gp =
-                (nestedOsrInFlightGuard && (osrFirstLoop || boundedNativeInner)) ||
+                (nestedOsrInFlightGuard && (osrFirstLoop || protectedNativeInner)) ||
                 promotedLoop
                     ? nullptr : tryGpuLoop(blk);
             // With a compile-time fixed nonnegative count <= INT32_MAX, the
@@ -9208,10 +9229,15 @@ bool jitEmitScript(llvm::Module& mod, llvm::LLVMContext& lc, Runtime& runtime,
         const char* proof =
             std::getenv("XYO_JIT_OSR_NESTED_SOURCE_PROOF");
         cg.nestedOsrInFlightGuard = proof && proof[0] == '1';
+        const char* innerYield = std::getenv(
+            "XYO_JIT_OSR_NESTED_INNER_YIELD_DEOPT");
+        cg.nestedOsrInFlightInnerYield = cg.nestedOsrInFlightGuard &&
+            innerYield && innerYield[0] == '1';
         if (const char* bounded =
                 std::getenv("XYO_JIT_OSR_NESTED_INNER_BOUNDED");
-            cg.nestedOsrInFlightGuard && bounded &&
-            bounded[0] == '1')
+            cg.nestedOsrInFlightGuard &&
+            !cg.nestedOsrInFlightInnerYield &&
+            bounded && bounded[0] == '1')
             cg.nestedOsrBoundedInner = true;
     }
     // Validate a lossless snapshot of the selected source script. Capturing

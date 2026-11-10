@@ -55,8 +55,9 @@ namespace xyo {
 // one inner repeat of 1..8 iterations containing 1..4 numeric increments.
 // Reject dynamic TIMES, unknown/recursive edges, nested sub-loops and
 // reporters that could hide suspension or observable intermediate effects.
-static bool safeBoundedNativeInnerRepeat(const Blocks& blocks,
-                                         const Block& outer) {
+static bool safeBoundedNativeInnerRepeat(
+    const Blocks& blocks, const Block& outer, bool allowInnerYield = false,
+    std::string* innerId = nullptr) {
     if (outer.opcode != "control_repeat") return false;
     const auto* sub = outer.inputs.find("SUBSTACK");
     if (!sub || sub->block.empty()) return false;
@@ -126,8 +127,10 @@ static bool safeBoundedNativeInnerRepeat(const Blocks& blocks,
                 const auto field = count->fields.find("NUM");
                 if (field == count->fields.end()) return false;
                 const double n = cast::toNumber(field->second.value);
-                if (!std::isfinite(n) || n < 1 || n > 8 ||
+                if (!std::isfinite(n) || n < 1 ||
+                    n > (allowInnerYield ? 8192.0 : 8.0) ||
                     std::floor(n) != n) return false;
+                if (innerId) *innerId = blk->id;
                 if (!self(self, body->block, true)) return false;
             } else {
                 if (blk->opcode != "data_changevariableby" &&
@@ -210,6 +213,7 @@ uint64_t xyo_rt_nested_osr_arg_get(JitCtx*, const char*,
                                     const char16_t*, uint32_t);
 uint64_t xyo_rt_nested_osr_arg_peek(JitCtx*, const char16_t*, uint32_t);
 void xyo_rt_nested_osr_yield_checkpoint(JitCtx*, double);
+void xyo_rt_nested_osr_inner_yield_checkpoint(JitCtx*, double, double);
 void xyo_proc_push(JitCtx*, const char*, const void*, int32_t,
                    const char*, int32_t, int32_t);
 void xyo_proc_pop(JitCtx*);
@@ -456,6 +460,8 @@ const std::pair<const char*, void*> kRtSymbols[] = {
     {"xyo_rt_nested_osr_arg_peek", (void*)&xyo_rt_nested_osr_arg_peek},
     {"xyo_rt_nested_osr_yield_checkpoint",
      (void*)&xyo_rt_nested_osr_yield_checkpoint},
+    {"xyo_rt_nested_osr_inner_yield_checkpoint",
+     (void*)&xyo_rt_nested_osr_inner_yield_checkpoint},
     {"xyo_proc_push", (void*)&xyo_proc_push},
     {"xyo_proc_pop", (void*)&xyo_proc_pop},
     {"xyo_rt_setarg", (void*)&xyo_rt_setarg},
@@ -1187,14 +1193,32 @@ std::unique_ptr<PendingJitCompilation> LLVMBackend::prepareAsync(
             "XYO_JIT_OSR_NESTED_INNER_BOUNDED");
         const char* proof = std::getenv(
             "XYO_JIT_OSR_NESTED_SOURCE_PROOF");
-        const bool safeBounded = !flat && bounded &&
+        const char* requestedInnerYield = std::getenv(
+            "XYO_JIT_OSR_NESTED_INNER_YIELD_DEOPT");
+        const bool innerYield = requestedInnerYield &&
+            requestedInnerYield[0] == '1';
+        // Inner yields must take priority over OSR-010's atomic lowering.
+        // Both paths require an independently source-proven loop shape.
+        std::string frozenInnerId;
+        const bool safeInner = !flat && proof && proof[0] == '1' &&
+            innerYield && safeBoundedNativeInnerRepeat(
+                *thread.blockContainer, *nested.loop, true,
+                &frozenInnerId);
+        const bool safeBounded = !innerYield && !flat && bounded &&
             bounded[0] == '1' && proof && proof[0] == '1' &&
             safeBoundedNativeInnerRepeat(
                 *thread.blockContainer, *nested.loop);
-        if (safeBounded && std::getenv("XYO_JIT_OSR_NESTED_TRACE"))
+        if (safeInner) {
+            code->nestedOsrInnerYieldGuard = true;
+            code->nestedOsrInnerLoopId = std::move(frozenInnerId);
+        }
+        if ((safeInner || safeBounded) &&
+            std::getenv("XYO_JIT_OSR_NESTED_TRACE"))
             std::fprintf(stderr,
-                "[jit-osr-inflight] bounded inner repeat accepted\n");
-        if (!flat && !safeBounded) nested = {};
+                safeInner
+                    ? "[jit-osr-inflight] yielding inner repeat accepted\n"
+                    : "[jit-osr-inflight] bounded inner repeat accepted\n");
+        if (!flat && !safeInner && !safeBounded) nested = {};
     }
     const uint64_t nestedSourceRevision = nested.loop
         ? thread.blockContainer->revision() : 0;

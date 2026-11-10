@@ -218,6 +218,10 @@ struct JitCtx {
     // This is NOT an arbitrary LLVM SSA/effect-PC deoptimizer.
     int32_t nestedOsrDeoptReady = 0;
     double nestedOsrDeoptRemaining = 0.0;
+    // 0: invalid; 1: completed outer body; 2: completed inner body.
+    // OSR-011 snapshots are valid only after an actual Fiber yield.
+    int32_t nestedOsrDeoptPhase = 0;
+    double nestedOsrDeoptInnerRemaining = 0.0;
 };
 
 /// Publish an entire execution slice with one atomic RMW, including when a
@@ -295,6 +299,9 @@ struct CompiledScript {
     // Requires source proof. Only a completed counted-loop body may be
     // handed back after a native Fiber scheduler suspension.
     bool nestedOsrInFlightGuard = false;
+    // Frozen source id; never select an inner loop from edited Blocks.
+    bool nestedOsrInnerYieldGuard = false;
+    std::string nestedOsrInnerLoopId;
 };
 
 class JitEngine {
