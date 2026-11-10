@@ -996,12 +996,20 @@ void xyo_rt_nested_osr_inner_yield_checkpoint(
         return std::isfinite(v) && v >= 0.0 &&
                v <= 1099511627776.0 && std::floor(v) == v;
     };
+    // Scratch rounds TIMES with Math.round (ties toward +infinity).
+    // LLVM's f64 countdown can be fractional and after the last body
+    // as low as -0.5. Normalize the completed-body latch, never
+    // re-evaluate the mutable source TIMES reporter.
+    if (!std::isfinite(innerAfterBody) ||
+        innerAfterBody < -0.5 ||
+        innerAfterBody > 1099511627776.0) return;
+    const double normalizedInner = std::floor(innerAfterBody + 0.5);
     if (!compiled->nestedOsrInFlightGuard ||
         !compiled->nestedOsrInnerYieldGuard ||
         compiled->nestedOsrInnerLoopId.empty() ||
-        !valid(outerAfterBody) || !valid(innerAfterBody)) return;
+        !valid(outerAfterBody) || !valid(normalizedInner)) return;
     c->nestedOsrDeoptRemaining = outerAfterBody;
-    c->nestedOsrDeoptInnerRemaining = innerAfterBody;
+    c->nestedOsrDeoptInnerRemaining = normalizedInner;
     c->nestedOsrDeoptPhase = 2;
     c->nestedOsrDeoptReady = 1;
 }

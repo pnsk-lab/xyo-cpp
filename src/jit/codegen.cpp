@@ -8086,7 +8086,8 @@ struct Codegen {
             // 「カウンタ + append」ループなら par-for を試す（warp 実行中のみ）。
             // 失敗（0 返却）時は従来の CPU ループへ落ちる。
             const bool triedParFor =
-                nestedOsrInFlightGuard && (osrFirstLoop || boundedNativeInner)
+                nestedOsrInFlightGuard &&
+                (osrFirstLoop || protectedNativeInner)
                     ? false : tryEmitParFor(blk, n, head, merge);
             if (!triedParFor) {
                 if (gp) {

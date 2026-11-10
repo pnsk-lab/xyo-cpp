@@ -193,6 +193,11 @@ if(NOT EMSCRIPTEN)
   target_link_libraries(xyo-nested-warp-inner-yield-deopt-smoke PRIVATE xyo)
   target_compile_options(xyo-nested-warp-inner-yield-deopt-smoke
     PRIVATE -fno-exceptions -fno-rtti)
+  add_executable(xyo-nested-warp-dynamic-inner-deopt-smoke
+    platform/nested_warp_dynamic_inner_deopt_smoke.cpp)
+  target_link_libraries(xyo-nested-warp-dynamic-inner-deopt-smoke PRIVATE xyo)
+  target_compile_options(xyo-nested-warp-dynamic-inner-deopt-smoke
+    PRIVATE -fno-exceptions -fno-rtti)
   # A headless Runtime::step test; do not nest in SDL-only tests.
   if(XYO_JIT AND Python3_Interpreter_FOUND)
     add_test(NAME xyo-nested-warp-silent-edit
@@ -246,6 +251,28 @@ if(NOT EMSCRIPTEN)
         --without-block-count)
     set_tests_properties(xyo-nested-warp-inner-yield-deopt-fast
       PROPERTIES TIMEOUT 600)
+    foreach(dynamic_mode IN ITEMS default active)
+      foreach(dynamic_fast IN ITEMS on off)
+        set(dynamic_name "xyo-nested-warp-dynamic-inner-deopt")
+        set(dynamic_args)
+        if(dynamic_mode STREQUAL "active")
+          string(APPEND dynamic_name "-active")
+          list(APPEND dynamic_args --stress-active-times)
+        endif()
+        if(dynamic_fast STREQUAL "off")
+          string(APPEND dynamic_name "-fast")
+          list(APPEND dynamic_args --without-block-count)
+        endif()
+        add_test(NAME "${dynamic_name}"
+          COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_nested_warp_dynamic_inner_deopt.py"
+            --harness "$<TARGET_FILE:xyo-nested-warp-dynamic-inner-deopt-smoke>"
+            --out "${CMAKE_BINARY_DIR}/${dynamic_name}"
+            ${dynamic_args})
+        set_tests_properties("${dynamic_name}"
+          PROPERTIES TIMEOUT 600)
+      endforeach()
+    endforeach()
     # Keep the optimized, uninstrumented LLVM path under test too:
     # block counting disables some native scalar/loop optimizations.
     add_test(NAME xyo-nested-warp-inflight-body-edit-fast

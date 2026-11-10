@@ -50,6 +50,50 @@
 
 namespace xyo {
 
+// OSR-012: accept only bounded, pure, acyclic variable/add/sub TIMES.
+// The mutable live value must never replace LLVM's private countdown.
+static bool safeDynamicInnerTimes(const Blocks& blocks,
+                                  const std::string& root) {
+    std::unordered_set<std::string> seen;
+    bool hasVariable = false;
+    const auto visit = [&](auto&& self, const std::string& id,
+                           uint32_t depth) -> bool {
+        if (id.empty() || depth > 4 || seen.size() >= 12 ||
+            !seen.insert(id).second) return false;
+        const Block* node = blocks.getBlock(id);
+        if (!node || !node->next.empty()) return false;
+        const auto& op = node->opcode;
+        if (op == "data_variable") {
+            if (!node->inputs.items.empty()) return false;
+            const auto field = node->fields.find("VARIABLE");
+            if (field == node->fields.end() ||
+                field->second.id.empty()) return false;
+            hasVariable = true;
+            return true;
+        }
+        if (op == "math_number" || op == "math_integer" ||
+            op == "math_whole_number" ||
+            op == "math_positive_number") {
+            if (!node->inputs.items.empty()) return false;
+            const auto field = node->fields.find("NUM");
+            return field != node->fields.end() &&
+                   std::isfinite(cast::toNumber(field->second.value));
+        }
+        if (op != "operator_add" && op != "operator_subtract")
+            return false;
+        if (node->inputs.items.size() != 2) return false;
+        for (const char* inputName : {"NUM1", "NUM2"}) {
+            const BlockInput* operand = node->inputs.find(inputName);
+            if (!operand) return false;
+            const auto& child = operand->block.empty()
+                ? operand->shadow : operand->block;
+            if (!self(self, child, depth + 1)) return false;
+        }
+        return true;
+    };
+    return visit(visit, root, 0) && hasVariable;
+}
+
 // OSR-010: the enclosing native counted-repeat body is a safe deopt point
 // only if this ONE short inner repeat is atomic. This proof accepts exactly
 // one inner repeat of 1..8 iterations containing 1..4 numeric increments.
@@ -57,7 +101,7 @@ namespace xyo {
 // reporters that could hide suspension or observable intermediate effects.
 static bool safeBoundedNativeInnerRepeat(
     const Blocks& blocks, const Block& outer, bool allowInnerYield = false,
-    std::string* innerId = nullptr) {
+    std::string* innerId = nullptr, bool allowDynamicTimes = false) {
     if (outer.opcode != "control_repeat") return false;
     const auto* sub = outer.inputs.find("SUBSTACK");
     if (!sub || sub->block.empty()) return false;
@@ -118,23 +162,29 @@ static bool safeBoundedNativeInnerRepeat(
                 const auto& timesId = times->block.empty()
                     ? times->shadow : times->block;
                 const Block* count = blocks.getBlock(timesId);
-                if (!count || !count->next.empty() ||
-                    (count->opcode != "math_number" &&
-                     count->opcode != "math_integer" &&
-                     count->opcode != "math_whole_number" &&
-                     count->opcode != "math_positive_number"))
+                if (!count || !count->next.empty()) return false;
+                const bool literal = count->opcode == "math_number" ||
+                    count->opcode == "math_integer" ||
+                    count->opcode == "math_whole_number" ||
+                    count->opcode == "math_positive_number";
+                if (literal) {
+                    if (!count->inputs.items.empty()) return false;
+                    const auto field = count->fields.find("NUM");
+                    if (field == count->fields.end()) return false;
+                    const double n = cast::toNumber(field->second.value);
+                    if (!std::isfinite(n) || n < 1 ||
+                        n > (allowInnerYield ? 8192.0 : 8.0) ||
+                        std::floor(n) != n) return false;
+                } else if (!(allowInnerYield && allowDynamicTimes &&
+                             safeDynamicInnerTimes(blocks, timesId))) {
                     return false;
-                const auto field = count->fields.find("NUM");
-                if (field == count->fields.end()) return false;
-                const double n = cast::toNumber(field->second.value);
-                if (!std::isfinite(n) || n < 1 ||
-                    n > (allowInnerYield ? 8192.0 : 8.0) ||
-                    std::floor(n) != n) return false;
+                }
                 if (innerId) *innerId = blk->id;
                 if (!self(self, body->block, true)) return false;
             } else {
                 if (blk->opcode != "data_changevariableby" &&
-                    !(blk->opcode == "data_setvariableto" && !innerBody))
+                    !(blk->opcode == "data_setvariableto" &&
+                      (!innerBody || allowDynamicTimes)))
                     return false;
                 const auto field = blk->fields.find("VARIABLE");
                 if (field == blk->fields.end() ||
@@ -1199,11 +1249,15 @@ std::unique_ptr<PendingJitCompilation> LLVMBackend::prepareAsync(
             requestedInnerYield[0] == '1';
         // Inner yields must take priority over OSR-010's atomic lowering.
         // Both paths require an independently source-proven loop shape.
+        const char* dynamic = std::getenv(
+            "XYO_JIT_OSR_NESTED_INNER_DYNAMIC");
+        const bool allowDynamic = innerYield && dynamic &&
+            dynamic[0] == '1';
         std::string frozenInnerId;
         const bool safeInner = !flat && proof && proof[0] == '1' &&
             innerYield && safeBoundedNativeInnerRepeat(
                 *thread.blockContainer, *nested.loop, true,
-                &frozenInnerId);
+                &frozenInnerId, allowDynamic);
         const bool safeBounded = !innerYield && !flat && bounded &&
             bounded[0] == '1' && proof && proof[0] == '1' &&
             safeBoundedNativeInnerRepeat(
