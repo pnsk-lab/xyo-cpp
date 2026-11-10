@@ -365,6 +365,9 @@ jobs:
         with:
           bun-version: "1.4.4"
 
+      - name: Validate strict 100% ScratchBench parity gate
+        run: bun tools/ci/test-scratch-bench-summary.ts
+
       - name: Install scratch-bench
         working-directory: scratch-bench
         run: |
