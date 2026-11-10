@@ -1050,6 +1050,50 @@ void xyo_rt_nested_osr_triple_yield_checkpoint(
     c->nestedOsrDeoptReady = 1;
 }
 
+// OSR-014: fourth-level counted source continuation. Only committed
+// leaf bodies at actual Fiber yields may publish phase-4 counters.
+void xyo_rt_nested_osr_quad_yield_checkpoint(
+    JitCtx* c, double outerAfterBody, double middleAfterBody,
+    double deepAfterBody, double fourthAfterBody) {
+    if (!c || !c->thread || !c->thread->nestedOsrActive ||
+        !c->thread->compiled) return;
+    const auto* compiled =
+        static_cast<const CompiledScript*>(c->thread->compiled);
+    // A malformed phase-4 update must invalidate older checkpoint data.
+    c->nestedOsrDeoptReady = 0;
+    c->nestedOsrDeoptPhase = 0;
+    if (!compiled->nestedOsrInFlightGuard ||
+        !compiled->nestedOsrInnerYieldGuard ||
+        compiled->nestedOsrInnerLoopId.empty() ||
+        compiled->nestedOsrDeepInnerLoopId.empty() ||
+        compiled->nestedOsrFourthLoopId.empty()) return;
+    const auto validNative = [](double v) {
+        return std::isfinite(v) && v >= -0.5 &&
+               v <= 1099511627776.0;
+    };
+    const auto validCount = [](double v) {
+        return std::isfinite(v) && v >= 0.0 &&
+               v <= 1099511627776.0 && std::floor(v) == v;
+    };
+    if (!validCount(outerAfterBody) ||
+        !validNative(middleAfterBody) ||
+        !validNative(deepAfterBody) ||
+        !validNative(fourthAfterBody)) return;
+    // Native post-body values have not had the loop-latch decrement
+    // applied. Scratch half-integer repeat counts round toward +inf.
+    const double middle = std::floor(middleAfterBody + 0.5);
+    const double deep = std::floor(deepAfterBody + 0.5);
+    const double fourth = std::floor(fourthAfterBody + 0.5);
+    if (!validCount(middle) || !validCount(deep) ||
+        !validCount(fourth)) return;
+    c->nestedOsrDeoptRemaining = outerAfterBody;
+    c->nestedOsrDeoptInnerRemaining = middle;
+    c->nestedOsrDeoptDeepRemaining = deep;
+    c->nestedOsrDeoptFourthRemaining = fourth;
+    c->nestedOsrDeoptPhase = 4;
+    c->nestedOsrDeoptReady = 1;
+}
+
 uint64_t xyo_rt_nested_osr_arg_peek(
     JitCtx* c, const char16_t* name, uint32_t length) {
     Thread* t = c ? c->thread : nullptr;

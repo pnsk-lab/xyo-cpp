@@ -203,6 +203,11 @@ if(NOT EMSCRIPTEN)
   target_link_libraries(xyo-nested-warp-triple-yield-deopt-smoke PRIVATE xyo)
   target_compile_options(xyo-nested-warp-triple-yield-deopt-smoke
     PRIVATE -fno-exceptions -fno-rtti)
+  add_executable(xyo-nested-warp-quad-yield-deopt-smoke
+    platform/nested_warp_quad_yield_deopt_smoke.cpp)
+  target_link_libraries(xyo-nested-warp-quad-yield-deopt-smoke PRIVATE xyo)
+  target_compile_options(xyo-nested-warp-quad-yield-deopt-smoke
+    PRIVATE -fno-exceptions -fno-rtti)
   # A headless Runtime::step test; do not nest in SDL-only tests.
   if(XYO_JIT AND Python3_Interpreter_FOUND)
     add_test(NAME xyo-nested-warp-silent-edit
@@ -299,6 +304,30 @@ if(NOT EMSCRIPTEN)
             --out "${CMAKE_BINARY_DIR}/${triple_name}"
             ${triple_args})
         set_tests_properties("${triple_name}" PROPERTIES TIMEOUT 600)
+      endforeach()
+    endforeach()
+    foreach(quad_fraction IN ITEMS off on)
+      foreach(quad_fast IN ITEMS off on)
+        set(quad_name "xyo-nested-warp-quad-yield")
+        set(quad_args --outer-count 100000)
+        if(quad_fraction STREQUAL "on")
+          string(APPEND quad_name "-fractional")
+          list(APPEND quad_args --fractional)
+        else()
+          string(APPEND quad_name "-deopt")
+        endif()
+        if(quad_fast STREQUAL "on")
+          string(APPEND quad_name "-fast")
+          list(APPEND quad_args --without-block-count)
+        endif()
+        add_test(NAME "${quad_name}"
+          COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_nested_warp_quad_yield_deopt.py"
+            --harness "$<TARGET_FILE:xyo-nested-warp-quad-yield-deopt-smoke>"
+            --out "${CMAKE_BINARY_DIR}/${quad_name}"
+            ${quad_args})
+        set_tests_properties("${quad_name}"
+          PROPERTIES TIMEOUT 600)
       endforeach()
     endforeach()
     # Keep the optimized, uninstrumented LLVM path under test too:

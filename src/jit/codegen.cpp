@@ -271,6 +271,8 @@ struct Codegen {
     bool nestedOsrInFlightInnerYield = false;
     // Strict opt-in: selected outer -> middle -> leaf source counters.
     bool nestedOsrInFlightTripleYield = false;
+    // Strict opt-in fourth counted loop, no arbitrary SSA-PC recovery.
+    bool nestedOsrInFlightQuadYield = false;
     std::map<std::u16string, llvm::Value*> hoistedNestedOsrArgs;
     /// ループ本体で書き込まれる変数/リスト（不変性判定用）
     struct LoopWriteScan {
@@ -1021,6 +1023,26 @@ struct Codegen {
             callN("xyo_rt_nested_osr_inner_yield_checkpoint", voidt,
                   {ctxArg, enclosingAfterBody, afterBody});
             return;
+        }
+        if (nestedOsrInFlightQuadYield && yieldStack.size() >= 3) {
+            const auto& selected = yieldStack[yieldStack.size() - 3];
+            const auto& middle = yieldStack[yieldStack.size() - 2];
+            if (selected.sourceLoop == osrStartLoop &&
+                middle.sourceLoop &&
+                (middle.remainingF64 || middle.remainingI32) &&
+                (selected.remainingF64 || selected.remainingI32)) {
+                llvm::Value* selectedCurrent =
+                    remaining(selected.remainingI32, selected.remainingF64);
+                llvm::Value* middleCurrent =
+                    remaining(middle.remainingI32, middle.remainingF64);
+                // Phase 4: a fully committed leaf body with three
+                // unfinished enclosing repeat bodies.
+                callN("xyo_rt_nested_osr_quad_yield_checkpoint", voidt,
+                    {ctxArg, b.CreateFSub(selectedCurrent, cf64(1.0)),
+                     b.CreateFSub(middleCurrent, cf64(1.0)),
+                     enclosingAfterBody, afterBody});
+                return;
+            }
         }
         if (!nestedOsrInFlightTripleYield || yieldStack.size() < 2)
             return;
@@ -9259,6 +9281,13 @@ bool jitEmitScript(llvm::Module& mod, llvm::LLVMContext& lc, Runtime& runtime,
         cg.nestedOsrInFlightTripleYield =
             cg.nestedOsrInFlightInnerYield &&
             triple && triple[0] == '1';
+        const char* quad = std::getenv(
+            "XYO_JIT_OSR_NESTED_QUAD_YIELD");
+        const char* dynamic = std::getenv(
+            "XYO_JIT_OSR_NESTED_INNER_DYNAMIC");
+        cg.nestedOsrInFlightQuadYield =
+            cg.nestedOsrInFlightTripleYield &&
+            dynamic && dynamic[0] == '1' && quad && quad[0] == '1';
         if (const char* bounded =
                 std::getenv("XYO_JIT_OSR_NESTED_INNER_BOUNDED");
             cg.nestedOsrInFlightGuard &&

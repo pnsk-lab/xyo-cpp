@@ -224,6 +224,8 @@ struct JitCtx {
     double nestedOsrDeoptInnerRemaining = 0.0;
     // OSR-013: the deepest completed body in three lexical repeats.
     double nestedOsrDeoptDeepRemaining = 0.0;
+    // OSR-014: deepest source latch in four lexical counted repeats.
+    double nestedOsrDeoptFourthRemaining = 0.0;
 };
 
 /// Publish an entire execution slice with one atomic RMW, including when a
@@ -305,6 +307,7 @@ struct CompiledScript {
     bool nestedOsrInnerYieldGuard = false;
     std::string nestedOsrInnerLoopId;
     std::string nestedOsrDeepInnerLoopId;
+    std::string nestedOsrFourthLoopId;
 };
 
 class JitEngine {

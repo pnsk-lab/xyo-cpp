@@ -102,14 +102,16 @@ static bool safeDynamicInnerTimes(const Blocks& blocks,
 static bool safeBoundedNativeInnerRepeat(
     const Blocks& blocks, const Block& outer, bool allowInnerYield = false,
     std::string* innerId = nullptr, bool allowDynamicTimes = false,
-    bool allowTripleYield = false, std::string* deepId = nullptr) {
+    bool allowTripleYield = false, std::string* deepId = nullptr,
+    bool allowQuadYield = false, std::string* fourthId = nullptr) {
     if (outer.opcode != "control_repeat") return false;
     const auto* sub = outer.inputs.find("SUBSTACK");
     if (!sub || sub->block.empty()) return false;
     std::unordered_set<std::string> seen;
     size_t nodes = 0;
     size_t nested = 0;
-    const size_t maxNested = allowTripleYield ? 2 : 1;
+    const size_t maxNested = allowQuadYield ? 3 :
+                             allowTripleYield ? 2 : 1;
     // Even a primitive setter may contain an asynchronous VALUE reporter.
     // Accept only bounded, pure, acyclic expression graphs at the source
     // boundary; never infer that an arbitrary extension/compat call is safe.
@@ -184,6 +186,7 @@ static bool safeBoundedNativeInnerRepeat(
                 }
                 if (depth == 0 && innerId) *innerId = blk->id;
                 if (depth == 1 && deepId) *deepId = blk->id;
+                if (depth == 2 && fourthId) *fourthId = blk->id;
                 if (!self(self, body->block, depth + 1)) return false;
             } else {
                 if (blk->opcode != "data_changevariableby" &&
@@ -270,6 +273,8 @@ void xyo_rt_nested_osr_yield_checkpoint(JitCtx*, double);
 void xyo_rt_nested_osr_inner_yield_checkpoint(JitCtx*, double, double);
 void xyo_rt_nested_osr_triple_yield_checkpoint(
     JitCtx*, double, double, double);
+void xyo_rt_nested_osr_quad_yield_checkpoint(
+    JitCtx*, double, double, double, double);
 void xyo_proc_push(JitCtx*, const char*, const void*, int32_t,
                    const char*, int32_t, int32_t);
 void xyo_proc_pop(JitCtx*);
@@ -520,6 +525,8 @@ const std::pair<const char*, void*> kRtSymbols[] = {
      (void*)&xyo_rt_nested_osr_inner_yield_checkpoint},
     {"xyo_rt_nested_osr_triple_yield_checkpoint",
      (void*)&xyo_rt_nested_osr_triple_yield_checkpoint},
+    {"xyo_rt_nested_osr_quad_yield_checkpoint",
+     (void*)&xyo_rt_nested_osr_quad_yield_checkpoint},
     {"xyo_proc_push", (void*)&xyo_proc_push},
     {"xyo_proc_pop", (void*)&xyo_proc_pop},
     {"xyo_rt_setarg", (void*)&xyo_rt_setarg},
@@ -1265,13 +1272,18 @@ std::unique_ptr<PendingJitCompilation> LLVMBackend::prepareAsync(
             "XYO_JIT_OSR_NESTED_TRIPLE_YIELD");
         const bool allowTriple = allowDynamic && triple &&
             triple[0] == '1';
+        const char* quad = std::getenv(
+            "XYO_JIT_OSR_NESTED_QUAD_YIELD");
+        const bool allowQuad = allowTriple && quad &&
+            quad[0] == '1';
         std::string frozenInnerId;
         std::string frozenDeepId;
+        std::string frozenFourthId;
         const bool safeInner = !flat && proof && proof[0] == '1' &&
             innerYield && safeBoundedNativeInnerRepeat(
                 *thread.blockContainer, *nested.loop, true,
                 &frozenInnerId, allowDynamic, allowTriple,
-                &frozenDeepId);
+                &frozenDeepId, allowQuad, &frozenFourthId);
         const bool safeBounded = !innerYield && !flat && bounded &&
             bounded[0] == '1' && proof && proof[0] == '1' &&
             safeBoundedNativeInnerRepeat(
@@ -1280,6 +1292,7 @@ std::unique_ptr<PendingJitCompilation> LLVMBackend::prepareAsync(
             code->nestedOsrInnerYieldGuard = true;
             code->nestedOsrInnerLoopId = std::move(frozenInnerId);
             code->nestedOsrDeepInnerLoopId = std::move(frozenDeepId);
+            code->nestedOsrFourthLoopId = std::move(frozenFourthId);
         }
         if ((safeInner || safeBounded) &&
             std::getenv("XYO_JIT_OSR_NESTED_TRACE"))

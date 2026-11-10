@@ -1480,12 +1480,17 @@ void Sequencer::jitStepThread(Thread& thread) {
                 c->nestedOsrDeoptPhase == 3 &&
                 compiled->nestedOsrInnerYieldGuard &&
                 !compiled->nestedOsrDeepInnerLoopId.empty();
+            const bool quadPhase =
+                c->nestedOsrDeoptPhase == 4 &&
+                compiled->nestedOsrInnerYieldGuard &&
+                !compiled->nestedOsrDeepInnerLoopId.empty() &&
+                !compiled->nestedOsrFourthLoopId.empty();
             const bool outerPhase = c->nestedOsrDeoptPhase == 1;
             // The inner source id is frozen by compile-time proof.
             // Check the current edited source still attaches it to the
             // selected outer repeat before resuming from a source latch.
             const bool innerTopology = [&] {
-                if (!(innerPhase || triplePhase) ||
+                if (!(innerPhase || triplePhase || quadPhase) ||
                     compiled->nestedOsrInnerLoopId.empty()) return false;
                 const Block* outer =
                     blocks->getBlock(compiled->nestedOsrLoopId);
@@ -1513,7 +1518,8 @@ void Sequencer::jitStepThread(Thread& thread) {
                        std::floor(n) == n;
             };
             const bool deepestTopology = [&] {
-                if (!triplePhase || !innerTopology) return false;
+                if (!(triplePhase || quadPhase) || !innerTopology)
+                    return false;
                 const Block* middle =
                     blocks->getBlock(compiled->nestedOsrInnerLoopId);
                 const Block* leaf =
@@ -1535,17 +1541,46 @@ void Sequencer::jitStepThread(Thread& thread) {
                 }
                 return false;
             }();
+            const bool fourthTopology = [&] {
+                if (!quadPhase || !deepestTopology) return false;
+                const Block* deep =
+                    blocks->getBlock(compiled->nestedOsrDeepInnerLoopId);
+                const Block* leaf =
+                    blocks->getBlock(compiled->nestedOsrFourthLoopId);
+                if (!deep || !leaf ||
+                    deep->opcode != "control_repeat" ||
+                    leaf->opcode != "control_repeat") return false;
+                const auto* sub = deep->inputs.find("SUBSTACK");
+                if (!sub || sub->block.empty()) return false;
+                std::unordered_set<std::string> visited;
+                std::string id = sub->block;
+                for (size_t budget = 16; !id.empty() && budget--;) {
+                    if (!visited.insert(id).second) return false;
+                    if (id == compiled->nestedOsrFourthLoopId)
+                        return true;
+                    const Block* node = blocks->getBlock(id);
+                    if (!node) return false;
+                    id = node->next;
+                }
+                return false;
+            }();
             const double innerRemaining =
                 c->nestedOsrDeoptInnerRemaining;
             const double deepestRemaining =
                 c->nestedOsrDeoptDeepRemaining;
+            const double fourthRemaining =
+                c->nestedOsrDeoptFourthRemaining;
             const bool safe = c->nestedOsrDeoptReady == 1 &&
                 (outerPhase ||
                  (innerPhase && innerTopology &&
                   validCounter(innerRemaining)) ||
                  (triplePhase && deepestTopology &&
                   validCounter(innerRemaining) &&
-                  validCounter(deepestRemaining))) &&
+                  validCounter(deepestRemaining)) ||
+                 (quadPhase && fourthTopology &&
+                  validCounter(innerRemaining) &&
+                  validCounter(deepestRemaining) &&
+                  validCounter(fourthRemaining))) &&
                 !thread.isKilled &&
                 runtime.isActiveThread(&thread) &&
                 thread.peekStack() == compiled->nestedOsrLoopId &&
@@ -1572,7 +1607,7 @@ void Sequencer::jitStepThread(Thread& thread) {
                 return;
             }
             ec->loopCounter = remaining;
-            if (innerPhase || triplePhase) {
+            if (innerPhase || triplePhase || quadPhase) {
                 // Original caller/outer frames still root all arguments.
                 // Reconstruct only the frozen lexical source loop path.
                 const auto restoreCounted =
@@ -1587,13 +1622,23 @@ void Sequencer::jitStepThread(Thread& thread) {
                     };
                 restoreCounted(compiled->nestedOsrInnerLoopId,
                                innerRemaining);
-                if (triplePhase)
+                if (triplePhase || quadPhase)
                     restoreCounted(compiled->nestedOsrDeepInnerLoopId,
                                    deepestRemaining);
+                if (quadPhase)
+                    restoreCounted(compiled->nestedOsrFourthLoopId,
+                                   fourthRemaining);
             }
             thread.status = STATUS_RUNNING;
             if (std::getenv("XYO_JIT_OSR_NESTED_TRACE")) {
-                if (triplePhase)
+                if (quadPhase)
+                    std::fprintf(stderr,
+                        "[jit-osr-inflight] deopt quad outer=%.0f "
+                        "middle=%.0f deep=%.0f leaf=%.0f "
+                        "source-changed=1\n",
+                        remaining, innerRemaining,
+                        deepestRemaining, fourthRemaining);
+                else if (triplePhase)
                     std::fprintf(stderr,
                         "[jit-osr-inflight] deopt triple outer=%.0f "
                         "middle=%.0f leaf=%.0f source-changed=1\n",
