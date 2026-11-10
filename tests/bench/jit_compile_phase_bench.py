@@ -40,6 +40,7 @@ CONFIGS = {
     "interpreter": ("off", None, None, None),
     "hotspot_auto": ("hotspot", None, None, None),
     "hotspot_parfor_on": ("hotspot", None, None, None),
+    "hotspot_parfor_partition": ("hotspot", None, None, None),
     "hotspot_async": ("hotspot", None, None, None),
     "hotspot_lazy_on": ("hotspot", None, None, "on"),
     "hotspot_lazy_off": ("hotspot", None, None, "off"),
@@ -116,7 +117,11 @@ def run_one(binary: Path, project: Path, config: str, cpu: int,
            if not k.startswith("XYO_JIT_") and not k.startswith("XYO_STARTUP_")}
     env.update(XYO_STARTUP_TIMING="1", XYO_JIT_TIMING="1",
                XYO_GPU="0", XYO_PAR="0",
-               XYO_PARFOR="1" if config.endswith("_parfor_on") else "0")
+               XYO_PARFOR="1" if (
+                   config.endswith("_parfor_on") or
+                   config == "hotspot_parfor_partition") else "0")
+    if config == "hotspot_parfor_partition":
+        env["XYO_JIT_LAZY_PARFOR_PARTITION"] = "1"
     if object_timing:
         env["XYO_JIT_OBJECT_TIMING"] = "1"
     if opt is not None:

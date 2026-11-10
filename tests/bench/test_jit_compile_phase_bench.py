@@ -49,6 +49,7 @@ class PhaseParserTests(unittest.TestCase):
         self.assertEqual(CONFIGS["hotspot_async"][0], "hotspot")
         self.assertEqual(CONFIGS["hotspot_lazy_on"][3], "on")
         self.assertEqual(CONFIGS["hotspot_lazy_off"][3], "off")
+        self.assertEqual(CONFIGS["hotspot_parfor_partition"][0], "hotspot")
 
 
 if __name__ == "__main__":

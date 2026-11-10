@@ -6,6 +6,7 @@
 
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/ExecutionEngine/Orc/IRTransformLayer.h>
+#include <llvm/ExecutionEngine/Orc/IRPartitionLayer.h>
 #include <llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h>
 #include <llvm/ExecutionEngine/Orc/ObjectTransformLayer.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
@@ -1125,6 +1126,68 @@ LLVMBackend::LLVMBackend() {
     });
 }
 
+// Experimental ORC partitioning. If a materialized function passes the
+// address of an internal par-for callback to native C++, materialize both
+// functions in one ORC partition. Do not assume that a function pointer
+// referring to an unmaterialized private definition is callable.
+static std::optional<llvm::orc::IRPartitionLayer::GlobalValueSet>
+partitionParForCallbacks(llvm::orc::IRPartitionLayer::GlobalValueSet requested) {
+    auto together = requested;
+    for (const llvm::GlobalValue* requestedValue : requested) {
+        const auto* caller = llvm::dyn_cast<llvm::Function>(requestedValue);
+        if (!caller || caller->isDeclaration()) continue;
+        for (const llvm::BasicBlock& block : *caller) {
+            for (const llvm::Instruction& inst : block) {
+                const auto* call = llvm::dyn_cast<llvm::CallBase>(&inst);
+                if (!call) continue;
+                const llvm::Value* target =
+                    call->getCalledOperand()->stripPointerCasts();
+                const auto* callee = llvm::dyn_cast<llvm::Function>(target);
+                if (!callee || callee->getName() != "xyo_par_for") continue;
+                if (call->arg_size() != 8) return std::nullopt;
+                const llvm::Value* pointer =
+                    call->getArgOperand(7)->stripPointerCasts();
+                const auto* body = llvm::dyn_cast<llvm::Function>(pointer);
+                if (!body || body->isDeclaration() ||
+                    body->getParent() != caller->getParent())
+                    return std::nullopt;
+                together.insert(body);
+            }
+        }
+    }
+    if (together.size() != requested.size() &&
+        std::getenv("XYO_JIT_LAZY_CALLBACK_TRACE"))
+        std::fprintf(stderr,
+            "[jit-lazy-partition] requested=%zu materialized=%zu callbacks=%zu\n",
+            requested.size(), together.size(),
+            together.size() - requested.size());
+    return together;
+}
+
+// The opt-in is allowed only for a completely direct, locally defined
+// callback. If future lowering introduces an indirect call, preserve the
+// full-eager safety guard instead of using unproven pointer materialization.
+static bool supportsLazyParForPartition(const llvm::Module& module) {
+    const llvm::Function* dispatch = module.getFunction("xyo_par_for");
+    if (!dispatch || dispatch->use_empty()) return false;
+    for (const llvm::User* user : dispatch->users()) {
+        const auto* call = llvm::dyn_cast<llvm::CallBase>(user);
+        if (!call || call->getCalledOperand()->stripPointerCasts() != dispatch ||
+            call->arg_size() != 8)
+            return false;
+        const auto* body = llvm::dyn_cast<llvm::Function>(
+            call->getArgOperand(7)->stripPointerCasts());
+        if (!body || body->isDeclaration() ||
+            body->getParent() != &module || !body->hasInternalLinkage())
+            return false;
+        // If another consumer captures this private function address, the
+        // direct caller+callback partition is no longer a complete proof.
+        for (const llvm::User* use : body->users())
+            if (use != call) return false;
+    }
+    return true;
+}
+
 bool LLVMBackend::ensureLazyJit() {
     if (!jit || !lazyProcedures) return false;
     if (lazyJit) return true;
@@ -1154,6 +1217,10 @@ bool LLVMBackend::ensureLazyJit() {
         return false;
     }
     auto lazy = std::move(*result);
+    // This partition function is inert for ordinary call sites. A par-for
+    // callback is grouped with the caller before LLVM code generation.
+    // LLVM may expand the requested partition for other IR dependencies.
+    lazy->setPartitionFunction(partitionParForCallbacks);
     configureLazyIR(*lazy);
     configureObjectDump(*lazy, objectPhase);
     registerRuntimeSymbols(*lazy);
@@ -1594,13 +1661,25 @@ std::unique_ptr<CompiledScript> LLVMBackend::compile(
                 mod->getFunction("xyo_par_for");
             const bool hasParForCallback =
                 parForDispatch && !parForDispatch->use_empty();
+            const char* partitionEnv =
+                std::getenv("XYO_JIT_LAZY_PARFOR_PARTITION");
+            const bool partitionRequested =
+                partitionEnv && partitionEnv[0] == '1';
+            const bool partitionSafe = hasParForCallback &&
+                partitionRequested && supportsLazyParForPartition(*mod);
             if (hasParForCallback &&
-                std::getenv("XYO_JIT_LAZY_CALLBACK_TRACE"))
-                std::fprintf(stderr,
-                    "[jit-lazy-guard] script=%s reason=parfor-callback\n",
-                    topId.c_str());
+                std::getenv("XYO_JIT_LAZY_CALLBACK_TRACE")) {
+                if (partitionSafe)
+                    std::fprintf(stderr,
+                        "[jit-lazy-guard] script=%s reason=parfor-partition-opt-in\n",
+                        topId.c_str());
+                else
+                    std::fprintf(stderr,
+                        "[jit-lazy-guard] script=%s reason=parfor-callback\n",
+                        topId.c_str());
+            }
             const bool deferredCandidate = lazyProcedures &&
-                !hasParForCallback &&
+                (!hasParForCallback || partitionSafe) &&
                 chooseLazyCompile(
                     jitLazyMode(), jitMode(), irFunctions, irInstructions,
                     countDirectProcedureCalls(blocks, top));

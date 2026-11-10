@@ -776,6 +776,16 @@ if(TARGET xyo-cli)
               --out "${CMAKE_CURRENT_BINARY_DIR}/jit-lazy-parfor-fixtures")
     set_tests_properties(xyo-jit-lazy-parfor-callback PROPERTIES TIMEOUT 120)
 
+    # Experimental per-script ORC partitioning is opt-in and fail-closed.
+    # Check real sequential and worker-pool callback paths against eager
+    # and interpreter, including two distinct address-taken body functions.
+    add_test(NAME xyo-jit-lazy-parfor-partition
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_lazy_parfor_partition.py"
+              --native "$<TARGET_FILE:xyo-cli>"
+              --out "${CMAKE_CURRENT_BINARY_DIR}/jit-lazy-parfor-partition-fixtures")
+    set_tests_properties(xyo-jit-lazy-parfor-partition PROPERTIES TIMEOUT 180)
+
     # Preserve Scratch semantics with dynamic limits, fractional bounds, or
     # index mutation when optional static induction analysis is enabled.
     add_test(NAME xyo-jit-induction-ranges
