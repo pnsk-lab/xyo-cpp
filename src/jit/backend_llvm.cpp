@@ -745,6 +745,11 @@ struct LLVMBackend final : JitBackend {
     std::shared_ptr<JitObjectPhaseCounters> objectPhase;
     llvm::orc::ThreadSafeContext tsc;
     std::unique_ptr<llvm::orc::LLJIT> jit;
+    // Opt-in native par-for passes function addresses to host workers.
+    // Keep isolated LLVM contexts alive until the owning lazy ORC engine
+    // has shut down and joined its compile threads. Member order matters:
+    // lazyJit is declared AFTER these contexts, so it dies first.
+    std::vector<llvm::orc::ThreadSafeContext> pinnedParForContexts;
     std::unique_ptr<llvm::orc::LLLazyJIT> lazyJit;
     bool lazyProcedures = false;
     JitPinned pinned;
@@ -1711,6 +1716,8 @@ std::unique_ptr<CompiledScript> LLVMBackend::compile(
             // has substantial distinct procedure bodies. Small scripts use
             // the normal ORC layer and avoid call-through trampoline cost.
             lazyThisScript = deferIR;
+            if (lazyThisScript && isolatedContext && partitionSafe)
+                pinnedParForContexts.push_back(scriptContext);
             llvm::orc::ThreadSafeModule tsm(
                 std::move(mod), scriptContext);
             llvm::Error err = lazyThisScript

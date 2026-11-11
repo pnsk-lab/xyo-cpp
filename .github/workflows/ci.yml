@@ -3,7 +3,7 @@ name: CI
 on:
   # Native OSR integration branches run CI without requiring a PR token.
   push:
-    branches: [main, 'work/osr-ci-v123', 'work/parfor-parity-integration-v123', 'work/parfor-llvm18-runtime-v123', 'work/parfor-longrun-v123', 'work/warp-watchdog-tsan-v123']
+    branches: [main, 'work/osr-ci-v123', 'work/parfor-parity-integration-v123', 'work/parfor-llvm18-runtime-v123', 'work/parfor-longrun-v123', 'work/warp-watchdog-tsan-v123', 'work/parfor-context-tsan-v123']
   pull_request:
   workflow_dispatch:
 
