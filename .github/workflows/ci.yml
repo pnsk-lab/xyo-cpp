@@ -3,7 +3,7 @@ name: CI
 on:
   # Native OSR integration branches run CI without requiring a PR token.
   push:
-    branches: [main, 'work/osr-ci-v123', 'work/parfor-parity-integration-v123']
+    branches: [main, 'work/osr-ci-v123', 'work/parfor-parity-integration-v123', 'work/parfor-llvm18-runtime-v123']
   pull_request:
   workflow_dispatch:
 
@@ -231,15 +231,21 @@ jobs:
             -DLLVM_CONFIG="/usr/lib/llvm-${LLVM_STATIC}/bin/llvm-config" \
             -DXYO_RSVG=OFF -DXYO_REQUIRE_SDL2=ON
 
-      - name: Build（レンダラ回帰 + LLVM 18 ORC互換テスト）
+      - name: Build（nanosvg + LLVM 18 native par-for JIT）
         run: |
-          cmake --build build-norsvg             --target xyo-render-tests xyo-jit-parfor-partition-policy             -j"$(nproc)"
+          cmake --build build-norsvg --parallel "$(nproc)" \
+            --target xyo-cli xyo-render-tests xyo-jit-parfor-partition-policy
 
-      # ctest 経由で回す（テスト側の ENVIRONMENT = SDL dummy + XYO_JIT_MODE=eager
-      # を効かせるため。直接実行すると HotSpot のままで isCompiled 検査が落ちる）。
-      - name: レンダラ回帰 + LLVM 18 ORC参照証明
+      # Runtime tests must execute actual LLVM 18-generated callbacks.
+      # The native par-for test verifies interpreter/eager/default hotspot/
+      # opt-in hotspot, sequential+8-worker dispatch and callback lifetime.
+      - name: レンダラ回帰 + LLVM 18 ORC実行検証
         run: |
-          ctest --test-dir build-norsvg --output-on-failure             -R '^(xyo-render-tests|xyo-jit-parfor-partition-policy)$'
+          python3 tools/ci/check_llvm18_parfor_ctests.py --self-test
+          python3 tools/ci/check_llvm18_parfor_ctests.py \
+            --build-dir build-norsvg
+          ctest --test-dir build-norsvg --output-on-failure --parallel 2 \
+            -R '^(xyo-render-tests|xyo-jit-parfor-partition-policy|xyo-jit-lazy-parfor-callback|xyo-jit-lazy-parfor-partition)$'
 
   # Windows の JIT は MSYS2 の mingw-w64 LLVM（静的アーカイブ同梱）で検証する。
   windows-jit:
