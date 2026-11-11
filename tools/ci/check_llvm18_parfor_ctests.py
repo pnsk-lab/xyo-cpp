@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Preflight the four LLVM 18/nanosvg CTests before launching them.
+"""Preflight the five LLVM 18/nanosvg CTests before launching them.
 
 CMake can register tests whose binaries were not built with a selective
 target invocation. A missing test may otherwise appear as Not Run and the
@@ -20,6 +20,7 @@ REQUIRED_TESTS = frozenset({
     "xyo-jit-parfor-partition-policy",
     "xyo-jit-lazy-parfor-callback",
     "xyo-jit-lazy-parfor-partition",
+    "xyo-jit-lazy-parfor-longrun",
 })
 
 
@@ -86,6 +87,14 @@ class PreflightUnitTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing registered"):
             validate_tests(self.tests[:-1], Path("."))
 
+    def test_longrun_registration_required(self):
+        excluded = [
+            test for test in self.tests
+            if test["name"] != "xyo-jit-lazy-parfor-longrun"
+        ]
+        with self.assertRaisesRegex(ValueError, "xyo-jit-lazy-parfor-longrun"):
+            validate_tests(excluded, Path("."))
+
     def test_duplicate_registration(self):
         with self.assertRaisesRegex(ValueError, "duplicate CTest"):
             validate_tests(self.tests + [self.tests[0]], Path("."))
@@ -126,7 +135,7 @@ def main() -> None:
     )
     for checked in validate_tests(json.loads(proc.stdout)["tests"], build):
         print(f"PASS {checked}")
-    print("PASS all four LLVM 18 CTests registered and runnable")
+    print("PASS all five LLVM 18 CTests registered and runnable")
 
 
 if __name__ == "__main__":

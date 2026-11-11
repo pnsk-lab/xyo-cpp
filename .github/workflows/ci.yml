@@ -3,7 +3,7 @@ name: CI
 on:
   # Native OSR integration branches run CI without requiring a PR token.
   push:
-    branches: [main, 'work/osr-ci-v123', 'work/parfor-parity-integration-v123', 'work/parfor-llvm18-runtime-v123']
+    branches: [main, 'work/osr-ci-v123', 'work/parfor-parity-integration-v123', 'work/parfor-llvm18-runtime-v123', 'work/parfor-longrun-v123']
   pull_request:
   workflow_dispatch:
 
@@ -245,7 +245,7 @@ jobs:
           python3 tools/ci/check_llvm18_parfor_ctests.py \
             --build-dir build-norsvg
           ctest --test-dir build-norsvg --output-on-failure --parallel 2 \
-            -R '^(xyo-render-tests|xyo-jit-parfor-partition-policy|xyo-jit-lazy-parfor-callback|xyo-jit-lazy-parfor-partition)$'
+            -R '^(xyo-render-tests|xyo-jit-parfor-partition-policy|xyo-jit-lazy-parfor-callback|xyo-jit-lazy-parfor-partition|xyo-jit-lazy-parfor-longrun)$'
 
   # Windows の JIT は MSYS2 の mingw-w64 LLVM（静的アーカイブ同梱）で検証する。
   windows-jit:

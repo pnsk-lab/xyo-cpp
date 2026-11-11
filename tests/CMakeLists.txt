@@ -800,6 +800,18 @@ if(TARGET xyo-cli)
               --out "${CMAKE_CURRENT_BINARY_DIR}/jit-lazy-parfor-partition-fixtures")
     set_tests_properties(xyo-jit-lazy-parfor-partition PROPERTIES TIMEOUT 180)
 
+    # Reuse two machine-code callback pointers across 16 iterations of the
+    # SAME warp procedure in ONE JIT instance (32 native worker batches).
+    # Compare all 131072 ordered list values against the interpreter and
+    # eager/guarded HotSpot; also repeat the opt-in execution.
+    add_test(NAME xyo-jit-lazy-parfor-longrun
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_lazy_parfor_longrun.py"
+              --native "$<TARGET_FILE:xyo-cli>"
+              --out "${CMAKE_CURRENT_BINARY_DIR}/jit-lazy-parfor-longrun-fixtures"
+              --trip 4096 --rounds 16 --repeat-optin 3)
+    set_tests_properties(xyo-jit-lazy-parfor-longrun PROPERTIES TIMEOUT 180)
+
     # Multiple fresh processes exercise native worker completion and
     # JIT teardown repeatedly. This does not claim safety for concurrent
     # external destruction of an active Runtime.
