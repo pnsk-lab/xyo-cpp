@@ -3,7 +3,7 @@ name: CI
 on:
   # Native OSR integration branches run CI without requiring a PR token.
   push:
-    branches: [main, 'work/osr-ci-v123']
+    branches: [main, 'work/osr-ci-v123', 'work/parfor-parity-integration-v123']
   pull_request:
   workflow_dispatch:
 
@@ -406,6 +406,17 @@ jobs:
             --parity-runs 1 --timeout 180 --out results/ci-parity \
             2>&1 | tee ../.bench/parity.log
 
+      # The pinned official parity suite still has its independent 100%
+      # gate above. Run it alongside an actual opted-in native callback to
+      # detect ORC co-partition regressions, not merely flag acceptance.
+      - name: Par-for lazy partition / full parity integration
+        run: |
+          test -s scratch-bench/.cache/build/parity.sb3
+          python3 tests/differential/jit_lazy_parfor_parity_integration.py \
+            --native "$XYO_BIN" \
+            --parity scratch-bench/.cache/build/parity.sb3 \
+            --output .bench/parfor-parity-integration
+
       - name: Validate results and publish summary
         if: always()
         run: bun tools/ci/scratch-bench-summary.ts
@@ -422,5 +433,6 @@ jobs:
             .bench/performance.log
             .bench/turbowarp.log
             .bench/parity.log
+            .bench/parfor-parity-integration/parity-comparison.json
           if-no-files-found: warn
           retention-days: 14

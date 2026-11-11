@@ -812,6 +812,12 @@ if(TARGET xyo-cli)
     set_tests_properties(xyo-jit-lazy-parfor-partition-stress
       PROPERTIES TIMEOUT 180)
 
+    add_test(NAME xyo-jit-parfor-parity-merge-unit
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/differential/test_jit_lazy_parfor_parity_integration.py")
+    set_tests_properties(xyo-jit-parfor-parity-merge-unit
+      PROPERTIES TIMEOUT 30)
+
     # Preserve Scratch semantics with dynamic limits, fractional bounds, or
     # index mutation when optional static induction analysis is enabled.
     add_test(NAME xyo-jit-induction-ranges
