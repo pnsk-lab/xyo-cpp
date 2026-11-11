@@ -94,7 +94,7 @@ void testValidTwoCallbacks() {
     require(xyo::supportsLazyParForPartition(fixture.module),
             "two direct private callback references accepted");
 
-    llvm::orc::IRPartitionLayer::GlobalValueSet requested{caller};
+    xyo::ParForPartitionValueSet requested{caller};
     auto combined = xyo::partitionParForCallbacks(requested);
     require(combined.has_value(), "valid partition exists");
     require(combined->size() == 3 && combined->count(caller) &&

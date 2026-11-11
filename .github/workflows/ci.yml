@@ -231,13 +231,15 @@ jobs:
             -DLLVM_CONFIG="/usr/lib/llvm-${LLVM_STATIC}/bin/llvm-config" \
             -DXYO_RSVG=OFF -DXYO_REQUIRE_SDL2=ON
 
-      - name: Build（レンダラ回帰テスト）
-        run: cmake --build build-norsvg --target xyo-render-tests -j"$(nproc)"
+      - name: Build（レンダラ回帰 + LLVM 18 ORC互換テスト）
+        run: |
+          cmake --build build-norsvg             --target xyo-render-tests xyo-jit-parfor-partition-policy             -j"$(nproc)"
 
       # ctest 経由で回す（テスト側の ENVIRONMENT = SDL dummy + XYO_JIT_MODE=eager
       # を効かせるため。直接実行すると HotSpot のままで isCompiled 検査が落ちる）。
-      - name: レンダラ回帰（SDL dummy / nanosvg）
-        run: ctest --test-dir build-norsvg -R xyo-render-tests --output-on-failure
+      - name: レンダラ回帰 + LLVM 18 ORC参照証明
+        run: |
+          ctest --test-dir build-norsvg --output-on-failure             -R '^(xyo-render-tests|xyo-jit-parfor-partition-policy)$'
 
   # Windows の JIT は MSYS2 の mingw-w64 LLVM（静的アーカイブ同梱）で検証する。
   windows-jit:

@@ -129,3 +129,43 @@ potentially undefined-behavior destruction stress test.
 This branch changes only tests, documentation and the CI workflow.
 It does not change the JIT implementation, the default par-for
 guard, or `main`.
+
+
+## CI run #82 / LLVM 18 header compatibility
+
+GitHub Actions run
+`https://github.com/pnsk-lab/xyo-cpp/actions/runs/42934249451`
+ran all eight jobs on push `77c391d`.
+
+Six jobs passed: Linux (LLVM 23), dedicated native OSR,
+Windows JIT, both macOS architectures and ScratchBench.
+ScratchBench's official Parity gate **passed**, and the added
+co-partition integration also **passed** with real ORC
+materialization.
+
+Two LLVM 18.1.3 jobs failed before link:
+Linux fully static and the nanosvg fallback build both failed at
+`#include <llvm/ExecutionEngine/Orc/IRPartitionLayer.h>`.
+This is a compile-time API mismatch introduced by the new experimental
+policy header, not a Parity failure.
+
+The compatibility fix keeps a version-specific ORC partition type:
+- LLVM 18/19: `CompileOnDemandLayer::GlobalValueSet`
+- LLVM 20+: `IRPartitionLayer::GlobalValueSet`
+
+A shared `ParForPartitionValueSet` alias avoids version-specific
+types in the callback implementation and policy IR regression.
+The previous function-pointer `Use` validation, default Eager
+fallback and actual callback co-materialization are unchanged.
+
+The nanosvg LLVM 18 CI job also now builds and runs
+`xyo-jit-parfor-partition-policy`, providing explicit LLVM 18
+API regression coverage beyond merely compiling `xyo`.
+
+Local LLVM 23 Release rebuild: **PASS**; four focused CTests:
+**4/4 PASS**; with the freshly rebuilt executable, the pinned
+2,123-case augmented Parity result remained **2121/2123 for both
+configurations**, with both failed-case IDs 8 and 9 unchanged,
+and verified lazy co-materialization.
+
+The LLVM 18 CI outcome after this fix must be checked separately.

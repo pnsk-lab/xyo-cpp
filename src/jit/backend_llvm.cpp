@@ -7,7 +7,6 @@
 
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/ExecutionEngine/Orc/IRTransformLayer.h>
-#include <llvm/ExecutionEngine/Orc/IRPartitionLayer.h>
 #include <llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h>
 #include <llvm/ExecutionEngine/Orc/ObjectTransformLayer.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
@@ -1131,8 +1130,8 @@ LLVMBackend::LLVMBackend() {
 // address of an internal par-for callback to native C++, materialize both
 // functions in one ORC partition. Do not assume that a function pointer
 // referring to an unmaterialized private definition is callable.
-std::optional<llvm::orc::IRPartitionLayer::GlobalValueSet>
-partitionParForCallbacks(llvm::orc::IRPartitionLayer::GlobalValueSet requested) {
+std::optional<ParForPartitionValueSet>
+partitionParForCallbacks(ParForPartitionValueSet requested) {
     auto together = requested;
     for (const llvm::GlobalValue* requestedValue : requested) {
         const auto* caller = llvm::dyn_cast<llvm::Function>(requestedValue);
