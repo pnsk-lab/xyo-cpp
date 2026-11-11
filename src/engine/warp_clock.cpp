@@ -14,7 +14,12 @@ int64_t unixMilliseconds() {
 namespace xyo {
 
 WarpClockWatchdog::WarpClockWatchdog(bool sampleWallClock)
-    : sampleWallClock_(sampleWallClock), worker_([this] { run(); }) {}
+    : sampleWallClock_(sampleWallClock) {
+    // All state members must finish initialization before run() can access
+    // them. Launching worker_ from its initializer races against subsequent
+    // default member initializers (TSan: stopped_/active_/generation_).
+    worker_ = std::thread([this] { run(); });
+}
 
 WarpClockWatchdog::~WarpClockWatchdog() {
     {

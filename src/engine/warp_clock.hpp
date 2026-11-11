@@ -47,13 +47,15 @@ private:
     const bool sampleWallClock_;
     std::mutex mutex_;
     std::condition_variable cv_;
-    std::thread worker_;
     std::atomic<bool> armed_{false};
     bool stopped_ = false;
     bool active_ = false;
     uint64_t generation_ = 0;
     Clock::time_point deadline_ = Clock::time_point::max();
     bool unlimited_ = false;
+    // Keep the thread handle last: no worker may observe state members
+    // before their initialization. The constructor starts it in its body.
+    std::thread worker_;
 };
 
 } // namespace xyo

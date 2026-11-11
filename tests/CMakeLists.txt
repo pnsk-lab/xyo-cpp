@@ -70,6 +70,16 @@ if(NOT EMSCRIPTEN)
   add_executable(xyo-fiber-smoke platform/fiber_switch.cpp)
   target_link_libraries(xyo-fiber-smoke PRIVATE xyo)
   add_test(NAME xyo-fiber-smoke COMMAND xyo-fiber-smoke)
+
+  # Exercise worker lifetime and constructor publication in CTest.
+  # This program can also be linked standalone against warp_clock.cpp with
+  # -fsanitize=thread for data-race diagnosis.
+  add_executable(xyo-warp-clock-init-smoke
+    platform/warp_clock_watchdog_smoke.cpp)
+  target_link_libraries(xyo-warp-clock-init-smoke PRIVATE xyo)
+  add_test(NAME xyo-warp-clock-init-smoke
+    COMMAND xyo-warp-clock-init-smoke)
+  set_tests_properties(xyo-warp-clock-init-smoke PROPERTIES TIMEOUT 30)
 endif()
 
 # Manually run host-side numeric continuation A/B microbenchmark.

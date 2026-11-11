@@ -3,7 +3,7 @@ name: CI
 on:
   # Native OSR integration branches run CI without requiring a PR token.
   push:
-    branches: [main, 'work/osr-ci-v123', 'work/parfor-parity-integration-v123', 'work/parfor-llvm18-runtime-v123', 'work/parfor-longrun-v123']
+    branches: [main, 'work/osr-ci-v123', 'work/parfor-parity-integration-v123', 'work/parfor-llvm18-runtime-v123', 'work/parfor-longrun-v123', 'work/warp-watchdog-tsan-v123']
   pull_request:
   workflow_dispatch:
 
@@ -92,6 +92,19 @@ jobs:
 
       - name: Build
         run: cmake --build build -j"$(nproc)"
+
+      # Compile only the host watchdog with TSan, avoiding unsanitized
+      # ORC-generated machine code. A constructor read-before-initialization
+      # must be caught even if normal CTest happens to pass.
+      - name: Warp watchdog startup (ThreadSanitizer)
+        run: |
+          g++ -std=c++20 -O1 -g -fsanitize=thread \
+            -fno-omit-frame-pointer -pthread \
+            src/engine/warp_clock.cpp \
+            tests/platform/warp_clock_watchdog_smoke.cpp \
+            -o "${RUNNER_TEMP}/xyo-warp-clock-tsan"
+          TSAN_OPTIONS=halt_on_error=1:exitcode=66 \
+            "${RUNNER_TEMP}/xyo-warp-clock-tsan"
 
       # The costly native continuation suite runs in a second job.
       - name: Test (ctest, excluding dedicated native OSR)
