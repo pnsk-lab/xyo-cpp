@@ -1,0 +1,159 @@
+diff --git a/tools/ci/native_continuation_checkout.py b/tools/ci/native_continuation_checkout.py
+--- a/tools/ci/native_continuation_checkout.py
++++ b/tools/ci/native_continuation_checkout.py
+@@ -16,6 +16,20 @@
+ ROOT = Path(__file__).resolve().parents[2]
+ CMAKE = ROOT / "tests" / "CMakeLists.txt"
+ OSR016_CMAKE = ROOT / "tests" / "differential" / "osr016_fractional_boundary_tests.cmake"
++JIT_HEADER = ROOT / "src" / "jit" / "jit.hpp"
++# Fields consumed by the OSR-011 through OSR-015 native test harnesses.
++# These are real per-yield source continuation ABI, not test-only metadata.
++OSR_RUNTIME_ABI = {
++    "nestedOsrDeoptPhase": "int32_t",
++    "nestedOsrDeoptInnerRemaining": "double",
++    "nestedOsrDeoptDeepRemaining": "double",
++    "nestedOsrDeoptFourthRemaining": "double",
++    "nestedOsrInnerYieldGuard": "bool",
++    "nestedOsrInnerLoopId": "std::string",
++    "nestedOsrDeepInnerLoopId": "std::string",
++    "nestedOsrFourthLoopId": "std::string",
++}
++
+ TEST_NAME = re.compile(
+     r"add_test\(\s*NAME\s+"
+     r"(xyo-nested-warp-[\w-]+|xyo-native-simple-deopt-parity)\b"
+@@ -61,6 +75,7 @@
+     source_files.update(scripts)
+     source_files.add(CMAKE)
+     source_files.add(OSR016_CMAKE)
++    source_files.add(JIT_HEADER)
+     source_files.add(Path(__file__).resolve())
+     source_files.add(Path(__file__).with_name('test_native_continuation_checkout.py'))
+     return source_files, len(tests), len(harnesses), len(scripts)
+@@ -88,6 +103,21 @@
+         name.decode("utf-8", errors="surrogateescape")
+         for name in output.split(b"\0") if name
+     }
++
++
++def runtime_abi_missing() -> list[str]:
++    # Check real C++ declarations, not comments or name-only references.
++    # The compiler/build is the final authority; this is a fast preflight
++    # against accidentally publishing 38 tests on an older runtime.
++    header = JIT_HEADER.read_text(encoding="utf-8")
++    return [
++        name for name, type_name in OSR_RUNTIME_ABI.items()
++        if not re.search(
++            r"^\s*" + re.escape(type_name) + r"\s+" + name + r"\s*(?:=|;)",
++            header,
++            re.MULTILINE,
++        )
++    ]
+ 
+ 
+ def main() -> int:
+@@ -125,6 +155,16 @@
+ 
+     if missing:
+         return 1
++    abi_missing = runtime_abi_missing()
++    for field in abi_missing:
++        print(f"MISSING_OSR_ABI: src/jit/jit.hpp::{field}", file=sys.stderr)
++    if abi_missing:
++        print(
++            "The nested OSR harnesses require unreleased JitCtx/CompiledScript "
++            "continuation fields; integrate the real runtime implementation.",
++            file=sys.stderr,
++        )
++        return 1
+     if (untracked or dirty) and not args.allow_uncommitted:
+         print(
+             "CI requires all source dependencies to be committed in HEAD.",
+diff --git a/tools/ci/test_native_continuation_checkout.py b/tools/ci/test_native_continuation_checkout.py
+--- a/tools/ci/test_native_continuation_checkout.py
++++ b/tools/ci/test_native_continuation_checkout.py
+@@ -79,6 +79,32 @@
+             "tests/differential/native_simple_resume.py",
+             "# another required Python fixture\n",
+         )
++        # A tiny C++ ABI declaration fixture: no compilation required.
++        # Match the real native ABI types, not just the member spellings.
++        self.write(
++            "src/jit/jit.hpp",
++            "struct JitCtx {\n"
++            + "  int32_t nestedOsrDeoptPhase = 0;\n"
++            + "".join(
++                f"  double {name} = 0.0;\n"
++                for name in (
++                    "nestedOsrDeoptInnerRemaining",
++                    "nestedOsrDeoptDeepRemaining",
++                    "nestedOsrDeoptFourthRemaining",
++                )
++            )
++            + "};\nstruct CompiledScript {\n"
++            + "  bool nestedOsrInnerYieldGuard = false;\n"
++            + "".join(
++                f"  std::string {name};\n"
++                for name in (
++                    "nestedOsrInnerLoopId",
++                    "nestedOsrDeepInnerLoopId",
++                    "nestedOsrFourthLoopId",
++                )
++            )
++            + "};\n",
++        )
+ 
+         self.git("init", "-q")
+         self.git("add", ".")
+@@ -195,6 +221,51 @@
+         self.assertEqual(result.returncode, 1)
+         self.assertIn("MISSING: tests/differential/fixture_01.py", result.stderr)
+ 
++    def test_incorrect_counter_field_type_is_rejected(self) -> None:
++        path = self.root / "src/jit/jit.hpp"
++        path.write_text(
++            path.read_text().replace(
++                "double nestedOsrDeoptInnerRemaining",
++                "int32_t nestedOsrDeoptInnerRemaining",
++            )
++        )
++        result = self.run_guard("--allow-uncommitted")
++        self.assertEqual(result.returncode, 1)
++        self.assertIn(
++            "MISSING_OSR_ABI: src/jit/jit.hpp::nestedOsrDeoptInnerRemaining",
++            result.stderr,
++        )
++
++    def test_missing_osr_runtime_header_is_rejected(self) -> None:
++        (self.root / "src/jit/jit.hpp").unlink()
++        result = self.run_guard()
++        self.assertEqual(result.returncode, 1)
++        self.assertIn("MISSING: src/jit/jit.hpp", result.stderr)
++
++    def test_missing_phase_member_fails_even_diagnostic_mode(self) -> None:
++        path = self.root / "src/jit/jit.hpp"
++        path.write_text(
++            path.read_text().replace("nestedOsrDeoptPhase", "renamedPhase")
++        )
++        result = self.run_guard("--allow-uncommitted")
++        self.assertEqual(result.returncode, 1)
++        self.assertIn(
++            "MISSING_OSR_ABI: src/jit/jit.hpp::nestedOsrDeoptPhase",
++            result.stderr,
++        )
++
++    def test_missing_source_loop_id_member_is_rejected(self) -> None:
++        path = self.root / "src/jit/jit.hpp"
++        path.write_text(
++            path.read_text().replace("nestedOsrFourthLoopId", "differentId")
++        )
++        result = self.run_guard("--allow-uncommitted")
++        self.assertEqual(result.returncode, 1)
++        self.assertIn(
++            "MISSING_OSR_ABI: src/jit/jit.hpp::nestedOsrFourthLoopId",
++            result.stderr,
++        )
++
+     def test_missing_cpp_harness_is_rejected(self) -> None:
+         (self.root / "tests/platform/harness_03.cpp").unlink()
+         result = self.run_guard()

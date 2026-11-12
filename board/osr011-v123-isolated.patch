@@ -1,0 +1,982 @@
+diff --git a/docs/osr011-v123-isolated-2026-11-10.md b/docs/osr011-v123-isolated-2026-11-10.md
+new file mode 100644
+index 0000000..41335b0
+--- /dev/null
++++ b/docs/osr011-v123-isolated-2026-11-10.md
+@@ -0,0 +1,70 @@
++# OSR-011 — Source-proven inner repeat yield and double-counter restore (2026-11-10)
++
++## Scope and base
++
++This is an independently extracted, default-off continuation feature based on
++the **published v1.2.3** source plus the locally validated OSR-010 commit
++`2e08007992285fac519601147f29055e0ee54f93`.
++
++Worktree: `/home/kicky/dev/cpp/xyo-cpp-osr011-v123`.
++Branch: `work/osr011-v123`.
++
++No OSR-012 dynamic inner TIMES, OSR-013/014 deeper loops, OSR-015 edit topology
++extensions or other shared experimental JIT optimization is included.
++
++## Source proof
++
++Only `XYO_JIT_OSR_NESTED_INNER_YIELD_DEOPT=1`, jointly with
++`XYO_JIT_OSR_NESTED_INFLIGHT_DEOPT=1` and
++`XYO_JIT_OSR_NESTED_SOURCE_PROOF=1`, enables this mode.
++
++A single directly nested repeat has a statically proved finite integer literal
++trip count from 1 through 8192; its inner body is at most four numeric
++increment statements. The existing OSR-010 whitelist validates VALUE
++reporters as bounded, side-effect-free and acyclic. Unknown, extension,
++dynamic, and otherwise unsupported shapes are refused.
++
++OSR-010's `XYO_JIT_OSR_NESTED_INNER_BOUNDED` retains its existing behavior;
++when both are requested, the true inner yield takes precedence, rather than
++silently using an atomic lowering.
++
++## Native ABI and semantics
++
++- `JitCtx`: append `nestedOsrDeoptPhase` (0 invalid / 1 outer / 2 inner)
++  and `nestedOsrDeoptInnerRemaining` without moving existing offsets.
++- `CompiledScript`: freeze the source inner loop ID and its eligibility
++  guard at compilation time, not after an editor change.
++- LLVM: emit a phase-2 checkpoint with the two independent live native
++  loop counters only at an actual inner body Fiber yield. Suppress opaque
++  repeat batching, GPU, and par-for lowering on the protected loop but
++  **keep the real scheduler yield**.
++- RT: validate a finite integer pair after the just-completed source
++  body, drop any previous valid checkpoint if current values are invalid,
++  and record the phase under the yielding Fiber's exclusive ownership.
++- Sequencer: on source revision mismatch, verify the frozen inner ID
++  remains attached to the selected outer repeat, validate both counters
++  and the original frame's provenance. Dispose of the suspended native
++  Fiber *before* execution transfer, preserve the original interpreter
++  caller frames and their GC roots, and add a synthetic inner repeat
++  StackFrame with its exact saved counter. Invalid provenance fails closed.
++
++This is **not** general arbitrary LLVM SSA/effect-PC deoptimization.
++
++## Validation
++
++- LLVM 23 Release / SDL2 enabled: selective build of `xyo-cli` and
++  inner/bounded native smoke executables PASS.
++- OSR-011 regular and fast differential CTests: **2/2 PASS**, 88.61s
++  wall-clock in parallel (88.61s / 80.46s individually).
++  Evidence: `osr011-targeted.log`.
++- The cases include real native inner-yield, first and fourth native
++  suspension source edits, exact Interpreter resumed counters and
++  effects, complete block-count parity, disabled fallback, and
++  count-9000 rejection.
++- Full CMake native build: PASS.
++- Full CTest matrix: **118/118 PASS, 0 failures**, 499.03 seconds
++  at four-way parallelism, including xyo-tests, GUI Scratch parity,
++  OSR-010/011 and all previously registered native tests.
++  Evidence: `osr011-full-ctest.log`.
++
++No remote push or new release is intended as part of this extraction.
+diff --git a/src/engine/sequencer.cpp b/src/engine/sequencer.cpp
+index df7f2ee..251fe34 100644
+--- a/src/engine/sequencer.cpp
++++ b/src/engine/sequencer.cpp
+@@ -1473,7 +1473,47 @@ void Sequencer::jitStepThread(Thread& thread) {
+             ExecContext* ec = inner && inner->executionContext
+                 ? inner->executionContext.get() : nullptr;
+             const double remaining = c->nestedOsrDeoptRemaining;
++            const bool innerPhase =
++                c->nestedOsrDeoptPhase == 2 &&
++                compiled->nestedOsrInnerYieldGuard;
++            const bool outerPhase = c->nestedOsrDeoptPhase == 1;
++            // The inner source id is frozen by compile-time proof.
++            // Check the current edited source still attaches it to the
++            // selected outer repeat before resuming from a source latch.
++            const bool innerTopology = [&] {
++                if (!innerPhase ||
++                    compiled->nestedOsrInnerLoopId.empty()) return false;
++                const Block* outer =
++                    blocks->getBlock(compiled->nestedOsrLoopId);
++                const Block* nested =
++                    blocks->getBlock(compiled->nestedOsrInnerLoopId);
++                if (!outer || outer->opcode != "control_repeat" ||
++                    !nested || nested->opcode != "control_repeat")
++                    return false;
++                const auto* sub = outer->inputs.find("SUBSTACK");
++                if (!sub || sub->block.empty()) return false;
++                std::unordered_set<std::string> seen;
++                std::string id = sub->block;
++                for (size_t budget = 16; !id.empty() && budget--;) {
++                    if (!seen.insert(id).second) return false;
++                    if (id == compiled->nestedOsrInnerLoopId) return true;
++                    const Block* stmt = blocks->getBlock(id);
++                    if (!stmt) return false;
++                    id = stmt->next;
++                }
++                return false;
++            }();
++            const auto validCounter = [](double n) {
++                return std::isfinite(n) && n >= 0.0 &&
++                       n <= 1099511627776.0 &&
++                       std::floor(n) == n;
++            };
++            const double innerRemaining =
++                c->nestedOsrDeoptInnerRemaining;
+             const bool safe = c->nestedOsrDeoptReady == 1 &&
++                (outerPhase ||
++                 (innerPhase && innerTopology &&
++                  validCounter(innerRemaining))) &&
+                 !thread.isKilled &&
+                 runtime.isActiveThread(&thread) &&
+                 thread.peekStack() == compiled->nestedOsrLoopId &&
+@@ -1500,12 +1540,30 @@ void Sequencer::jitStepThread(Thread& thread) {
+                 return;
+             }
+             ec->loopCounter = remaining;
++            if (innerPhase) {
++                // Preserve the original caller/outer GC-rooted frames and
++                // their arguments. Resume the completed inner-body latch
++                // with the exact native countdown at the real Fiber yield.
++                thread.pushStack(compiled->nestedOsrInnerLoopId);
++                StackFrame* frame = thread.peekStackFrame();
++                frame->isLoop = true;
++                frame->executionContext = std::make_unique<ExecContext>();
++                frame->executionContext->hasLoopCounter = true;
++                frame->executionContext->loopCounter = innerRemaining;
++            }
+             thread.status = STATUS_RUNNING;
+-            if (std::getenv("XYO_JIT_OSR_NESTED_TRACE"))
+-                std::fprintf(stderr,
+-                    "[jit-osr-inflight] deopt remaining=%.0f "
+-                    "source-changed=1; interpreter owns original loop\\n",
+-                    remaining);
++            if (std::getenv("XYO_JIT_OSR_NESTED_TRACE")) {
++                if (innerPhase)
++                    std::fprintf(stderr,
++                        "[jit-osr-inflight] deopt inner outer=%.0f "
++                        "inner=%.0f source-changed=1\n",
++                        remaining, innerRemaining);
++                else
++                    std::fprintf(stderr,
++                        "[jit-osr-inflight] deopt remaining=%.0f "
++                        "source-changed=1; interpreter owns original loop\n",
++                        remaining);
++            }
+             return;
+         }
+     }
+diff --git a/src/jit/backend_llvm.cpp b/src/jit/backend_llvm.cpp
+index b56924c..469292d 100644
+--- a/src/jit/backend_llvm.cpp
++++ b/src/jit/backend_llvm.cpp
+@@ -55,8 +55,9 @@ namespace xyo {
+ // one inner repeat of 1..8 iterations containing 1..4 numeric increments.
+ // Reject dynamic TIMES, unknown/recursive edges, nested sub-loops and
+ // reporters that could hide suspension or observable intermediate effects.
+-static bool safeBoundedNativeInnerRepeat(const Blocks& blocks,
+-                                         const Block& outer) {
++static bool safeBoundedNativeInnerRepeat(
++    const Blocks& blocks, const Block& outer, bool allowInnerYield = false,
++    std::string* innerId = nullptr) {
+     if (outer.opcode != "control_repeat") return false;
+     const auto* sub = outer.inputs.find("SUBSTACK");
+     if (!sub || sub->block.empty()) return false;
+@@ -126,8 +127,10 @@ static bool safeBoundedNativeInnerRepeat(const Blocks& blocks,
+                 const auto field = count->fields.find("NUM");
+                 if (field == count->fields.end()) return false;
+                 const double n = cast::toNumber(field->second.value);
+-                if (!std::isfinite(n) || n < 1 || n > 8 ||
++                if (!std::isfinite(n) || n < 1 ||
++                    n > (allowInnerYield ? 8192.0 : 8.0) ||
+                     std::floor(n) != n) return false;
++                if (innerId) *innerId = blk->id;
+                 if (!self(self, body->block, true)) return false;
+             } else {
+                 if (blk->opcode != "data_changevariableby" &&
+@@ -210,6 +213,7 @@ uint64_t xyo_rt_nested_osr_arg_get(JitCtx*, const char*,
+                                     const char16_t*, uint32_t);
+ uint64_t xyo_rt_nested_osr_arg_peek(JitCtx*, const char16_t*, uint32_t);
+ void xyo_rt_nested_osr_yield_checkpoint(JitCtx*, double);
++void xyo_rt_nested_osr_inner_yield_checkpoint(JitCtx*, double, double);
+ void xyo_proc_push(JitCtx*, const char*, const void*, int32_t,
+                    const char*, int32_t, int32_t);
+ void xyo_proc_pop(JitCtx*);
+@@ -456,6 +460,8 @@ const std::pair<const char*, void*> kRtSymbols[] = {
+     {"xyo_rt_nested_osr_arg_peek", (void*)&xyo_rt_nested_osr_arg_peek},
+     {"xyo_rt_nested_osr_yield_checkpoint",
+      (void*)&xyo_rt_nested_osr_yield_checkpoint},
++    {"xyo_rt_nested_osr_inner_yield_checkpoint",
++     (void*)&xyo_rt_nested_osr_inner_yield_checkpoint},
+     {"xyo_proc_push", (void*)&xyo_proc_push},
+     {"xyo_proc_pop", (void*)&xyo_proc_pop},
+     {"xyo_rt_setarg", (void*)&xyo_rt_setarg},
+@@ -1187,14 +1193,32 @@ std::unique_ptr<PendingJitCompilation> LLVMBackend::prepareAsync(
+             "XYO_JIT_OSR_NESTED_INNER_BOUNDED");
+         const char* proof = std::getenv(
+             "XYO_JIT_OSR_NESTED_SOURCE_PROOF");
+-        const bool safeBounded = !flat && bounded &&
++        const char* requestedInnerYield = std::getenv(
++            "XYO_JIT_OSR_NESTED_INNER_YIELD_DEOPT");
++        const bool innerYield = requestedInnerYield &&
++            requestedInnerYield[0] == '1';
++        // Inner yields must take priority over OSR-010's atomic lowering.
++        // Both paths require an independently source-proven loop shape.
++        std::string frozenInnerId;
++        const bool safeInner = !flat && proof && proof[0] == '1' &&
++            innerYield && safeBoundedNativeInnerRepeat(
++                *thread.blockContainer, *nested.loop, true,
++                &frozenInnerId);
++        const bool safeBounded = !innerYield && !flat && bounded &&
+             bounded[0] == '1' && proof && proof[0] == '1' &&
+             safeBoundedNativeInnerRepeat(
+                 *thread.blockContainer, *nested.loop);
+-        if (safeBounded && std::getenv("XYO_JIT_OSR_NESTED_TRACE"))
++        if (safeInner) {
++            code->nestedOsrInnerYieldGuard = true;
++            code->nestedOsrInnerLoopId = std::move(frozenInnerId);
++        }
++        if ((safeInner || safeBounded) &&
++            std::getenv("XYO_JIT_OSR_NESTED_TRACE"))
+             std::fprintf(stderr,
+-                "[jit-osr-inflight] bounded inner repeat accepted\n");
+-        if (!flat && !safeBounded) nested = {};
++                safeInner
++                    ? "[jit-osr-inflight] yielding inner repeat accepted\n"
++                    : "[jit-osr-inflight] bounded inner repeat accepted\n");
++        if (!flat && !safeInner && !safeBounded) nested = {};
+     }
+     const uint64_t nestedSourceRevision = nested.loop
+         ? thread.blockContainer->revision() : 0;
+diff --git a/src/jit/codegen.cpp b/src/jit/codegen.cpp
+index dac1bfb..8dbb333 100644
+--- a/src/jit/codegen.cpp
++++ b/src/jit/codegen.cpp
+@@ -266,6 +266,9 @@ struct Codegen {
+     bool nestedOsrInFlightGuard = false;
+     // OSR-010: a source-proven 1..8 inner repeat must complete atomically.
+     bool nestedOsrBoundedInner = false;
++    // OSR-011: a source-proven 1..8192 inner repeat preserves real yields
++    // and captures the two private counters at every handoff.
++    bool nestedOsrInFlightInnerYield = false;
+     std::map<std::u16string, llvm::Value*> hoistedNestedOsrArgs;
+     /// ループ本体で書き込まれる変数/リスト（不変性判定用）
+     struct LoopWriteScan {
+@@ -985,20 +988,33 @@ struct Codegen {
+ 
+     void emitNestedOsrYieldCheckpoint() {
+         if (!nestedOsrInFlightGuard || !osrStartLoop ||
+-            curYieldSourceLoop != osrStartLoop ||
++            !curYieldSourceLoop ||
+             (!curYieldRemainingF64 && !curYieldRemainingI32))
+             return;
+-        llvm::Value* remaining = curYieldRemainingI32
+-            ? b.CreateSIToFP(
+-                b.CreateLoad(i32t, curYieldRemainingI32), f64t)
+-            : b.CreateLoad(f64t, curYieldRemainingF64);
+-        // emitLoopYield is called at the END of a completed Scratch body
+-        // but the private LLVM counter is decremented only AFTER yield.
+-        // Convert to the exact count expected at the next Interpreter
+-        // repeat latch. Source edits can then discard the suspended Fiber
+-        // without running any more LLVM or replaying prior effects.
+-        call2("xyo_rt_nested_osr_yield_checkpoint", voidt, ctxArg,
+-              b.CreateFSub(remaining, cf64(1.0)));
++        const auto remaining = [&](AllocaInst* integer, AllocaInst* real) {
++            return integer
++                ? b.CreateSIToFP(b.CreateLoad(i32t, integer), f64t)
++                : b.CreateLoad(f64t, real);
++        };
++        llvm::Value* current =
++            remaining(curYieldRemainingI32, curYieldRemainingF64);
++        llvm::Value* afterBody = b.CreateFSub(current, cf64(1.0));
++        if (curYieldSourceLoop == osrStartLoop) {
++            // Phase 1: the selected outer source body has completed.
++            call2("xyo_rt_nested_osr_yield_checkpoint", voidt, ctxArg,
++                  afterBody);
++            return;
++        }
++        if (!nestedOsrInFlightInnerYield || yieldStack.empty()) return;
++        const auto& outer = yieldStack.back();
++        if (outer.sourceLoop != osrStartLoop ||
++            (!outer.remainingF64 && !outer.remainingI32)) return;
++        // Phase 2: inner body completed, outer body remains incomplete.
++        llvm::Value* outerCurrent =
++            remaining(outer.remainingI32, outer.remainingF64);
++        callN("xyo_rt_nested_osr_inner_yield_checkpoint", voidt,
++              {ctxArg, b.CreateFSub(outerCurrent, cf64(1.0)),
++               afterBody});
+     }
+ 
+     // The deadline poll is shared by ordinary Scratch loops and SSA
+@@ -7915,22 +7931,27 @@ struct Codegen {
+             const bool osrFirstLoop = blk == osrStartLoop;
+             const bool boundedNativeInner =
+                 nestedOsrInFlightGuard && nestedOsrBoundedInner &&
+-                !osrFirstLoop;
++                !nestedOsrInFlightInnerYield && !osrFirstLoop;
++            // Real inner yields must not be hidden by repeat batching,
++            // GPU/par-for delegation, or scalar strip mining.
++            const bool protectedNativeInner = boundedNativeInner ||
++                (nestedOsrInFlightGuard &&
++                 nestedOsrInFlightInnerYield && !osrFirstLoop);
+             const auto conditionalRepeat = (osrFirstLoop ||
+-                boundedNativeInner || runtime.blockCountEnabled)
++                protectedNativeInner || runtime.blockCountEnabled)
+                 ? std::optional<ConditionalRepeatPlan>{}
+                 : conditionalRepeatPlan(blk);
+-            const auto repeatCopies = (osrFirstLoop || boundedNativeInner || runtime.blockCountEnabled)
++            const auto repeatCopies = (osrFirstLoop || protectedNativeInner || runtime.blockCountEnabled)
+                 ? std::nullopt : repeatCopyPlan(blk);
+             if (verbose && repeatCopies)
+                 std::fprintf(stderr, "xyo-jit: repeat SSA copies %s\n",
+                              blk->id.c_str());
+-            const auto repeatAffine = (osrFirstLoop || boundedNativeInner || runtime.blockCountEnabled)
++            const auto repeatAffine = (osrFirstLoop || protectedNativeInner || runtime.blockCountEnabled)
+                 ? std::nullopt : repeatAffinePlan(blk);
+             if (verbose && repeatAffine)
+                 std::fprintf(stderr, "xyo-jit: repeat SSA affine %s\n",
+                              blk->id.c_str());
+-            if (!osrFirstLoop && !boundedNativeInner && !runtime.blockCountEnabled) {
++            if (!osrFirstLoop && !protectedNativeInner && !runtime.blockCountEnabled) {
+                 if (auto plan = multiTransientPattern(blk)) {
+                     emitTransientMultiRepeat(blk, *plan);
+                     return;
+@@ -7943,7 +7964,7 @@ struct Codegen {
+             // for (i = toNum(TIMES); i >= 0.5; i--) { body; loopYield }
+             // Fixed-count straight-line bodies are eligible for bounded
+             // strip-mining into groups of at most 512 logical iterations.
+-            if (auto plan = (osrFirstLoop || boundedNativeInner || runtime.blockCountEnabled)
++            if (auto plan = (osrFirstLoop || protectedNativeInner || runtime.blockCountEnabled)
+                     ? std::optional<RepeatUnrollPlan>{}
+                     : repeatUnrollPlan(blk)) {
+                 // Evaluate TIMES once, exactly as in the ordinary lowering.
+@@ -8015,7 +8036,7 @@ struct Codegen {
+             // 本体が GPU 並列実行可能なら xyo_gpu_repeat へ委譲し、
+             // 失敗時のみ従来の CPU ループへ進む分岐を emit する。
+             const gpu::Program* gp =
+-                (nestedOsrInFlightGuard && (osrFirstLoop || boundedNativeInner)) ||
++                (nestedOsrInFlightGuard && (osrFirstLoop || protectedNativeInner)) ||
+                 promotedLoop
+                     ? nullptr : tryGpuLoop(blk);
+             // With a compile-time fixed nonnegative count <= INT32_MAX, the
+@@ -9208,10 +9229,15 @@ bool jitEmitScript(llvm::Module& mod, llvm::LLVMContext& lc, Runtime& runtime,
+         const char* proof =
+             std::getenv("XYO_JIT_OSR_NESTED_SOURCE_PROOF");
+         cg.nestedOsrInFlightGuard = proof && proof[0] == '1';
++        const char* innerYield = std::getenv(
++            "XYO_JIT_OSR_NESTED_INNER_YIELD_DEOPT");
++        cg.nestedOsrInFlightInnerYield = cg.nestedOsrInFlightGuard &&
++            innerYield && innerYield[0] == '1';
+         if (const char* bounded =
+                 std::getenv("XYO_JIT_OSR_NESTED_INNER_BOUNDED");
+-            cg.nestedOsrInFlightGuard && bounded &&
+-            bounded[0] == '1')
++            cg.nestedOsrInFlightGuard &&
++            !cg.nestedOsrInFlightInnerYield &&
++            bounded && bounded[0] == '1')
+             cg.nestedOsrBoundedInner = true;
+     }
+     // Validate a lossless snapshot of the selected source script. Capturing
+diff --git a/src/jit/jit.hpp b/src/jit/jit.hpp
+index 3aba9a7..9399dc3 100644
+--- a/src/jit/jit.hpp
++++ b/src/jit/jit.hpp
+@@ -218,6 +218,10 @@ struct JitCtx {
+     // This is NOT an arbitrary LLVM SSA/effect-PC deoptimizer.
+     int32_t nestedOsrDeoptReady = 0;
+     double nestedOsrDeoptRemaining = 0.0;
++    // 0: invalid; 1: completed outer body; 2: completed inner body.
++    // OSR-011 snapshots are valid only after an actual Fiber yield.
++    int32_t nestedOsrDeoptPhase = 0;
++    double nestedOsrDeoptInnerRemaining = 0.0;
+ };
+ 
+ /// Publish an entire execution slice with one atomic RMW, including when a
+@@ -295,6 +299,9 @@ struct CompiledScript {
+     // Requires source proof. Only a completed counted-loop body may be
+     // handed back after a native Fiber scheduler suspension.
+     bool nestedOsrInFlightGuard = false;
++    // Frozen source id; never select an inner loop from edited Blocks.
++    bool nestedOsrInnerYieldGuard = false;
++    std::string nestedOsrInnerLoopId;
+ };
+ 
+ class JitEngine {
+diff --git a/src/jit/rt.cpp b/src/jit/rt.cpp
+index 4d16d50..f799d58 100644
+--- a/src/jit/rt.cpp
++++ b/src/jit/rt.cpp
+@@ -975,6 +975,34 @@ void xyo_rt_nested_osr_yield_checkpoint(
+         std::floor(remainingAfterBody) != remainingAfterBody)
+         return;
+     c->nestedOsrDeoptRemaining = remainingAfterBody;
++    c->nestedOsrDeoptInnerRemaining = 0.0;
++    c->nestedOsrDeoptPhase = 1;
++    c->nestedOsrDeoptReady = 1;
++}
++
++// OSR-011: called after scalar spills at a genuine inner-body scheduler
++// handoff. LLVM's private counters have not yet run their decrements.
++// The enclosing outer body has not completed. Both after-body counts
++// must be preserved with their exact source loop phase.
++void xyo_rt_nested_osr_inner_yield_checkpoint(
++    JitCtx* c, double outerAfterBody, double innerAfterBody) {
++    if (!c || !c->thread || !c->thread->nestedOsrActive ||
++        !c->thread->compiled) return;
++    const auto* compiled =
++        static_cast<const CompiledScript*>(c->thread->compiled);
++    c->nestedOsrDeoptReady = 0;
++    c->nestedOsrDeoptPhase = 0;
++    const auto valid = [](double v) {
++        return std::isfinite(v) && v >= 0.0 &&
++               v <= 1099511627776.0 && std::floor(v) == v;
++    };
++    if (!compiled->nestedOsrInFlightGuard ||
++        !compiled->nestedOsrInnerYieldGuard ||
++        compiled->nestedOsrInnerLoopId.empty() ||
++        !valid(outerAfterBody) || !valid(innerAfterBody)) return;
++    c->nestedOsrDeoptRemaining = outerAfterBody;
++    c->nestedOsrDeoptInnerRemaining = innerAfterBody;
++    c->nestedOsrDeoptPhase = 2;
+     c->nestedOsrDeoptReady = 1;
+ }
+ 
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 6b8cda5..b0d356f 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -188,6 +188,11 @@ if(NOT EMSCRIPTEN)
+   target_link_libraries(xyo-nested-warp-bounded-inner-deopt-smoke PRIVATE xyo)
+   target_compile_options(xyo-nested-warp-bounded-inner-deopt-smoke
+     PRIVATE -fno-exceptions -fno-rtti)
++  add_executable(xyo-nested-warp-inner-yield-deopt-smoke
++    platform/nested_warp_inner_yield_deopt_smoke.cpp)
++  target_link_libraries(xyo-nested-warp-inner-yield-deopt-smoke PRIVATE xyo)
++  target_compile_options(xyo-nested-warp-inner-yield-deopt-smoke
++    PRIVATE -fno-exceptions -fno-rtti)
+   # A headless Runtime::step test; do not nest in SDL-only tests.
+   if(XYO_JIT AND Python3_Interpreter_FOUND)
+     add_test(NAME xyo-nested-warp-silent-edit
+@@ -226,6 +231,21 @@ if(NOT EMSCRIPTEN)
+         --without-block-count)
+     set_tests_properties(xyo-nested-warp-bounded-inner-deopt-fast
+       PROPERTIES TIMEOUT 600)
++    add_test(NAME xyo-nested-warp-inner-yield-deopt
++      COMMAND "${Python3_EXECUTABLE}"
++        "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_nested_warp_inner_yield_deopt.py"
++        --harness "$<TARGET_FILE:xyo-nested-warp-inner-yield-deopt-smoke>"
++        --out "${CMAKE_BINARY_DIR}/nested-warp-inner-yield-deopt")
++    set_tests_properties(xyo-nested-warp-inner-yield-deopt
++      PROPERTIES TIMEOUT 600)
++    add_test(NAME xyo-nested-warp-inner-yield-deopt-fast
++      COMMAND "${Python3_EXECUTABLE}"
++        "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_nested_warp_inner_yield_deopt.py"
++        --harness "$<TARGET_FILE:xyo-nested-warp-inner-yield-deopt-smoke>"
++        --out "${CMAKE_BINARY_DIR}/nested-warp-inner-yield-deopt-fast"
++        --without-block-count)
++    set_tests_properties(xyo-nested-warp-inner-yield-deopt-fast
++      PROPERTIES TIMEOUT 600)
+     # Keep the optimized, uninstrumented LLVM path under test too:
+     # block counting disables some native scalar/loop optimizations.
+     add_test(NAME xyo-nested-warp-inflight-body-edit-fast
+diff --git a/tests/differential/jit_nested_warp_inner_yield_deopt.py b/tests/differential/jit_nested_warp_inner_yield_deopt.py
+new file mode 100644
+index 0000000..5dd2830
+--- /dev/null
++++ b/tests/differential/jit_nested_warp_inner_yield_deopt.py
+@@ -0,0 +1,161 @@
++#!/usr/bin/env python3
++"""OSR-011: real native LLVM yield *inside* a nested Scratch repeat.
++
++The lexical source has root repeat(3) -> warp procedure -> outer
++repeat(120k) -> inner repeat(128) -> variable increment, with a string
++suffix after the inner control statement. After an actual phase-2 Fiber
++suspension, a live source edit redirects inner increment sum->branchCount.
++The interpreter must inherit BOTH already-decremented counters without
++replaying completed inner effects, outer prefix, or caller suffix.
++"""
++from __future__ import annotations
++
++import argparse
++import os
++from pathlib import Path
++import re
++import sys
++
++sys.path.insert(0, str(Path(__file__).parent))
++from jit_nested_warp_bounded_inner_deopt import nested_fixture
++from jit_nested_warp_inflight_body_edit import run_mode, PROMOTION, RESTORE, EDIT
++
++INNER_DEOPT = re.compile(
++    r"\[jit-osr-inflight\] deopt inner outer=([0-9.]+) "
++    r"inner=([0-9.]+) source-changed=1"
++)
++
++
++def verify(harness: Path, project: Path, *, outer_count: int,
++           inner_count: int, block_count: bool):
++    total = 3 * outer_count * inner_count * 2
++    os.environ["XYO_OSR_EXPECTED_SUM"] = str(total)
++    baseline, _ = run_mode(
++        harness, project, "baseline", count=block_count
++    )
++    assert baseline["v_sum"] == f"n:{total}", baseline
++    assert baseline["v_branchCount"] == "s:0", baseline
++    expected_blocks = baseline.get("__block_count")
++
++    disabled, disabled_trace = run_mode(
++        harness, project, "disabled", count=block_count
++    )
++    assert disabled == baseline, (disabled, baseline)
++    assert not PROMOTION.search(disabled_trace), disabled_trace[-1800:]
++
++    positive, trace = run_mode(
++        harness, project, "positive", count=block_count
++    )
++    assert positive == baseline, (positive, baseline)
++    promotions = len(PROMOTION.findall(trace))
++    assert promotions >= 1, trace[-3200:]
++    assert len(RESTORE.findall(trace)) == promotions, trace[-3200:]
++    assert "yielding inner repeat accepted" in trace, trace[-3200:]
++    print(f"PASS phase2 positive: LLVM promotions/restores {promotions}/{promotions} "
++          f"count={'on' if block_count else 'off'}", flush=True)
++
++    # Without the provenance guard LLVM is allowed to specialize/batch
++    # the inner repeat and may have no observable native Fiber yield.
++    # Requiring one would accidentally constrain the default optimizer.
++    # The negative stale-LLVM comparison is already covered by OSR-009.
++    for mode in ("guarded", "guarded-late"):
++        state, trace = run_mode(
++            harness, project, mode, count=block_count
++        )
++        edits = EDIT.findall(trace)
++        assert len(edits) == 1, (mode, edits, trace[-2400:])
++        inner_remaining, flag, committed, at_count, yields = edits[0]
++        guarded = mode.startswith("guarded")
++        assert int(flag) == int(guarded), (mode, edits)
++        assert int(yields) >= (4 if mode.endswith("-late") else 1)
++        assert 0 < float(committed) < total
++        promotes, restores = (
++            len(PROMOTION.findall(trace)), len(RESTORE.findall(trace))
++        )
++        assert 1 <= promotes <= 3, (mode, promotes, trace[-2500:])
++        assert restores == promotes - int(guarded), (
++            mode, promotes, restores, trace[-2500:]
++        )
++        actual_deopts = INNER_DEOPT.findall(trace)
++        assert len(actual_deopts) == int(guarded), (
++            mode, actual_deopts, trace[-2800:]
++        )
++        if guarded:
++            outer, inner = actual_deopts[0]
++            assert 0 <= float(outer) <= outer_count
++            assert 0 <= float(inner) < inner_count
++        sum_value = int(state["v_sum"][2:])
++        branch = int(state["v_branchCount"][2:])
++        assert sum_value + branch == total, (mode, state)
++        if guarded:
++            assert sum_value == int(float(committed)), (
++                mode, sum_value, committed, trace[-2600:]
++            )
++            assert branch == total - sum_value
++        else:
++            assert sum_value > int(float(committed)), (
++                mode, sum_value, committed, trace[-2600:]
++            )
++        for key, value in baseline.items():
++            if key not in ("v_sum", "v_branchCount"):
++                assert state[key] == value, (
++                    mode, key, state[key], value
++                )
++        if block_count:
++            assert state["__block_count"] == expected_blocks, (
++                mode, expected_blocks, state["__block_count"]
++            )
++        print(f"PASS {mode}: native={promotes}, "
++              f"inner-source-deopt={int(guarded)}, "
++              f"sum={sum_value}, edited={branch}, "
++              f"blocks={state.get('__block_count','disabled')}",
++              flush=True)
++
++    # Source-proven inner loop count >8192 is deliberately rejected.
++    # Small outer count keeps this rejection fixture inexpensive.
++    print("PASS inner phase-2 source edit/counter continuity "
++          "and negative guard controls", flush=True)
++
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--harness", type=Path, required=True)
++    p.add_argument("--out", type=Path, required=True)
++    # Async LLVM compilation can complete after a short 40k-iteration
++    # outer loop on a busy shared machine. Give every parent invocation
++    # enough interpreted work to guarantee an actual native promotion,
++    # instead of sporadically skipping the phase-2 yield entirely.
++    p.add_argument("--outer-count", type=int, default=120_000)
++    p.add_argument("--inner-count", type=int, default=128)
++    p.add_argument("--without-block-count", action="store_true")
++    a = p.parse_args()
++    a.out.mkdir(parents=True, exist_ok=True)
++    project = nested_fixture(
++        a.out / "real-native-inner-yield.sb3",
++        outer_count=a.outer_count, inner_count=a.inner_count,
++    )
++    verify(a.harness, project, outer_count=a.outer_count,
++           inner_count=a.inner_count,
++           block_count=not a.without_block_count)
++    if a.inner_count <= 8192:
++        rejected = nested_fixture(
++            a.out / "rejected-inner-yield-9000.sb3",
++            outer_count=32, inner_count=9000,
++        )
++        os.environ["XYO_OSR_EXPECTED_SUM"] = str(3 * 32 * 9000 * 2)
++        count = not a.without_block_count
++        before, _ = run_mode(
++            a.harness, rejected, "baseline", count=count
++        )
++        after, trace = run_mode(
++            a.harness, rejected, "rejected", count=count
++        )
++        assert after == before, (after, before)
++        assert not PROMOTION.search(trace), trace[-2500:]
++        assert "yielding inner repeat accepted" not in trace
++        print("PASS inner count=9000 rejected, full Interpreter parity",
++              flush=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/platform/nested_warp_inner_yield_deopt_smoke.cpp b/tests/platform/nested_warp_inner_yield_deopt_smoke.cpp
+new file mode 100644
+index 0000000..9d8a434
+--- /dev/null
++++ b/tests/platform/nested_warp_inner_yield_deopt_smoke.cpp
+@@ -0,0 +1,332 @@
++// OSR-011: actual native yield INSIDE a single nested counted repeat
++// while OSR-008 emits a scheduler yield only at the outer body boundary.
++// Edit the nested changevariableby target after native Fiber suspension.
++// Edit a *currently executing* Scratch counted-repeat body AFTER a real
++// native Fiber yield, before any more compiled instructions run. The old
++// body writes sum; the edited source writes branchCount. resetCache()
++// rebuilds Interpreter BlockCached fields just as the real editor does.
++// Without the in-flight guard, stale LLVM keeps writing sum. With the guard,
++// the original Interpreter frame must execute the new source from its exact
++// saved loop counter, without replaying any committed effects.
++// Tests perform the edit after either the first or fourth native yield.
++#ifdef NDEBUG
++#undef NDEBUG
++#endif
++
++#include "../../src/engine/runtime.hpp"
++#include "../../src/engine/thread.hpp"
++#include "../../src/ir/scratch_pipeline.hpp"
++#include "../../src/ir/scratch_source_digest.hpp"
++#include "../../src/jit/jit.hpp"
++#include "../../src/load/sb3.hpp"
++#include "../../src/model/target.hpp"
++#include "../../src/core/sstr.hpp"
++
++#include <cassert>
++#include <cmath>
++#include <cstdlib>
++#include <fstream>
++#include <iomanip>
++#include <iostream>
++#include <iterator>
++#include <map>
++#include <sstream>
++#include <string>
++#include <vector>
++
++using namespace xyo;
++
++namespace {
++
++void env(const char* name, const char* value) {
++#if defined(_WIN32)
++    assert(_putenv_s(name, value) == 0);
++#else
++    assert(::setenv(name, value, 1) == 0);
++#endif
++}
++
++std::string canonical(Value v) {
++    if (v.isBool()) return v.asBool() ? "true" : "false";
++    if (v.isString()) return "s:" + SStr::toUtf8(v.asStrPtr());
++    if (v.isNumber()) {
++        std::ostringstream out;
++        out << std::setprecision(17) << v.asNumberUnchecked();
++        return "n:" + out.str();
++    }
++    std::ostringstream out;
++    out << "raw:" << std::hex << v.bits;
++    return out.str();
++}
++
++void check(bool condition, const char* reason) {
++    if (condition) return;
++    std::cerr << "FAIL " << reason << '\n';
++    std::exit(2);
++}
++
++Target* findBench(Runtime& rt) {
++    for (Target* target : rt.targets)
++        if (target && target->sprite &&
++            target->sprite->name == u"Bench")
++            return target;
++    return nullptr;
++}
++
++Block* runningSumIncrement(Blocks& blocks) {
++    for (auto& [id, node] : blocks.allBlocks()) {
++        if (node.opcode != "data_changevariableby") continue;
++        const auto field = node.fields.find("VARIABLE");
++        if (field != node.fields.end() && field->second.id == "v_sum")
++            return &node;
++    }
++    return nullptr;
++}
++
++bool replaceActiveBody(Thread& thread, const CompiledScript& ready) {
++    Blocks& blocks = *thread.blockContainer;
++    const Block* root = blocks.getBlock(thread.topBlock);
++    check(root && ready.nestedOsrEntry, "missing source root/LLVM");
++    Block* running = runningSumIncrement(blocks);
++    check(running, "missing running sum increment in procedure body");
++    auto field = running->fields.find("VARIABLE");
++    check(field != running->fields.end(), "missing VARIABLE field");
++    const auto initial = ir::ScratchCompilationUnit::capture(blocks, root);
++    check(initial.valid(), "invalid pre-edit Scratch source");
++    const auto before = ir::scratchSourceDigest(initial);
++    const uint64_t revision = blocks.revision();
++    // Real source edit: the interpreter must create fresh BlockCached
++    // ArgValues; a silent field edit without resetCache would leave the
++    // interpreter itself executing the old target variable.
++    field->second.id = "v_branchCount";
++    blocks.resetCache();
++    const auto updated = ir::ScratchCompilationUnit::capture(blocks, root);
++    check(updated.valid(), "invalid updated Scratch source");
++    check(blocks.revision() != revision,
++          "real editor edit must advance source revision");
++    check(ir::scratchSourceDigest(updated) != before,
++          "active-body edit did not change source digest");
++    std::cerr << "[osr-body-edit] changed id=" << running->id
++              << " v_sum->v_branchCount revision=" << revision
++              << "->" << blocks.revision() << '\n';
++    return true;
++}
++
++} // namespace
++
++int main(int argc, char** argv) {
++    if (argc != 3) {
++        std::cerr << "usage: body-edit <project.sb3> "
++                     "<baseline|positive|unguarded|guarded|unguarded-late|guarded-late>\n";
++        return 2;
++    }
++    const std::string mode = argv[2];
++    const char* expectedText = std::getenv("XYO_OSR_EXPECTED_SUM");
++    const double expectedSum = expectedText ?
++        std::strtod(expectedText, nullptr) : 48000000.0;
++    check(std::isfinite(expectedSum) && expectedSum > 0,
++          "invalid expected native/interpreter sum");
++    const bool baseline = mode == "baseline";
++    const bool rejected = mode == "rejected";
++    const bool disabled = mode == "disabled";
++    const bool late = mode == "unguarded-late" ||
++                      mode == "guarded-late";
++    const bool edited = mode == "unguarded" || mode == "guarded" ||
++                        late;
++    const bool proof = !baseline;
++    const bool inFlight = rejected || disabled ||
++        mode == "positive" || mode == "guarded" ||
++        mode == "guarded-late";
++    const uint32_t nativeYieldsBeforeEdit = late ? 4 : 1;
++    check(baseline || rejected || disabled || edited ||
++          mode == "positive",
++          "unknown test mode");
++    env("XYO_JIT_MODE", baseline ? "off" : "hotspot");
++    env("XYO_JIT_ASYNC", "1");
++    env("XYO_JIT_OSR", "1");
++    env("XYO_JIT_OSR_NESTED", "1");
++    env("XYO_JIT_OSR_NESTED_DEEP", "1");
++    env("XYO_JIT_OSR_NESTED_PARENT_REPEAT", "1");
++    env("XYO_JIT_OSR_NESTED_ARG_READS", "1");
++    env("XYO_JIT_OSR_NESTED_DIRECT_ARGS", "1");
++    env("XYO_JIT_OSR_NESTED_HOIST_ARGS", "1");
++    env("XYO_JIT_OSR_NESTED_SOURCE_PROOF", proof ? "1" : "0");
++    env("XYO_JIT_OSR_NESTED_INFLIGHT_DEOPT", inFlight ? "1" : "0");
++    env("XYO_JIT_OSR_NESTED_INNER_BOUNDED", "0");
++    env("XYO_JIT_OSR_NESTED_INNER_YIELD_DEOPT",
++        inFlight && !disabled ? "1" : "0");
++    env("XYO_JIT_OSR_TIMING", "1");
++    env("XYO_JIT_OSR_NESTED_TRACE", "1");
++    env("XYO_PAR", "0");
++    env("XYO_PARFOR", "0");
++    env("XYO_GPU", "0");
++
++    setJitMode(baseline ? JitMode::Off : JitMode::HotSpot);
++    std::ifstream file(argv[1], std::ios::binary);
++    check(bool(file), "cannot open fixture");
++    std::vector<uint8_t> source{
++        std::istreambuf_iterator<char>(file),
++        std::istreambuf_iterator<char>()
++    };
++    check(!source.empty(), "empty fixture");
++
++    Runtime rt;
++    const auto loaded = loadSb3File(rt, source.data(), source.size());
++    check(loaded.ok, "loadSb3File failed");
++    Target* target = findBench(rt);
++    check(target && target->blocks, "Bench target missing");
++    // The timeout is a public runtime scheduler configuration, not an
++    // instrumentation hook. It makes an actual warp Fiber suspension occur
++    // in a small GC/string test rather than requiring a 500ms CPU burst.
++    // Use normal test warp timing. On very fast native executions the
++    // fourth observed yield may occur in a later parent invocation.
++    // The verifier accounts for each completed native caller suffix.
++    rt.warpTimeMs = baseline ? 500.0 : 0.0;
++    rt.greenFlag();
++
++    bool changed = false;
++    bool published = false;
++    bool sawNativeYield = false;
++    bool sawNativeInnerYield = false;
++    double deoptCheckpoint = -1.0;
++    double sumAtEdit = -1.0;
++    uint64_t countAtEdit = 0;
++    uint64_t observedNativeYields = 0;
++    double lastObservedSum = -1;
++    uint64_t iterations = 0;
++    constexpr uint64_t maxSteps = 200000;
++    for (; iterations < maxSteps; ++iterations) {
++        if (rt.threads.empty()) break;
++        // The host may edit the live source ONLY while the native Fiber
++        // is suspended at xyo_yield. It is a serial scheduler safe point.
++        if (!changed && !baseline) {
++            for (Thread* t : rt.threads) {
++                if (!t || !t->jitCtx || !t->fiber ||
++                    !t->isCompiled || !t->nestedOsrActive ||
++                    !t->topBlockPtr || !t->blockContainer)
++                    continue;
++                const auto* candidate = static_cast<const CompiledScript*>(
++                    t->compiled);
++                if (!candidate || !candidate->nestedOsrEntry ||
++                    candidate->nestedOsrInFlightGuard != inFlight)
++                    continue;
++                sawNativeYield = true;
++                published = true;
++                if (inFlight && t->jitCtx->nestedOsrDeoptPhase == 2)
++                    sawNativeInnerYield = true;
++                if (inFlight) {
++                    // Only a REAL inner-body-completed Fiber suspension
++                    // is the verified source edit injection site.
++                    if (t->jitCtx->nestedOsrDeoptPhase != 2)
++                        continue;
++                    check(t->jitCtx->nestedOsrDeoptReady == 1,
++                          "native inner yield missing safe checkpoint");
++                    check(t->jitCtx->nestedOsrDeoptInnerRemaining >= 0.0,
++                          "negative nested source loop checkpoint");
++                    deoptCheckpoint =
++                        t->jitCtx->nestedOsrDeoptInnerRemaining;
++                }
++                if (edited) {
++                    const Variable* sum =
++                        target->lookupVariableById("v_sum");
++                    check(sum && sum->value.isNumber(),
++                          "cannot snapshot sum at native yield");
++                    const double currentSum =
++                        sum->value.asNumberUnchecked();
++                    if (currentSum <= lastObservedSum) continue;
++                    lastObservedSum = currentSum;
++                    ++observedNativeYields;
++                    if (observedNativeYields < nativeYieldsBeforeEdit)
++                        continue;
++                    sumAtEdit = currentSum;
++                    countAtEdit =
++                        rt.executedBlocks.load(std::memory_order_relaxed);
++                    changed = replaceActiveBody(*t, *candidate);
++                    rt.warpTimeMs = 500.0;
++                    std::cerr
++                        << "[osr-body-edit] suspended remaining="
++                        << deoptCheckpoint << " guard=" << int(inFlight)
++                        << " committed-sum="
++                        << static_cast<uint64_t>(sumAtEdit)
++                        << " blocks=" << countAtEdit
++                        << " yields=" << observedNativeYields << '\n';
++                    break;
++                }
++            }
++        }
++        rt.step();
++    }
++    check(iterations < maxSteps, "runtime exceeded step budget");
++    if (!baseline && !rejected && !disabled) {
++        check(published && sawNativeYield,
++              "native LLVM never yielded at an observable safe point");
++        if (inFlight)
++            check(sawNativeInnerYield,
++                  "LLVM never yielded inside the native inner repeat");
++    }
++    if (rejected || disabled) check(!sawNativeYield,
++                       "unapproved nested loop was promoted");
++    if (edited) check(changed, "source edit was not injected at a native yield");
++    check(rt.threads.empty(), "project left unfinished threads");
++    const auto number = [&](const char* id) {
++        const Variable* v = target->lookupVariableById(id);
++        if (!v || !v->value.isNumber()) {
++            std::cerr << "missing/non-numeric variable id=" << id
++                      << " found=" << int(v != nullptr)
++                      << " value=" << (v ? canonical(v->value) : "(none)")
++                      << " steps=" << iterations << '\n';
++            check(false, "missing numeric result");
++        }
++        return v->value.asNumberUnchecked();
++    };
++    if (inFlight && edited) {
++        check(sumAtEdit > 0 && sumAtEdit < expectedSum,
++              "edit did not occur after partial native execution");
++        check(number("v_sum") == sumAtEdit,
++              "post-deopt interpreter used stale native variable field");
++        check(number("v_branchCount") == expectedSum - sumAtEdit,
++              "remaining loop work did not use edited branchCount");
++    } else if (edited) {
++        check(number("v_sum") > sumAtEdit,
++              "without guard, native loop unexpectedly respected edit");
++    } else {
++        check(number("v_sum") == expectedSum, "incorrect original sum");
++        const Variable* branch = target->lookupVariableById("v_branchCount");
++        check(branch && canonical(branch->value) == "s:0",
++              "unexpected branchCount");
++    }
++    if (edited)
++        check(number("v_sum") + number("v_branchCount") == expectedSum,
++              "missing/duplicated increments across native/interpreter split");
++    check(number("v_entered") == 3.0, "outer repeat restarted");
++    check(number("v_afterInner") == 3.0,
++          "caller suffix replay/missing");
++    // Scratch assignments can preserve string literal Value tags.
++    const auto literal = [&](const char* id) {
++        const Variable* v = target->lookupVariableById(id);
++        check(v != nullptr, "missing literal result");
++        return canonical(v->value);
++    };
++    check(literal("v_done") == "s:1", "root script unfinished");
++    check(literal("v_times") == "s:17",
++          "dynamic repeat TIMES unexpectedly reevaluated");
++
++    std::map<std::string, std::string> results;
++    if (rt.blockCountEnabled)
++        results["__block_count"] =
++            "n:" + std::to_string(
++                rt.executedBlocks.load(std::memory_order_relaxed));
++    for (const auto& [id, variable] : target->variables)
++        if (variable.type != Variable::kListType)
++            results[id] = canonical(variable.value);
++    std::cout << "SPLIT sum-at-edit=" << sumAtEdit
++              << " count-at-edit=" << countAtEdit << '\n';
++    std::cout << "TEST mode=" << mode << " steps=" << iterations
++              << " nested-yield=" << int(sawNativeInnerYield)
++              << " edited=" << int(changed)
++              << " native-yield=" << int(sawNativeYield)
++              << " checkpoint=" << deoptCheckpoint << '\n';
++    for (const auto& [id, value] : results)
++        std::cout << "STATE " << id << "=" << value << '\n';
++    return 0;
++}

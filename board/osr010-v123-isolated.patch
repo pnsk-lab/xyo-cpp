@@ -1,0 +1,223 @@
+diff --git a/src/jit/backend_llvm.cpp b/src/jit/backend_llvm.cpp
+index 597b7a1..b56924c 100644
+--- a/src/jit/backend_llvm.cpp
++++ b/src/jit/backend_llvm.cpp
+@@ -50,6 +50,102 @@
+ 
+ namespace xyo {
+ 
++// OSR-010: the enclosing native counted-repeat body is a safe deopt point
++// only if this ONE short inner repeat is atomic. This proof accepts exactly
++// one inner repeat of 1..8 iterations containing 1..4 numeric increments.
++// Reject dynamic TIMES, unknown/recursive edges, nested sub-loops and
++// reporters that could hide suspension or observable intermediate effects.
++static bool safeBoundedNativeInnerRepeat(const Blocks& blocks,
++                                         const Block& outer) {
++    if (outer.opcode != "control_repeat") return false;
++    const auto* sub = outer.inputs.find("SUBSTACK");
++    if (!sub || sub->block.empty()) return false;
++    std::unordered_set<std::string> seen;
++    size_t nodes = 0;
++    size_t nested = 0;
++    // Even a primitive setter may contain an asynchronous VALUE reporter.
++    // Accept only bounded, pure, acyclic expression graphs at the source
++    // boundary; never infer that an arbitrary extension/compat call is safe.
++    const auto safeValue = [&](const Block* statement) -> bool {
++        const auto* value = statement->inputs.find("VALUE");
++        if (!value) return false;
++        std::unordered_set<std::string> exprNodes;
++        const auto check = [&](auto&& self, const BlockInput* input,
++                               unsigned depth) -> bool {
++            if (!input || depth > 6) return false;
++            const auto& id = input->block.empty()
++                ? input->shadow : input->block;
++            if (id.empty()) return true;
++            if (exprNodes.size() >= 16 ||
++                !exprNodes.insert(id).second) return false;
++            const Block* r = blocks.getBlock(id);
++            if (!r || !r->next.empty()) return false;
++            const auto& op = r->opcode;
++            if (op == "argument_reporter_string_number" ||
++                op == "argument_reporter_boolean" ||
++                op == "data_variable" ||
++                op == "math_number" || op == "math_integer" ||
++                op == "math_whole_number" ||
++                op == "math_positive_number" || op == "math_angle" ||
++                op == "text" || op == "colour_picker")
++                return r->inputs.items.empty();
++            if (op == "operator_join")
++                return self(self, r->inputs.find("STRING1"), depth+1) &&
++                       self(self, r->inputs.find("STRING2"), depth+1);
++            if (op == "operator_add" || op == "operator_subtract" ||
++                op == "operator_multiply" || op == "operator_divide")
++                return self(self, r->inputs.find("NUM1"), depth+1) &&
++                       self(self, r->inputs.find("NUM2"), depth+1);
++            return false;
++        };
++        return check(check, value, 0);
++    };
++    const auto scan = [&](auto&& self, std::string id,
++                          bool innerBody) -> bool {
++        size_t inChain = 0;
++        while (!id.empty()) {
++            if (++nodes > 16 || ++inChain > 16 ||
++                !seen.insert(id).second) return false;
++            const Block* blk = blocks.getBlock(id);
++            if (!blk) return false;
++            if (blk->opcode == "control_repeat") {
++                if (innerBody || ++nested > 1) return false;
++                const auto* times = blk->inputs.find("TIMES");
++                const auto* body = blk->inputs.find("SUBSTACK");
++                if (!times || !body || body->block.empty()) return false;
++                // Literal Scratch numeric input only: no runtime reporter.
++                const auto& timesId = times->block.empty()
++                    ? times->shadow : times->block;
++                const Block* count = blocks.getBlock(timesId);
++                if (!count || !count->next.empty() ||
++                    (count->opcode != "math_number" &&
++                     count->opcode != "math_integer" &&
++                     count->opcode != "math_whole_number" &&
++                     count->opcode != "math_positive_number"))
++                    return false;
++                const auto field = count->fields.find("NUM");
++                if (field == count->fields.end()) return false;
++                const double n = cast::toNumber(field->second.value);
++                if (!std::isfinite(n) || n < 1 || n > 8 ||
++                    std::floor(n) != n) return false;
++                if (!self(self, body->block, true)) return false;
++            } else {
++                if (blk->opcode != "data_changevariableby" &&
++                    !(blk->opcode == "data_setvariableto" && !innerBody))
++                    return false;
++                const auto field = blk->fields.find("VARIABLE");
++                if (field == blk->fields.end() ||
++                    field->second.id.empty() || !safeValue(blk))
++                    return false;
++            }
++            if (innerBody && inChain > 4) return false;
++            id = blk->next;
++        }
++        return true;
++    };
++    return scan(scan, sub->block, false) && nested == 1;
++}
++
+ bool jitEmitScript(llvm::Module&, llvm::LLVMContext&, Runtime&, Target*,
+                    Blocks*, const std::string&, const std::string&,
+                    CompiledScript&, JitPinned&,
+@@ -1084,7 +1180,21 @@ std::unique_ptr<PendingJitCompilation> LLVMBackend::prepareAsync(
+             id = statement->next;
+         }
+         if (flat && !id.empty()) flat = false;
+-        if (!flat) nested = {};
++        // Source-proven OSR-010: a bounded inner loop has no independent
++        // scheduler yield; the outer loop still exposes a complete-body
++        // checkpoint. Without the explicit flag, preserve fail-closed.
++        const char* bounded = std::getenv(
++            "XYO_JIT_OSR_NESTED_INNER_BOUNDED");
++        const char* proof = std::getenv(
++            "XYO_JIT_OSR_NESTED_SOURCE_PROOF");
++        const bool safeBounded = !flat && bounded &&
++            bounded[0] == '1' && proof && proof[0] == '1' &&
++            safeBoundedNativeInnerRepeat(
++                *thread.blockContainer, *nested.loop);
++        if (safeBounded && std::getenv("XYO_JIT_OSR_NESTED_TRACE"))
++            std::fprintf(stderr,
++                "[jit-osr-inflight] bounded inner repeat accepted\n");
++        if (!flat && !safeBounded) nested = {};
+     }
+     const uint64_t nestedSourceRevision = nested.loop
+         ? thread.blockContainer->revision() : 0;
+diff --git a/src/jit/codegen.cpp b/src/jit/codegen.cpp
+index a8efc1d..dac1bfb 100644
+--- a/src/jit/codegen.cpp
++++ b/src/jit/codegen.cpp
+@@ -264,6 +264,8 @@ struct Codegen {
+     bool hoistNestedOsrArgs = false;
+     // Optional bounded deopt only at a fully completed counted-loop body.
+     bool nestedOsrInFlightGuard = false;
++    // OSR-010: a source-proven 1..8 inner repeat must complete atomically.
++    bool nestedOsrBoundedInner = false;
+     std::map<std::u16string, llvm::Value*> hoistedNestedOsrArgs;
+     /// ループ本体で書き込まれる変数/リスト（不変性判定用）
+     struct LoopWriteScan {
+@@ -7911,20 +7913,24 @@ struct Codegen {
+ 
+         if (op == "control_repeat") {
+             const bool osrFirstLoop = blk == osrStartLoop;
+-            const auto conditionalRepeat = (osrFirstLoop || runtime.blockCountEnabled)
++            const bool boundedNativeInner =
++                nestedOsrInFlightGuard && nestedOsrBoundedInner &&
++                !osrFirstLoop;
++            const auto conditionalRepeat = (osrFirstLoop ||
++                boundedNativeInner || runtime.blockCountEnabled)
+                 ? std::optional<ConditionalRepeatPlan>{}
+                 : conditionalRepeatPlan(blk);
+-            const auto repeatCopies = (osrFirstLoop || runtime.blockCountEnabled)
++            const auto repeatCopies = (osrFirstLoop || boundedNativeInner || runtime.blockCountEnabled)
+                 ? std::nullopt : repeatCopyPlan(blk);
+             if (verbose && repeatCopies)
+                 std::fprintf(stderr, "xyo-jit: repeat SSA copies %s\n",
+                              blk->id.c_str());
+-            const auto repeatAffine = (osrFirstLoop || runtime.blockCountEnabled)
++            const auto repeatAffine = (osrFirstLoop || boundedNativeInner || runtime.blockCountEnabled)
+                 ? std::nullopt : repeatAffinePlan(blk);
+             if (verbose && repeatAffine)
+                 std::fprintf(stderr, "xyo-jit: repeat SSA affine %s\n",
+                              blk->id.c_str());
+-            if (!osrFirstLoop && !runtime.blockCountEnabled) {
++            if (!osrFirstLoop && !boundedNativeInner && !runtime.blockCountEnabled) {
+                 if (auto plan = multiTransientPattern(blk)) {
+                     emitTransientMultiRepeat(blk, *plan);
+                     return;
+@@ -7937,7 +7943,7 @@ struct Codegen {
+             // for (i = toNum(TIMES); i >= 0.5; i--) { body; loopYield }
+             // Fixed-count straight-line bodies are eligible for bounded
+             // strip-mining into groups of at most 512 logical iterations.
+-            if (auto plan = (osrFirstLoop || runtime.blockCountEnabled)
++            if (auto plan = (osrFirstLoop || boundedNativeInner || runtime.blockCountEnabled)
+                     ? std::optional<RepeatUnrollPlan>{}
+                     : repeatUnrollPlan(blk)) {
+                 // Evaluate TIMES once, exactly as in the ordinary lowering.
+@@ -8009,7 +8015,8 @@ struct Codegen {
+             // 本体が GPU 並列実行可能なら xyo_gpu_repeat へ委譲し、
+             // 失敗時のみ従来の CPU ループへ進む分岐を emit する。
+             const gpu::Program* gp =
+-                (osrFirstLoop && nestedOsrInFlightGuard) || promotedLoop
++                (nestedOsrInFlightGuard && (osrFirstLoop || boundedNativeInner)) ||
++                promotedLoop
+                     ? nullptr : tryGpuLoop(blk);
+             // With a compile-time fixed nonnegative count <= INT32_MAX, the
+             // existing IEEE test i >= 0.5 followed by i -= 1 performs exactly
+@@ -8058,7 +8065,7 @@ struct Codegen {
+             // 「カウンタ + append」ループなら par-for を試す（warp 実行中のみ）。
+             // 失敗（0 返却）時は従来の CPU ループへ落ちる。
+             const bool triedParFor =
+-                osrFirstLoop && nestedOsrInFlightGuard
++                nestedOsrInFlightGuard && (osrFirstLoop || boundedNativeInner)
+                     ? false : tryEmitParFor(blk, n, head, merge);
+             if (!triedParFor) {
+                 if (gp) {
+@@ -8112,7 +8119,9 @@ struct Codegen {
+                 if (in) emitChainBlocks(chainOf(in->block), true);
+             }
+             if (!bbDone(b.GetInsertBlock())) {
+-                emitLoopYield();
++                // Only the PROVEN bounded inner-loop body's yield is
++                // suppressed; the enclosing outer latch stays observable.
++                if (!boundedNativeInner) emitLoopYield();
+                 if (intIv) {
+                     llvm::Value* remaining = b.CreateLoad(i32t, intIv);
+                     b.CreateStore(b.CreateSub(remaining, ci32(1)), intIv);
+@@ -9199,6 +9208,11 @@ bool jitEmitScript(llvm::Module& mod, llvm::LLVMContext& lc, Runtime& runtime,
+         const char* proof =
+             std::getenv("XYO_JIT_OSR_NESTED_SOURCE_PROOF");
+         cg.nestedOsrInFlightGuard = proof && proof[0] == '1';
++        if (const char* bounded =
++                std::getenv("XYO_JIT_OSR_NESTED_INNER_BOUNDED");
++            cg.nestedOsrInFlightGuard && bounded &&
++            bounded[0] == '1')
++            cg.nestedOsrBoundedInner = true;
+     }
+     // Validate a lossless snapshot of the selected source script. Capturing
+     // only this script avoids copying the entire Scratch project on every

@@ -48,6 +48,27 @@ tests/bench/algos/v8out/
 # 独立した実験用 Git チェックアウト（本リポジトリには含めない）
 /scratch-bench/
 
-# Multi-agent board: transient exclusive claim locks
+# Multi-agent board
+# タスク・連絡（board/tasks, board/messages）は追跡対象。
+# 以下は再生成可能な作業用成果物なので追跡しない。
 /board/.locks/
 /board/.test-sandbox/
+/board/.*
+/board/prof-*
+/board/*.log
+/board/*.err
+/board/*.out
+/board/*.stderr
+/board/*.stdout
+/board/*.core
+/board/*.fractch
+/board/*-xyo
+/board/*-smoke
+/board/*-cli
+# 過去の調査で使ったソースのコピー（正本は src/ 以下）
+/board/nested-osr-wip/
+
+# User-managed translation model weights (not redistributed)
+/models/
+*.gguf
+*.safetensors

@@ -1,10 +1,10 @@
 ---
 id: MATH-018
 title: 64反復整数SSAのループカウンター32bit化とパリティ・性能評価
-status: review
+status: done
 owner: agent-math-gpt6
 priority: P1
-updated: 2026-11-08
+updated: 2026-11-12
 ---
 
 ## Scope

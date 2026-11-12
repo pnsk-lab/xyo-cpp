@@ -1,0 +1,94 @@
+diff --git a/src/blocks/core.cpp b/src/blocks/core.cpp
+index bc97a98..8bdd7bf 100644
+--- a/src/blocks/core.cpp
++++ b/src/blocks/core.cpp
+@@ -454,8 +454,11 @@ Value opMathop(const ArgValues& a, BlockUtility&) {
+     if (equalsAsciiLower(op, u"floor")) return V(std::floor(n));
+     if (equalsAsciiLower(op, u"ceiling")) return V(std::ceil(n));
+     if (equalsAsciiLower(op, u"sqrt")) return V(std::sqrt(n));
+-    if (equalsAsciiLower(op, u"sin"))
++    if (equalsAsciiLower(op, u"sin")) {
++        // Scratch math-util.toFixed(10) normalizes sin(-0) to +0.
++        if (n == 0.0) return V(0.0);
+         return V(jsnum::jsRound(v8math::sin((M_PI * n) / 180.0) * 1e10) / 1e10);
++    }
+     if (equalsAsciiLower(op, u"cos"))
+         return V(jsnum::jsRound(v8math::cos((M_PI * n) / 180.0) * 1e10) / 1e10);
+     if (equalsAsciiLower(op, u"tan")) return V(rt::tanDeg(n));
+diff --git a/src/jit/codegen.cpp b/src/jit/codegen.cpp
+index a8efc1d..1940aae 100644
+--- a/src/jit/codegen.cpp
++++ b/src/jit/codegen.cpp
+@@ -3578,7 +3578,12 @@ struct Codegen {
+                 decl(fn == 4 ? "sin" : "cos", f64t, {f64t}), {rad});
+             v = b.CreateUnaryIntrinsic(Intrinsic::round,
+                                        b.CreateFMul(v, cf64(1e10)));
+-            return b.CreateFDiv(v, cf64(1e10));
++            llvm::Value* rounded = b.CreateFDiv(v, cf64(1e10));
++            // Scratch's toFixed(10) turns sin(-0) into +0.
++            return fn == 4
++                ? b.CreateSelect(b.CreateFCmpOEQ(x, cf64(0.0)),
++                                 cf64(0.0), rounded)
++                : rounded;
+         }
+         case 7: case 8: case 9: {
+             // Scratch: (asin(x) * 180) / pi。定数を先に畳まない。
+diff --git a/src/jit/rt.cpp b/src/jit/rt.cpp
+index 4d16d50..c05e3cd 100644
+--- a/src/jit/rt.cpp
++++ b/src/jit/rt.cpp
+@@ -416,7 +416,9 @@ double xyo_mathop(JitCtx*, int32_t fn, double x) {
+     case 1: return std::floor(x);
+     case 2: return std::ceil(x);
+     case 3: return std::sqrt(x);
+-    case 4: return jsnum::jsRound(v8math::sin(kPi * x / 180.0) * 1e10) / 1e10;
++    case 4: return x == 0.0
++        ? 0.0 // Scratch toFixed(10) returns positive zero even for sin(-0).
++        : jsnum::jsRound(v8math::sin(kPi * x / 180.0) * 1e10) / 1e10;
+     case 5: return jsnum::jsRound(v8math::cos(kPi * x / 180.0) * 1e10) / 1e10;
+     case 6: {
+         // MathUtil.tan: %360、±90/270 は ±Infinity、他は 1e10 丸め
+diff --git a/tests/unit/test_motion_numeric.cpp b/tests/unit/test_motion_numeric.cpp
+index cb40bc4..63c3f25 100644
+--- a/tests/unit/test_motion_numeric.cpp
++++ b/tests/unit/test_motion_numeric.cpp
+@@ -162,7 +162,18 @@ int test_motion_numeric_main() {
+         if (test.x == 230 && test.y == 0 && test.direction == 37)
+             check(target->direction == -37.00000000000003);
+ #endif
+-        check(std::abs(target->x) <= 220 && std::abs(target->y) <= 170);
++        // Bounce fencing uses a pixel-centre hull inset, not a full 40x20
++        // bounding box. The reflected direction determines the inset and
++        // may legitimately leave the centre beyond (220, 170) by <= 0.71px.
++        const double angle = target->rotationStyle == "all around"
++            ? (target->direction - 90.0) * 3.14159265358979323846 / 180.0
++            : 0.0;
++        const double pixelInset = target->visible
++            ? std::abs(target->size / 200.0) *
++                (std::abs(std::cos(angle)) + std::abs(std::sin(angle)))
++            : 0.0;
++        check(std::abs(target->x) <= 220.0 + pixelInset + 1e-9 &&
++              std::abs(target->y) <= 170.0 + pixelInset + 1e-9);
+     }
+     rt.renderer=nullptr;
+     std::printf("numeric motion: %d checks, %d failures\n",checks,failures);
+diff --git a/tests/unit/test_nan_codegen.cpp b/tests/unit/test_nan_codegen.cpp
+index c52cf74..4e4d433 100644
+--- a/tests/unit/test_nan_codegen.cpp
++++ b/tests/unit/test_nan_codegen.cpp
+@@ -86,8 +86,13 @@ Value evaluate(const E& e, Value x, Value y) {
+         if (e->literal == "abs") result = std::fabs(n);
+         else if (e->literal == "floor") result = std::floor(n);
+         else if (e->literal == "ceiling") result = std::ceil(n);
+-        else if (e->literal == "sin")
+-            result = jsRoundRef(std::sin((kPi * n) / 180.0) * 1e10) / 1e10;
++        else if (e->literal == "sin") {
++            // Scratch's toFixed(10) converts sin(-0) to positive zero.
++            // The runtime must preserve this even though std::sin(-0) is -0.
++            result = n == 0.0
++                ? 0.0
++                : jsRoundRef(std::sin((kPi * n) / 180.0) * 1e10) / 1e10;
++        }
+         else if (e->literal == "cos")
+             result = jsRoundRef(std::cos((kPi * n) / 180.0) * 1e10) / 1e10;
+         else if (e->literal == "asin") result = v8math::asin(n) * 180.0 / kPi;

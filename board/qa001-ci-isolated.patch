@@ -1,0 +1,502 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -92,8 +92,10 @@
+       - name: Build
+         run: cmake --build build -j"$(nproc)"
+ 
+-      - name: Test (ctest)
+-        run: ctest --test-dir build --output-on-failure
++      # Long-running nested warp/OSR and native deopt use a separate Linux job.
++      # Keep this job below its 45-minute timeout without dropping coverage.
++      - name: Test (ctest; native continuation suite runs separately)
++        run: ctest --test-dir build --output-on-failure -E '^(xyo-nested-warp-|xyo-native-simple-deopt-parity$)'
+ 
+       - name: Smoke（run / AOT / play）
+         run: |
+@@ -116,6 +118,108 @@
+         with:
+           name: linux-test-log
+           path: build/Testing/Temporary/LastTest.log
++          if-no-files-found: ignore
++
++  # The regular Linux CTest already takes ~31 minutes at 112 tests.
++  # Avoid a 45-minute timeout as nested warp/OSR and native deopt grow;
++  # run these long-running tests in a dedicated LLVM JIT + SDL2 job.
++  linux-nested-osr:
++    name: Linux / LLVM native continuation + nested warp regressions
++    runs-on: ubuntu-24.04
++    timeout-minutes: 90
++    steps:
++      - uses: actions/checkout@v5
++
++      - uses: ./.github/actions/linux-deps
++        with:
++          llvm: ${{ env.LLVM_LATEST }}
++          llvm_apt: "true"
++          extra: libsdl2-dev libgl-dev glslc
++
++      # A clean checkout must contain all 38 CTest fixtures and 9 native
++      # harness sources, not just their CMake registration.
++      - name: Self-test native continuation checkout audit
++        run: python3 tools/ci/test_native_continuation_checkout.py -v
++
++      - name: Verify committed native continuation sources
++        run: python3 tools/ci/native_continuation_checkout.py
++
++      - name: Configure (LLVM JIT + SDL2)
++        run: |
++          cmake -B build-osr -G Ninja -DCMAKE_BUILD_TYPE=Release \
++            -DLLVM_CONFIG="/usr/lib/llvm-${LLVM_LATEST}/bin/llvm-config" \
++            -DXYO_JIT=ON -DXYO_JIT_BACKEND=llvm \
++            -DXYO_SDL2=ON -DXYO_REQUIRE_SDL2=ON \
++            -DXYO_BUILD_SHELL=ON -DXYO_BUILD_TESTS=ON
++
++      - name: Build OSR harnesses and CLI only
++        # The OSR-specific job does not need unrelated unit-test executables.
++        run: |
++          cmake --build build-osr --parallel 2 --target \
++            xyo-cli \
++            xyo-nested-warp-silent-edit-smoke \
++            xyo-nested-warp-inflight-deopt-smoke \
++            xyo-nested-warp-inflight-body-edit-smoke \
++            xyo-nested-warp-bounded-inner-deopt-smoke \
++            xyo-nested-warp-inner-yield-deopt-smoke \
++            xyo-nested-warp-dynamic-inner-deopt-smoke \
++            xyo-nested-warp-triple-yield-deopt-smoke \
++            xyo-nested-warp-quad-yield-deopt-smoke \
++            xyo-nested-warp-topology-failclosed-smoke
++
++      - name: Verify native continuation CTest coverage
++        run: |
++          ctest --test-dir build-osr -N -R '^(xyo-nested-warp-|xyo-native-simple-deopt-parity$)' > nested-osr-tests.txt
++          cat nested-osr-tests.txt
++          count=$(sed -n 's/^Total Tests: //p' nested-osr-tests.txt)
++          test -n "$count" && test "$count" -ge 38
++          # Guard both native root deopt and the four OSR-016 registrations.
++          for name in xyo-native-simple-deopt-parity xyo-nested-warp-fractional-boundary xyo-nested-warp-fractional-boundary-fast xyo-nested-warp-fractional-boundary-late xyo-nested-warp-fractional-boundary-late-fast; do
++            grep -Eq "Test +#[0-9]+: ${name}$" nested-osr-tests.txt
++          done
++          # CTest may list a test even when its Python fixture or native
++          # executable is absent. Fail before running the expensive suite.
++          python3 - <<'PY'
++          import json
++          import pathlib
++          import re
++          import subprocess
++          import sys
++
++          suite = re.compile(r"^(xyo-nested-warp-|xyo-native-simple-deopt-parity$)")
++          tests = json.loads(subprocess.check_output([
++              "ctest", "--test-dir", "build-osr", "--show-only=json-v1"
++          ], text=True))["tests"]
++          selected = [test for test in tests if suite.search(test["name"])]
++          missing = []
++          for test in selected:
++              for index, argument in enumerate(test.get("command", [])):
++                  path = pathlib.Path(argument)
++                  required = (
++                      index == 0
++                      or argument.endswith(".py")
++                      or (path.name == "xyo" and path.is_absolute())
++                      or (path.name.startswith("xyo-nested-warp-")
++                          and path.name.endswith("-smoke"))
++                  )
++                  if required and path.is_absolute() and not path.is_file():
++                      missing.append((test["name"], argument))
++          if missing:
++              for test_name, filename in missing:
++                  print(f"Missing dependency for {test_name}: {filename}", file=sys.stderr)
++              sys.exit(1)
++          print(f"Verified {len(selected)} native continuation tests and their executables/scripts")
++          PY
++
++      - name: Native continuation and nested warp regressions (ctest)
++        run: ctest --test-dir build-osr --output-on-failure --parallel 2 -R '^(xyo-nested-warp-|xyo-native-simple-deopt-parity$)'
++
++      - name: OSR test log on failure
++        if: failure()
++        uses: actions/upload-artifact@v5
++        with:
++          name: linux-native-continuation-test-log
++          path: build-osr/Testing/Temporary/LastTest.log
+           if-no-files-found: ignore
+ 
+   # 動的依存ゼロのバイナリ（LLVM 18 の静的アーカイブ + 静的 libstdc++）。
+diff --git a/tools/ci/native_continuation_checkout.py b/tools/ci/native_continuation_checkout.py
+new file mode 100644
+--- /dev/null
++++ b/tools/ci/native_continuation_checkout.py
+@@ -0,0 +1,148 @@
++#!/usr/bin/env python3
++"""Fail fast when native continuation CTests depend on uncommitted sources.
++
++This runs before CMake configuration in GitHub Actions. In a local dirty
++working tree, --allow-untracked provides a non-mutating inventory check.
++"""
++from __future__ import annotations
++
++import argparse
++from pathlib import Path
++import re
++import subprocess
++import sys
++
++
++ROOT = Path(__file__).resolve().parents[2]
++CMAKE = ROOT / "tests" / "CMakeLists.txt"
++OSR016_CMAKE = ROOT / "tests" / "differential" / "osr016_fractional_boundary_tests.cmake"
++TEST_NAME = re.compile(
++    r"add_test\(\s*NAME\s+"
++    r"(xyo-nested-warp-[\w-]+|xyo-native-simple-deopt-parity)\b"
++    r"(.*?)\)",
++    re.DOTALL,
++)
++HARNESS = re.compile(
++    r"add_executable\(\s*(xyo-nested-warp-[\w-]+-smoke)"
++    r"\s+platform/([\w_]+\.cpp)\s*\)"
++)
++PYTHON_SOURCE = re.compile(r"differential/([\w-]+\.py)")
++
++
++def required_files() -> tuple[set[Path], int, int, int]:
++    cmake = CMAKE.read_text(encoding="utf-8")
++    osr016 = OSR016_CMAKE.read_text(encoding="utf-8")
++
++    tests = TEST_NAME.findall(cmake + "\n" + osr016)
++    if len(tests) < 38:
++        raise RuntimeError(f"Expected at least 38 native continuation CTests, found {len(tests)}")
++
++    harnesses = HARNESS.findall(cmake)
++    if len(harnesses) < 9:
++        raise RuntimeError(f"Expected at least 9 native harnesses, found {len(harnesses)}")
++
++    source_files = {
++        ROOT / "tests" / "platform" / source
++        for _, source in harnesses
++    }
++    scripts = {
++        ROOT / "tests" / "differential" / name
++        for _, body in tests
++        for name in PYTHON_SOURCE.findall(body)
++    }
++    # OSR-016 expands its command via the _xyo_osr016_script CMake variable.
++    scripts.update(
++        ROOT / "tests" / "differential" / name
++        for name in PYTHON_SOURCE.findall(osr016)
++    )
++    if len(scripts) < 22:
++        raise RuntimeError(f"Expected at least 22 Python scripts, found {len(scripts)}")
++
++    source_files.update(scripts)
++    source_files.add(CMAKE)
++    source_files.add(OSR016_CMAKE)
++    source_files.add(Path(__file__).resolve())
++    source_files.add(Path(__file__).with_name('test_native_continuation_checkout.py'))
++    return source_files, len(tests), len(harnesses), len(scripts)
++
++
++def committed_files() -> set[str]:
++    # Only HEAD is published by actions/checkout. An index-staged but
++    # uncommitted fixture must still be rejected by this audit.
++    result = subprocess.check_output(
++        ["git", "ls-tree", "-r", "--name-only", "-z", "HEAD"],
++        cwd=ROOT,
++    )
++    return {
++        item.decode("utf-8", errors="surrogateescape")
++        for item in result.split(b"\0") if item
++    }
++
++
++def modified_files(paths: set[str]) -> set[str]:
++    output = subprocess.check_output(
++        ["git", "diff", "--name-only", "-z", "HEAD", "--", *sorted(paths)],
++        cwd=ROOT,
++    )
++    return {
++        name.decode("utf-8", errors="surrogateescape")
++        for name in output.split(b"\0") if name
++    }
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument(
++        "--allow-uncommitted", "--allow-untracked",
++        dest="allow_uncommitted", action="store_true",
++        help="Diagnostic mode for a dirty local tree; never used in CI.",
++    )
++    args = parser.parse_args()
++
++    sources, test_count, harness_count, script_count = required_files()
++    tracked = committed_files()
++    missing = []
++    untracked = []
++    required_names = {path.relative_to(ROOT).as_posix() for path in sources}
++    dirty = modified_files(required_names) & tracked
++    for path in sorted(sources):
++        relative = path.relative_to(ROOT).as_posix()
++        if not path.is_file():
++            missing.append(relative)
++        elif relative not in tracked:
++            untracked.append(relative)
++
++    print(
++        f"Native continuation sources: {test_count} tests, "
++        f"{harness_count} C++ harnesses, {script_count} Python scripts"
++    )
++    for relative in missing:
++        print(f"MISSING: {relative}", file=sys.stderr)
++    for relative in untracked:
++        print(f"UNTRACKED: {relative}", file=sys.stderr)
++    for relative in sorted(dirty):
++        print(f"UNCOMMITTED_CHANGE: {relative}", file=sys.stderr)
++
++    if missing:
++        return 1
++    if (untracked or dirty) and not args.allow_uncommitted:
++        print(
++            "CI requires all source dependencies to be committed in HEAD.",
++            file=sys.stderr,
++        )
++        return 1
++
++    print(
++        "PASS: required files exist"
++        + (" (uncommitted files allowed locally)"
++           if untracked or dirty else " and match HEAD")
++    )
++    return 0
++
++
++if __name__ == "__main__":
++    try:
++        raise SystemExit(main())
++    except (OSError, subprocess.CalledProcessError, RuntimeError) as error:
++        print(f"Source audit failed: {error}", file=sys.stderr)
++        raise SystemExit(1)
+diff --git a/tools/ci/test_native_continuation_checkout.py b/tools/ci/test_native_continuation_checkout.py
+new file mode 100644
+--- /dev/null
++++ b/tools/ci/test_native_continuation_checkout.py
+@@ -0,0 +1,219 @@
++"""Regression tests for the native-continuation Git checkout preflight.
++
++Creates tiny isolated Git repositories. Nothing is staged or modified in the
++developer's working tree.
++"""
++from __future__ import annotations
++
++from pathlib import Path
++import shutil
++import subprocess
++import sys
++import tempfile
++import unittest
++
++
++GUARD_SOURCE = Path(__file__).with_name("native_continuation_checkout.py")
++
++
++class NativeContinuationCheckoutTests(unittest.TestCase):
++    def setUp(self) -> None:
++        self.temp = tempfile.TemporaryDirectory(prefix="xyo-ci-guard-")
++        self.addCleanup(self.temp.cleanup)
++        self.root = Path(self.temp.name)
++        self.cmake = self.root / "tests" / "CMakeLists.txt"
++        self.osr_cmake = (
++            self.root / "tests" / "differential"
++            / "osr016_fractional_boundary_tests.cmake"
++        )
++        self.guard = self.root / "tools" / "ci" / "native_continuation_checkout.py"
++
++        self.guard.parent.mkdir(parents=True)
++        shutil.copyfile(GUARD_SOURCE, self.guard)
++        shutil.copyfile(
++            Path(__file__),
++            self.root / 'tools/ci/test_native_continuation_checkout.py',
++        )
++
++        harness_lines = []
++        for index in range(9):
++            name = f"harness_{index:02d}.cpp"
++            harness_lines.append(
++                f"add_executable(xyo-nested-warp-case{index}-smoke"
++                f" platform/{name})"
++            )
++            self.write(f"tests/platform/{name}", "int run() { return 0; }\n")
++
++        cases = []
++        for index in range(33):
++            fixture = f"fixture_{index % 21:02d}.py"
++            cases.append(
++                f"add_test(NAME xyo-nested-warp-case{index:02d}"
++                f" COMMAND python3 differential/{fixture})"
++            )
++        cases.append(
++            "add_test(NAME xyo-native-simple-deopt-parity"
++            " COMMAND python3 differential/native_simple_resume.py)"
++        )
++        self.cmake.parent.mkdir(parents=True, exist_ok=True)
++        self.cmake.write_text(
++            "\n".join(harness_lines + cases) + "\n", encoding="utf-8"
++        )
++
++        self.osr_cmake.parent.mkdir(parents=True, exist_ok=True)
++        self.osr_cmake.write_text(
++            "\n".join(
++                f"add_test(NAME xyo-nested-warp-fractional-test{index}"
++                " COMMAND python3 differential/fixture_00.py)"
++                for index in range(4)
++            ) + "\n",
++            encoding="utf-8",
++        )
++
++        for index in range(21):
++            self.write(
++                f"tests/differential/fixture_{index:02d}.py",
++                "# a required Python fixture\n",
++            )
++        self.write(
++            "tests/differential/native_simple_resume.py",
++            "# another required Python fixture\n",
++        )
++
++        self.git("init", "-q")
++        self.git("add", ".")
++        self.commit("initial fixtures")
++
++    def write(self, relative: str, content: str) -> None:
++        path = self.root / relative
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text(content, encoding="utf-8")
++
++    def git(self, *args: str) -> subprocess.CompletedProcess[str]:
++        result = subprocess.run(
++            ["git", *args],
++            cwd=self.root,
++            text=True,
++            capture_output=True,
++            check=False,
++        )
++        if result.returncode != 0:
++            self.fail(f"git {args} failed: {result.stderr}")
++        return result
++
++    def commit(self, message: str) -> None:
++        self.git(
++            "-c", "user.name=Test",
++            "-c", "user.email=test@example.invalid",
++            "commit", "-qm", message,
++        )
++
++    def run_guard(self, *args: str) -> subprocess.CompletedProcess[str]:
++        return subprocess.run(
++            [sys.executable, str(self.guard), *args],
++            cwd=self.root,
++            capture_output=True,
++            text=True,
++            check=False,
++        )
++
++    def make_script_uncommitted(self) -> str:
++        relative = "tests/differential/fixture_00.py"
++        self.git("rm", "-q", "--cached", relative)
++        self.commit("remove fixture from HEAD without deleting working copy")
++        return relative
++
++    def test_complete_committed_checkout_passes(self) -> None:
++        result = self.run_guard()
++        self.assertEqual(result.returncode, 0, result.stderr)
++        self.assertIn(
++            "38 tests, 9 C++ harnesses, 22 Python scripts", result.stdout
++        )
++        self.assertIn("exist and match HEAD", result.stdout)
++
++    def test_existing_but_uncommitted_python_is_rejected(self) -> None:
++        missing_from_head = self.make_script_uncommitted()
++        result = self.run_guard()
++        self.assertEqual(result.returncode, 1)
++        self.assertIn("UNTRACKED: " + missing_from_head, result.stderr)
++
++    def test_staged_but_uncommitted_python_is_rejected(self) -> None:
++        missing_from_head = self.make_script_uncommitted()
++        self.git("add", missing_from_head)
++        result = self.run_guard()
++        self.assertEqual(result.returncode, 1)
++        self.assertIn("UNTRACKED: " + missing_from_head, result.stderr)
++
++    def test_allow_untracked_is_only_a_local_diagnostic_override(self) -> None:
++        self.make_script_uncommitted()
++        result = self.run_guard("--allow-untracked")
++        self.assertEqual(result.returncode, 0, result.stderr)
++        self.assertIn("uncommitted files allowed locally", result.stdout)
++
++    def test_modified_committed_script_is_rejected(self) -> None:
++        script = 'tests/differential/fixture_01.py'
++        self.write(script, '# unsaved local edit\n')
++        result = self.run_guard()
++        self.assertEqual(result.returncode, 1)
++        self.assertIn('UNCOMMITTED_CHANGE: ' + script, result.stderr)
++
++    def test_staged_edit_to_committed_script_is_rejected(self) -> None:
++        script = 'tests/differential/fixture_01.py'
++        self.write(script, '# modified and staged\n')
++        self.git('add', script)
++        result = self.run_guard()
++        self.assertEqual(result.returncode, 1)
++        self.assertIn('UNCOMMITTED_CHANGE: ' + script, result.stderr)
++
++    def test_modified_ctest_registration_is_rejected(self) -> None:
++        self.cmake.write_text(
++            self.cmake.read_text(encoding='utf-8') + '# dirty\n',
++            encoding='utf-8',
++        )
++        result = self.run_guard()
++        self.assertEqual(result.returncode, 1)
++        self.assertIn('UNCOMMITTED_CHANGE: tests/CMakeLists.txt', result.stderr)
++
++    def test_local_diagnostic_can_inspect_modified_sources(self) -> None:
++        self.write('tests/differential/fixture_01.py', '# modified locally\n')
++        result = self.run_guard('--allow-uncommitted')
++        self.assertEqual(result.returncode, 0, result.stderr)
++        self.assertIn('uncommitted files allowed locally', result.stdout)
++
++    def test_missing_checkout_selftest_is_rejected(self) -> None:
++        (self.root / 'tools/ci/test_native_continuation_checkout.py').unlink()
++        result = self.run_guard()
++        self.assertEqual(result.returncode, 1)
++        self.assertIn(
++            'MISSING: tools/ci/test_native_continuation_checkout.py',
++            result.stderr,
++        )
++
++    def test_missing_python_fixture_is_rejected(self) -> None:
++        (self.root / "tests/differential/fixture_01.py").unlink()
++        result = self.run_guard("--allow-untracked")
++        self.assertEqual(result.returncode, 1)
++        self.assertIn("MISSING: tests/differential/fixture_01.py", result.stderr)
++
++    def test_missing_cpp_harness_is_rejected(self) -> None:
++        (self.root / "tests/platform/harness_03.cpp").unlink()
++        result = self.run_guard()
++        self.assertEqual(result.returncode, 1)
++        self.assertIn("MISSING: tests/platform/harness_03.cpp", result.stderr)
++
++    def test_missing_osr016_include_is_rejected(self) -> None:
++        self.osr_cmake.unlink()
++        result = self.run_guard()
++        self.assertEqual(result.returncode, 1)
++        self.assertIn("Source audit failed", result.stderr)
++
++    def test_incomplete_ctest_registration_is_rejected(self) -> None:
++        lines = self.cmake.read_text(encoding="utf-8").splitlines()
++        self.cmake.write_text("\n".join(lines[:-5]) + "\n", encoding="utf-8")
++        result = self.run_guard()
++        self.assertEqual(result.returncode, 1)
++        self.assertIn("Expected at least 38 native continuation CTests", result.stderr)
++
++
++if __name__ == "__main__":
++    unittest.main()
