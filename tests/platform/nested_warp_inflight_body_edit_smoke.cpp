@@ -71,11 +71,14 @@ Target* findBench(Runtime& rt) {
 }
 
 Block* runningSumIncrement(Blocks& blocks) {
-    for (auto& [id, node] : blocks.allBlocks()) {
+    // Read-only scan: Blocks::allBlocks() is const by design. Re-resolve
+    // via the legacy mutable getBlock() (plain find, no revision or
+    // cache effects), matching the direct non-resetCache edit below.
+    for (const auto& [id, node] : blocks.allBlocks()) {
         if (node.opcode != "data_changevariableby") continue;
         const auto field = node.fields.find("VARIABLE");
         if (field != node.fields.end() && field->second.id == "v_sum")
-            return &node;
+            return blocks.getBlock(id);
     }
     return nullptr;
 }
