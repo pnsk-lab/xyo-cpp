@@ -11,8 +11,25 @@
 #include "../core/gc.hpp"
 #include "../core/sstr.hpp"
 #include "../jit/jit.hpp"
+#include "../jit/layq.hpp"
+#include "../jit/rt_rooted_ssa_arguments.hpp"
+#include "../jit/rt_generated_ssa_roots.hpp"
+#include "../jit/deopt_telemetry.hpp"
 #include "../ir/scratch_pipeline.hpp"
 #include "../ir/scratch_source_digest.hpp"
+#include "../ir/source_typed_ssa_bridge.hpp"
+#if defined(XYO_JIT)
+// This compiler-only SSA reporter audit pulls LLVM IR headers, which must
+// not be instantiated or linked in a native no-JIT build.
+#include "../ir/source_reporter_ssa_location_bridge.hpp"
+#include "../ir/source_reporter_storage_owner_audit.hpp"
+#include "../ir/source_reporter_input_slot_audit.hpp"
+#include "../ir/source_reported_entry_destination_audit.hpp"
+#include "../ir/source_scalar_prefix_audit.hpp"
+#include "../ir/source_reported_entry_prefix_plan.hpp"
+#include "../ir/source_reporter_input_roots.hpp"
+#include "../ir/source_list_read_index_trace.hpp"
+#endif
 #include "numeric_thread.hpp"
 #include "source_continuation_handoff.hpp"
 #include "../wasm/hot_jit.hpp"
@@ -295,6 +312,17 @@ JitCtx* acquireJitCtx() {
 }
 void releaseJitCtx(JitCtx* c) {
     if (!c) return;
+    // LAYQ diagnostics: per-thread poll/handoff/quantum summary. Only
+    // threads that actually polled print, so scheduler-churn workloads
+    // (millions of short threads) stay quiet.
+    if (layqStatsEnabled() && (c->layqPolls != 0 || c->layqTaken != 0)) {
+        std::fprintf(stderr,
+                     "[layq] polls=%llu taken=%llu avgQ=%.1f\n",
+                     (unsigned long long)c->layqPolls,
+                     (unsigned long long)c->layqTaken,
+                     c->layqPolls ? (double)c->layqQSum / (double)c->layqPolls
+                                  : 0.0);
+    }
     // Covers normal entry return, stopped/killed threads, fiber-chain
     // completion and a context retired without a final yield.
     flushJitBlockCount(c);
@@ -323,9 +351,399 @@ bool Sequencer::warpBudgetExhausted(const Thread& thread) const {
     return thread.warpTimer.timeElapsed() > runtime.warpTimeMs;
 }
 
+// Decide whether a runnable thread should execute serially, join a worker
+// batch, or remain asleep on its proven event dependency. Parallel batches
+// are flushed before any serial effect to preserve Scratch's spawn order.
+Sequencer::ParFlush Sequencer::dispatchReadyThread(
+    Thread& thread, bool eventDriven, bool isolatedWatch,
+    bool allowParallel) {
+    ParFlush outcome;
+    Thread* activeThread = &thread;
+    const bool wasEventWait =
+        (eventDriven || isolatedWatch) &&
+        activeThread->eventWaitArmed;
+    const uintptr_t oldWaitSite = activeThread->eventWaitSite;
+    const uint64_t oldWaitExit = activeThread->eventWaitExitCount;
+    static const bool auditWaitNotifications = [] {
+        const char* env = std::getenv("XYO_WAIT_NOTIFY_AUDIT");
+        return env && env[0] == '1';
+    }();
+    if (wasEventWait) {
+        // A pure condition with exactly one scalar dependency
+        // cannot change while that value's bits and source/
+        // binding generations remain identical. This is stronger
+        // than the global progress epoch: unrelated scripts can
+        // make progress without waking every suspended Fiber.
+        // If the watched value or its binding changed, force one
+        // reevaluation even if the global epoch is unchanged.
+        const bool watchValid = activeThread->eventWatchValid;
+        const bool watchUnchanged = watchValid &&
+            canSkipEventWaitByDependency(*activeThread);
+        const bool epochUnchanged = eventDriven && !watchValid &&
+            activeThread->eventWaitEpoch ==
+                eventProgressEpoch.load(std::memory_order_relaxed);
+        if (auditWaitNotifications && watchValid)
+            runtime.auditWaitDependencyDecision(*activeThread);
+        if (watchUnchanged || epochUnchanged) {
+            ++eventSkippedPasses_;
+            return {};
+        }
+    }
+    if (wasEventWait) {
+        ++eventWakeups_;
+        activeThread->eventWaitArmed = false;
+    }
+    // Tiny scripts whose generated entry cannot yield are
+    // cheaper to run in-order than to enqueue, build conflict
+    // groups and hand off to workers. Long or yielding scripts
+    // retain the original parallel scheduling policy.
+    static const bool serialShortSync = [] {
+        const char* env = std::getenv("XYO_SHORT_SYNC_SERIAL");
+        return !env || env[0] != '0';
+    }();
+    const auto* compiled = activeThread->isCompiled
+        ? static_cast<const CompiledScript*>(
+            activeThread->compiled)
+        : nullptr;
+    const bool immediate = serialShortSync && compiled &&
+        compiled->shortSync;
+    // Resumed event waiters run in-order: one extra evaluation
+    // cannot silently overtake a writer in a parallel batch.
+    const AccessSet* access = allowParallel && !immediate && !wasEventWait
+        ? parallelAccessFor(*activeThread) : nullptr;
+    if (access) {
+        // 並列バッチに溜める — flush は次の serial スレッドの
+        // 直前に必ず行うため、先行スレッドの効果は後続へ
+        // 逐次スケジュールと同じ順序で見える。
+        // 帳簿（active 計数・stopped 判定）は flush 時に
+        // 実行後の状態で行う。
+        parBatch_.push_back(activeThread);
+        parSets_.push_back(access);
+    } else {
+        ParFlush fr = flushParBatch();
+        outcome.stopped |= fr.stopped;
+        outcome.active += fr.active;
+        // Snapshot the notification before the native wait completes:
+        // xyo_wait_event_done() unregisters the watcher during stepThread().
+        // This is diagnostic only and never changes the scheduler decision.
+        const bool notifiedAtResume = auditWaitNotifications && wasEventWait &&
+            runtime.waitNotificationPending(*activeThread);
+        stepThread(*activeThread);
+        if (auditWaitNotifications && wasEventWait) {
+            const WaitResumeState before{true, oldWaitSite, oldWaitExit};
+            const WaitResumeState after{
+                activeThread->eventWaitArmed,
+                activeThread->eventWaitSite,
+                activeThread->eventWaitExitCount};
+            runtime.auditWaitResumeOutcome(
+                classifyWaitResume(before, after), notifiedAtResume);
+        }
+        if (eventDriven && !(wasEventWait &&
+            activeThread->eventWaitArmed &&
+            activeThread->eventWaitSite == oldWaitSite &&
+            activeThread->eventWaitExitCount == oldWaitExit)) {
+            // Same condition, false again = no script-side
+            // progress. A different wait or completed script may
+            // have modified observable Scratch state.
+            eventProgressEpoch.fetch_add(1, std::memory_order_relaxed);
+        }
+        // Self-rebroadcast can replace the active thread in the
+        // list while its current block continues to completion.
+        // Its next scheduling turn is now unreachable.
+        if (!runtime.isActiveThread(activeThread))
+            retireThread(*activeThread);
+        if (activeThread->status == STATUS_RUNNING)
+            ++outcome.active;
+        if (activeThread->stack.empty() ||
+            activeThread->status == STATUS_DONE) {
+            outcome.stopped = true;
+        }
+    }
+    activeThread->hasWarpTimer = false;
+    return outcome;
+}
+
+// Preserve active-list order while retiring completed script identities.
+// Thread reclamation remains owned by Runtime, not this compaction pass.
+void Sequencer::compactFinishedThreads(std::vector<Thread*>& doneThreads) {
+    size_t nextActive = 0;
+    for (size_t i = 0; i < runtime.threads.size(); ++i) {
+        Thread* t = runtime.threads[i];
+        if (!t->stack.empty() && t->status != STATUS_DONE) {
+            t->runtimeIndex = nextActive;
+            runtime.threads[nextActive++] = t;
+        } else {
+            // Some interpreter stop paths set STATUS_DONE directly without
+            // calling retireThread. Remove reverse watches before this
+            // identity is reclaimed or recycled.
+            runtime.untrackWaitDependencies(*t);
+            runtime.threadMap.erase(t->getId());
+            t->releaseFinished();
+            doneThreads.push_back(t);
+        }
+    }
+    runtime.threads.resize(nextActive);
+    runtime.invalidateSchedulerReadySet();
+}
+
+// Execute exactly one Scratch scheduler pass. Iteration deliberately observes
+// append/restart operations performed by a running receiver. The pass itself
+// owns completion compaction; the outer tick loop owns time and redraw policy.
+size_t Sequencer::runSchedulerPass(
+    bool ranFirstTick, bool eventDriven, bool isolatedWatch,
+    bool allowParallel, std::vector<Thread*>& doneThreads) {
+        size_t numActiveThreads = 0;
+        bool stoppedThread = false;
+        // JS: const threads = this.runtime.threads — パス開始時に掴む。
+        // stopAll で差し替わっても stepping 経由で旧配列を反復する。
+        stepping = &runtime.threads;
+        // Debug-only safety net for direct Target::variables edits. Normal
+        // scheduling never scans the reverse dependency registry.
+        static const bool verifyWaitBindings = [] {
+            const char* env = std::getenv("XYO_WAIT_REGISTRY_VERIFY");
+            return env && env[0] == '1';
+        }();
+        if (verifyWaitBindings)
+            runtime.validateWaitDependencyBindings();
+        static const bool indexedReady = [] {
+            const char* env = std::getenv("XYO_SCHED_READY_INDEX");
+            return env && env[0] == '1';
+        }();
+        // Experimental wait-ready suppression is distinct from the normal
+        // Ready Index. Require a reverse writer registry, and keep all other
+        // waiters in the conservative live scan.
+        static const bool waitSleepRequested = [] {
+            const char* flag = std::getenv("XYO_WAIT_READY_SLEEP");
+            const char* registry = std::getenv("XYO_WAIT_WAKE_REGISTRY");
+            return flag && flag[0] == '1' &&
+                   registry && registry[0] == '1';
+        }();
+        const bool waitReadySleep = indexedReady && waitSleepRequested &&
+            (eventDriven || isolatedWatch);
+        // Always revisit suppressed waiters when the host enters a new
+        // Runtime::step frame, and once every 256 passes even if a caller
+        // steps this scheduler directly without advancing stepSerial.
+        // A source edit, unchecked host write or cache invalidation can
+        // therefore delay a wake but can never permanently strand a waiter.
+        const bool periodicRecheck = waitReadySleep && hasDeferredWaiters_ &&
+            (waitReadyLastFrame_ != runtime.stepSerial ||
+             (++waitReadyPassSerial_ & 255u) == 0);
+        if (periodicRecheck) {
+            waitReadyLastFrame_ = runtime.stepSerial;
+            ++waitReadyStats_.frameRechecks;
+        }
+        // Capture epochs *before* draining changes. A publication racing
+        // reconstruction will then change the epoch and force the ordinary
+        // live scan, rather than silently excluding a newly woken thread.
+        const uint64_t mutationAtStart =
+            runtime.schedulerMutationEpoch.load(std::memory_order_relaxed);
+        const uint64_t structureAtStart =
+            runtime.schedulerStructureEpoch.load(std::memory_order_relaxed);
+        if (indexedReady &&
+            (periodicRecheck ||
+             readySlotsEpoch_ != mutationAtStart ||
+             readySlotsStructureEpoch_ != structureAtStart ||
+             readySlotsLength_ != stepping->size())) {
+            bool rebuild = periodicRecheck ||
+                readySlotsStructureEpoch_ != structureAtStart ||
+                readySlotsLength_ != stepping->size() ||
+                readySlotsEpoch_ == UINT64_MAX;
+            const auto changes = runtime.takeSchedulerStatusChanges();
+            if (!rebuild) {
+                for (Thread* thread : changes) {
+                    const size_t index = thread->runtimeIndex;
+                    if (index >= stepping->size() ||
+                        (*stepping)[index] != thread) {
+                        // Another writer touched the public thread array
+                        // without publishing a structural mutation.
+                        rebuild = true;
+                        break;
+                    }
+                    const auto at = std::lower_bound(
+                        readySlots_.begin(), readySlots_.end(), index);
+                    if (thread->status == STATUS_PROMISE_WAIT) {
+                        if (at != readySlots_.end() && *at == index)
+                            readySlots_.erase(at);
+                    } else if (at == readySlots_.end() || *at != index) {
+                        // DONE must also be included so the completion
+                        // compactor can observe a previously sleeping slot.
+                        readySlots_.insert(at, index);
+                    }
+                }
+                if (waitReadySleep && hasDeferredWaiters_ && !rebuild) {
+                    // Skip the registry mutex entirely until some native
+                    // wait has actually been omitted from readySlots_.
+                    // A native JIT store records a waiting Thread identity,
+                    // even if no status transition occurred. Read but DO
+                    // NOT drain it: the resume audit still needs that bit.
+                    for (Thread* thread : runtime.snapshotWaitWakeups()) {
+                        const size_t index = thread->runtimeIndex;
+                        if (index >= stepping->size() ||
+                            (*stepping)[index] != thread) {
+                            rebuild = true;
+                            break;
+                        }
+                        if (thread->status == STATUS_PROMISE_WAIT) continue;
+                        const auto at = std::lower_bound(
+                            readySlots_.begin(), readySlots_.end(), index);
+                        if (at == readySlots_.end() || *at != index)
+                            readySlots_.insert(at, index);
+                    }
+                }
+            }
+            if (rebuild) {
+                // Every native waiter goes back in the rebuilt index.
+                // It may be suppressed again after this pass proves it quiet.
+                hasDeferredWaiters_ = false;
+                readySlots_.clear();
+                readySlots_.reserve(stepping->size());
+                for (size_t i = 0; i < stepping->size(); ++i) {
+                    if ((*stepping)[i]->status != STATUS_PROMISE_WAIT)
+                        readySlots_.push_back(i);
+                }
+            }
+            readySlotsEpoch_ = mutationAtStart;
+            readySlotsStructureEpoch_ = structureAtStart;
+            readySlotsLength_ = stepping->size();
+        }
+        // The experimental reverse index may also omit pure native waits
+        // whose tracked values and source/binding stamp are unchanged.
+        // The regular Promise-only index retains its original threshold.
+        const bool sparsePass = indexedReady &&
+            readySlotsLength_ >= (waitReadySleep ? 16u : 32u) &&
+            readySlots_.size() * 2 <= readySlotsLength_;
+        if (waitReadySleep && sparsePass) ++waitReadyStats_.sparsePasses;
+        if (waitReadySleep) waitSleepCandidates_.clear();
+        size_t nextIndex = 0;
+        size_t sparseCursor = 0;
+        for (;;) {
+            size_t i;
+            if (sparsePass &&
+                readySlotsEpoch_ == runtime.schedulerMutationEpoch.load(std::memory_order_relaxed) &&
+                readySlotsLength_ == stepping->size()) {
+                // At most one execution per slot per pass, in Scratch order.
+                while (sparseCursor < readySlots_.size() &&
+                       readySlots_[sparseCursor] < nextIndex)
+                    ++sparseCursor;
+                if (sparseCursor == readySlots_.size()) break;
+                i = readySlots_[sparseCursor++];
+            } else {
+                // A broadcast, promise resolution, or thread mutation can
+                // make a later slot ready. Resume the ordinary live scan.
+                if (nextIndex >= stepping->size()) break;
+                i = nextIndex;
+            }
+            nextIndex = i + 1;
+            Thread* activeThread = this->activeThread = (*stepping)[i];
+            if (activeThread->stack.empty() ||
+                activeThread->status == STATUS_DONE) {
+                stoppedThread = true;
+                continue;
+            }
+            if (activeThread->status == STATUS_YIELD_TICK && !ranFirstTick) {
+                activeThread->status = STATUS_RUNNING;
+            }
+            if (activeThread->status == STATUS_RUNNING ||
+                activeThread->status == STATUS_YIELD) {
+                const bool wasPureWait = waitReadySleep &&
+                    activeThread->eventWaitArmed &&
+                    activeThread->eventWatchValid;
+                if (wasPureWait) ++waitReadyStats_.scannedWaiters;
+                const ParFlush result = dispatchReadyThread(
+                    *activeThread, eventDriven, isolatedWatch, allowParallel);
+                stoppedThread |= result.stopped;
+                numActiveThreads += result.active;
+                if (wasPureWait && activeThread->eventWaitArmed &&
+                    activeThread->eventWatchValid &&
+                    activeThread->status == STATUS_RUNNING &&
+                    i < stepping->size() && (*stepping)[i] == activeThread &&
+                    canSkipEventWaitByDependency(*activeThread) &&
+                    !runtime.waitNotificationPending(*activeThread)) {
+                    // Defer erasure until after iteration: sparseCursor
+                    // must not observe a mutated sorted vector mid-pass.
+                    waitSleepCandidates_.push_back(i);
+                }
+            }
+        }
+        {
+            ParFlush fr = flushParBatch();
+            stoppedThread |= fr.stopped;
+            numActiveThreads += fr.active;
+        }
+        // Suppress only *proven* quiet native waits, and only if no writer
+        // or structural mutation raced our pass. The first pass of every
+        // host frame and a periodic pass will examine them again. A watched
+        // write bumps mutationEpoch and re-inserts its notified Thread.
+        if (waitReadySleep && !waitSleepCandidates_.empty() &&
+            readySlotsEpoch_ ==
+                runtime.schedulerMutationEpoch.load(std::memory_order_relaxed) &&
+            readySlotsStructureEpoch_ ==
+                runtime.schedulerStructureEpoch.load(std::memory_order_relaxed) &&
+            readySlotsLength_ == stepping->size()) {
+            for (size_t index : waitSleepCandidates_) {
+                auto at = std::lower_bound(
+                    readySlots_.begin(), readySlots_.end(), index);
+                if (at != readySlots_.end() && *at == index) {
+                    readySlots_.erase(at);
+                    hasDeferredWaiters_ = true;
+                    ++waitReadyStats_.deferredSlots;
+                }
+            }
+        }
+        if (stoppedThread) compactFinishedThreads(doneThreads);
+        // LAYQ v2 push: publish the recommended pure-class quantum derived
+        // from this pass's still-runnable count, but only when it changes —
+        // steady state performs zero stores, so JIT readers keep a shared
+        // L1 line. Only adaptive JIT reads the hint (fixed pins its own
+        // constant; off needs nothing), so publish only in adaptive mode.
+        // Release store; relaxed JIT loads (see layq.hpp contract). Danger
+        // pins the hint to the pure cap: polls can never fire for time
+        // budgets there, so contention-driven shrinking would only add
+        // overhead.
+        if (layqMode() == LayqMode::Adaptive) {
+            const LayqConfig layqCfg = layqConfig();
+            const uint64_t competitors =
+                layqCompetitors((uint64_t)numActiveThreads);
+            uint64_t target = layqTarget(competitors, layqCfg.qmaxPure,
+                                         layqCfg.qmin);
+            if (runtime.dangerMode) target = layqCfg.qmaxPure;
+            const auto qt = target > 0xFFFFFFFFu
+                ? 0xFFFFFFFFu
+                : static_cast<uint32_t>(target);
+            static const bool layqTrace = std::getenv("XYO_YIELD_QTRACE") !=
+                nullptr;
+            if (layqTrace)
+                std::fprintf(stderr,
+                             "[layq-pub] active=%zu competitors=%llu "
+                             "target=%llu\n",
+                             numActiveThreads,
+                             (unsigned long long)competitors,
+                             (unsigned long long)target);
+            if (runtime.yieldQuantumHint.load(std::memory_order_relaxed) !=
+                qt)
+                runtime.yieldQuantumHint.store(qt, std::memory_order_release);
+        }
+        return numActiveThreads;
+}
+
 std::vector<Thread*> Sequencer::stepThreads() {
     std::vector<Thread*> doneThreads;
-    const double WORK_TIME = 0.75 * runtime.currentStepTime;
+    // Preserve the opt-in index across ticks. Runtime's mutation epoch
+    // invalidates it on wakeups, script mutations and completion compaction.
+    // Diagnostic-only override for isolating scheduler time budgeting from
+    // the cost of visiting actual Scratch threads. The default remains
+    // TurboWarp's 75% of currentStepTime, independent of CLI frame pacing.
+    // A smaller budget reduces work per frame; it is NOT a free speedup.
+    static const double explicitWorkBudgetMs = [] {
+        const char* setting = std::getenv("XYO_SCHED_WORK_BUDGET_MS");
+        if (!setting || !*setting) return 0.0;
+        char* end = nullptr;
+        const double ms = std::strtod(setting, &end);
+        return end != setting && end && !*end &&
+            std::isfinite(ms) && ms >= 0.5 && ms <= 250.0 ? ms : 0.0;
+    }();
+    const double WORK_TIME = explicitWorkBudgetMs > 0.0
+        ? explicitWorkBudgetMs : 0.75 * runtime.currentStepTime;
     runtime.updateCurrentMSecs();
     timer.start();
     const bool eventDriven = eventSchedulerEnabled();
@@ -363,128 +781,10 @@ std::vector<Thread*> Sequencer::stepThreads() {
     while (!runtime.threads.empty() && numActiveThreads > 0 &&
            timer.timeElapsed() < WORK_TIME &&
            (runtime.turboMode || !runtime.redrawRequested)) {
-        numActiveThreads = 0;
-        bool stoppedThread = false;
-        // JS: const threads = this.runtime.threads — パス開始時に掴む。
-        // stopAll で差し替わっても stepping 経由で旧配列を反復する。
-        stepping = &runtime.threads;
-        for (size_t i = 0; i < stepping->size(); ++i) {
-            Thread* activeThread = this->activeThread = (*stepping)[i];
-            if (activeThread->stack.empty() ||
-                activeThread->status == STATUS_DONE) {
-                stoppedThread = true;
-                continue;
-            }
-            if (activeThread->status == STATUS_YIELD_TICK && !ranFirstTick) {
-                activeThread->status = STATUS_RUNNING;
-            }
-            if (activeThread->status == STATUS_RUNNING ||
-                activeThread->status == STATUS_YIELD) {
-                const bool wasEventWait =
-                    (eventDriven || isolatedWatch) &&
-                    activeThread->eventWaitArmed;
-                const uintptr_t oldWaitSite = activeThread->eventWaitSite;
-                const uint64_t oldWaitExit = activeThread->eventWaitExitCount;
-                if (wasEventWait) {
-                    // A pure condition with exactly one scalar dependency
-                    // cannot change while that value's bits and source/
-                    // binding generations remain identical. This is stronger
-                    // than the global progress epoch: unrelated scripts can
-                    // make progress without waking every suspended Fiber.
-                    // If the watched value or its binding changed, force one
-                    // reevaluation even if the global epoch is unchanged.
-                    const bool watchValid = activeThread->eventWatchValid;
-                    const bool watchUnchanged = watchValid &&
-                        canSkipEventWaitByDependency(*activeThread);
-                    const bool epochUnchanged = eventDriven && !watchValid &&
-                        activeThread->eventWaitEpoch ==
-                            eventProgressEpoch.load(std::memory_order_relaxed);
-                    if (watchUnchanged || epochUnchanged) {
-                        ++eventSkippedPasses_;
-                        continue;
-                    }
-                }
-                if (wasEventWait) {
-                    ++eventWakeups_;
-                    activeThread->eventWaitArmed = false;
-                }
-                // Tiny scripts whose generated entry cannot yield are
-                // cheaper to run in-order than to enqueue, build conflict
-                // groups and hand off to workers. Long or yielding scripts
-                // retain the original parallel scheduling policy.
-                static const bool serialShortSync = [] {
-                    const char* env = std::getenv("XYO_SHORT_SYNC_SERIAL");
-                    return !env || env[0] != '0';
-                }();
-                const auto* compiled = activeThread->isCompiled
-                    ? static_cast<const CompiledScript*>(
-                        activeThread->compiled)
-                    : nullptr;
-                const bool immediate = serialShortSync && compiled &&
-                    compiled->shortSync;
-                // Resumed event waiters run in-order: one extra evaluation
-                // cannot silently overtake a writer in a parallel batch.
-                const AccessSet* access = allowParallel && !immediate && !wasEventWait
-                    ? parallelAccessFor(*activeThread) : nullptr;
-                if (access) {
-                    // 並列バッチに溜める — flush は次の serial スレッドの
-                    // 直前に必ず行うため、先行スレッドの効果は後続へ
-                    // 逐次スケジュールと同じ順序で見える。
-                    // 帳簿（active 計数・stopped 判定）は flush 時に
-                    // 実行後の状態で行う。
-                    parBatch_.push_back(activeThread);
-                    parSets_.push_back(access);
-                } else {
-                    ParFlush fr = flushParBatch();
-                    stoppedThread |= fr.stopped;
-                    numActiveThreads += fr.active;
-                    stepThread(*activeThread);
-                    if (eventDriven && !(wasEventWait &&
-                        activeThread->eventWaitArmed &&
-                        activeThread->eventWaitSite == oldWaitSite &&
-                        activeThread->eventWaitExitCount == oldWaitExit)) {
-                        // Same condition, false again = no script-side
-                        // progress. A different wait or completed script may
-                        // have modified observable Scratch state.
-                        eventProgressEpoch.fetch_add(1, std::memory_order_relaxed);
-                    }
-                    // Self-rebroadcast can replace the active thread in the
-                    // list while its current block continues to completion.
-                    // Its next scheduling turn is now unreachable.
-                    if (!runtime.isActiveThread(activeThread))
-                        retireThread(*activeThread);
-                    if (activeThread->status == STATUS_RUNNING)
-                        ++numActiveThreads;
-                    if (activeThread->stack.empty() ||
-                        activeThread->status == STATUS_DONE) {
-                        stoppedThread = true;
-                    }
-                }
-                activeThread->hasWarpTimer = false;
-            }
-        }
-        {
-            ParFlush fr = flushParBatch();
-            stoppedThread |= fr.stopped;
-            numActiveThreads += fr.active;
-        }
+        numActiveThreads = runSchedulerPass(
+            ranFirstTick, eventDriven, isolatedWatch, allowParallel,
+            doneThreads);
         ranFirstTick = true;
-
-        if (stoppedThread) {
-            size_t nextActive = 0;
-            for (size_t i = 0; i < runtime.threads.size(); ++i) {
-                Thread* t = runtime.threads[i];
-                if (!t->stack.empty() && t->status != STATUS_DONE) {
-                    t->runtimeIndex = nextActive;
-                    runtime.threads[nextActive++] = t;
-                } else {
-                    runtime.threadMap.erase(t->getId());
-                    t->releaseFinished();
-                    doneThreads.push_back(t);
-                }
-            }
-            runtime.threads.resize(nextActive);
-        }
         // A lone, read-only sound-polling forever has nothing to observe
         // until another Scratch script can change a condition. No other
         // runnable thread remains in this tick, so probing it thousands of
@@ -512,10 +812,26 @@ std::vector<Thread*> Sequencer::stepThreads() {
     stepping = nullptr;
     detachedLists.clear();
     if (warpWatchdog_) warpWatchdog_->disarm();
+    // A collection postponed while another native Fiber owned unrooted
+    // SSA can be drained only after that last Fiber retires. Do not
+    // poll the collector in the common no-pending scheduler path.
+    if (Gc::get().explicitCollectionPending()) {
+        const auto collectionsBefore = Gc::get().collectCount();
+        const size_t bytesBefore = Gc::get().bytesAllocated();
+        Gc::get().collectIfNeeded();
+        if (Gc::get().collectCount() > collectionsBefore &&
+            std::getenv("XYO_RT_GC_SOFT_BUDGET_MB"))
+            std::fprintf(stderr,
+                "[native-gc-deferred-drained] collected=1 "
+                "active_fibers=%zu bytes_before=%zu bytes_after=%zu\n",
+                FiberPool::activeCount(), bytesBefore,
+                Gc::get().bytesAllocated());
+    }
     return doneThreads;
 }
 
 void Sequencer::stepThread(Thread& thread) {
+    thread.pendingShortBroadcast = false;
     // Optional cooperative startup of a pending native script. A long
     // one-shot warp procedure cannot currently OSR out of interpreter
     // stack frames, so defer its *first* Scratch instruction for a bounded
@@ -609,38 +925,71 @@ void Sequencer::stepThread(Thread& thread) {
             return checkpoint->phase ==
                 ir::SourceResumePhase::AfterCallee;
         }();
-        // The native CallFrame mirror historically counts only yields
-        // with an active nonroot procedure. The RT-001 root-only
-        // producer deliberately leaves those stable statistics intact:
-        // its first genuine post-Fiber root loop yield has 0 such
-        // procedure yields. Permit it ONLY in the strict root-loop test
-        // gate and ONLY for the first requested native checkpoint.
+        // IR-001's historical yields() counts NONROOT procedure mirror
+        // yields. A pure LLVM root script never increments it. Count
+        // genuine source-verified root loop suspensions separately per
+        // Scratch Thread so --after=N can select the 2nd, 17th, or Nth
+        // root latch rather than silently never attempting a handoff.
+        // Only the opt-in producer is eligible; do not count unknown
+        // phases, finished Fibers, or stale/disabled source sessions.
         static const bool rootOnlyProducerEnabled = [] {
             const char* v = std::getenv("XYO_RT_ROOT_ONLY_DEOPT");
             return v && v[0] == '1';
         }();
-        const bool rootOnlyFirstYield =
-            (onlyRootAfterLoop || rootOnlyProducerEnabled) &&
-            nativeDeoptAfter == 1 && thread.nativeProcedureFrames &&
-            thread.nativeProcedureFrames->depth() == 1 &&
-            thread.nativeProcedureFrames->yields() == 0 &&
-            // The opt-in producer may attach a frame at script entry,
-            // but its mere presence never proves an executable source PC.
-            // Before adoption, require a completed loop body from the
-            // actual suspended LLVM Fiber, not an unknown/inside phase.
-            [&] {
-                const auto state =
-                    thread.nativeProcedureFrames->sourceCheckpoint();
-                return state &&
-                    state->phase == ir::SourceResumePhase::AfterLoopBody &&
-                    !state->loops.empty() &&
-                    state->frame.resumePc ==
-                        state->loops.back().sourcePc;
-            }();
-        const bool attemptDeopt = nativeSimpleDeopt &&
-            thread.nativeProcedureFrames && correctNativePhase &&
-            (thread.nativeProcedureFrames->yields() >= nativeDeoptAfter ||
-             rootOnlyFirstYield);
+        const bool certifiedRootLatch = [&] {
+            if (!rootOnlyProducerEnabled || !nativeSimpleDeopt ||
+                !thread.fiber || thread.status != STATUS_RUNNING ||
+                !thread.nativeProcedureFrames ||
+                !thread.nativeProcedureFrames->enabled() ||
+                !thread.nativeProcedureFrames->sourceUnchanged() ||
+                thread.nativeProcedureFrames->depth() != 1 ||
+                thread.nativeProcedureFrames->yields() != 0)
+                return false;
+            const auto state =
+                thread.nativeProcedureFrames->sourceCheckpoint();
+            return state &&
+                state->phase == ir::SourceResumePhase::AfterLoopBody &&
+                !state->loops.empty() &&
+                state->frame.resumePc == state->loops.back().sourcePc;
+        }();
+        if (certifiedRootLatch &&
+            thread.nativeRootLoopYieldCount != UINT64_MAX)
+            ++thread.nativeRootLoopYieldCount;
+        const bool rootOnlyYieldDue = certifiedRootLatch &&
+            thread.nativeRootLoopYieldCount >= nativeDeoptAfter;
+        // An actual native Fiber that observed the opt-in soft memory
+        // budget at a source-certified loop yield may request the
+        // *existing* independently verified interpreter handoff without
+        // enabling the test-only forced Nth-yield deopt mode.
+        // A failed verification must leave the Fiber runnable and
+        // MUST NOT run GC over its unrooted SSA registers.
+        const bool budgetRequest =
+            thread.nativeGcSoftBudgetYieldDue &&
+            !thread.nativeGcSoftBudgetAttempted;
+        if (budgetRequest)
+            thread.nativeGcSoftBudgetAttempted = true;
+        const bool attemptDeopt =
+            (nativeSimpleDeopt && thread.nativeProcedureFrames &&
+             correctNativePhase &&
+             (thread.nativeProcedureFrames->yields() >= nativeDeoptAfter ||
+              rootOnlyYieldDue)) ||
+            (budgetRequest && thread.nativeProcedureFrames &&
+             correctNativePhase);
+        // Test-only proof that each thread reaches the specified native
+        // checkpoint exactly, rather than inheriting another hat's count.
+        static const bool traceRootYield = [] {
+            const char* v = std::getenv("XYO_RT_TEST_ROOT_YIELD_COUNT");
+            return v && v[0] == '1';
+        }();
+        if (traceRootYield && certifiedRootLatch &&
+            thread.nativeRootLoopYieldCount == nativeDeoptAfter) {
+            std::fprintf(stderr,
+                "[native-root-yield] script=%s count=%llu target=%llu\n",
+                thread.topBlock.c_str(),
+                static_cast<unsigned long long>(
+                    thread.nativeRootLoopYieldCount),
+                static_cast<unsigned long long>(nativeDeoptAfter));
+        }
         // Test-only revision change before native continuation handoff.
         // Do not resetCache(): doing so frees cached BlockCached objects
         // still referenced by the suspended native recursive Fiber.
@@ -730,10 +1079,32 @@ void Sequencer::stepThread(Thread& thread) {
                 }
             }
         }
+        // Memory-pressure deoptimization is a change of execution
+        // engine, NOT a Scratch yield. A warp script must retain its
+        // current scheduler turn until the ordinary warp time limit.
+        // Otherwise a second green-flag hat observes partial side
+        // effects that it could not observe in Interpreter-only mode.
+        //
+        // The native JitCtx is the authoritative *currently executing*
+        // warp state even when its detached source/SSA certificate is
+        // invalid and the Interpreter handoff must fail closed.
+        // Capture it BEFORE a successful handoff releases JitCtx.
+        const bool resumeNativeWarpSameTurn =
+            budgetRequest && thread.jitCtx && thread.jitCtx->isWarp;
+        bool resumeWarpSameTurn = false;
         if ((sourceHandoffProbe || attemptDeopt) &&
             thread.nativeProcedureFrames && thread.status == STATUS_RUNNING &&
             thread.fiber) {
             auto handoff = captureNativeSourceHandoff(thread);
+            if (attemptDeopt && !handoff) {
+                noteJitDeopt(JitDeoptPath::NativeHandoff,
+                             JitDeoptReason::HandoffRefused, false);
+                if (budgetRequest)
+                    std::fprintf(stderr,
+                        "[native-gc-soft-budget] script=%s requested=1 "
+                        "adopted=0 collected=0 reason=no-handoff\n",
+                        thread.topBlock.c_str());
+            }
             if (sourceHandoffProbe) {
                 if (handoff)
                     std::fprintf(stderr,
@@ -764,8 +1135,19 @@ void Sequencer::stepThread(Thread& thread) {
                 }
                 const bool adopted = adoptSimpleNativeSourceHandoff(
                     thread, *handoff);
+                noteJitDeopt(JitDeoptPath::NativeHandoff,
+                             adopted ? JitDeoptReason::ExplicitHandoff
+                                     : JitDeoptReason::HandoffRefused,
+                             adopted);
                 std::fprintf(stderr, "[native-simple-deopt] script=%s adopted=%d\n",
                     thread.topBlock.c_str(), int(adopted));
+                // Never collect on a refused handoff. The native Fiber
+                // is still live and its unrooted SSA must be preserved.
+                if (budgetRequest && !adopted)
+                    std::fprintf(stderr,
+                        "[native-gc-soft-budget] script=%s requested=1 "
+                        "adopted=0 collected=0 reason=source-refused\n",
+                        thread.topBlock.c_str());
                 // Opt-in GC proof: *both* the suspended native Fiber and
                 // the exported, GC-rooted source snapshot must be gone
                 // before collection. Only interpreter parameter frames
@@ -785,7 +1167,94 @@ void Sequencer::stepThread(Thread& thread) {
                         thread.topBlock.c_str(), objectsBefore,
                         Gc::get().objectCount());
                 }
+                if (adopted && budgetRequest) {
+                    // The restored Interpreter has become the only
+                    // owner of all committed Scratch effects. We can
+                    // now safely collect and reclaim memory pressure
+                    // *after* the native Fiber is discarded. If the
+                    // existing post-adopt-GC test already collected,
+                    // don't do an additional redundant sweep.
+                    handoff.reset();
+                    const size_t before = Gc::get().bytesAllocated();
+                    const uint64_t collectionsBefore = Gc::get().collectCount();
+                    if (!testGcAfterAdopt)
+                        Gc::get().collect();
+                    // A different suspended native Fiber can veto this
+                    // sweep. Do not misreport a deferred collection as
+                    // completed; the global GC barrier drains it only
+                    // after the final live native Fiber has retired.
+                    const bool collected = testGcAfterAdopt
+                        ? !Gc::get().explicitCollectionPending()
+                        : Gc::get().collectCount() > collectionsBefore;
+                    const auto warpFrames = std::count_if(
+                        thread.stackFrames.begin(),
+                        thread.stackFrames.end(),
+                        [](const auto& frame) {
+                            return frame && frame->warpMode;
+                        });
+                    std::fprintf(stderr,
+                        "[native-gc-soft-budget] script=%s requested=1 "
+                        "adopted=1 collected=%d bytes_before=%zu "
+                        "bytes_after=%zu warp_frames=%zu pending=%d "
+                        "active_fibers=%zu\n",
+                        thread.topBlock.c_str(), int(collected), before,
+                        Gc::get().bytesAllocated(), size_t(warpFrames),
+                        int(Gc::get().explicitCollectionPending()),
+                        FiberPool::activeCount());
+                }
+                if (adopted && !testGcAfterAdopt &&
+                    Gc::get().explicitCollectionPending()) {
+                    // The native Fiber and detached non-executable
+                    // SSA roots have now been retired. The restored
+                    // interpreter variables/control frames are the
+                    // authoritative GC roots. Fulfil a previously
+                    // deferred native explicit-GC request only NOW,
+                    // never at an intermediate unrooted native yield.
+                    handoff.reset();
+                    const auto before = Gc::get().collectCount();
+                    Gc::get().collectIfNeeded();
+                    std::fprintf(stderr,
+                        "[native-ssa-explicit-gc-drained] script=%s "
+                        "before=%llu after=%llu pending=%d\n",
+                        thread.topBlock.c_str(),
+                        static_cast<unsigned long long>(before),
+                        static_cast<unsigned long long>(
+                            Gc::get().collectCount()),
+                        int(Gc::get().explicitCollectionPending()));
+                }
+                if (adopted && budgetRequest && thread.status == STATUS_RUNNING &&
+                    !thread.stackFrames.empty() &&
+                    thread.peekStackFrame()->warpMode)
+                    resumeWarpSameTurn = true;
             }
+        }
+        if (resumeNativeWarpSameTurn && thread.isCompiled &&
+            thread.fiber && thread.jitCtx &&
+            thread.status == STATUS_RUNNING &&
+            runtime.isActiveThread(&thread) && !thread.isKilled) {
+            // Source/SSA refusal does not revoke the native Fiber, but
+            // the GC request itself must not manufacture a Scratch
+            // scheduling boundary. Continue the original machine code
+            // until its ordinary warp watchdog (or a real yield) fires.
+            // nativeGcSoftBudgetAttempted prevents a second budget
+            // interruption, so one resume suffices and cannot loop on
+            // the same rejected certificate.
+            jitStepThread(thread);
+        }
+        if (resumeWarpSameTurn && runtime.isActiveThread(&thread) &&
+            !thread.isKilled && !thread.stack.empty()) {
+            // Preserve the time spent running the native half of this
+            // scheduler slice. Starting a fresh 500-ms warp timer here
+            // would incorrectly extend the atomic window after transfer.
+            if (!thread.hasWarpTimer) {
+                thread.hasWarpTimer = true;
+                if (timer.usesSteadyClock() &&
+                    thread.warpTimer.usesSteadyClock())
+                    thread.warpTimer.setStartTime(timer.startTime());
+                else
+                    thread.warpTimer.start();
+            }
+            stepThreadBound(thread, 0);
         }
         return;
     }
@@ -886,6 +1355,479 @@ bool Sequencer::adoptSimpleNativeSourceHandoff(
     if (!decoded || decoded->empty() || !handoff.image->symbols)
         return false;
     const auto& leaf = decoded->back();
+    // IR-owned, deep-copied typed SSA diagnostics. Raw values are
+    // deliberately never treated as GC roots or interpreter inputs.
+    std::optional<ir::SourceTypedSsaSnapshot> typedSsaCopy;
+    // Partial proof: only *live native function arguments* whose exact
+    // NaN-boxed bits match independently rooted Scratch CallFrame args.
+    // Ordinary LLVM instruction words and live pointers remain unsafe.
+    std::optional<rt::RootedSsaArgumentAudit> rootedSsaAudit;
+    // Unlike original CallFrame arguments, these are fresh native
+    // strings retained at the source checkpoint via exact GC handles.
+    std::optional<rt::GeneratedSsaRootAudit> generatedSsaAudit;
+
+    // RT-001 optional detached integer-SSA diagnostic. Unlike the
+    // lexical CallFrame counters this is native LLVM's exact raw SSA
+    // instruction result vector, copied into Thread before Fiber yield.
+    // It is NOT an executable deopt environment: unsupported pointers,
+    // non-integer values, GC liveness and effects are still unresolved.
+    // The already source-certified interpreter plan remains mandatory.
+    static const bool requireTypedManifest = [] {
+        const char* v = std::getenv("XYO_RT_REQUIRE_TYPED_SSA_MANIFEST");
+        return v && v[0] == '1';
+    }();
+    static const bool checkDetachedSsa = [] {
+        const char* v = std::getenv("XYO_RT_CHECK_LLVM_SSA_CAPTURE");
+        return v && v[0] == '1';
+    }();
+    static const bool requireRootedSsaArgs = [] {
+        const char* v = std::getenv("XYO_RT_REQUIRE_ROOTED_SSA_ARGS");
+        return v && v[0] == '1';
+    }();
+    static const bool requireGeneratedSsaRoots = [] {
+        const char* v = std::getenv("XYO_RT_REQUIRE_GENERATED_SSA_ROOTS");
+        return v && v[0] == '1';
+    }();
+    // Strict gate ONLY on scheduler Fiber -> interpreter handoff.
+    // A structurally matching reporter table by itself never authorizes
+    // recovery when source reporter destinations or native SSA are missing.
+    static const bool requireReporterSsaAudit = [] {
+        const char* v = std::getenv(
+            "XYO_RT_REQUIRE_REPORTER_SSA_AUDIT");
+        return v && v[0] == '1';
+    }();
+    if (checkDetachedSsa || requireTypedManifest || requireRootedSsaArgs ||
+        requireGeneratedSsaRoots || requireReporterSsaAudit) {
+        static const std::string corrupt = [] {
+            const char* v = std::getenv("XYO_RT_TEST_CORRUPT_LLVM_SSA");
+            return v ? std::string(v) : std::string{};
+        }();
+        const bool forceComplete = [] {
+            const char* v = std::getenv("XYO_RT_REQUIRE_COMPLETE_LLVM_SSA");
+            return v && v[0] == '1';
+        }();
+        NativeRtSsaCapture* ssa = thread.nativeRtSsaCapture.get();
+        if (!ssa || ssa->words.empty() ||
+            ssa->words.size() != ssa->descriptors.size())
+            return false;
+        // Test corruption only touches detached host-owned metadata,
+        // never the native machine registers or activation stack.
+        if (corrupt == "value")
+            ssa->words.front() ^= uint64_t{1};
+        else if (corrupt == "source")
+            ++ssa->sourcePc;
+        else if (corrupt == "kind")
+            ssa->descriptors.front() ^= uint64_t{0x400} << 32;
+        else if (corrupt == "unresolved")
+            ++ssa->unresolvedPointers;
+        else if (corrupt == "origin")
+            ++ssa->pointerOrigins[0];
+        else if (corrupt == "stack-count")
+            ++ssa->stackDerivedPointers;
+        else if (corrupt == "stack-roots")
+            ++ssa->distinctStackAllocas;
+        else if (corrupt == "site-rehash") {
+            ++ssa->siteId;
+            ssa->fingerprint = ssa->computeFingerprint();
+        } else if (corrupt == "kind-rehash") {
+            // Preserve a syntactically valid descriptor width, but
+            // change the instruction/argument kind. FNV recomputation
+            // bypasses ONLY the local copy-integrity check; the
+            // separately retained compiler manifest must still veto.
+            if (!ssa->descriptors.empty()) {
+                const uint64_t descriptor = ssa->descriptors.front();
+                ssa->descriptors.front() =
+                    (descriptor & UINT32_MAX) |
+                    ((uint64_t(uint32_t(descriptor >> 32) ^ 0x200))
+                     << 32);
+                ssa->fingerprint = ssa->computeFingerprint();
+            }
+        } else if (corrupt == "rooted-arg-rehash") {
+            // Leave the typed manifest and detached FNV both valid.
+            // The independent, GC-rooted source owner must catch an
+            // observed live i64 parameter that no longer matches.
+            for (size_t i = 0; i < ssa->descriptors.size(); ++i) {
+                const uint32_t family =
+                    uint32_t(ssa->descriptors[i] >> 32) &
+                    ~uint32_t{255};
+                if (family == 0x200) {
+                    ssa->words[i] ^= uint64_t{1};
+                    ssa->fingerprint = ssa->computeFingerprint();
+                    break;
+                }
+            }
+        } else if (corrupt == "alias-map-rehash") {
+            // Forge the mutable runtime SSA->source argument owner and
+            // RECOMPUTE its FNV. The independent compiler mapping must
+            // still reject before native Fiber retirement.
+            if (!ssa->aliasArguments.empty()) {
+                auto it = std::find_if(
+                    ssa->aliasArguments.begin(),
+                    ssa->aliasArguments.end(),
+                    [](uint32_t a) { return a > 0; });
+                if (it != ssa->aliasArguments.end()) {
+                    *it = 0;
+                    ssa->fingerprint = ssa->computeFingerprint();
+                }
+            }
+        } else if (corrupt == "alias-both-drop") {
+            // Even a perfectly rehashed old-style snapshot that
+            // dropped BOTH provenance arrays must fail closed in the
+            // new strict owner-checking mode.
+            ssa->aliasArguments.clear();
+            ssa->compilerAliasArguments.clear();
+            ssa->fingerprint = ssa->computeFingerprint();
+        } else if (corrupt == "alias-word-rehash") {
+            // Alters an instruction PHI/SELECT value that claims exact
+            // rooted source-argument ancestry, without altering the
+            // original compiler alias map (when such a value exists).
+            for (size_t i = 0; i < ssa->aliasArguments.size(); ++i) {
+                const uint32_t family =
+                    uint32_t(ssa->descriptors[i] >> 32) &
+                    ~uint32_t{255};
+                if (family == 0 && ssa->aliasArguments[i]) {
+                    ssa->words[i] ^= uint64_t{1};
+                    ssa->fingerprint = ssa->computeFingerprint();
+                    break;
+                }
+            }
+        } else if (corrupt == "generated-word-rehash") {
+            // Corrupt only a certified native-created string SSA word,
+            // keeping compiler descriptors and local FNV valid.
+            for (size_t i = 0; i < ssa->generatedStrings.size(); ++i) {
+                if (ssa->generatedStrings[i]) {
+                    ssa->words[i] ^= uint64_t{1};
+                    ssa->fingerprint = ssa->computeFingerprint();
+                    break;
+                }
+            }
+        } else if (corrupt == "generated-mask-rehash") {
+            for (auto& source : ssa->generatedStrings) {
+                if (source) {
+                    source = 0;
+                    ssa->fingerprint = ssa->computeFingerprint();
+                    break;
+                }
+            }
+        } else if (corrupt == "generated-both-drop") {
+            ssa->generatedStrings.clear();
+            ssa->compilerGeneratedStrings.clear();
+            ssa->fingerprint = ssa->computeFingerprint();
+        } else if (corrupt == "generated-root-drop") {
+            for (size_t i = 0; i < ssa->generatedStringHandles.size(); ++i) {
+                auto& handle = ssa->generatedStringHandles[i];
+                if (handle) {
+                    if (ssa->generatedStringRoots)
+                        ssa->generatedStringRoots->release(handle);
+                    handle = {};
+                    break;
+                }
+            }
+        } else if (corrupt == "manifest-drop") {
+            ssa->compilerManifest.reset();
+        } else if (corrupt == "manifest-site") {
+            if (ssa->compilerManifest)
+                ++ssa->compilerManifest->siteId;
+        } else if (corrupt == "manifest-kind") {
+            if (ssa->compilerManifest &&
+                !ssa->compilerManifest->descriptors.empty())
+                ssa->compilerManifest->descriptors.front() ^=
+                    (uint64_t{0x200} << 32);
+        } else if (corrupt == "reporter-input-root-drop") {
+            // Preserve the compiled source and numeric SSA fingerprints;
+            // lose only the separately registered historical list/reporter
+            // heap-string root handle. The scheduler must fail closed.
+            for (auto& handle : ssa->reporterInputHandles) {
+                if (!handle) continue;
+                if (ssa->reporterInputRoots)
+                    ssa->reporterInputRoots->release(handle);
+                handle = {};
+                break;
+            }
+        } else if (corrupt == "reporter-owner-epoch") {
+            // Test-only: mutate detached reporter OWNER epoch while
+            // keeping LLVM words, compiler manifest and local FNV
+            // unchanged. The independently reacquired Target stamp
+            // must still refuse a native Fiber handoff.
+            ++ssa->reporterOwnerLocalGeneration;
+        } else if (corrupt == "origin-swap") {
+            // This preserves the total pointer count, so a sum-only
+            // check cannot detect it; the frozen fingerprint must.
+            auto from = std::find_if(
+                ssa->pointerOrigins.begin(), ssa->pointerOrigins.end(),
+                [](uint32_t count) { return count > 0; });
+            if (from != ssa->pointerOrigins.end()) {
+                const size_t i = size_t(from -
+                    ssa->pointerOrigins.begin());
+                const size_t j = (i + 1) % ssa->pointerOrigins.size();
+                --ssa->pointerOrigins[i];
+                ++ssa->pointerOrigins[j];
+            }
+        }
+        uint64_t pointerSum = 0;
+        for (uint32_t count : ssa->pointerOrigins)
+            pointerSum += count;
+        const auto& source = *handoff.image->symbols;
+        if (ssa->sourceRevision != source.sourceRevision ||
+            ssa->digestLo != source.sourceDigest.lo ||
+            ssa->digestHi != source.sourceDigest.hi ||
+            ssa->sourcePc != leaf.frame.resumePc ||
+            ssa->procedureId != leaf.frame.procedureId ||
+            pointerSum != ssa->unresolvedPointers ||
+            ssa->distinctStackAllocas > ssa->stackDerivedPointers ||
+            ssa->stackDerivedPointers > ssa->unresolvedPointers ||
+            uint64_t(ssa->unresolvedPointers) +
+                uint64_t(ssa->unresolvedOther) !=
+                uint64_t(ssa->unsupported) ||
+            ssa->fingerprint != ssa->computeFingerprint() ||
+            (forceComplete &&
+             (!ssa->numericComplete || ssa->unsupported != 0)))
+            return false;
+
+        if (requireTypedManifest || requireRootedSsaArgs ||
+            requireGeneratedSsaRoots || requireReporterSsaAudit) {
+            const auto* expected = ssa->compilerManifest
+                ? &*ssa->compilerManifest : nullptr;
+            if (!expected ||
+                expected->revision != source.sourceRevision ||
+                expected->digestLo != source.sourceDigest.lo ||
+                expected->digestHi != source.sourceDigest.hi ||
+                expected->procedureId != leaf.frame.procedureId ||
+                expected->resumePc != leaf.frame.resumePc)
+                return false;
+            // This copies raw values into an IR-owned, independently
+            // verified diagnostic image. It never interprets those
+            // bits as SStr*, Scratch Value, or executable continuation.
+            typedSsaCopy = ir::verifyDetachedTypedSsa(*ssa, *expected);
+            if (!typedSsaCopy || !typedSsaCopy->matches(*expected))
+                return false;
+        }
+        if (requireRootedSsaArgs || requireGeneratedSsaRoots) {
+            if (!handoff.image->frames) return false;
+            rootedSsaAudit = rt::verifyRootedSsaArguments(
+                *ssa, *handoff.image->frames,
+                uint32_t(decoded->size()), leaf.frame.procedureId,
+                leaf.frame.arguments, true);
+            if (!rootedSsaAudit ||
+                !rootedSsaAudit->matchedAllObservedArguments)
+                return false;
+        }
+        if (requireGeneratedSsaRoots) {
+            generatedSsaAudit = rt::verifyGeneratedSsaRoots(*ssa);
+            if (!generatedSsaAudit) return false;
+        }
+#if defined(XYO_JIT)
+        if (requireReporterSsaAudit) {
+            const auto* compiled = static_cast<const CompiledScript*>(
+                thread.compiled);
+            const auto* entry = compiled && compiled->nativeReporterSites
+                ? compiled->nativeReporterSites->find(ssa->siteId) : nullptr;
+            if (!entry || !ssa->compilerManifest ||
+                !handoff.image->frames)
+                return false;
+            // Revalidate at the actual scheduler safe point, not merely
+            // at the earlier native capture, to reject stale frame roots
+            // and tampered SSA data before retiring the live Fiber.
+            const auto report = ir::auditSourceReporterSsaLocations(
+                entry->gap, entry->frozen, *ssa->compilerManifest,
+                *ssa, *handoff.image->frames);
+            if (!report) return false;
+            const auto owners = thread.target
+                ? ir::auditCompiledReporterStorageOwners(
+                    entry->frozen.reporters, *thread.target)
+                : std::nullopt;
+            const bool epochStable = owners && ssa->reporterOwnerReadback &&
+                ssa->reporterOwnerTarget == thread.target &&
+                ssa->reporterOwnerStage == owners->epoch.stage &&
+                ssa->reporterOwnerLocalGeneration ==
+                    owners->epoch.localGeneration &&
+                ssa->reporterOwnerStageGeneration ==
+                    owners->epoch.stageGeneration;
+            std::fprintf(stderr,
+                "[ir001-scheduler-reporter-owners] site=%llu "
+                "matched=%d epoch_stable=%d lists=%u scalars=%u "
+                "missing=%u wrong_type=%u unresolved=%u "
+                "value_restorable=0 executable=0\n",
+                static_cast<unsigned long long>(ssa->siteId),
+                int(bool(owners)), int(epochStable),
+                owners ? owners->typedListOwners : 0,
+                owners ? owners->typedScalarOwners : 0,
+                owners ? owners->missingOwners : 0,
+                owners ? owners->wrongTypeOwners : 0,
+                owners ? owners->unresolvedOrigins : 0);
+            if (!epochStable || !owners->ownershipComplete())
+                return false;
+            // Recheck AFTER native yield and BEFORE Fiber retirement.
+            // A stale dropped handle never becomes an executable value.
+            if (!ir::verifySourceReporterInputStrings(
+                    *ssa, entry->frozen, *ssa->compilerManifest))
+                return false;
+            // Only original (read-time) event records are acceptable.
+            // No fresh Scratch INDEX evaluation or current list dereference.
+            if (ssa->reporterListReadEvidence &&
+                !ir::verifyListReadEvidence(
+                    entry->frozen, *ssa->compilerManifest, *ssa,
+                    *ssa->reporterListReadEvidence))
+                return false;
+            const auto capturedInputs = ir::auditReporterInputSlots(
+                entry->frozen, *report, *ssa->compilerManifest, *ssa);
+            if (!capturedInputs || !thread.blockContainer) return false;
+            const auto destinations =
+                ir::auditReporterInterpreterDestinations(
+                    entry->frozen, *capturedInputs,
+                    *thread.blockContainer);
+            if (!destinations) return false;
+            std::fprintf(stderr,
+                "[ir001-scheduler-reported-entry-map] site=%llu "
+                "mapped=%u input_count=%zu "
+                "incomplete_prefix=%u contiguous_prefix=%u "
+                "source_complete=0 executable=0\n",
+                static_cast<unsigned long long>(ssa->siteId),
+                destinations->mapped, capturedInputs->inputs.size(),
+                destinations->incompletePrefix,
+                destinations->contiguousReportedPrefix);
+            if (destinations->mapped != capturedInputs->inputs.size())
+                return false;
+            const auto& historical = ssa->reporterScalarPrefixEvidence;
+            if (!destinations->missingPrefixOps.empty()) {
+                if (!historical || !handoff.image->symbols ||
+                    !ir::verifyHistoricalScalarPrefix(
+                        *historical, *destinations,
+                        ssa->reporterListReadEvidence.get(),
+                        *thread.blockContainer,
+                        entry->frozen.revision,
+                        [&](uint64_t pc) -> std::string_view {
+                            const auto id = handoff.image->symbols->block(pc);
+                            return id ? *id : std::string_view{};
+                        }))
+                    return false;
+            }
+            if (historical && handoff.image->symbols &&
+                !ir::verifyLiveScalarReadWords(
+                    *historical, entry->frozen,
+                    *ssa->compilerManifest, *ssa,
+                    *thread.blockContainer,
+                    [&](uint64_t pc) -> std::string_view {
+                        const auto id = handoff.image->symbols->block(pc);
+                        return id ? *id : std::string_view{};
+                    }))
+                return false;
+            const auto& restoredPrefix = ssa->reporterPrefixPlan;
+            if (restoredPrefix &&
+                !ir::verifyEvaluatedReportedPrefix(
+                    *restoredPrefix, *destinations,
+                    *thread.blockContainer))
+                return false;
+            std::fprintf(stderr,
+                "[ir001-scheduler-reported-prefix-plan] site=%llu "
+                "captured=%u valid=%d executable=0\n",
+                static_cast<unsigned long long>(ssa->siteId),
+                restoredPrefix ? restoredPrefix->capturedOperations : 0,
+                int(bool(restoredPrefix)));
+            std::fprintf(stderr,
+                "[ir001-scheduler-scalar-prefix] site=%llu "
+                "matched=%u expected=%zu "
+                "source_complete=0 executable=0\n",
+                static_cast<unsigned long long>(ssa->siteId),
+                historical ? historical->matched : 0,
+                destinations->missingPrefixOps.size());
+            std::fprintf(stderr,
+                "[ir001-scheduler-reporter-inputs] site=%llu "
+                "inputs=%zu immediate=%u rooted_heap=%u "
+                "unrooted_heap=%u ambiguous=%u "
+                "restorable=0 executable=0\n",
+                static_cast<unsigned long long>(ssa->siteId),
+                capturedInputs->inputs.size(),
+                capturedInputs->immediateCount,
+                capturedInputs->rootedHeapObservations,
+                capturedInputs->unrootedHeapObservations,
+                capturedInputs->ambiguousInputs);
+            // No interpreter ReportedEntry / parent ArgValues writeback
+            // has been proven for this source location. Do not treat an
+            // observed SSA word as an executable continuation, EVEN if
+            // it is a pointer-free numeric Scratch immediate.
+            std::fprintf(stderr,
+                "[ir001-scheduler-reporter-audit] site=%llu "
+                "observed=%zu unmapped=%u unsupported=%u "
+                "source_complete=0 executable=0\n",
+                static_cast<unsigned long long>(report->physicalSiteId),
+                report->reporters.size(), report->unresolvedReporters,
+                report->unsupportedLlvmValues);
+            // This opt-in strict mode does not infer live native pointers
+            // or Scratch temporary destinations. A rejected handoff
+            // preserves the native Fiber for its normal continuation.
+            if (report->unresolvedReporters ||
+                report->unsupportedLlvmValues ||
+                !capturedInputs->inputs.empty())
+                return false;
+        }
+#else
+        // No LLVM-produced SSA exists in a JIT-disabled runtime.
+        if (requireReporterSsaAudit) return false;
+#endif
+        static const bool trace = [] {
+            const char* v = std::getenv("XYO_RT_TRACE_LLVM_SSA_CAPTURE");
+            return v && v[0] == '1';
+        }();
+        if (trace && generatedSsaAudit)
+            std::fprintf(stderr,
+                "[native-ssa-generated-roots] script=%s "
+                "certified=%u rooted=%u immediate=%u checked=1\n",
+                thread.topBlock.c_str(),
+                generatedSsaAudit->provenStringSlots,
+                generatedSsaAudit->rootedHeapStrings,
+                generatedSsaAudit->immediateStrings);
+        if (trace && rootedSsaAudit)
+            std::fprintf(stderr,
+                "[native-ssa-rooted-args] script=%s matched=%u "
+                "heap_strings=%u nonargument_words=%u checked=1 "
+                "aliased=%u aliased_strings=%u\n",
+                thread.topBlock.c_str(),
+                rootedSsaAudit->matchedArguments,
+                rootedSsaAudit->rootedStringArguments,
+                rootedSsaAudit->unverifiedInstructionWords,
+                rootedSsaAudit->matchedAliasedInstructions,
+                rootedSsaAudit->rootedAliasedStrings);
+        if (trace && typedSsaCopy) {
+            std::fprintf(stderr,
+                "[native-typed-ssa-manifest] script=%s site=%llu "
+                "pc=%llu words=%zu independent=1\n",
+                thread.topBlock.c_str(),
+                static_cast<unsigned long long>(
+                    typedSsaCopy->manifest.siteId),
+                static_cast<unsigned long long>(
+                    typedSsaCopy->manifest.resumePc),
+                typedSsaCopy->words.size());
+        }
+        if (trace) {
+            size_t floats = 0, numericArgs = 0, floatArgs = 0;
+            for (uint64_t desc : ssa->descriptors) {
+                switch (uint32_t(desc >> 32) & ~uint32_t{255}) {
+                    case 0x100: ++floats; break;
+                    case 0x200: ++numericArgs; break;
+                    case 0x300: ++floatArgs; break;
+                    default: break;
+                }
+            }
+            std::fprintf(stderr,
+                "[native-llvm-ssa-detached] script=%s site=%llu "
+                "pc=%llu words=%zu unsupported=%u complete=%d checked=1 "
+                "floats=%zu intargs=%zu floatargs=%zu pointers=%u other=%u "
+                "ptr_origins=%u,%u,%u,%u,%u,%u,%u "
+                "stack_derived=%u stack_roots=%u\n",
+                thread.topBlock.c_str(),
+                static_cast<unsigned long long>(ssa->siteId),
+                static_cast<unsigned long long>(ssa->sourcePc),
+                ssa->words.size(), ssa->unsupported,
+                int(ssa->numericComplete), floats, numericArgs, floatArgs,
+                ssa->unresolvedPointers, ssa->unresolvedOther,
+                ssa->pointerOrigins[0], ssa->pointerOrigins[1],
+                ssa->pointerOrigins[2], ssa->pointerOrigins[3],
+                ssa->pointerOrigins[4], ssa->pointerOrigins[5],
+                ssa->pointerOrigins[6],
+                ssa->stackDerivedPointers, ssa->distinctStackAllocas);
+        }
+    }
     if (leaf.phase == ir::SourceResumePhase::AfterLoopBody) {
         if (leaf.loops.empty() || plan->postCalleeScriptExit ||
             !plan->postCalleeNextBlock.empty() ||
@@ -899,6 +1841,64 @@ bool Sequencer::adoptSimpleNativeSourceHandoff(
             !controls.back().isLoop ||
             controls.back().blockId != *savedLoop)
             return false;
+
+        // IR-001's opt-in numeric LLVM checkpoint sidecar contains
+        // lexical *loop counter slots*, not all compiler-live SSA.
+        // Cross-check this separate typed export against the source-
+        // authenticated native CallFrame before any Fiber is retired.
+        // It is extra consistency evidence only; effect continuity and
+        // the exact Scratch latch are still proved by the RT plan.
+        static const bool requireLoopSsa = [] {
+            const char* v =
+                std::getenv("XYO_RT_REQUIRE_LOOP_SSA_DIAGNOSTIC");
+            return v && v[0] == '1';
+        }();
+        if (requireLoopSsa) {
+            // Test-only fault injection mutates only the detached sidecar,
+            // never the still-running LLVM Fiber or original CallFrame.
+            static const std::string corruptMode = [] {
+                const char* v =
+                    std::getenv("XYO_RT_TEST_CORRUPT_LOOP_SSA");
+                return v ? std::string(v) : std::string{};
+            }();
+            auto& sidecar = handoff.image->diagnosticSsa;
+            if (corruptMode == "drop") {
+                sidecar.reset();
+            } else if (sidecar && !sidecar->slots.empty()) {
+                if (corruptMode == "value")
+                    sidecar->values.front() ^= uint64_t{1};
+                else if (corruptMode == "slot")
+                    ++sidecar->slots.front().id;
+            }
+            const auto& symbols = *handoff.image->symbols;
+            ir::SourceSsaManifest manifest{
+                symbols.sourceRevision, symbols.sourceDigest.lo,
+                symbols.sourceDigest.hi, leaf.frame.procedureId,
+                leaf.frame.resumePc, {}};
+            std::vector<uint64_t> expectedWords;
+            // Stable slot IDs belong to the source compiler's original
+            // lexical loop table, not an untrusted snapshot manifest.
+            // Absent and noncounted loops have no numeric SSA slot.
+            for (uint32_t slot = 0; slot < symbols.loops.size(); ++slot) {
+                const auto& sourceLoop = symbols.loops[slot];
+                const auto saved = std::find_if(
+                    leaf.loops.begin(), leaf.loops.end(),
+                    [&](const ir::SourceLoopResume& loop) {
+                        return loop.sourcePc == sourceLoop.sourcePc;
+                    });
+                if (saved == leaf.loops.end() ||
+                    saved->counterBits ==
+                        ir::CallFrameAbi::kNoLoopCounter)
+                    continue;
+                if (!sourceLoop.counted || sourceLoop.localSlot != slot)
+                    return false;
+                manifest.slots.push_back({slot, 64});
+                expectedWords.push_back(saved->counterBits);
+            }
+            if (!handoff.image->matchesSsaManifest(manifest) ||
+                !sidecar || sidecar->values != expectedWords)
+                return false;
+        }
     }
 
     thread.stack.clear();
@@ -926,6 +1926,10 @@ bool Sequencer::adoptSimpleNativeSourceHandoff(
         auto* call = thread.peekStackFrame();
         call->hasParams = true;
         call->params = std::move(restored.arguments);
+        // pushStack inherits an enclosing warp flag; additionally
+        // restore the original procedure's own verified warp setting.
+        // This is required for correct loop latch and tick scheduling.
+        call->warpMode = call->warpMode || restored.declaredWarp;
         call->executionContext = std::make_unique<ExecContext>();
         call->executionContext->executed = true;
         // The original lexical ordering can interleave IF and LOOP frames:
@@ -961,6 +1965,99 @@ bool Sequencer::adoptSimpleNativeSourceHandoff(
     thread.fiber = nullptr;
     releaseJitCtx(thread.jitCtx);
     thread.jitCtx = nullptr;
+    // The numeric SSA words live in RT-owned heap storage, never in
+    // the discarded native activation. Verify them *after* FiberPool
+    // release in diagnostic mode, then destroy this inert copy.
+    static const bool traceDetachedAfterRelease = [] {
+        const char* v = std::getenv("XYO_RT_TRACE_LLVM_SSA_CAPTURE");
+        return v && v[0] == '1';
+    }();
+    if (traceDetachedAfterRelease && thread.nativeRtSsaCapture)
+        std::fprintf(stderr,
+            "[native-llvm-ssa-post-release] script=%s words=%zu intact=%d\n",
+            thread.topBlock.c_str(),
+            thread.nativeRtSsaCapture->words.size(),
+            int(thread.nativeRtSsaCapture->fingerprint ==
+                thread.nativeRtSsaCapture->computeFingerprint()));
+    if (generatedSsaAudit) {
+        // Test-only full GC AFTER the native Fiber has been destroyed
+        // but BEFORE the detached generated-string root owner expires.
+        // The independent GC handles must still resolve exactly.
+        static const bool gcDuringTransfer = [] {
+            const char* v = std::getenv(
+                "XYO_RT_TEST_GC_DURING_SSA_TRANSFER");
+            return v && v[0] == '1';
+        }();
+        if (gcDuringTransfer) {
+            Gc::get().collect();
+            std::fprintf(stderr,
+                "[native-ssa-generated-gc] script=%s collected=1\n",
+                thread.topBlock.c_str());
+        }
+        const auto checkedAgain = thread.nativeRtSsaCapture
+            ? rt::verifyGeneratedSsaRoots(*thread.nativeRtSsaCapture)
+            : std::nullopt;
+        const bool intact = checkedAgain &&
+            checkedAgain->provenStringSlots ==
+                generatedSsaAudit->provenStringSlots &&
+            checkedAgain->rootedHeapStrings ==
+                generatedSsaAudit->rootedHeapStrings &&
+            checkedAgain->immediateStrings ==
+                generatedSsaAudit->immediateStrings;
+        if (traceDetachedAfterRelease)
+            std::fprintf(stderr,
+                "[native-ssa-generated-post-release] script=%s "
+                "certified=%u rooted=%u immediate=%u intact=%d\n",
+                thread.topBlock.c_str(),
+                generatedSsaAudit->provenStringSlots,
+                generatedSsaAudit->rootedHeapStrings,
+                generatedSsaAudit->immediateStrings, int(intact));
+    }
+    if (rootedSsaAudit) {
+        const auto checkedAgain =
+            thread.nativeRtSsaCapture && handoff.image->frames
+                ? rt::verifyRootedSsaArguments(
+                    *thread.nativeRtSsaCapture,
+                    *handoff.image->frames,
+                    uint32_t(decoded->size()),
+                    leaf.frame.procedureId, leaf.frame.arguments,
+                    true)
+                : std::nullopt;
+        const bool intact = checkedAgain &&
+            checkedAgain->matchedAllObservedArguments &&
+            checkedAgain->matchedArguments ==
+                rootedSsaAudit->matchedArguments &&
+            checkedAgain->rootedStringArguments ==
+                rootedSsaAudit->rootedStringArguments &&
+            checkedAgain->matchedAliasedInstructions ==
+                rootedSsaAudit->matchedAliasedInstructions &&
+            checkedAgain->rootedAliasedStrings ==
+                rootedSsaAudit->rootedAliasedStrings;
+        if (traceDetachedAfterRelease)
+            std::fprintf(stderr,
+                "[native-ssa-rooted-args-post-release] script=%s "
+                "matched=%u heap_strings=%u intact=%d "
+                "aliased=%u aliased_strings=%u\n",
+                thread.topBlock.c_str(),
+                rootedSsaAudit->matchedArguments,
+                rootedSsaAudit->rootedStringArguments, int(intact),
+                rootedSsaAudit->matchedAliasedInstructions,
+                rootedSsaAudit->rootedAliasedStrings);
+    }
+    if (typedSsaCopy) {
+        const bool intact = thread.nativeRtSsaCapture &&
+            thread.nativeRtSsaCapture->compilerManifest &&
+            typedSsaCopy->matches(
+                *thread.nativeRtSsaCapture->compilerManifest) &&
+            typedSsaCopy->words == thread.nativeRtSsaCapture->words;
+        if (traceDetachedAfterRelease)
+            std::fprintf(stderr,
+                "[native-typed-ssa-post-release] script=%s "
+                "words=%zu intact=%d\n",
+                thread.topBlock.c_str(),
+                typedSsaCopy->words.size(), int(intact));
+    }
+    thread.nativeRtSsaCapture.reset();
     thread.nativeProcedureFrames.reset();
     thread.jitVarCache.clear();
     thread.jitVarSlots.clear();
@@ -1033,6 +2130,7 @@ bool Sequencer::tryNestedWasm(Thread& thread,
 
 void Sequencer::stepThreadBound(Thread& thread, size_t minDepth,
                                 const std::string* stopAt, bool* yielded) {
+    thread.pendingShortBroadcast = false;
     if (yielded) *yielded = false;
     const bool countBlocks =
         minDepth == 0 && !thread.isCompiled && runtime.jit &&
@@ -1221,7 +2319,11 @@ void Sequencer::numericStepThread(Thread& thread) {
             ir::numericRollbackReasonName(session->continuation.rollbackReason()),
             static_cast<unsigned long long>(session->continuation.committedSlices()),
             static_cast<unsigned long long>(session->continuation.rolledBackSlices()));
+    const JitDeoptReason rollbackReason =
+        numericDeoptReason(ir::numericRollbackReasonName(
+            session->continuation.rollbackReason()));
     const bool restored = ir::restoreNumericInterpreter(thread, *session);
+    noteJitDeopt(JitDeoptPath::NumericCfg, rollbackReason, restored);
     thread.numericSession.reset();
     if (!restored) {
         // This should be unreachable for the restricted single-loop form.
@@ -1239,7 +2341,51 @@ void Sequencer::numericStepThread(Thread& thread) {
 /// fiber の yield は「他スレッドへ譲る」チェックポイント（同一パスで再開）。
 /// status は生成コード側のヘルパが必要時に設定する。
 void Sequencer::jitStepThread(Thread& thread) {
+    thread.pendingShortBroadcast = false;
     const auto* compiled = static_cast<const CompiledScript*>(thread.compiled);
+    // Defense in depth: even a directly attached CompiledScript must not
+    // enter a native Fiber in fiberless mode. Only a fresh script may start
+    // in the interpreter; never replay a mid-procedure/OSR continuation.
+    if (jitFiberlessEnabled() && compiled && compiled->mayYield &&
+        !compiled->wasm && !thread.jitCtx && !thread.fiber &&
+        !thread.osrActive && !thread.nestedOsrActive &&
+        !thread.interpreterStarted && thread.stack.size() == 1 &&
+        thread.peekStack() == thread.topBlock) {
+        thread.isCompiled = false;
+        thread.compiled = nullptr;
+        stepThreadBound(thread, 0);
+        return;
+    }
+    // START-015: a native v3 artifact was compiled from a specific Blocks
+    // revision. A source edit can invalidate both unresolved and resolved
+    // BlockCached slots; do not enter or resume stale native machine code.
+    // Source edits must be applied by the host at scheduler safe points,
+    // after any worker batch joins. No concurrent unsynchronized edits.
+    if (compiled && compiled->aotSourceRevision &&
+        (!thread.blockContainer ||
+         compiled->aotSourceBlocks != thread.blockContainer ||
+         compiled->aotSourceRevision != thread.blockContainer->revision())) {
+        const bool fresh = !thread.jitCtx && !thread.fiber &&
+                           !thread.interpreterStarted &&
+                           !thread.osrActive && !thread.nestedOsrActive;
+        if (std::getenv("XYO_AOT_SOURCE_TRACE"))
+            std::fprintf(stderr,
+                "[aot-source-stale] script=%s fresh=%d action=%s\n",
+                thread.topBlock.c_str(), int(fresh),
+                fresh ? "interpreter" : "retire");
+        if (fresh) {
+            thread.isCompiled = false;
+            thread.compiled = nullptr;
+            // The root has not run yet, so interpretation starts once.
+            stepThreadBound(thread, 0);
+        } else {
+            // There is no general source-certified continuation for an
+            // arbitrary yielding native Fiber. Retire, never replay its
+            // already committed side effects or resume stale code.
+            retireThread(thread);
+        }
+        return;
+    }
     const auto finishNative = [&] {
         // Verify every interpreter callsite still exists in exactly the
         // selected order. LLVM owns only the final counted loop; all prefix
@@ -1422,6 +2568,15 @@ void Sequencer::jitStepThread(Thread& thread) {
         c->blockCounter = runtime.blockCountEnabled
             ? &runtime.executedBlocks : nullptr;
         c->sequencer = this;
+        // LAYQ: fresh quantum; stop snapshot so a pooled context reused
+        // after a stop does not spuriously hand off on its first poll.
+        // Pointer wiring follows the sampled-clock precedent (same block
+        // below wires sampledWarpClockUs et al.).
+        c->yieldQuantum = 64;
+        c->observedStopEpoch =
+            runtime.stopEpoch.load(std::memory_order_relaxed);
+        c->quantumHintPtr = &runtime.yieldQuantumHint;
+        c->stopEpochPtr = &runtime.stopEpoch;
         c->compatEc = &thread.compatibilityStackFrame;
         if (thread.osrActive)
             c->osrRepeatRemaining = thread.osrRemaining;
@@ -1473,7 +2628,116 @@ void Sequencer::jitStepThread(Thread& thread) {
             ExecContext* ec = inner && inner->executionContext
                 ? inner->executionContext.get() : nullptr;
             const double remaining = c->nestedOsrDeoptRemaining;
+            const bool innerPhase =
+                c->nestedOsrDeoptPhase == 2 &&
+                compiled->nestedOsrInnerYieldGuard;
+            const bool triplePhase =
+                c->nestedOsrDeoptPhase == 3 &&
+                compiled->nestedOsrInnerYieldGuard &&
+                !compiled->nestedOsrDeepInnerLoopId.empty();
+            const bool quadPhase =
+                c->nestedOsrDeoptPhase == 4 &&
+                compiled->nestedOsrInnerYieldGuard &&
+                !compiled->nestedOsrDeepInnerLoopId.empty() &&
+                !compiled->nestedOsrFourthLoopId.empty();
+            const bool outerPhase = c->nestedOsrDeoptPhase == 1;
+            // The inner source ID is frozen in the CompiledScript, not
+            // selected from a modified source graph. It must remain an
+            // attached counted repeat in the same selected outer body.
+            const bool innerTopology = [&] {
+                if (!(innerPhase || triplePhase || quadPhase) ||
+                    compiled->nestedOsrInnerLoopId.empty())
+                    return false;
+                const Block* outer =
+                    blocks->getBlock(compiled->nestedOsrLoopId);
+                const Block* inner =
+                    blocks->getBlock(compiled->nestedOsrInnerLoopId);
+                if (!outer || outer->opcode != "control_repeat" ||
+                    !inner || inner->opcode != "control_repeat")
+                    return false;
+                const auto* sub = outer->inputs.find("SUBSTACK");
+                if (!sub || sub->block.empty()) return false;
+                std::unordered_set<std::string> visited;
+                std::string id = sub->block;
+                for (size_t budget = 16; !id.empty() && budget--; ) {
+                    if (!visited.insert(id).second) return false;
+                    if (id == compiled->nestedOsrInnerLoopId)
+                        return true;
+                    const Block* node = blocks->getBlock(id);
+                    if (!node) return false;
+                    id = node->next;
+                }
+                return false;
+            }();
+            const auto validRemaining = [](double n) {
+                return std::isfinite(n) && n >= 0.0 &&
+                       n <= 1099511627776.0 &&
+                       std::floor(n) == n;
+            };
+            const bool deepestTopology = [&] {
+                if (!(triplePhase || quadPhase) || !innerTopology)
+                    return false;
+                const Block* middle =
+                    blocks->getBlock(compiled->nestedOsrInnerLoopId);
+                const Block* leaf =
+                    blocks->getBlock(compiled->nestedOsrDeepInnerLoopId);
+                if (!middle || !leaf ||
+                    middle->opcode != "control_repeat" ||
+                    leaf->opcode != "control_repeat") return false;
+                const auto* sub = middle->inputs.find("SUBSTACK");
+                if (!sub || sub->block.empty()) return false;
+                std::string id = sub->block;
+                std::unordered_set<std::string> visited;
+                for (size_t budget = 16; !id.empty() && budget--; ) {
+                    if (!visited.insert(id).second) return false;
+                    if (id == compiled->nestedOsrDeepInnerLoopId)
+                        return true;
+                    const Block* node = blocks->getBlock(id);
+                    if (!node) return false;
+                    id = node->next;
+                }
+                return false;
+            }();
+            const bool fourthTopology = [&] {
+                if (!quadPhase || !deepestTopology) return false;
+                const Block* deep =
+                    blocks->getBlock(compiled->nestedOsrDeepInnerLoopId);
+                const Block* leaf =
+                    blocks->getBlock(compiled->nestedOsrFourthLoopId);
+                if (!deep || !leaf ||
+                    deep->opcode != "control_repeat" ||
+                    leaf->opcode != "control_repeat") return false;
+                const auto* sub = deep->inputs.find("SUBSTACK");
+                if (!sub || sub->block.empty()) return false;
+                std::unordered_set<std::string> visited;
+                std::string id = sub->block;
+                for (size_t budget = 16; !id.empty() && budget--; ) {
+                    if (!visited.insert(id).second) return false;
+                    if (id == compiled->nestedOsrFourthLoopId)
+                        return true;
+                    const Block* node = blocks->getBlock(id);
+                    if (!node) return false;
+                    id = node->next;
+                }
+                return false;
+            }();
+            const double innerRemaining =
+                c->nestedOsrDeoptInnerRemaining;
+            const double deepestRemaining =
+                c->nestedOsrDeoptDeepRemaining;
+            const double fourthRemaining =
+                c->nestedOsrDeoptFourthRemaining;
             const bool safe = c->nestedOsrDeoptReady == 1 &&
+                (outerPhase ||
+                 (innerPhase && innerTopology &&
+                  validRemaining(innerRemaining)) ||
+                 (triplePhase && deepestTopology &&
+                  validRemaining(innerRemaining) &&
+                  validRemaining(deepestRemaining)) ||
+                 (quadPhase && fourthTopology &&
+                  validRemaining(innerRemaining) &&
+                  validRemaining(deepestRemaining) &&
+                  validRemaining(fourthRemaining))) &&
                 !thread.isKilled &&
                 runtime.isActiveThread(&thread) &&
                 thread.peekStack() == compiled->nestedOsrLoopId &&
@@ -1496,16 +2760,69 @@ void Sequencer::jitStepThread(Thread& thread) {
             thread.compiled = nullptr;
             if (!safe) {
                 // An unprovable frame must not replay effects.
+                noteJitDeopt((triplePhase || quadPhase) ?
+                             JitDeoptPath::NestedTriple :
+                             innerPhase ? JitDeoptPath::NestedInner :
+                                          JitDeoptPath::NestedOuter,
+                             JitDeoptReason::UnsafeResume, false);
                 retireThread(thread);
                 return;
             }
             ec->loopCounter = remaining;
+            if (innerPhase || triplePhase || quadPhase) {
+                // The original outer frame and GC argument roots remain
+                // alive. Neither its body nor the middle body has ended
+                // at a leaf-phase checkpoint. Push the exact frozen
+                // source control frames, outermost first.
+                const auto restoreCounted = [&](const std::string& id,
+                                                double value) {
+                    thread.pushStack(id);
+                    StackFrame* frame = thread.peekStackFrame();
+                    frame->isLoop = true;
+                    frame->executionContext =
+                        std::make_unique<ExecContext>();
+                    frame->executionContext->hasLoopCounter = true;
+                    frame->executionContext->loopCounter = value;
+                };
+                restoreCounted(compiled->nestedOsrInnerLoopId,
+                               innerRemaining);
+                if (triplePhase || quadPhase)
+                    restoreCounted(compiled->nestedOsrDeepInnerLoopId,
+                                   deepestRemaining);
+                if (quadPhase)
+                    restoreCounted(compiled->nestedOsrFourthLoopId,
+                                   fourthRemaining);
+            }
             thread.status = STATUS_RUNNING;
-            if (std::getenv("XYO_JIT_OSR_NESTED_TRACE"))
-                std::fprintf(stderr,
-                    "[jit-osr-inflight] deopt remaining=%.0f "
-                    "source-changed=1; interpreter owns original loop\\n",
-                    remaining);
+            noteJitDeopt((triplePhase || quadPhase) ?
+                             JitDeoptPath::NestedTriple :
+                         innerPhase ? JitDeoptPath::NestedInner :
+                                      JitDeoptPath::NestedOuter,
+                         JitDeoptReason::SourceChanged, true);
+            if (std::getenv("XYO_JIT_OSR_NESTED_TRACE")) {
+                if (quadPhase)
+                    std::fprintf(stderr,
+                        "[jit-osr-inflight] deopt quad outer=%.0f "
+                        "middle=%.0f deep=%.0f leaf=%.0f "
+                        "source-changed=1\\n",
+                        remaining, innerRemaining,
+                        deepestRemaining, fourthRemaining);
+                else if (triplePhase)
+                    std::fprintf(stderr,
+                        "[jit-osr-inflight] deopt triple outer=%.0f "
+                        "middle=%.0f leaf=%.0f source-changed=1\\n",
+                        remaining, innerRemaining, deepestRemaining);
+                else if (innerPhase)
+                    std::fprintf(stderr,
+                        "[jit-osr-inflight] deopt inner outer=%.0f "
+                        "inner=%.0f source-changed=1\\n",
+                        remaining, innerRemaining);
+                else
+                    std::fprintf(stderr,
+                        "[jit-osr-inflight] deopt remaining=%.0f "
+                        "source-changed=1; interpreter owns original loop\\n",
+                        remaining);
+            }
             return;
         }
     }
@@ -1518,7 +2835,55 @@ void Sequencer::jitStepThread(Thread& thread) {
     std::optional<ProfScope> ps;
     if (prof().enabled) { ps.emplace(&prof().fiberNs); ++prof().nFiber; }
 #endif
-    c->fiber->resume();
+    // RT-001 (opt-in): before the next authenticated LLVM source
+    // checkpoint, newly allocated SStrs may exist only in SSA registers.
+    // Automatic heap-threshold GC inside xyo_join* could run before
+    // any detached GC handle exists. Defer only that automatic GC during
+    // the bounded native Fiber activation; it becomes eligible again
+    // on return to the serial scheduler, after the checkpoint callback
+    // has had a chance to register exact generated-string handles.
+    //
+    // Explicit Gc::collect() is now also postponed by the nested
+    // DeferExplicitCollect guard, then drained only after the native
+    // Fiber is retired at a verified handoff or on script completion.
+    // This does NOT certify arbitrary live LLVM values.
+    static const bool deferNativeAutomaticGc = [] {
+        const char* value = std::getenv("XYO_RT_REQUIRE_GENERATED_SSA_ROOTS");
+        return value && value[0] == '1';
+    }();
+    static const bool traceNativeGcDeferral = [] {
+        const char* value = std::getenv("XYO_RT_TRACE_NATIVE_GC_DEFERRAL");
+        return value && value[0] == '1';
+    }();
+    // The source-certified budget request is per actual scheduler
+    // activation. Do not reuse a stale request on the next resume.
+    thread.nativeGcSoftBudgetYieldDue = false;
+    if (deferNativeAutomaticGc) {
+        const uint64_t before = traceNativeGcDeferral
+            ? Gc::get().collectCount() : 0;
+        const size_t bytesBefore = traceNativeGcDeferral
+            ? Gc::get().bytesAllocated() : 0;
+        {
+            Gc::DeferCollect defer;
+            Gc::DeferExplicitCollect deferExplicit;
+            c->fiber->resume();
+        }
+        if (traceNativeGcDeferral) {
+            const uint64_t after = Gc::get().collectCount();
+            const size_t bytesAfter = Gc::get().bytesAllocated();
+            const size_t deferredBytes = bytesAfter >= bytesBefore
+                ? bytesAfter - bytesBefore : 0;
+            std::fprintf(stderr,
+                "[native-gc-deferred] script=%s before=%llu "
+                "after=%llu unchanged=%d allocated_bytes=%zu\n",
+                thread.topBlock.c_str(),
+                static_cast<unsigned long long>(before),
+                static_cast<unsigned long long>(after),
+                int(before == after), deferredBytes);
+        }
+    } else {
+        c->fiber->resume();
+    }
     if (c->fiber->finished() || thread.status == STATUS_DONE ||
         thread.isKilled || !runtime.isActiveThread(&thread)) {
         // A thread may be restarted or stopped while it is the currently
@@ -1533,6 +2898,43 @@ void Sequencer::jitStepThread(Thread& thread) {
         thread.fiber = nullptr;
         releaseJitCtx(c);
         thread.jitCtx = nullptr;
+        // A deferred native explicit collection is safe to perform
+        // once this native activation has FINISHED and no unrooted
+        // SSA registers can be resumed. Do not drain on mere yield.
+        if (deferNativeAutomaticGc &&
+            (Gc::get().explicitCollectionPending() ||
+             thread.nativeGcSoftBudgetAttempted)) {
+            const auto before = Gc::get().collectCount();
+            const size_t bytesBefore = Gc::get().bytesAllocated();
+            // A rejected soft budget request can only be collected
+            // AFTER the native Fiber completes. The usual GC threshold
+            // may be larger than the configured soft budget, so a
+            // plain collectIfNeeded() is insufficient in that case.
+            if (thread.nativeGcSoftBudgetAttempted)
+                Gc::get().collect();
+            else
+                Gc::get().collectIfNeeded();
+            if (thread.nativeGcSoftBudgetAttempted)
+                std::fprintf(stderr,
+                    "[native-gc-soft-budget-finished] script=%s "
+                    "collected=%d bytes_before=%zu bytes_after=%zu "
+                    "pending=%d active_fibers=%zu\n",
+                    thread.topBlock.c_str(),
+                    int(Gc::get().collectCount() > before), bytesBefore,
+                    Gc::get().bytesAllocated(),
+                    int(Gc::get().explicitCollectionPending()),
+                    FiberPool::activeCount());
+            if (traceNativeGcDeferral &&
+                !thread.nativeGcSoftBudgetAttempted)
+                std::fprintf(stderr,
+                    "[native-ssa-explicit-gc-finished] script=%s "
+                    "before=%llu after=%llu pending=%d\n",
+                    thread.topBlock.c_str(),
+                    static_cast<unsigned long long>(before),
+                    static_cast<unsigned long long>(
+                        Gc::get().collectCount()),
+                    int(Gc::get().explicitCollectionPending()));
+        }
     } else if (thread.status == STATUS_YIELD) {
         // パス内 yield（`u.yield()` 相当）は STATUS_RUNNING に戻す — JS の
         // stepThread も stepThreadBound も yield から戻るときに同じことを
@@ -1546,13 +2948,35 @@ void Sequencer::jitStepThread(Thread& thread) {
 }
 
 void Sequencer::retireThread(Thread& thread) {
+    runtime.untrackWaitDependencies(thread);
+    thread.pendingShortBroadcast = false;
+    // A killed async Fiber does not unwind the C++ reporter's stack.
+    // Release Thread-owned LLVM Variable::value roots on retirement.
+    // Every external GC sweep is still guarded while other Fibers run.
+    if (!thread.nativeAsyncVariableRoots.empty() &&
+        std::getenv("XYO_RT_TRACE_ASYNC_VAR_ROOTS")) {
+        size_t heapRoots = 0;
+        for (const auto& owner : thread.nativeAsyncVariableRoots)
+            heapRoots += owner->size();
+        std::fprintf(stderr,
+            "[native-async-var-retire] owners=%zu heap_roots=%zu "
+            "gc_safe=0\n",
+            thread.nativeAsyncVariableRoots.size(), heapRoots);
+    }
+    thread.nativeAsyncVariableRoots.clear();
+    thread.nativeAsyncReporterReturnPc = 0;
+    thread.nativeAsyncReporterFramePtr = 0;
+    thread.nativeAsyncReporterInputBuffer = 0;
+    thread.nativeAsyncReporterInputWords = 0;
     thread.numericSession.reset();
     // JS 版は stack のみクリアし stackFrames は残す（edge-activated hat が
     // retire 直後に goToNextBlock → reuseStackForNextBlock で最終フレームを
     // 再利用するため）。
     thread.stack.clear();
     thread.requestScriptGlowInFrame = false;
-    thread.status = STATUS_DONE;
+    // Retirement can be called by external stop/broadcast paths as well as
+    // from the running scheduler; invalidate any cached runnable membership.
+    runtime.transitionThread(thread, STATUS_DONE);
     // 現在実行中の fiber 自身の解放はできない — ~Thread に委ねる。
     // 中断したままの他 fiber は status DONE で二度と resume されないので
     // ここで解放してよい。
@@ -1578,8 +3002,22 @@ bool Sequencer::parallelEnabled() const {
     // never a parallel worker that might race GC root allocation.
     const char* handoff = std::getenv("XYO_RT_SOURCE_HANDOFF_PROBE");
     const char* deopt = std::getenv("XYO_RT_NATIVE_DEOPT_ONCE");
+    // Exact GcValueHandles source ownership is a serial scheduler
+    // safe-point operation. Do not run the generated SSA experiment on
+    // worker threads or through Fiber::resumeChain, even if a caller
+    // enabled the GC-root producer without enabling a deopt probe.
+    const char* generatedRoots =
+        std::getenv("XYO_RT_REQUIRE_GENERATED_SSA_ROOTS");
+    // The opt-in native Variable* rebind calls Target::lookupOrCreate
+    // at each use. Target's VariableMap is intentionally serial and
+    // can be structurally mutated by the editor; never resolve these
+    // borrowed nodes concurrently with another worker's map access.
+    const char* guardVarSlots =
+        std::getenv("XYO_RT_GUARD_NATIVE_VAR_SLOTS");
     if ((handoff && handoff[0] == '1') ||
-        (deopt && deopt[0] == '1')) return false;
+        (deopt && deopt[0] == '1') ||
+        (generatedRoots && generatedRoots[0] == '1') ||
+        (guardVarSlots && guardVarSlots[0] == '1')) return false;
     static const bool enabled = std::getenv("XYO_PAR") == nullptr ||
                                 std::string(std::getenv("XYO_PAR")) != "0";
     // Affinity is a per-script effect, not a property of the whole Runtime.
@@ -1605,12 +3043,23 @@ const AccessSet* Sequencer::parallelAccessFor(Thread& t) const {
     if (t.accessResolved && t.accessGen == runtime.jit->accessGeneration())
         return t.accessCache;
     auto* cs = static_cast<const CompiledScript*>(t.compiled);
+    // A stale v3 script must not even enter a parallel batch or reuse
+    // a cached worker eligibility decision from before an editor change.
+    if (cs && cs->aotSourceRevision &&
+        (!t.blockContainer || cs->aotSourceBlocks != t.blockContainer ||
+         cs->aotSourceRevision != t.blockContainer->revision()))
+        return nullptr;
     // GPU helpers may invoke the renderer or shared compute backends, even in
     // a script whose Scratch-level effects are purely numeric.
     if (!cs || !cs->entry || cs->wasm ||
         cs->mainThread || !cs->gpuProgs.empty()) return nullptr;
     const AccessSet* as = runtime.jit->accessFor(t, runtime);
     const AccessSet* res = as && as->workerSafe() ? as : nullptr;
+    // Parallel native execution must not trigger lazy Blocks cache mutation
+    // from worker threads. Resolve only worker-eligible scripts here, after
+    // the last parallel batch has already joined.
+    if (res && !cs->aotLazyWorkerSlots.empty() &&
+        !runtime.jit->prepareAotWorker(*cs)) res = nullptr;
     t.accessCache = res;
     t.accessResolved = true;
     t.accessGen = runtime.jit->accessGeneration();

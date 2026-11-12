@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "../aot/aot.hpp"
+#include "layq.hpp"
 #include "../core/value.hpp"
 #include "../engine/deps.hpp"
 #include "../gpu/gpu_isa.hpp"
@@ -32,9 +33,11 @@ struct Block;
 struct ExecContext;
 struct Variable;
 struct NumericJitCode;
+struct AotLazyCachedSlot;
 class Fiber;
 namespace wasm { struct HotCode; }
 namespace ir { struct SourceFrameSymbols; }
+namespace ir { struct SourceReporterRuntimeSites; }
 
 // --- 実行モード -------------------------------------------------------
 //
@@ -145,6 +148,20 @@ inline bool jitModeExplicit() {
 }
 inline bool jitEnabled() { return jitMode() != JitMode::Off; }
 
+// Incremental fiber removal: in this opt-in mode execute compiled,
+// non-suspending native scripts directly, retain existing stackless numeric
+// and WASM continuations, and run unsupported suspending scripts with the
+// interpreter until LLVM continuations can replace their native stacks.
+// This is a correctness baseline, NOT a performance optimization.
+inline bool jitFiberlessEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("XYO_JIT_FIBERLESS");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
+
 // --- JIT ABI ------------------------------------------------------------
 
 using ScriptFn = void (*)(struct JitCtx*);
@@ -218,6 +235,42 @@ struct JitCtx {
     // This is NOT an arbitrary LLVM SSA/effect-PC deoptimizer.
     int32_t nestedOsrDeoptReady = 0;
     double nestedOsrDeoptRemaining = 0.0;
+    // OSR-011: the MOST RECENT scheduler yield's source phase.
+    // 1: completed selected outer-loop body; 2: completed one inner
+    // loop body while the enclosing outer body is not yet complete.
+    // Zero/invalid means no proven executable continuation.
+    int32_t nestedOsrDeoptPhase = 0;
+    double nestedOsrDeoptInnerRemaining = 0.0;
+    // OSR-013 phase 3: selected outer -> middle -> leaf source loop.
+    // A deep native yield has completed one LEAF body, but neither
+    // enclosing iteration body has reached its source latch.
+    double nestedOsrDeoptDeepRemaining = 0.0;
+    // OSR-014 phase 4: four lexical counted repeats, last body
+    // completed; all enclosing counted-loop bodies are unfinished.
+    double nestedOsrDeoptFourthRemaining = 0.0;
+    // LAYQ (src/jit/layq.hpp): per-thread warp-poll quantum, always a
+    // power of two (keeps the mask form `q - (n & (q-1))`). Initialized
+    // to 64 at attach; the adaptive policy widens it when idle.
+    // ABI: appended, older JitCtx offsets unchanged.
+    uint64_t yieldQuantum = 64;
+    // LAYQ: last Runtime::stopEpoch observed at a warp poll. A mismatch
+    // hands off (spill + xyo_yield), bounding stop latency at one
+    // quantum regardless of the deadline cadence.
+    uint64_t observedStopEpoch = 0;
+    // LAYQ v2: scheduler-published recommended quantum + stop generation.
+    // Pointer indirection follows the sampledWarpClockUs precedent (avoids
+    // offsetof into Runtime, which is not standard-layout): wired at
+    // attach, read with relaxed atomic loads in JIT poll/entry blocks.
+    // Defaults point at never-written fallbacks (floor quantum, no stop)
+    // so hand-rolled test contexts without attach stay safe.
+    std::atomic<uint32_t>* quantumHintPtr = &layqFallbackQuantum;
+    std::atomic<uint64_t>* stopEpochPtr = &layqFallbackStopEpoch;
+    // LAYQ diagnostic counters (XYO_YIELD_QSTATS=1 dumps them at release):
+    // polls executed, polls that handed off, sum of quanta in force.
+    // Own-thread only (written by generated poll blocks, read at release).
+    uint64_t layqPolls = 0;
+    uint64_t layqTaken = 0;
+    uint64_t layqQSum = 0;
 };
 
 /// Publish an entire execution slice with one atomic RMW, including when a
@@ -245,6 +298,18 @@ extern "C" Variable* xyo_jitVar(JitCtx* c, const char* id,
 extern "C" void xyo_varslot_init(JitCtx* c, uint64_t idx, const char* id,
                                  const char16_t* name, int32_t isList);
 
+/// RT-001 opt-in native binding verification. Resolve against the live
+/// Target; optional FAST mode borrows the cache only while the complete
+/// local/stage binding stamp matches. A stale pointer is never read.
+/// The JIT must call this at EACH use and never hoist the return.
+extern "C" Variable* xyo_varslot_checked(JitCtx* c, uint64_t idx,
+                                         const char* id,
+                                         const char16_t* name,
+                                         int32_t isList);
+// Serial-only, side-effecting owner verification for opt-in LLVM
+// inline generation guard. Returns null for stage targets.
+extern "C" const Target* xyo_varslot_guard_stage(JitCtx* c);
+
 /// コンパイル済みスクリプト（target->blocks 共有 — クローン間で共有可）
 struct CompiledScript {
     ScriptFn entry = nullptr;
@@ -265,6 +330,9 @@ struct CompiledScript {
     /// Compat/reporter fallbacks or AOT-owned GPU programs require the caller
     /// thread even when opcode-level dependency analysis looks compute-only.
     bool mainThread = false;
+    // v3 only: all cached slots used by this script and its procedures.
+    // Descriptor lifetime belongs to JitEngine::Impl.
+    std::vector<AotLazyCachedSlot*> aotLazyWorkerSlots;
     /// GPU 並列ループプログラム（生成コードがポインタで参照するため
     /// モジュールと同寿命でここが所有）。生成コードが実際に参照する
     /// のは `ParallelLoop::program`。
@@ -295,6 +363,23 @@ struct CompiledScript {
     // Requires source proof. Only a completed counted-loop body may be
     // handed back after a native Fiber scheduler suspension.
     bool nestedOsrInFlightGuard = false;
+    // An explicitly proven single nested repeat may itself yield. The
+    // source ID is frozen at compile time, not taken from mutated Blocks.
+    bool nestedOsrInnerYieldGuard = false;
+    std::string nestedOsrInnerLoopId;
+    // Nonempty only for proven two nested loops under selected repeat.
+    std::string nestedOsrDeepInnerLoopId;
+    std::string nestedOsrFourthLoopId;
+    // IR-001 opt-in, immutable compiled reporter->SSA provenance. Owned
+    // by JitEngine alongside this compiled script, never by Thread.
+    // Append-only to preserve older CompiledScript field offsets.
+    // No raw LLVM pointers/GC values or executable restore permission.
+    std::shared_ptr<const ir::SourceReporterRuntimeSites> nativeReporterSites;
+    // START-015: append-only host-side stamp, without moving existing
+    // CompiledScript fields or changing generated JitCtx ABI offsets.
+    // A nonzero sourceRevision requires exact owner and revision equality.
+    Blocks* aotSourceBlocks = nullptr;
+    uint64_t aotSourceRevision = 0;
 };
 
 class JitEngine {
@@ -320,7 +405,10 @@ public:
     // before any user script starts. Only queues work, never executes blocks.
     void prefetchWarpBroadcasts(Runtime& runtime);
     // Only for an interpreter thread that has executed no Scratch block yet.
-    const CompiledScript* readyScript(const Block* top) const;
+    // Native AOT v3 requires a *current* source Blocks owner. If omitted,
+    // only ordinary (non-AOT) JIT code can be returned.
+    const CompiledScript* readyScript(
+        const Block* top, const Blocks* source = nullptr) const;
     // Read-only scheduler query; compiling_ belongs to the main thread.
     bool isCompiling(const Block* top) const {
         return top && compiling_.contains(top);
@@ -351,6 +439,9 @@ public:
     /// 表現）。並列実行可否は workerSafe() と GPU 呼出しの有無で判定。
     /// yield する fiber も、GC を遅延したバッチ内では並列実行できる。
     const AccessSet* accessFor(const Thread& thread, Runtime& runtime);
+    // Called on the scheduler thread, before native worker dispatch.
+    // Never build Blocks caches on a worker. An unresolved source is unsafe.
+    bool prepareAotWorker(const CompiledScript& script) const;
 
     /// AOT オブジェクト（`xyo aot` が生成）をロードし、slot に実
     /// アドレスを束縛してスクリプトを通常のコンパイルキャッシュへ
@@ -393,6 +484,10 @@ private:
     };
     /// トップ Block* → コンパイル結果（Block は Blocks 所有でポインタ安定）
     std::unordered_map<const void*, ScriptEntry> cache_;
+    // START-015: active native Fibers may still borrow CompiledScript*
+    // after invalidate(). Retain v3 code objects until engine shutdown;
+    // invalidate their source stamps so no old code is dispatched again.
+    std::vector<std::unique_ptr<CompiledScript>> retiredAot_;
     std::unordered_map<const void*, std::shared_ptr<NumericJitCode>>
         numericCache_;
     std::unordered_set<const void*> numericRejected_;

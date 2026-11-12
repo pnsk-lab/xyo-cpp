@@ -226,7 +226,6 @@
         const std::string reporter = instBlock(&valueSandbox, "operator_add", {},
                                               0, 0, false);
         bl::attachToValue(&valueSandbox, reporter, owner, "STEPS");
-        valueSandbox.resetCache();
         wsDirty_ = true;
         rebuildWs();
         bool foundReporter = false;

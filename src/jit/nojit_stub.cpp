@@ -24,7 +24,8 @@ bool JitEngine::tryAttachNumeric(Thread&, const Block*) {
 }
 void JitEngine::pollAsync() {}
 void JitEngine::prefetchWarpBroadcasts(Runtime&) {}
-const CompiledScript* JitEngine::readyScript(const Block*) const {
+const CompiledScript* JitEngine::readyScript(
+        const Block*, const Blocks*) const {
     return nullptr;
 }
 void JitEngine::noteInterpBlocks(const void*, uint64_t) {}
@@ -34,6 +35,9 @@ uint8_t JitEngine::scanScriptLoop(Blocks&, const Block*, uint32_t*) {
 }
 const AccessSet* JitEngine::accessFor(const Thread&, Runtime&) {
     return nullptr;
+}
+bool JitEngine::prepareAotWorker(const CompiledScript&) const {
+    return false; // No native AOT worker execution without JIT support.
 }
 void JitEngine::invalidate() {}
 bool JitEngine::ok() const { return false; }
@@ -49,3 +53,7 @@ extern "C" xyo::Variable* xyo_jitVar(xyo::JitCtx*, const char*,
 }
 extern "C" void xyo_varslot_init(xyo::JitCtx*, uint64_t, const char*,
                                  const char16_t*, int32_t) {}
+extern "C" xyo::Variable* xyo_varslot_checked(
+    xyo::JitCtx*, uint64_t, const char*, const char16_t*, int32_t) {
+    return nullptr;
+}

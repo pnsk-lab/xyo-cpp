@@ -411,6 +411,28 @@ struct SelfContainedSourceContinuation {
             leaf->resumePc == manifest.resumePc;
     }
 
+    // Copy raw numeric SSA words while their native backing storage is
+    // still alive. The source manifest must come from the matching
+    // compiler artifact, never be reconstructed from untrusted frame data.
+    // A failed capture leaves any prior verified diagnostic unchanged.
+    // This is diagnostic ownership transfer, NOT executable deopt.
+    bool captureDiagnosticSsa(const SourceSsaManifest& manifest,
+                              std::span<const uint64_t> words) {
+        if (!valid() || !symbols || !frames ||
+            manifest.revision != symbols->sourceRevision ||
+            manifest.digestLo != symbols->sourceDigest.lo ||
+            manifest.digestHi != symbols->sourceDigest.hi)
+            return false;
+        const auto leaf = frames->frames().top();
+        if (!leaf || leaf->procedureId != manifest.procedureId ||
+            leaf->resumePc != manifest.resumePc)
+            return false;
+        auto capture = SourceSsaSnapshot::capture(manifest, words);
+        if (!capture) return false;
+        diagnosticSsa = std::move(*capture);
+        return true;
+    }
+
     bool valid() const {
         if (!frames || !symbols || !symbols->sourceRevision ||
             !symbols->sourceDigest || !symbols->verifiedSourceIdentity ||
@@ -1547,6 +1569,29 @@ public:
             disable("failed-commit-path");
             return;
         }
+        // Diagnostic-only readback of the compiled IDs and counters from
+        // the actual CallFrame. This is NOT executable deopt proof.
+        if (traceLoopPathReadback_) {
+            const auto proof = verifyLoopPathReadback(
+                blockIds, counterBits, count, phase);
+            std::string ids;
+            for (uint32_t i = 0; i < count; ++i) {
+                if (!ids.empty()) ids += ',';
+                ids += blockIds[i] ? blockIds[i] : "(null)";
+            }
+            std::fprintf(stderr,
+                "[ir001-runtime-loop-path] block=%s phase=%u "
+                "loop_path_depth=%u loop_path_ids=%s "
+                "readback=%d counted=%u uncounted=%u "
+                "gc_root_proven=0 source_complete=0 executable=0\n",
+                blockIds[count - 1] ? blockIds[count - 1] : "(null)",
+                unsigned(phase), count, ids.c_str(), int(bool(proof)),
+                proof ? proof->counted : 0,
+                proof ? proof->uncounted : 0);
+            // Missing proof is a diagnostic gap, NOT a reason to stop
+            // the native Fiber or revoke an otherwise valid mirror.
+            // The generic interpreter deopt executor remains gated.
+        }
         // Snapshot actual LLVM-emitted numeric counter words at the
         // checkpoint. IDs are lexical counter slots, not arbitrary SSA IDs.
         // Only enabled when explicitly requested to avoid hot-path overhead.
@@ -1628,6 +1673,66 @@ public:
              result.phase == SourceResumePhase::AfterLoopBody) &&
             result.loops.back().sourcePc != frame->resumePc)
             return std::nullopt;
+        return result;
+    }
+
+    // IR-001: compare one LLVM checkpoint's path and exact numeric words
+    // with the saved runtime CallFrame. This does NOT restore SSA or GC state.
+    struct LoopPathReadback {
+        uint32_t depth = 0;
+        uint32_t counted = 0;
+        uint32_t uncounted = 0;
+    };
+    std::optional<LoopPathReadback> verifyLoopPathReadback(
+        const char* const* compiledIds, const uint64_t* compiledBits,
+        uint32_t depth, SourceResumePhase phase) const {
+        if (!enabled_ || !symbols_ || !symbols_->verifiedSourceIdentity ||
+            symbols_->verifiedSourceIdentity->rootPc != symbols_->sourceRootPc ||
+            symbols_->verifiedSourceIdentity->revision != symbols_->sourceRevision ||
+            symbols_->verifiedSourceIdentity->digest != symbols_->sourceDigest ||
+            !compiledIds || !compiledBits || depth == 0 ||
+            depth > kMaxTrackedLoops ||
+            (phase != SourceResumePhase::InsideLoopBody &&
+             phase != SourceResumePhase::AfterLoopBody))
+            return std::nullopt;
+        const auto saved = sourceCheckpoint();
+        if (!saved || saved->phase != phase ||
+            saved->loops.size() != depth ||
+            saved->frame.resumePc != saved->loops.back().sourcePc)
+            return std::nullopt;
+        LoopPathReadback result{depth, 0, 0};
+        for (uint32_t i = 0; i < depth; ++i) {
+            if (!compiledIds[i] || !compiledIds[i][0])
+                return std::nullopt;
+            const auto& stored = saved->loops[i];
+            const auto name = symbols_->block(stored.sourcePc);
+            const auto expectedPc = pcFor(compiledIds[i]);
+            if (!name || *name != compiledIds[i] ||
+                !expectedPc || stored.sourcePc != *expectedPc ||
+                stored.counterBits != compiledBits[i])
+                return std::nullopt;
+            const auto it = std::find_if(symbols_->loops.begin(),
+                symbols_->loops.end(), [&](const auto& loop) {
+                    return loop.sourcePc == stored.sourcePc;
+                });
+            if (it == symbols_->loops.end() ||
+                it->ownerProcedureId != saved->frame.procedureId ||
+                it->enclosingLoops.size() != i)
+                return std::nullopt;
+            for (uint32_t j = 0; j < i; ++j)
+                if (it->enclosingLoops[j] != saved->loops[j].sourcePc)
+                    return std::nullopt;
+            if (it->counted) {
+                if (stored.counterBits == CallFrameAbi::kNoLoopCounter ||
+                    !Value{stored.counterBits}.isNumber())
+                    return std::nullopt;
+                ++result.counted;
+            } else {
+                if (stored.counterBits != CallFrameAbi::kNoLoopCounter)
+                    return std::nullopt;
+                ++result.uncounted;
+            }
+        }
         return result;
     }
 
@@ -2048,6 +2153,10 @@ private:
     std::unordered_map<std::string, CallTarget> calls_;
     std::unordered_map<uint64_t, SourceReturnSite> returnSites_;
     std::shared_ptr<const SourceFrameSymbols> symbols_;
+    const bool traceLoopPathReadback_ = [] {
+        const char* flag = std::getenv("XYO_IR001_TRACE_SOURCE_VALUES");
+        return flag && flag[0] == '1';
+    }();
     const bool loopSsaDiagnosticEnabled_ = [] {
         const char* flag = std::getenv("XYO_JIT_CALLFRAME_LOOP_SSA_DIAGNOSTIC");
         return flag && flag[0] == '1';

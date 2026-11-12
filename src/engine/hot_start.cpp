@@ -770,7 +770,7 @@ bool loadHotStart(Runtime& rt, const std::string& path, uint64_t fingerprint,
     rt.threadMap.clear();
     rt.ownedThreads.clear();
     rt.reusableThreads.clear();
-    rt.waitQueue.clear();
+    rt.clearWaitQueue();
     rt.questionList.clear();
     rt.lastStepDoneThreads.clear();
     std::vector<Thread*> handles;
@@ -873,7 +873,7 @@ bool loadHotStart(Runtime& rt, const std::string& path, uint64_t fingerprint,
         else if (type == "think") wait.bubbleType = "think";
         else if (!type.empty()) return fail(why, "invalid bubble type");
         wait.bubbleUsageId = int(entry.get("bubbleUsage").asNumber());
-        rt.waitQueue.push_back(wait);
+        rt.enqueueWait(wait);
     }
     std::vector<SoundPlaybackState> sounds;
     for (const auto& entry : root.get("sounds").asArray()) {

@@ -410,6 +410,7 @@ void DlssGlPipeline::discardImages() {
         glDeleteFramebuffers(2, copyFbos_);
         copyFbos_[0] = copyFbos_[1] = 0;
     }
+    biasMask_.destroy();
     motionConverter_.destroy();
     optical_.destroy();
     images_.destroy();
@@ -466,9 +467,23 @@ bool DlssGlPipeline::resize(SDL_Renderer* renderer, int w, int h,
          !motionConverter_.create(physical_, device_,
                                    optical_.packedBuffer(), w, h,
                                    optical_.gridSize(),
-                                   optical_.costBuffer()))) {
+                                   optical_.costBuffer(),
+                                   [] {
+                                       const char* rigid =
+                                           std::getenv("XYO_DLSS_RIGID_MOTION");
+                                       const char* affine =
+                                           std::getenv("XYO_DLSS_AFFINE_MOTION");
+                                       return (rigid && rigid[0] == '1') ||
+                                              (affine && affine[0] == '1');
+                                   }()))) {
         fail("OpticalFlow/NGX RG16F motion allocation failed: " +
              optical_.lastError() + " " + motionConverter_.lastError());
+        return false;
+    }
+    const char* biasEnv = std::getenv("XYO_DLSS_ALPHA_BIAS");
+    if (biasEnv && biasEnv[0] == '1' &&
+        !biasMask_.create(physical_, device_, uint32_t(w), uint32_t(h))) {
+        fail("DLSS alpha bias allocation failed: " + biasMask_.lastError());
         return false;
     }
     display_ = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32,
@@ -489,7 +504,12 @@ bool DlssGlPipeline::resize(SDL_Renderer* renderer, int w, int h,
 
 SDL_Texture* DlssGlPipeline::apply(SDL_Renderer* renderer,
                                    SDL_Texture* input, int ow, int oh,
-                                   bool forceHistoryReset) {
+                                   bool forceHistoryReset,
+                                   std::span<const DlssBiasRect> biasRects,
+                                   std::span<const DlssRigidMotionRect> rigidRects,
+                                   float jitterX, float jitterY,
+                                   float opticalJitterDeltaX,
+                                   float opticalJitterDeltaY) {
     if (!input || ow < 1 || oh < 1) return nullptr;
     int w = 0, h = 0;
     if (SDL_QueryTexture(input, nullptr, nullptr, &w, &h) ||
@@ -697,7 +717,54 @@ SDL_Texture* DlssGlPipeline::apply(SDL_Renderer* renderer,
                     costLimit = static_cast<uint32_t>(value);
             }
         }
-        motionConverter_.record(cmd_, costLimit);
+        motionConverter_.record(cmd_, costLimit, rigidRects,
+                                opticalJitterDeltaX, opticalJitterDeltaY);
+        if (!rigidRects.empty() && std::getenv("XYO_DLSS_REAL_DEBUG")) {
+            static bool loggedRigid = false;
+            if (!loggedRigid) {
+                loggedRigid = true;
+                if (rigidRects[0].affine > 0.5f) {
+                    const auto& r = rigidRects[0];
+                    std::fprintf(stderr,
+                        "[real DLSS] affine motion override active: %zu "
+                        "opaque quads; current->previous rows "
+                        "[(%.4f, %.4f, %.4f), (%.4f, %.4f, %.4f)]\n",
+                        rigidRects.size(),
+                        r.previousX[0], r.previousX[1], r.previousX[2],
+                        r.previousY[0], r.previousY[1], r.previousY[2]);
+                } else {
+                    std::fprintf(stderr,
+                        "[real DLSS] rigid motion override active: %zu opaque "
+                        "rectangles, first current->previous=(%.3f, %.3f)\n",
+                        rigidRects.size(), rigidRects[0].deltaX,
+                        rigidRects[0].deltaY);
+                }
+            }
+        }
+    }
+    // A zero-region frame supplies no mask to NGX and needs no compute pass.
+    // Old image contents are irrelevant until a later nonempty frame rewrites it.
+    if (biasMask_.ready() && !biasRects.empty()) {
+        if (profile) {
+            static bool loggedActiveMask = false;
+            if (!loggedActiveMask) {
+                loggedActiveMask = true;
+                std::fprintf(stderr,
+                    "[real DLSS] GPU current-color bias mask active "
+                    "(R8_UNORM, %zu rectangles; opt-in)\n",
+                    biasRects.size());
+            }
+        }
+        float strength = 1.0f;
+        if (const char* raw = std::getenv("XYO_DLSS_ALPHA_BIAS_STRENGTH")) {
+            const float parsed = std::strtof(raw, nullptr);
+            if (std::isfinite(parsed) && parsed >= 0.0f && parsed <= 1.0f)
+                strength = parsed;
+        }
+        if (!biasMask_.record(cmd_, biasRects, strength)) {
+            fail("Vulkan current-color bias mask recording failed");
+            return nullptr;
+        }
     }
     DlssVkFrame frame{};
     frame.color = ngxImage(images_.color());
@@ -709,6 +776,14 @@ SDL_Texture* DlssGlPipeline::apply(SDL_Renderer* renderer,
                       {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}}
         : ngxImage(images_.motion());
     frame.output = ngxImage(images_.output());
+    frame.jitterX = jitterX;
+    frame.jitterY = jitterY;
+    if (biasMask_.ready() && !biasRects.empty()) {
+        frame.currentColorBias = DlssVkImage{
+            biasMask_.image(), biasMask_.view(), biasMask_.format(),
+            biasMask_.width(), biasMask_.height(),
+            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    }
     // Optical flow alone is not geometric motion: temporal reuse stays
     // experimental and only starts after the second valid frame.
     const char* temporalEnv = std::getenv("XYO_DLSS_TEMPORAL");

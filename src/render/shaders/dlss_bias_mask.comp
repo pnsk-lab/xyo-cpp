@@ -1,0 +1,26 @@
+#version 450
+layout(local_size_x=16, local_size_y=16) in;
+layout(r8, binding=0) writeonly uniform image2D biasMask;
+layout(std430, binding=1) readonly buffer Rectangles {
+    ivec4 bounds[];
+} regions;
+layout(push_constant) uniform Params {
+    int width;
+    int height;
+    int count;
+    float strength;
+} params;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= params.width || p.y >= params.height) return;
+    float mask = 0.0;
+    for (int i=0; i<params.count; ++i) {
+        ivec4 r = regions.bounds[i];
+        if (p.x >= r.x && p.x < r.z && p.y >= r.y && p.y < r.w) {
+            mask = params.strength;
+            break;
+        }
+    }
+    imageStore(biasMask, p, vec4(mask, 0.0, 0.0, 1.0));
+}

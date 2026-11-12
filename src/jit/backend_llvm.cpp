@@ -12,6 +12,7 @@
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PassInstrumentation.h>
+#include <llvm/Support/CodeGen.h>
 #include <llvm/Support/DynamicLibrary.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/TargetSelect.h>
@@ -30,6 +31,7 @@
 #include <vector>
 
 #include "../blocks/pen_api.hpp"
+#include "../core/cast.hpp"
 #include "../core/gc.hpp"
 #include "../core/json.hpp"
 #include "../core/jsnum.hpp"
@@ -43,12 +45,154 @@
 #include "../ir/cfg_lower_llvm.hpp"
 #include "../ir/scratch_f64_kernel.hpp"
 #include "../ir/scratch_pipeline.hpp"
+#include "../ir/commit_once_effects.hpp"
+#include "../ir/source_effect_dispatch.hpp"
+#include "../ir/source_effect_runtime_trace.hpp"
+#include "../ir/llvm_effect_write_audit.hpp"
+#include "../ir/rt_postopt_ssa_audit.hpp"
+#include "../ir/rt_yield_edge_stackmap.hpp"
+#include "../ir/rt_yield_ssa_machine_stackmap.hpp"
 #include <llvm/IR/Verifier.h>
 #include "aot_emit.hpp"
 #include "nested_warp_osr.hpp"
 #include "procedure_frame_state.hpp"
+#include "guard_fallback_instrument.hpp"
+#ifdef XYO_RT001_ORC_FDE_PLUGIN
+#include "rt_orc_fde_lifecycle.hpp"
+#endif
 
 namespace xyo {
+
+// OSR-010. A nested native body is recoverable at its enclosing repeat
+// boundary only if every INNER repeat is short, statically bounded and
+// incapable of yielding on its own. This is a *restricted* alternative to
+// the flat-only OSR-008 eligibility check; there is no general LLVM
+// nested-loop / SSA-PC deoptimization.
+//
+// Keep this separate from the generic safeNestedLoopBody whitelist: this
+// controls the much stronger property "there is no scheduler suspension
+// between the beginning and end of a source outer-loop body".
+// OSR-012: accept only a finite, acyclic, side-effect-free reporter tree
+// with at least one real variable reference. The source proof validates
+// reporter *shape*, not the mutable runtime value. LLVM's private counter
+// remains authoritative even if the variable changes inside the body.
+static bool safeDynamicInnerTimes(const Blocks& blocks,
+                                  const std::string& root) {
+    std::unordered_set<std::string> seen;
+    bool hasVariable = false;
+    const auto visit = [&](auto&& self, const std::string& id,
+                           uint32_t depth) -> bool {
+        if (id.empty() || depth > 4 || seen.size() >= 12 ||
+            !seen.insert(id).second) return false;
+        const Block* node = blocks.getBlock(id);
+        if (!node || !node->next.empty()) return false;
+        const std::string& opcode = node->opcode;
+        if (opcode == "data_variable") {
+            if (!node->inputs.items.empty()) return false;
+            const auto field = node->fields.find("VARIABLE");
+            if (field == node->fields.end() ||
+                field->second.id.empty()) return false;
+            hasVariable = true;
+            return true;
+        }
+        if (opcode == "math_number" || opcode == "math_integer" ||
+            opcode == "math_whole_number" ||
+            opcode == "math_positive_number") {
+            if (!node->inputs.items.empty()) return false;
+            const auto field = node->fields.find("NUM");
+            return field != node->fields.end() &&
+                   std::isfinite(cast::toNumber(field->second.value));
+        }
+        if (opcode != "operator_add" &&
+            opcode != "operator_subtract") return false;
+        if (node->inputs.items.size() != 2) return false;
+        for (const char* name : {"NUM1", "NUM2"}) {
+            const BlockInput* operand = node->inputs.find(name);
+            if (!operand) return false;
+            const std::string& effective = operand->block.empty()
+                ? operand->shadow : operand->block;
+            if (!self(self, effective, depth + 1)) return false;
+        }
+        return true;
+    };
+    return visit(visit, root, 0) && hasVariable;
+}
+
+// Source-proven OSR-010..014 continuation: exactly one nested counted
+// repeat (or exactly two/three with the explicit deeper-yield opt-ins). Dynamic
+// trip-count reporters are deliberately limited to pure variable +/-
+// finite numbers. Never infer the live iteration count from the source:
+// the native private counter remains the only authority after execution.
+static bool safeBoundedNativeInnerRepeat(
+    const Blocks& blocks, const Block& outer, bool allowInnerYield,
+    bool allowDynamicTimes, uint32_t maxNested,
+    std::string* innerId = nullptr, std::string* deepestId = nullptr,
+    std::string* fourthId = nullptr) {
+    if (outer.opcode != "control_repeat") return false;
+    const auto* sub = outer.inputs.find("SUBSTACK");
+    if (!sub || sub->block.empty()) return false;
+    std::unordered_set<std::string> seen;
+    size_t total = 0;
+    size_t nestedLoops = 0;
+    const auto checkTimes = [&](const Block* node) -> bool {
+        const auto* times = node->inputs.find("TIMES");
+        const auto* body = node->inputs.find("SUBSTACK");
+        if (!times || !body || body->block.empty()) return false;
+        const std::string& id =
+            times->block.empty() ? times->shadow : times->block;
+        const Block* n = blocks.getBlock(id);
+        if (!n || !n->next.empty()) return false;
+        const bool literal =
+            n->opcode == "math_number" ||
+            n->opcode == "math_integer" ||
+            n->opcode == "math_whole_number" ||
+            n->opcode == "math_positive_number";
+        if (literal) {
+            const auto field = n->fields.find("NUM");
+            if (field == n->fields.end()) return false;
+            const double v = cast::toNumber(field->second.value);
+            return std::isfinite(v) && v >= 1.0 &&
+                   v <= (allowInnerYield ? 8192.0 : 8.0) &&
+                   std::floor(v) == v;
+        }
+        return allowInnerYield && allowDynamicTimes &&
+               safeDynamicInnerTimes(blocks, id);
+    };
+    const auto scanChain = [&](auto&& self, std::string id,
+                               size_t depth) -> bool {
+        size_t inChain = 0;
+        while (!id.empty()) {
+            if (++total > 24 || ++inChain > 16 ||
+                !seen.insert(id).second) return false;
+            const Block* node = blocks.getBlock(id);
+            if (!node) return false;
+            if (node->opcode == "control_repeat") {
+                if (depth >= maxNested ||
+                    nestedLoops != depth || !checkTimes(node)) return false;
+                ++nestedLoops;
+                if (depth == 0 && innerId) *innerId = node->id;
+                if (depth == 1 && deepestId) *deepestId = node->id;
+                if (depth == 2 && fourthId) *fourthId = node->id;
+                const auto* body = node->inputs.find("SUBSTACK");
+                if (!body || !self(self, body->block, depth+1))
+                    return false;
+            } else if (node->opcode != "data_changevariableby" &&
+                       !(node->opcode == "data_setvariableto" &&
+                         (depth == 0 || allowDynamicTimes))) {
+                return false;
+            }
+            // OSR-010's fixed bounded inner repeat still rejects setter
+            // bodies, and every nested body remains at most 4 primitive
+            // commands. OSR-012/013 allow setters only behind DYNAMIC.
+            // Every completed body is committed at its actual yield.
+            if (depth > 0 && inChain > 4) return false;
+            id = node->next;
+        }
+        return true;
+    };
+    return scanChain(scanChain, sub->block, 0) &&
+           nestedLoops == maxNested;
+}
 
 bool jitEmitScript(llvm::Module&, llvm::LLVMContext&, Runtime&, Target*,
                    Blocks*, const std::string&, const std::string&,
@@ -70,6 +214,7 @@ void xyo_wait_event_yield(JitCtx*, uint64_t);
 void xyo_wait_event_done(JitCtx*);
 void xyo_loop_yield(JitCtx*);
 int32_t xyo_warp_yield_due(JitCtx*);
+int32_t xyo_rt_gc_soft_budget_due(JitCtx*);
 void xyo_empty_repeat_warp(JitCtx*, double);
 uint64_t xyo_gc_epoch();
 double xyo_to_num(uint64_t);
@@ -99,6 +244,7 @@ double xyo_mathop(JitCtx*, int32_t, double);
 double xyo_round(double);
 uint64_t xyo_var_get(JitCtx*, const char*);
 void xyo_var_set(JitCtx*, const char*, uint64_t);
+void xyo_wait_notify_var_store(JitCtx*, Variable*);
 void xyo_var_change(JitCtx*, const char*, uint64_t);
 uint64_t xyo_arg_get(JitCtx*, uint64_t);
 void xyo_rt_wait(JitCtx*, double);
@@ -106,19 +252,48 @@ void xyo_stop_all(JitCtx*);
 void xyo_stop_others(JitCtx*);
 void xyo_stop_script(JitCtx*);
 void xyo_broadcast_v(JitCtx*, uint64_t);
+void xyo_ir001_broadcast_v_source(
+    JitCtx*, uint64_t, const char*, uint64_t, uint64_t, uint64_t, uint64_t);
+void xyo_ir001_pen_stamp_source(
+    JitCtx*, const char*, uint64_t, uint64_t, uint64_t, uint64_t);
+void xyo_ir001_effect_checkpoint(
+    JitCtx*, const char*, uint64_t, uint64_t, uint64_t, uint64_t,
+    uint32_t);
+void xyo_ir001_vm_write(JitCtx*);
 void xyo_broadcast_wait_v(JitCtx*, uint64_t);
 double xyo_timer(JitCtx*);
 uint64_t xyo_rt_compat(JitCtx*, const void*);
+const void* xyo_rt_aot_cached(void*);
 uint64_t xyo_rt_reporter(JitCtx*, const char*);
+uint64_t xyo_rt_async_reporter(JitCtx*, const char*);
+uint64_t xyo_rt_async_reporter_rooted(
+    JitCtx*, const char*, const uint64_t*, uint32_t);
 uint64_t xyo_rt_nested_osr_arg_get(JitCtx*, const char*,
                                     const char16_t*, uint32_t);
 uint64_t xyo_rt_nested_osr_arg_peek(JitCtx*, const char16_t*, uint32_t);
 void xyo_rt_nested_osr_yield_checkpoint(JitCtx*, double);
+void xyo_rt_nested_osr_inner_yield_checkpoint(JitCtx*, double, double);
+void xyo_rt_nested_osr_triple_yield_checkpoint(
+    JitCtx*, double, double, double);
+void xyo_rt_nested_osr_quad_yield_checkpoint(
+    JitCtx*, double, double, double, double);
 void xyo_proc_push(JitCtx*, const char*, const void*, int32_t,
                    const char*, int32_t, int32_t);
 void xyo_proc_pop(JitCtx*);
 void xyo_proc_frame_init_root_verified(
     JitCtx*, uint64_t, uint64_t, uint64_t);
+void xyo_ir001_list_content_write_begin();
+void xyo_ir001_list_content_write_end();
+void xyo_ir001_scalar_read_eval(
+    JitCtx*, uint64_t, const char*, uint64_t);
+uint64_t xyo_ir001_list_read_epoch();
+void xyo_ir001_list_read_eval(
+    JitCtx*, uint64_t, const char*, uint64_t, uint64_t, uint64_t);
+void xyo_rt_capture_llvm_ssa(
+    JitCtx*, const uint64_t*, const uint64_t*,
+    uint32_t, uint32_t, uint32_t, uint64_t, uint64_t, uint64_t, uint64_t,
+    uint32_t, uint32_t, const uint32_t*, uint32_t, uint32_t,
+    const uint32_t*, const uint32_t*);
 void xyo_proc_frame_enter(JitCtx*, const char*, const char*,
                           const uint64_t*, uint32_t);
 void xyo_proc_frame_enter_rev(JitCtx*, const char*, const char*,
@@ -223,6 +398,7 @@ void xyo_sns_setdragmode(JitCtx*, uint64_t);
 void xyo_sns_resettimer(JitCtx*);
 uint64_t xyo_sns_current(JitCtx*, uint64_t);
 uint64_t xyo_sns_dayssince2000(JitCtx*);
+double xyo_sns_dayssince2000_f64(JitCtx*);
 uint64_t xyo_sns_loudness(JitCtx*);
 uint64_t xyo_sns_loud(JitCtx*);
 uint64_t xyo_sns_answer(JitCtx*);
@@ -266,14 +442,208 @@ int xyo_par_for(JitCtx*, int64_t trip, double init, double delta,
                 void (*body)(JitCtx*, int64_t, double, void**, int64_t*));
 }
 
+// Native-only guard slow-path telemetry. This function is referenced by
+// generated LLVM IR only with XYO_JIT_GUARD_STATS=1.
+extern "C" void xyo_jit_guard_slow(uint32_t kind) noexcept {
+    JitGuardSlowStats::get().noteHit(kind);
+}
+
+
+// IR-001: opt-in source-location observer around the ORIGINAL synchronous
+// runtime helper. The journal counters are evidence of host delivery, not
+// an authentication of intra-statement effects or deopt eligibility.
+namespace {
+ir::SourceEffectHostEpoch ir001ReadHostEpoch(const Runtime* runtime) {
+    if (!runtime || !runtime->observableJournal) return {};
+    const auto& journal = *runtime->observableJournal;
+    return {
+        runtime->observableSliceId, journal.revision(),
+        runtime->observableImmediateBroadcasts,
+        runtime->observableImmediateEffects,
+        journal.pendingCount(), journal.rootedPayloads(), true,
+        Gc::get().collectionGeneration(),
+        Gc::get().explicitCollectionPending()
+    };
+}
+
+template<class Perform>
+void ir001ObserveEffect(
+    JitCtx* c, const char* kind, const char* blockId, uint64_t sourcePc,
+    uint64_t compiledRevision, uint64_t digestLo, uint64_t digestHi,
+    bool broadcast, Perform&& perform) {
+    if (!c || !c->runtime) return;
+    Runtime* const runtime = c->runtime;
+    const bool journalBefore = runtime->observableJournal != nullptr;
+    const uint64_t beforePublished = journalBefore
+        ? runtime->observableJournal->revision() : 0;
+    const uint64_t beforeDelivered = broadcast
+        ? runtime->observableCommittedBroadcasts
+        : runtime->observableCommittedEffects;
+    const uint64_t beforeImmediate = broadcast
+        ? runtime->observableImmediateBroadcasts
+        : runtime->observableImmediateEffects;
+    const uint64_t beforeSlice = runtime->observableSliceId;
+    bool sourceRevisionMatches = false;
+    if (c->thread && c->thread->blockContainer && blockId) {
+        const auto* blocks = c->thread->blockContainer;
+        sourceRevisionMatches =
+            compiledRevision && sourcePc && (digestLo || digestHi) &&
+            blocks->revision() == compiledRevision &&
+            blocks->getBlock(blockId) != nullptr;
+    }
+    ir::SourceEffectDispatchObservation exactSource;
+    exactSource.blockId = blockId ? blockId : "";
+    exactSource.sourcePc = sourcePc;
+    exactSource.sourceRevision = compiledRevision;
+    exactSource.digestLo = digestLo;
+    exactSource.digestHi = digestHi;
+    exactSource.operation = broadcast
+        ? ir::ObservableOp::Broadcast : ir::ObservableOp::PenStamp;
+    auto& timelines = ir::NativeSourceEffectTimelineRegistry::get();
+    const uint64_t beforeMutationEpoch =
+        timelines.mutationEpochSnapshot();
+    const uint64_t beforeGcGeneration =
+        Gc::get().collectionGeneration();
+    {
+        ir::ScopedSourceEffectDispatch sourceScope(exactSource);
+        perform(); // exact existing effect semantics, no replay
+    }
+    exactSource.hostEpoch = ir001ReadHostEpoch(runtime);
+    if (c->thread)
+        timelines.observeDuringDelivery(
+            c->thread, exactSource, sourceRevisionMatches,
+            beforeMutationEpoch, beforeGcGeneration);
+    const bool exactDelivery =
+        sourceRevisionMatches && exactSource.exactDelivery();
+    const bool journalEnabled = runtime->observableJournal != nullptr;
+    const uint64_t afterPublished = journalEnabled
+        ? runtime->observableJournal->revision() : 0;
+    const uint64_t afterDelivered = broadcast
+        ? runtime->observableCommittedBroadcasts
+        : runtime->observableCommittedEffects;
+    const uint64_t afterImmediate = broadcast
+        ? runtime->observableImmediateBroadcasts
+        : runtime->observableImmediateEffects;
+    const uint64_t afterSlice = runtime->observableSliceId;
+    std::fprintf(stderr,
+        "[ir001-effect-source] kind=%s pc=%llu block=%s "
+        "revision=%llu digest=%016llx:%016llx revision_matches=%d "
+        "journal=%d published_delta=%llu delivered_delta=%llu "
+        "immediate_delta=%llu slice_delta=%llu "
+        "pending=%zu rooted=%zu exact_delivery=%d event_published=%u "
+        "event_delivered=%u event_slice=%llu\n",
+        kind, static_cast<unsigned long long>(sourcePc),
+        blockId ? blockId : "<null>",
+        static_cast<unsigned long long>(compiledRevision),
+        static_cast<unsigned long long>(digestLo),
+        static_cast<unsigned long long>(digestHi),
+        int(sourceRevisionMatches), int(journalEnabled),
+        static_cast<unsigned long long>(
+            afterPublished - beforePublished),
+        static_cast<unsigned long long>(
+            afterDelivered - beforeDelivered),
+        static_cast<unsigned long long>(
+            afterImmediate - beforeImmediate),
+        static_cast<unsigned long long>(afterSlice - beforeSlice),
+        journalEnabled ? runtime->observableJournal->pendingCount() : 0,
+        journalEnabled ? runtime->observableJournal->rootedPayloads() : 0,
+        int(exactDelivery), exactSource.published, exactSource.delivered,
+        static_cast<unsigned long long>(exactSource.sliceId));
+}
+} // namespace
+
+extern "C" void xyo_ir001_broadcast_v_source(
+    JitCtx* c, uint64_t message, const char* blockId, uint64_t sourcePc,
+    uint64_t compiledRevision, uint64_t digestLo, uint64_t digestHi) {
+    ir001ObserveEffect(c, "broadcast", blockId, sourcePc,
+        compiledRevision, digestLo, digestHi, true,
+        [&] { xyo_broadcast_v(c, message); });
+}
+
+extern "C" void xyo_ir001_pen_stamp_source(
+    JitCtx* c, const char* blockId, uint64_t sourcePc,
+    uint64_t compiledRevision, uint64_t digestLo, uint64_t digestHi) {
+    ir001ObserveEffect(c, "pen-stamp", blockId, sourcePc,
+        compiledRevision, digestLo, digestHi, false,
+        [&] { xyo_pen_stamp(c); });
+}
+
+// A conservative, diagnostic-only barrier emitted by the LLVM
+// statement lowerer at a possible variable/list write. The interpreter
+// is not instrumented here; this can only DISQUALIFY diagnostic
+// checkpoints, never certify all Scratch-visible writes are covered.
+extern "C" void xyo_ir001_vm_write(JitCtx* c) {
+    if (!c || !c->thread) return;
+    ir::noteSourceEffectUnjournaledMutation();
+    ir::NativeSourceEffectTimelineRegistry::get()
+        .noteNonJournalMutation(c->thread);
+}
+
+// A native Scratch loop's scheduler-owned checkpoint receives the
+// bounded, independently-owned event history (never a native stack ptr).
+// A matching timeline remains PARTIAL: uninstrumented Scratch blocks,
+// nested procedure effects, compiler effects and GC/live SSA are unknown.
+// This helper never enables a detached continuation or native deopt.
+extern "C" void xyo_ir001_effect_checkpoint(
+    JitCtx* c, const char* blockId, uint64_t loopPc,
+    uint64_t compiledRevision, uint64_t digestLo, uint64_t digestHi,
+    uint32_t phase) {
+    if (!c || !c->thread) return;
+    // Only a verified root CallFrame can supply source-level ownership
+    // for this initial diagnostic. Do not label callee bodies as root.
+    auto* frames = c->thread->nativeProcedureFrames.get();
+    const auto sourceCheckpoint = frames
+        ? frames->sourceCheckpoint()
+        : std::nullopt;
+    const auto expectedPhase = static_cast<ir::SourceResumePhase>(phase);
+    const bool sourceOwnerValid =
+        frames && frames->depth() == 1 &&
+        frames->sourceContentMatches() &&
+        sourceCheckpoint &&
+        sourceCheckpoint->frame.procedureId == 0 &&
+        sourceCheckpoint->frame.resumePc == loopPc &&
+        sourceCheckpoint->phase == expectedPhase &&
+        !sourceCheckpoint->loops.empty() &&
+        sourceCheckpoint->loops.back().sourcePc == loopPc &&
+        c->thread->blockContainer && blockId &&
+        c->thread->blockContainer->revision() == compiledRevision &&
+        c->thread->blockContainer->getBlock(blockId) != nullptr;
+    const auto source = ir::SourceEffectIdentity{
+        compiledRevision, digestLo, digestHi, 0};
+    const auto checkpoint =
+        ir::NativeSourceEffectTimelineRegistry::get().checkpoint(
+            c->thread, sourceOwnerValid ? source : ir::SourceEffectIdentity{},
+            loopPc, static_cast<ir::SourceResumePhase>(phase),
+            ir001ReadHostEpoch(c->runtime));
+    const auto& latest = checkpoint.latest;
+    std::fprintf(stderr,
+        "[ir001-effect-checkpoint] pc=%llu block=%s phase=%u "
+        "captured=%d seq=%llu effect_pc=%llu slice=%llu "
+        "source_owner=%d executable=0 vm_write_pending=%d "
+        "foreign_vm_write=%d interp_vm_write=%d\n",
+        static_cast<unsigned long long>(loopPc),
+        blockId ? blockId : "<null>", phase, int(checkpoint.captured),
+        static_cast<unsigned long long>(checkpoint.count),
+        static_cast<unsigned long long>(
+            latest ? latest->sourcePc : 0),
+        static_cast<unsigned long long>(
+            latest ? latest->journalSlice : 0),
+        int(sourceOwnerValid),
+        int(checkpoint.pendingNonJournalMutation),
+        int(checkpoint.foreignVmWrite),
+        int(checkpoint.interpreterVmWrite));
+}
+
 namespace {
 
 // 生成コードが直接参照する extern "C" シンボル
 const std::pair<const char*, void*> kRtSymbols[] = {
+    {"xyo_jit_guard_slow", (void*)&xyo_jit_guard_slow},
     // リスト長上限（データシンボル: 生成コードが直接ロードする）
     {"xyo_list_limit", (void*)&xyo::xyo_list_limit},
     {"xyo_proc_frame_init_root_verified",
      (void*)&xyo_proc_frame_init_root_verified},
+    {"xyo_rt_capture_llvm_ssa", (void*)&xyo_rt_capture_llvm_ssa},
     {"xyo_proc_frame_enter", (void*)&xyo_proc_frame_enter},
     {"xyo_proc_frame_enter_rev", (void*)&xyo_proc_frame_enter_rev},
     {"xyo_proc_frame_enter_verified",
@@ -297,6 +667,7 @@ const std::pair<const char*, void*> kRtSymbols[] = {
     {"xyo_wait_event_done", (void*)&xyo_wait_event_done},
     {"xyo_loop_yield", (void*)&xyo_loop_yield},
     {"xyo_warp_yield_due", (void*)&xyo_warp_yield_due},
+    {"xyo_rt_gc_soft_budget_due", (void*)&xyo_rt_gc_soft_budget_due},
     {"xyo_empty_repeat_warp", (void*)&xyo_empty_repeat_warp},
     {"xyo_gc_epoch", (void*)&xyo_gc_epoch},
     {"xyo_to_num", (void*)&xyo_to_num},
@@ -326,9 +697,12 @@ const std::pair<const char*, void*> kRtSymbols[] = {
         {"xyo_exp", (void*)&xyo_exp},
     {"xyo_var_get", (void*)&xyo_var_get},
     {"xyo_var_set", (void*)&xyo_var_set},
+    {"xyo_wait_notify_var_store", (void*)&xyo_wait_notify_var_store},
     {"xyo_var_change", (void*)&xyo_var_change},
     {"xyo_jitVar", (void*)&xyo_jitVar},
     {"xyo_varslot_init", (void*)&xyo_varslot_init},
+    {"xyo_varslot_checked", (void*)&xyo_varslot_checked},
+    {"xyo_varslot_guard_stage", (void*)&xyo_varslot_guard_stage},
     {"xyo_pen_up", (void*)&xyo_pen_up},
     {"xyo_pen_down", (void*)&xyo_pen_down},
     {"xyo_pen_clear", (void*)&xyo_pen_clear},
@@ -351,14 +725,31 @@ const std::pair<const char*, void*> kRtSymbols[] = {
     {"xyo_stop_others", (void*)&xyo_stop_others},
     {"xyo_stop_script", (void*)&xyo_stop_script},
     {"xyo_broadcast_v", (void*)&xyo_broadcast_v},
+    {"xyo_ir001_broadcast_v_source",
+     (void*)&xyo_ir001_broadcast_v_source},
+    {"xyo_ir001_pen_stamp_source",
+     (void*)&xyo_ir001_pen_stamp_source},
+    {"xyo_ir001_effect_checkpoint",
+     (void*)&xyo_ir001_effect_checkpoint},
+    {"xyo_ir001_vm_write", (void*)&xyo_ir001_vm_write},
     {"xyo_broadcast_wait_v", (void*)&xyo_broadcast_wait_v},
     {"xyo_timer", (void*)&xyo_timer},
     {"xyo_rt_compat", (void*)&xyo_rt_compat},
+    {"xyo_rt_aot_cached", (void*)&xyo_rt_aot_cached},
     {"xyo_rt_reporter", (void*)&xyo_rt_reporter},
+    {"xyo_rt_async_reporter", (void*)&xyo_rt_async_reporter},
+    {"xyo_rt_async_reporter_rooted",
+     (void*)&xyo_rt_async_reporter_rooted},
     {"xyo_rt_nested_osr_arg_get", (void*)&xyo_rt_nested_osr_arg_get},
     {"xyo_rt_nested_osr_arg_peek", (void*)&xyo_rt_nested_osr_arg_peek},
     {"xyo_rt_nested_osr_yield_checkpoint",
      (void*)&xyo_rt_nested_osr_yield_checkpoint},
+    {"xyo_rt_nested_osr_inner_yield_checkpoint",
+     (void*)&xyo_rt_nested_osr_inner_yield_checkpoint},
+    {"xyo_rt_nested_osr_triple_yield_checkpoint",
+     (void*)&xyo_rt_nested_osr_triple_yield_checkpoint},
+    {"xyo_rt_nested_osr_quad_yield_checkpoint",
+     (void*)&xyo_rt_nested_osr_quad_yield_checkpoint},
     {"xyo_proc_push", (void*)&xyo_proc_push},
     {"xyo_proc_pop", (void*)&xyo_proc_pop},
     {"xyo_rt_setarg", (void*)&xyo_rt_setarg},
@@ -389,6 +780,16 @@ const std::pair<const char*, void*> kRtSymbols[] = {
     {"xyo_list_deleteall", (void*)&xyo_list_deleteall},
     {"xyo_list_insert", (void*)&xyo_list_insert},
     {"xyo_list_replace", (void*)&xyo_list_replace},
+    {"xyo_ir001_scalar_read_eval",
+        (void*)&xyo_ir001_scalar_read_eval},
+    {"xyo_ir001_list_read_epoch",
+        (void*)&xyo_ir001_list_read_epoch},
+    {"xyo_ir001_list_read_eval",
+        (void*)&xyo_ir001_list_read_eval},
+    {"xyo_ir001_list_content_write_begin",
+        (void*)&xyo_ir001_list_content_write_begin},
+    {"xyo_ir001_list_content_write_end",
+        (void*)&xyo_ir001_list_content_write_end},
     {"xyo_list_item", (void*)&xyo_list_item},
     {"xyo_list_itemnum", (void*)&xyo_list_itemnum},
     {"xyo_list_length", (void*)&xyo_list_length},
@@ -447,6 +848,7 @@ const std::pair<const char*, void*> kRtSymbols[] = {
     {"xyo_sns_resettimer", (void*)&xyo_sns_resettimer},
     {"xyo_sns_current", (void*)&xyo_sns_current},
     {"xyo_sns_dayssince2000", (void*)&xyo_sns_dayssince2000},
+    {"xyo_sns_dayssince2000_f64", (void*)&xyo_sns_dayssince2000_f64},
     {"xyo_sns_loudness", (void*)&xyo_sns_loudness},
     {"xyo_sns_loud", (void*)&xyo_sns_loud},
     {"xyo_sns_answer", (void*)&xyo_sns_answer},
@@ -573,6 +975,419 @@ static llvm::OptimizationLevel jitIrOptimizationLevel() {
         : llvm::OptimizationLevel::O3;
 }
 
+// IR-001: inspect the actual POST-optimizer LLVM IR, not only the
+// source-level emitStackBlock pattern. Diagnostic-only and disabled
+// unless both the source-effect trace and post-opt audit are requested.
+static void auditIr001OptimizedWrites(llvm::Module& module,
+                                     const char* tier) {
+    const char* trace = std::getenv("XYO_IR001_TRACE_EFFECT_PC");
+    const char* flag = std::getenv("XYO_IR001_OPT_WRITE_AUDIT");
+    if (!trace || trace[0] != '1' || !flag || flag[0] != '1')
+        return;
+    const auto r = ir::auditLlvmEffectWrites(module);
+    // A possible unguarded store or opaque call is NOT silent: make the
+    // corresponding native checkpoint fail closed at runtime. The marker
+    // is inserted AFTER O2/O3, so optimizer motion cannot bypass it.
+    const uint64_t fenced = ir::fenceUnprovenLlvmEffectCheckpoints(module);
+    std::fprintf(stderr,
+        "[ir001-postopt-write] tier=%s events=%llu checkpoints=%llu "
+        "barriers=%llu writes=%llu unguarded=%llu "
+        "unguarded_opaque=%llu proven_local_calls=%llu "
+        "local_stack=%llu isolated_stack=%llu "
+        "unguarded_isolated_stack=%llu "
+        "checkpoint_only_functions=%llu fenced=%llu executable=0\n",
+        tier,
+        static_cast<unsigned long long>(r.tracedEffects),
+        static_cast<unsigned long long>(r.checkpoints),
+        static_cast<unsigned long long>(r.writeFences),
+        static_cast<unsigned long long>(r.memoryWrites),
+        static_cast<unsigned long long>(r.unguardedWrites),
+        static_cast<unsigned long long>(r.unguardedOpaqueCalls),
+        static_cast<unsigned long long>(r.locallyProvenCalls),
+        static_cast<unsigned long long>(r.localStackCandidates),
+        static_cast<unsigned long long>(r.isolatedStackWrites),
+        static_cast<unsigned long long>(r.unguardedIsolatedStackWrites),
+        static_cast<unsigned long long>(
+            r.functionsWithCheckpointsButNoEffects),
+        static_cast<unsigned long long>(fenced));
+}
+
+// RT-001: independently inspect SSA CAPTURE calls after O2/O3, on
+// BOTH eager and ORC lazy transform paths. A source-level manifest is
+// not a machine stack map; no diagnostic field authorizes native GC.
+static void auditRt001PostoptSsa(llvm::Module& module, const char* tier) {
+    const char* flag = std::getenv("XYO_RT_POSTOPT_SSA_AUDIT");
+    if (!flag || flag[0] != '1') return;
+    const auto sites = rt::auditPostoptSsaCaptures(module);
+    uint64_t unknown = 0;
+    uint64_t live = 0;
+    uint64_t invalid = 0;
+    for (const auto& site : sites) {
+        live += site.postoptLivePointers;
+        unknown += site.postoptUnknownPointers;
+        invalid += !site.reportValid;
+        std::fprintf(stderr,
+            "[rt001-postopt-ssa] tier=%s fn=%s site=%llu "
+            "pre_unresolved=%u captured=%u "
+            "post_live_ptr=%u post_unknown=%u "
+            "post_stack=%u post_host=%u post_static=%u "
+            "post_numeric=%u post_other=%u valid=%d gc_safe=0\n",
+            tier, site.functionName.c_str(),
+            static_cast<unsigned long long>(site.siteId),
+            site.declaredPointers, site.capturedWords,
+            site.postoptLivePointers, site.postoptUnknownPointers,
+            site.postoptStackPointers, site.postoptHostPointers,
+            site.postoptStaticPointers, site.postoptNumeric,
+            site.postoptOther, int(site.reportValid));
+    }
+    std::fprintf(stderr,
+        "[rt001-postopt-ssa-total] tier=%s sites=%zu "
+        "post_live_ptr=%llu post_unknown=%llu invalid=%llu "
+        "machine_roots_proven=0 gc_safe=0\n",
+        tier, sites.size(),
+        static_cast<unsigned long long>(live),
+        static_cast<unsigned long long>(unknown),
+        static_cast<unsigned long long>(invalid));
+}
+
+// Actual post-optimizer LLVM SSA + exact stack-array initialization
+// census at native asynchronous reporter calls. A valid buffer contract
+// is not a machine register map; GC remains deferred for live Fibers.
+static void auditRt001PostoptAsyncRoots(
+    llvm::Module& module, const char* tier) {
+    const char* flag = std::getenv("XYO_RT_POSTOPT_ASYNC_ROOT_AUDIT");
+    if (!flag || flag[0] != '1') return;
+    const auto sites = rt::auditPostoptAsyncRoots(module);
+    uint32_t invalid = 0;
+    for (const auto& site : sites) {
+        const bool valid = site.signatureValid && site.bufferValid &&
+                           site.completeStores && site.coveredAllLiveI64;
+        invalid += !valid;
+        std::fprintf(stderr,
+            "[rt001-postopt-async-root] tier=%s fn=%s words=%u "
+            "filled=%u live_i64=%u arg_i64=%u covered_i64=%u "
+            "unknown_i64=%u live_ptr=%u "
+            "signature=%d buffer=%d stores=%d covered=%d valid=%d "
+            "machine_roots_proven=0 gc_safe=0\n",
+            tier, site.functionName.c_str(), site.declaredWords,
+            site.initializedWords, site.liveI64, site.liveArgumentI64,
+            site.coveredLiveI64, site.unknownI64, site.livePointers,
+            int(site.signatureValid),
+            int(site.bufferValid), int(site.completeStores),
+            int(site.coveredAllLiveI64), int(valid));
+    }
+    std::fprintf(stderr,
+        "[rt001-postopt-async-root-total] tier=%s sites=%zu "
+        "invalid=%u machine_roots_proven=0 gc_safe=0\n",
+        tier, sites.size(), invalid);
+}
+
+// RT-001 experimental machine stackmap probe. Unlike a compiler-only
+// SSA census, the emitted llvm.experimental.stackmap is lowered into
+// actual register/stack location records by the target backend. Still
+// NOT a GC root-completeness proof and not a safe Fiber collection point.
+static void emitRt001MachineStackmapProbe(
+    llvm::Module& module, const char* tier) {
+    const char* flag = std::getenv("XYO_RT_MACHINE_STACKMAP_PROBE");
+    if (!flag || flag[0] != '1') return;
+    const auto records = rt::emitExperimentalPostoptStackmaps(module);
+    uint64_t emitted = 0;
+    uint64_t refused = 0;
+    for (const auto& site : records) {
+        emitted += site.emitted;
+        refused += !site.emitted;
+        std::fprintf(stderr,
+            "[rt001-machine-stackmap] tier=%s fn=%s site=%llu "
+            "stackmap_id=%llu unknown_ptrs=%u "
+            "context_ptrs=%d emitted=%d gc_safe=0\n",
+            tier, site.functionName.c_str(),
+            static_cast<unsigned long long>(site.sourceSite),
+            static_cast<unsigned long long>(site.stackmapId),
+            site.unknownPointerLocations,
+            int(site.emitted), int(site.emitted));
+    }
+    std::fprintf(stderr,
+        "[rt001-machine-stackmap-total] tier=%s sites=%zu "
+        "emitted=%llu refused=%llu machine_roots_proven=0 "
+        "gc_safe=0\n",
+        tier, records.size(),
+        static_cast<unsigned long long>(emitted),
+        static_cast<unsigned long long>(refused));
+}
+
+// RT-001 yield-edge machine-PC geometry diagnostic. This is inserted
+// after O2/O3 directly BEFORE a real xyo_yield/_fast call, not next to
+// a detached SSA capture. It never authorizes GC on live native Fibers.
+static void emitRt001YieldEdgeStackmapProbe(
+    llvm::Module& module, const char* tier) {
+    const char* flag = std::getenv("XYO_RT_YIELD_EDGE_STACKMAP_PROBE");
+    if (!flag || flag[0] != '1') return;
+    const auto sites = rt::emitExperimentalYieldEdgeStackmaps(module);
+    size_t emitted = 0, refused = 0;
+    for (const auto& site : sites) {
+        emitted += site.emitted;
+        refused += !site.emitted;
+        std::fprintf(stderr,
+            "[rt001-yield-edge-stackmap] tier=%s fn=%s "
+            "ordinal=%u helper=%s stackmap_id=%llu "
+            "locations=%u emitted=%d "
+            "machine_roots_proven=0 gc_safe=0\n",
+            tier, site.functionName.c_str(), site.ordinal,
+            site.yieldHelper.c_str(),
+            static_cast<unsigned long long>(site.id),
+            site.locationCount, int(site.emitted));
+    }
+    std::fprintf(stderr,
+        "[rt001-yield-edge-stackmap-total] tier=%s sites=%zu "
+        "emitted=%zu refused=%zu machine_roots_proven=0 gc_safe=0\n",
+        tier, sites.size(), emitted, refused);
+    // Separate fail-closed census: a helper that yields *inside*
+    // its own frame does not have a proven direct-call StackMap.
+    // This is deliberately never promoted to a GC-safe result.
+    // A second, independently named machine StackMap exposes
+    // conservative live i64 + pointer SSA location counts. It must
+    // run after the geometry probe, with direct-call identity checked
+    // before adding any locations. This is NOT native GC rooting.
+    const char* live = std::getenv(
+        "XYO_RT_YIELD_LIVE_SSA_STACKMAP");
+    if (live && live[0] == '1') {
+        // FULL mixed i64+pointer machine StackMaps change Scratch
+        // execution semantics in a real Unicode GC stress fixture.
+        // They are therefore fail-closed, even behind an opt-in.
+        // Separate diagnostic passes avoid that known bad combination
+        // but they DO NOT prove that mixing roots is valid.
+        const char* filter = std::getenv("XYO_RT_YIELD_SSA_FILTER");
+        const bool i64Only = filter &&
+            std::strcmp(filter, "i64") == 0;
+        const bool i64NoTick = filter &&
+            std::strcmp(filter, "i64_no_tick") == 0;
+        const bool pointerOnly = filter &&
+            std::strcmp(filter, "pointer") == 0;
+        const bool contextOnly = filter &&
+            std::strcmp(filter, "context") == 0;
+        // Even pointer-ONLY has been proven to corrupt the native
+        // GC-provenance Unicode negative-controls (x/z truncation).
+        // Thus only i64-only and context-only are permitted to emit
+        // a machine record in the actual runtime. Untrusted pointer
+        // SSA stays compiler-only and never becomes a GC root.
+        if (!i64Only && !i64NoTick && !contextOnly) {
+            std::fprintf(stderr,
+                "[rt001-yield-ssa-refused] tier=%s "
+                "reason=%s "
+                "ownership_proven=0 machine_roots_proven=0 gc_safe=0\n",
+                tier, pointerOnly ? "unsafe_pointer_ssa_probe"
+                                  : "unsafe_combined_ssa_probe");
+        } else {
+        rt::YieldSsaSelection selection = i64NoTick
+            ? rt::YieldSsaSelection::I64WithoutSchedulerTicks
+            : i64Only ? rt::YieldSsaSelection::I64Only
+                      : rt::YieldSsaSelection::ContextOnly;
+        uint32_t pointerLimit = UINT32_MAX;
+        if (const char* cap = std::getenv(
+                "XYO_RT_YIELD_SSA_POINTER_LIMIT")) {
+            char* end = nullptr;
+            const unsigned long parsed = std::strtoul(cap, &end, 10);
+            if (end && !*end && parsed <= UINT32_MAX)
+                pointerLimit = static_cast<uint32_t>(parsed);
+        }
+        const auto snapshots =
+            rt::emitExperimentalYieldSsaSnapshots(
+                module, selection, pointerLimit,
+                static_cast<uint32_t>(offsetof(JitCtx, yieldCheckN)),
+                offsetof(JitCtx, varSlotData),
+                offsetof(Variable, value));
+        uint32_t inserted = 0;
+        for (const auto& snapshot : snapshots) {
+            inserted += snapshot.emitted;
+            std::fprintf(stderr,
+                "[rt001-yield-ssa-stackmap] tier=%s fn=%s "
+                "ordinal=%u helper=%s stackmap_id=%llu "
+                "i64=%u pointers=%u other_int=%u float=%u "
+                "other_unsupported=%u expected_locations=%u "
+                "liveness_valid=%d emitted=%d "
+                "ownership_proven=0 machine_roots_proven=0 gc_safe=0\n",
+                tier, snapshot.functionName.c_str(),
+                snapshot.ordinal, snapshot.helper.c_str(),
+                static_cast<unsigned long long>(
+                    snapshot.stackmapId),
+                snapshot.liveI64, snapshot.livePointer,
+                snapshot.nonI64Numeric, snapshot.liveFloat,
+                snapshot.otherUnsupported,
+                snapshot.expectedLocations,
+                int(snapshot.livenessValid),
+                int(snapshot.emitted));
+            if (i64NoTick) {
+                std::fprintf(stderr,
+                    "[rt001-yield-ssa-numeric-excluded] tier=%s fn=%s "
+                    "ordinal=%u stackmap_id=%llu scheduler_ticks=%u "
+                    "other_unproven_i64=%u "
+                    "ownership_proven=0 machine_roots_proven=0 gc_safe=0\n",
+                    tier, snapshot.functionName.c_str(),
+                    snapshot.ordinal,
+                    static_cast<unsigned long long>(
+                        snapshot.stackmapId),
+                    snapshot.excludedNumericSchedulerTicks,
+                    snapshot.liveI64 -
+                        snapshot.excludedNumericSchedulerTicks);
+            }
+            // Optional disassembly-to-LLVM operand provenance. Each
+            // 1-based location index maps to exactly one post-O3 SSA
+            // definition/argument; never print raw pointer contents.
+            const char* traceOperands = std::getenv(
+                "XYO_RT_YIELD_SSA_TRACE_OPERANDS");
+            if (snapshot.emitted && traceOperands &&
+                traceOperands[0] == '1') {
+                for (const auto& operand : snapshot.sources) {
+                    std::fprintf(stderr,
+                        "[rt001-yield-ssa-operand] tier=%s fn=%s "
+                        "ordinal=%u stackmap_id=%llu location=%u "
+                        "family=%s source_id=%u opcode=%s "
+                        "ownership_proven=0 gc_safe=0\n",
+                        tier, snapshot.functionName.c_str(),
+                        snapshot.ordinal,
+                        static_cast<unsigned long long>(
+                            snapshot.stackmapId),
+                        operand.location, operand.family.c_str(),
+                        operand.sourceId, operand.opcode.c_str());
+                    // A candidate is only an LLVM producer provenance,
+                    // not a heap membership proof or a GC root.
+                    std::fprintf(stderr,
+                        "[rt001-yield-ssa-origin] tier=%s fn=%s "
+                        "ordinal=%u stackmap_id=%llu location=%u "
+                        "source_id=%u origin=%s ownership_proven=0 "
+                        "gc_safe=0\n",
+                        tier, snapshot.functionName.c_str(),
+                        snapshot.ordinal,
+                        static_cast<unsigned long long>(
+                            snapshot.stackmapId),
+                        operand.location, operand.sourceId,
+                        operand.origin.c_str());
+                    if (operand.semantic != "unclassified") {
+                        std::fprintf(stderr,
+                            "[rt001-yield-ssa-semantic] tier=%s fn=%s "
+                            "ordinal=%u stackmap_id=%llu location=%u "
+                            "source_id=%u semantic=%s "
+                            "root_kind=numeric_not_managed "
+                            "gc_safe=0\n",
+                            tier, snapshot.functionName.c_str(),
+                            snapshot.ordinal,
+                            static_cast<unsigned long long>(
+                                snapshot.stackmapId),
+                            operand.location, operand.sourceId,
+                            operand.semantic.c_str());
+                    }
+                }
+            }
+        }
+        std::fprintf(stderr,
+            "[rt001-yield-ssa-stackmap-total] tier=%s "
+            "sites=%zu emitted=%u refused=%zu "
+            "ownership_proven=0 machine_roots_proven=0 gc_safe=0\n",
+            tier, snapshots.size(), inserted,
+            snapshots.size() - inserted);
+        }
+    }
+    const auto unmapped = rt::auditUnmappedYieldEdges(module);
+    for (const auto& site : unmapped) {
+        std::fprintf(stderr,
+            "[rt001-yield-edge-unmapped] tier=%s fn=%s "
+            "ordinal=%u helper=%s reason=%s "
+            "machine_roots_proven=0 gc_safe=0\n",
+            tier, site.functionName.c_str(), site.ordinal,
+            site.helperName.c_str(), site.reason.c_str());
+    }
+    std::fprintf(stderr,
+        "[rt001-yield-edge-coverage] tier=%s "
+        "direct_mapped=%zu direct_refused=%zu "
+        "nested_or_unmapped=%zu "
+        "machine_roots_proven=0 gc_safe=0\n",
+        tier, emitted, refused, unmapped.size());
+}
+
+// Experimental native-translation StackMap, distinct from the
+// existing RT-001 SSA capture StackMap. Values are sampled immediately
+// before the reporter bridge, NOT at the parked Fiber's saved RIP.
+// No GC or interpreter restoration permission follows from this probe.
+static void emitRt001AsyncMachineStackmapProbe(
+    llvm::Module& module, const char* tier) {
+    const char* flag = std::getenv("XYO_RT_ASYNC_MACHINE_STACKMAP_PROBE");
+    if (!flag || flag[0] != '1') return;
+    const auto records = rt::emitExperimentalAsyncStackmaps(
+        module, offsetof(JitCtx, varSlotData));
+    const char* originFlag = std::getenv(
+        "XYO_RT_ASYNC_POINTER_ORIGINS");
+    const bool traceOrigins = originFlag && originFlag[0] == '1';
+    uint32_t emitted = 0, refused = 0;
+    for (const auto& site : records) {
+        emitted += site.emitted;
+        refused += !site.emitted;
+        const auto& p = site.pointerRegions;
+        std::fprintf(stderr,
+            "[rt001-async-machine-stackmap] tier=%s fn=%s site=%u "
+            "id=%llu ptr=%u stack=%u host=%u static=%u unknown=%u "
+            "live_i64=%u expected_locations=%u emitted=%d "
+            "machine_roots_proven=0 gc_safe=0\n",
+            tier, site.functionName.c_str(), site.siteOrdinal,
+            static_cast<unsigned long long>(site.stackmapId),
+            site.livePointers,
+            p[size_t(rt::PointerRegion::NativeStack)],
+            p[size_t(rt::PointerRegion::HostContext)],
+            p[size_t(rt::PointerRegion::StaticGlobal)],
+            p[size_t(rt::PointerRegion::Unknown)],
+            site.liveI64, 1u + site.livePointers + site.liveI64,
+            int(site.emitted));
+        if (traceOrigins && site.emitted) {
+            for (const auto& pointer : site.pointerOrigins) {
+                const char* regionName = "unknown";
+                switch (pointer.region) {
+                case rt::PointerRegion::NativeStack:
+                    regionName = "native_stack"; break;
+                case rt::PointerRegion::HostContext:
+                    regionName = "host_context"; break;
+                case rt::PointerRegion::StaticGlobal:
+                    regionName = "static_global"; break;
+                case rt::PointerRegion::Unknown:
+                case rt::PointerRegion::Count: break;
+                }
+                std::fprintf(stderr,
+                    "[rt001-async-pointer-origin] tier=%s fn=%s "
+                    "site=%u stackmap_id=%llu location=%u "
+                    "region=%s cause=%s def=%s callee=%s "
+                    "chain_terminal=%s derefs=%u derives=%u host_offset=%lld "
+                    "candidate_varslot=%lld ownership_proven=0 gc_safe=0\n",
+                    tier, site.functionName.c_str(), site.siteOrdinal,
+                    static_cast<unsigned long long>(site.stackmapId),
+                    pointer.locationIndex, regionName,
+                    rt::unknownPointerCauseName(pointer.unknownCause),
+                    pointer.definitionKind.c_str(),
+                    pointer.calleeName.empty() ? "none"
+                                                : pointer.calleeName.c_str(),
+                    pointer.hasUnknownLoadChain
+                        ? rt::pointerLoadTerminalName(
+                            pointer.unknownLoadChain.terminal)
+                        : "none",
+                    pointer.hasUnknownLoadChain
+                        ? pointer.unknownLoadChain.dereferences : 0,
+                    pointer.hasUnknownLoadChain
+                        ? pointer.unknownLoadChain.addressDerivations : 0,
+                    pointer.hasUnknownLoadChain &&
+                        pointer.unknownLoadChain.hostContextFieldOffset
+                        ? static_cast<long long>(
+                            *pointer.unknownLoadChain.hostContextFieldOffset)
+                        : -1LL,
+                    pointer.candidateBorrowedVarSlot
+                        ? static_cast<long long>(
+                            *pointer.candidateBorrowedVarSlot)
+                        : -1LL);
+            }
+        }
+    }
+    std::fprintf(stderr,
+        "[rt001-async-machine-stackmap-total] tier=%s sites=%zu "
+        "emitted=%u refused=%u machine_roots_proven=0 gc_safe=0\n",
+        tier, records.size(), emitted, refused);
+}
+
 // The full LLVM optimizer and ORC machine-code materialization happen on
 // this task's worker. All Scratch/GC-dependent IR emission and literal
 // pinning has already finished on the runtime thread.
@@ -638,6 +1453,7 @@ struct LLVMPreparedCompilation final : PendingJitCompilation {
             auto mpm = pb.buildPerModuleDefaultPipeline(
                 jitIrOptimizationLevel());
             mpm.run(ir, mam);
+            auditIr001OptimizedWrites(ir, "prepared");
             if (const char* d = std::getenv("XYO_JIT_DUMP2"))
                 if (*d) ir.print(llvm::errs(), nullptr);
         });
@@ -724,6 +1540,20 @@ static bool chooseLazyCompile(JitLazyMode policy, JitMode mode,
     if (policy == JitLazyMode::On)
         return functions >= 2;
 
+    // Eager compiles every spawned script on its first invocation. An
+    // exceptional, very large compilation unit can nevertheless contain
+    // hundreds of cold procedures; optimizing and materializing *all* of
+    // them before its entry executes caused a 10+ second GUI stall for a
+    // 241-function/440k-IR Scratch parity dispatcher. Keep eager entry
+    // compilation, but defer cold procedure bodies for units this large.
+    // Smaller eager scripts retain their original fully materialized path.
+    // Explicit lazy=off and XYO_JIT_FAST_START=0 both restore that path.
+    if (mode == JitMode::Eager) {
+        const char* fastStart = std::getenv("XYO_JIT_FAST_START");
+        return (!fastStart || fastStart[0] != '0') &&
+               functions >= 64 && instructions >= 100000;
+    }
+
     if (mode != JitMode::HotSpot) return false;
 
     // A multi-procedure Scratch script can spend hundreds of milliseconds
@@ -753,6 +1583,23 @@ static void configureLazyIR(llvm::orc::LLJIT& jit) {
             tsm.withModuleDo([](llvm::Module& module) {
                 if (!module.getModuleFlag("xyo.lazy.optimize"))
                     return;
+                // PROF-009. Per-materialization metadata is opt-in. The
+                // default lazy compiler never walks the IR for diagnostics.
+                const char* detailEnv = std::getenv("XYO_JIT_LAZY_DETAIL");
+                const bool detail = detailEnv && detailEnv[0] == '1' &&
+                                    detailEnv[1] == '\0';
+                size_t detailFunctions = 0, detailInstructions = 0;
+                std::string detailFirst;
+                if (detail) {
+                    for (const llvm::Function& function : module) {
+                        if (function.isDeclaration()) continue;
+                        if (detailFirst.empty())
+                            detailFirst = function.getName().str();
+                        ++detailFunctions;
+                        for (const llvm::BasicBlock& bb : function)
+                            detailInstructions += bb.size();
+                    }
+                }
                 const auto began = std::chrono::steady_clock::now();
                 llvm::PassBuilder pb;
                 llvm::LoopAnalysisManager lam;
@@ -767,13 +1614,33 @@ static void configureLazyIR(llvm::orc::LLJIT& jit) {
                 auto mpm = pb.buildPerModuleDefaultPipeline(
                     jitIrOptimizationLevel());
                 mpm.run(module, mam);
-                if (std::getenv("XYO_JIT_TIMING")) {
+                auditIr001OptimizedWrites(module, "lazy");
+                auditRt001PostoptSsa(module, "lazy");
+                auditRt001PostoptAsyncRoots(module, "lazy");
+                emitRt001MachineStackmapProbe(module, "lazy");
+                emitRt001AsyncMachineStackmapProbe(module, "lazy");
+                emitRt001YieldEdgeStackmapProbe(module, "lazy");
+                // The initial module is deliberately NOT optimized when
+                // using lazy materialization. Dump here, after LLVM O3,
+                // so DUMP2 consistently shows optimized IR in either mode.
+                if (const char* dump = std::getenv("XYO_JIT_DUMP2"))
+                    if (*dump) module.print(llvm::errs(), nullptr);
+                const bool legacyTiming =
+                    std::getenv("XYO_JIT_TIMING") != nullptr;
+                if (legacyTiming || detail) {
                     const double elapsed =
                         std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - began)
                             .count();
-                    std::fprintf(stderr, "[jit-lazy-ir] %.3fms\n",
-                                 elapsed);
+                    if (legacyTiming)
+                        std::fprintf(stderr, "[jit-lazy-ir] %.3fms\n",
+                                     elapsed);
+                    if (detail)
+                        std::fprintf(stderr,
+                            "[jit-lazy-detail] first=%s funcs=%zu "
+                            "ir=%zu opt_ms=%.3f\n",
+                            detailFirst.c_str(), detailFunctions,
+                            detailInstructions, elapsed);
                 }
             });
             return std::move(tsm);
@@ -832,6 +1699,52 @@ static void registerRuntimeSymbols(llvm::orc::LLJIT& jit) {
     }
 }
 
+// Diagnostic opt-in only. AddressSanitizer reserves huge virtual ranges;
+// lazy ORC can place module text and its trampoline/anonymous symbols more
+// than 2 GiB apart. Keep the production code model and optimization options
+// unchanged unless the caller explicitly requests a different model.
+template <typename Builder>
+static void configureExperimentalCodegen(Builder& builder, const char* engine) {
+    const char* level = std::getenv("XYO_JIT_CODEGEN_OPT");
+    const char* model = std::getenv("XYO_JIT_CODE_MODEL");
+    // ASan reserves large sparse virtual-address regions. With the small
+    // model, ORC lazy trampolines and code can end up >2 GiB apart, making
+    // a Delta32 fixup fail and a call-through fall to address zero.
+    // Large is only the sanitizer build default, never Release's default.
+#if defined(__SANITIZE_ADDRESS__)
+    constexpr bool asanLargeDefault = true;
+#elif defined(__clang__)
+    constexpr bool asanLargeDefault = __has_feature(address_sanitizer);
+#else
+    constexpr bool asanLargeDefault = false;
+#endif
+    // Override even in ASan builds: "large" forces Large, and
+    // "default" reverts to LLVM's native target code model.
+    const bool useLarge = model
+        ? std::strcmp(model, "large") == 0
+        : asanLargeDefault;
+    if (!level && !useLarge) return;
+
+    auto host = llvm::orc::JITTargetMachineBuilder::detectHost();
+    if (!host) {
+        std::fprintf(stderr,
+            "xyo-jit: cannot configure %s target machine\n", engine);
+        llvm::consumeError(host.takeError());
+        return;
+    }
+    if (level) {
+        llvm::CodeGenOptLevel opt = llvm::CodeGenOptLevel::Default;
+        if (std::strcmp(level, "less") == 0)
+            opt = llvm::CodeGenOptLevel::Less;
+        else if (std::strcmp(level, "none") == 0)
+            opt = llvm::CodeGenOptLevel::None;
+        host->setCodeGenOptLevel(opt);
+    }
+    if (useLarge)
+        host->setCodeModel(llvm::CodeModel::Large);
+    builder.setJITTargetMachineBuilder(std::move(*host));
+}
+
 LLVMBackend::LLVMBackend() {
     llvm::InitializeNativeTarget();
     llvm::InitializeNativeTargetAsmPrinter();
@@ -844,29 +1757,16 @@ LLVMBackend::LLVMBackend() {
     // pipeline stays unchanged; this isolates machine-code lowering cost
     // from O3's middle-end work when investigating large Scratch scripts.
     // The default target/code-generation settings are entirely unchanged.
-    if (const char* level = std::getenv("XYO_JIT_CODEGEN_OPT")) {
-        llvm::CodeGenOptLevel opt;
-        if (std::strcmp(level, "less") == 0)
-            opt = llvm::CodeGenOptLevel::Less;
-        else if (std::strcmp(level, "none") == 0)
-            opt = llvm::CodeGenOptLevel::None;
-        else
-            opt = llvm::CodeGenOptLevel::Default;
-        if (auto host = llvm::orc::JITTargetMachineBuilder::detectHost()) {
-            host->setCodeGenOptLevel(opt);
-            builder.setJITTargetMachineBuilder(std::move(*host));
-        } else {
-            std::fprintf(stderr, "xyo-jit: cannot configure JIT codegen level\n");
-            llvm::consumeError(host.takeError());
-        }
-    }
-    // HotSpot automatically selects an eager or on-demand compilation tier
-    // per script. Eager tests remain fully precompiled unless requested.
+    configureExperimentalCodegen(builder, "eager");
+    // Auto lazy materialization is available in HotSpot and for
+    // exceptionally large Eager compilation units. No secondary engine is
+    // constructed until a script actually qualifies for lazy IR.
     lazyProcedures =
         jitMode() != JitMode::Off &&
         (jitLazyMode() == JitLazyMode::On ||
          (jitLazyMode() == JitLazyMode::Auto &&
-          jitMode() == JitMode::HotSpot));
+          (jitMode() == JitMode::HotSpot ||
+           jitMode() == JitMode::Eager)));
     auto result = builder.create();
     if (!result) {
         std::fprintf(stderr, "xyo-jit: LLJIT init failed\n");
@@ -875,6 +1775,9 @@ LLVMBackend::LLVMBackend() {
     }
     auto jit = std::move(*result);
     configureObjectDump(*jit);
+#ifdef XYO_RT001_ORC_FDE_PLUGIN
+    rt::installOrcFdeLifecycleProbe(*jit, "eager");
+#endif
     registerRuntimeSymbols(*jit);
     this->jit = std::move(jit);
 
@@ -889,20 +1792,7 @@ bool LLVMBackend::ensureLazyJit() {
     if (lazyJit) return true;
 
     llvm::orc::LLLazyJITBuilder builder;
-    if (const char* level = std::getenv("XYO_JIT_CODEGEN_OPT")) {
-        llvm::CodeGenOptLevel opt = llvm::CodeGenOptLevel::Default;
-        if (std::strcmp(level, "less") == 0)
-            opt = llvm::CodeGenOptLevel::Less;
-        else if (std::strcmp(level, "none") == 0)
-            opt = llvm::CodeGenOptLevel::None;
-        if (auto host = llvm::orc::JITTargetMachineBuilder::detectHost()) {
-            host->setCodeGenOptLevel(opt);
-            builder.setJITTargetMachineBuilder(std::move(*host));
-        } else {
-            std::fprintf(stderr, "xyo-jit: cannot configure lazy codegen level\n");
-            llvm::consumeError(host.takeError());
-        }
-    }
+    configureExperimentalCodegen(builder, "lazy");
     // Lazy resolution may happen on different scheduler workers.
     // Separate code-generation contexts are required for concurrent LLVM.
     builder.setNumCompileThreads(2);
@@ -915,6 +1805,9 @@ bool LLVMBackend::ensureLazyJit() {
     auto lazy = std::move(*result);
     configureLazyIR(*lazy);
     configureObjectDump(*lazy);
+#ifdef XYO_RT001_ORC_FDE_PLUGIN
+    rt::installOrcFdeLifecycleProbe(*lazy, "lazy");
+#endif
     registerRuntimeSymbols(*lazy);
     lazyJit = std::move(lazy);
     return true;
@@ -1082,7 +1975,57 @@ std::unique_ptr<PendingJitCompilation> LLVMBackend::prepareAsync(
             id = statement->next;
         }
         if (flat && !id.empty()) flat = false;
-        if (!flat) nested = {};
+        // Strictly opt-in one inner repeat, fixed trip count 1..8 and
+        // at most four primitive change-variable statements per body.
+        // The corresponding LLVM path suppresses ONLY the nested
+        // repeat's yield. The enclosing selected repeat still yields
+        // at a fully committed source-body boundary, as in OSR-008.
+        const char* bounded =
+            std::getenv("XYO_JIT_OSR_NESTED_INNER_BOUNDED");
+        const char* sourceProof =
+            std::getenv("XYO_JIT_OSR_NESTED_SOURCE_PROOF");
+        const char* realInnerYield =
+            std::getenv("XYO_JIT_OSR_NESTED_INNER_YIELD_DEOPT");
+        const bool innerYieldRequested = realInnerYield &&
+            realInnerYield[0] == '1';
+        const char* dynamicFlag =
+            std::getenv("XYO_JIT_OSR_NESTED_INNER_DYNAMIC");
+        const bool allowDynamic = innerYieldRequested && dynamicFlag &&
+            dynamicFlag[0] == '1';
+        const char* tripleFlag =
+            std::getenv("XYO_JIT_OSR_NESTED_TRIPLE_YIELD");
+        const bool allowTriple = allowDynamic && tripleFlag &&
+            tripleFlag[0] == '1';
+        const char* quadFlag =
+            std::getenv("XYO_JIT_OSR_NESTED_QUAD_YIELD");
+        const bool allowQuad = allowTriple && quadFlag &&
+            quadFlag[0] == '1';
+        const uint32_t maxNested = allowQuad ? 3U :
+                                   allowTriple ? 2U : 1U;
+        std::string innerLoopId;
+        std::string deepestLoopId;
+        std::string fourthLoopId;
+        const bool safeNested = !flat && sourceProof &&
+            sourceProof[0] == '1' &&
+            ((bounded && bounded[0] == '1') || innerYieldRequested) &&
+            safeBoundedNativeInnerRepeat(
+                *thread.blockContainer, *nested.loop,
+                innerYieldRequested, allowDynamic, maxNested,
+                &innerLoopId, &deepestLoopId, &fourthLoopId);
+        // If both experimental flags are set, inner yields take priority:
+        // they must NEVER accidentally use the atomic bounded lowering.
+        if (safeNested && innerYieldRequested) {
+            code->nestedOsrInnerYieldGuard = true;
+            code->nestedOsrInnerLoopId = std::move(innerLoopId);
+            code->nestedOsrDeepInnerLoopId = std::move(deepestLoopId);
+            code->nestedOsrFourthLoopId = std::move(fourthLoopId);
+        }
+        if (safeNested &&
+            std::getenv("XYO_JIT_OSR_NESTED_TRACE"))
+            std::fprintf(stderr,
+                "[jit-osr-inflight] %s inner repeat accepted\\n",
+                innerYieldRequested ? "yielding" : "bounded");
+        if (!flat && !safeNested) nested = {};
     }
     const uint64_t nestedSourceRevision = nested.loop
         ? thread.blockContainer->revision() : 0;
@@ -1124,7 +2067,8 @@ std::unique_ptr<PendingJitCompilation> LLVMBackend::prepareAsync(
             nested.loop ? nested.loop->id.c_str() : "(none)",
             nested.callId.c_str());
     llvmc::withContext(context, [&](llvm::LLVMContext* lc) {
-        if (!std::getenv("XYO_JIT_KEEP_VALUE_NAMES") &&
+        if (!JitGuardSlowStats::enabled() &&
+            !std::getenv("XYO_JIT_KEEP_VALUE_NAMES") &&
             !std::getenv("XYO_JIT_DUMP") &&
             !std::getenv("XYO_JIT_DUMP2"))
             lc->setDiscardValueNames(true);
@@ -1166,6 +2110,8 @@ std::unique_ptr<PendingJitCompilation> LLVMBackend::prepareAsync(
             code->mayYield = true; // region may suspend across warp ticks
             code->mainThread = code->mainThread || continuation.mainThread;
         }
+        if (emitted && JitGuardSlowStats::enabled())
+            instrumentJitGuardSlowPaths(*mod);
     });
     if (!emitted) return {};
     return std::make_unique<LLVMPreparedCompilation>(
@@ -1222,7 +2168,8 @@ std::unique_ptr<CompiledScript> LLVMBackend::compile(
         // Names for temporary SSA values are never used by native code.
         // LLVM otherwise allocates and uniques a string for each one.
         // Preserve them explicitly for IR diagnostics and inspection.
-        if (!std::getenv("XYO_JIT_KEEP_VALUE_NAMES") &&
+        if (!JitGuardSlowStats::enabled() &&
+            !std::getenv("XYO_JIT_KEEP_VALUE_NAMES") &&
             !std::getenv("XYO_JIT_DUMP") &&
             !std::getenv("XYO_JIT_DUMP2"))
             lc->setDiscardValueNames(true);
@@ -1236,6 +2183,21 @@ std::unique_ptr<CompiledScript> LLVMBackend::compile(
                                procNameMap, nullptr, nullptr, &source);
         if (timing) emitMs = msBetween(tEmit, Clock::now());
         if (emitOk) {
+            // PROF-009: map generated ORC procedure symbols to source
+            // proccodes only when the opt-in lazy profiler is active.
+            if (const char* detail = std::getenv("XYO_JIT_LAZY_DETAIL");
+                detail && detail[0] == '1' && detail[1] == '\0') {
+                for (const auto& [key, symbol] : procNameMap) {
+                    std::string safeKey = key;
+                    for (char& c : safeKey)
+                        if (c == '\n' || c == '\r') c = ' ';
+                    std::fprintf(stderr,
+                        "[jit-proc-map] function=%s key=%s\n",
+                        symbol.c_str(), safeKey.c_str());
+                }
+            }
+            if (JitGuardSlowStats::enabled())
+                instrumentJitGuardSlowPaths(*mod);
             if (timing || lazyProcedures) {
                 for (const llvm::Function& generated : *mod) {
                     if (generated.isDeclaration()) continue;
@@ -1296,13 +2258,26 @@ std::unique_ptr<CompiledScript> LLVMBackend::compile(
                     countDirectProcedureCalls(blocks, top));
             // Failure to initialize the secondary ORC engine must not
             // prevent Scratch from running: fall back to normal O3.
+            // Eager's large-module startup tier is for interactive GUI
+            // responsiveness. A headless batch run normally cares about
+            // time-to-completion: deferred per-procedure materialization can
+            // increase that total when most procedures are eventually called.
             const bool deferIR =
-                deferredCandidate && ensureLazyJit();
+                deferredCandidate &&
+                (jitMode() != JitMode::Eager || runtime.renderer != nullptr ||
+                 jitLazyMode() == JitLazyMode::On) &&
+                ensureLazyJit();
             if (deferIR) {
                 mod->addModuleFlag(llvm::Module::Warning,
                                    "xyo.lazy.optimize", 1);
             } else {
                 mpm.run(*mod, mam);
+                auditIr001OptimizedWrites(*mod, "eager");
+                auditRt001PostoptSsa(*mod, "eager");
+                auditRt001PostoptAsyncRoots(*mod, "eager");
+                emitRt001MachineStackmapProbe(*mod, "eager");
+                emitRt001AsyncMachineStackmapProbe(*mod, "eager");
+                emitRt001YieldEdgeStackmapProbe(*mod, "eager");
             }
             if (timing) optMs = msBetween(tOptimize, Clock::now());
             if (profilePasses) {
@@ -1311,7 +2286,11 @@ std::unique_ptr<CompiledScript> LLVMBackend::compile(
                         std::fprintf(stderr, "[jit-pass] %s %.3fms %llu %s\n", topId.c_str(), data.first, (unsigned long long)data.second, name.c_str());
                 }
             }
-            if (const char* d = std::getenv("XYO_JIT_DUMP2"))
+            // The deferred module has not passed through O3 yet. Avoid
+            // labeling that IR as optimized: the lazy transform prints it
+            // after O3 instead. Keep a separate opt-in raw IR diagnostic.
+            if (const char* d = std::getenv(
+                    deferIR ? "XYO_JIT_DUMP_PREOPT" : "XYO_JIT_DUMP2"))
                 if (d[0] != '\0') mod->print(llvm::errs(), nullptr);
             const auto tSubmit = Clock::now();
             // Lazy compilation is worthwhile only when a top-level script
@@ -1380,6 +2359,20 @@ std::unique_ptr<CompiledScript> LLVMBackend::compile(
 }
 
 } // namespace xyo
+
+// RT-001 diagnostic lookup, with an always-present fail-closed stub
+// in builds where the optional ORC FDE plugin was not compiled.
+extern "C" int xyo_rt001_orc_fde_live_pc(
+    uintptr_t pc, uintptr_t* start, uintptr_t* end) {
+#ifdef XYO_RT001_ORC_FDE_PLUGIN
+    return xyo::rt::activeOrcFdeIndex().contains(pc, start, end);
+#else
+    (void)pc;
+    (void)start;
+    (void)end;
+    return 0;
+#endif
+}
 
 namespace xyo {
 std::unique_ptr<JitBackend> createJitBackend() {

@@ -157,6 +157,9 @@ public:
     Runtime* runtime;
     bool forceNoGlow;
 
+    // Legacy mutable interface: migrate write call sites to
+    // StructuralEdit::getBlock(). This overload is intentionally retained
+    // until remaining compiler/UI callers can be made const-correct.
     Block* getBlock(const std::string& id);
     const Block* getBlock(const std::string& id) const;
     /// Repeating CONDITION is safe to skip while no other script progresses.
@@ -194,6 +197,47 @@ public:
 
     void createBlock(Block block);
     void deleteBlock(const std::string& blockId);
+    // Committed semantic field edit. Always invalidates cached ops and
+    // advances the AOT v3 source revision, including when a Shadow is edited.
+    // Returns false for an unknown block (no revision change).
+    bool setBlockField(const std::string& blockId,
+                       const std::string& fieldName, BlockField field);
+    // Layout-only edit: x/y are not part of executable Scratch semantics
+    // and must not retire active native AOT Fibers during workspace cleanup.
+    bool setBlockPosition(const std::string& blockId, double x, double y);
+
+    // START-017: a synchronous structural editor transaction. Supports
+    // nesting and coalesces every internal create/delete/resetCache into
+    // exactly one source revision + cache invalidation at the outer commit.
+    // Even direct Block* graph rewrites within this scope are versioned.
+    // Do not execute Scratch scripts or query execute caches while open.
+    // Edits MUST run on the scheduler/editor thread after workers join.
+    class StructuralEdit {
+    public:
+        explicit StructuralEdit(Blocks& source) noexcept : source_(source) {
+            source_.beginStructuralEdit();
+        }
+        ~StructuralEdit() { source_.endStructuralEdit(); }
+        StructuralEdit(const StructuralEdit&) = delete;
+        StructuralEdit& operator=(const StructuralEdit&) = delete;
+        StructuralEdit(StructuralEdit&&) = delete;
+        StructuralEdit& operator=(StructuralEdit&&) = delete;
+        // Mutable block iteration is only available from an active,
+        // versioned edit scope. The outer destructor publishes the revision.
+        std::unordered_map<std::string, Block>& allBlocks() noexcept {
+            return source_.blocks_;
+        }
+        // START-019: mutable single-block access is tied to a versioned
+        // edit scope, just like mutable iteration. Do not retain the
+        // returned pointer beyond this transaction.
+        Block* getBlock(const std::string& id) noexcept {
+            auto it = source_.blocks_.find(id);
+            return it == source_.blocks_.end() ? nullptr : &it->second;
+        }
+    private:
+        Blocks& source_;
+    };
+
     /// トップレベルスクリプトの登録/解除（エディタのブロック編集で使用）
     void addScript(const std::string& topBlockId);
     void deleteScript(const std::string& topBlockId);
@@ -213,10 +257,18 @@ public:
     void runAllMonitored(Runtime& rt);
 
     size_t size() const { return blocks_.size(); }
-    /// 内部イテレーション用（fixSporkCompatibility 等）
-    std::unordered_map<std::string, Block>& allBlocks() { return blocks_; }
+    // All ordinary collection views are read-only. Mutating the graph
+    // requires a StructuralEdit; use edit.allBlocks() inside that scope.
+    const std::unordered_map<std::string, Block>& allBlocks() const noexcept {
+        return blocks_;
+    }
 
 private:
+    void beginStructuralEdit() noexcept;
+    void endStructuralEdit();
+    void resetCacheNow();
+    size_t structuralEditDepth_ = 0;
+    bool structuralEditPending_ = false;
     std::unordered_map<std::string, Block> blocks_;
     std::vector<std::string> scripts_;
     /// createBlock ごとに増えるロード/追加順カウンタ（Block::seq の源）

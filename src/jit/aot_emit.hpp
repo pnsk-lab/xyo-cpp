@@ -49,19 +49,45 @@ struct AotEmit {
     /// ブロック id はターゲットを跨いで一意とは限らない（生成器が
     /// "hat" 等を再利用し得る）ため、BlockCached slot のキーに混ぜる。
     uint32_t targetIndex = 0;
+    // New object format: one exported array replaces individual ORC symbols.
+    // Old objects remain loadable by the versioned AOT loader.
+    bool packedSlots = false;
+    bool lazyCached = false; // Explicit opt-in v3, never reinterpret a v2 slot.
+    // Per-script transitive slot references, including generated procedures.
+    // Capture every use (not only the first insertion into index).
+    bool recordingScript = false;
+    std::vector<uint32_t> scriptCachedSlots;
+    bool scriptUsesGpu = false;
 
-    const std::string& slot(AotSlotKind kind, const std::string& key) {
+    void beginScript() {
+        recordingScript = true;
+        scriptCachedSlots.clear();
+        scriptUsesGpu = false;
+    }
+    void endScript() { recordingScript = false; }
+
+    uint32_t slotIndex(AotSlotKind kind, const std::string& key) {
         std::string k;
         k.reserve(key.size() + 1);
         k.push_back(static_cast<char>(kind));
         k += key;
         auto it = index.find(k);
-        if (it != index.end()) return slots[it->second].global;
-        uint32_t i = static_cast<uint32_t>(slots.size());
-        slots.push_back(
-            {kind, key, "xyo_aot_slot_" + std::to_string(i)});
-        index.emplace(std::move(k), i);
-        return slots.back().global;
+        uint32_t i;
+        if (it != index.end()) {
+            i = it->second;
+        } else {
+            i = static_cast<uint32_t>(slots.size());
+            slots.push_back({kind, key, "xyo_aot_slot_" + std::to_string(i)});
+            index.emplace(std::move(k), i);
+        }
+        if (recordingScript && kind == AotSlotKind::BlockCached)
+            scriptCachedSlots.push_back(i);
+        if (recordingScript && kind == AotSlotKind::GpuProgram)
+            scriptUsesGpu = true;
+        return i;
+    }
+    const std::string& slot(AotSlotKind kind, const std::string& key) {
+        return slots[slotIndex(kind, key)].global;
     }
 };
 

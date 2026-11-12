@@ -30,8 +30,11 @@ void BlockUtility::promiseResolveNextTick() {
     Runtime::WaitEntry w;
     w.thread = thread;
     w.nextTick = true;
-    runtime()->waitQueue.push_back(w);
-    thread->status = STATUS_PROMISE_WAIT;
+    // On turbo/offscreen frames the next scheduler tick can land in the
+    // same Date.now millisecond. Wait for the next real 1ms clock tick.
+    w.deadlineMs = runtime()->currentMSecs + 1.0;
+    runtime()->enqueueWait(w);
+    runtime()->transitionThread(*thread, STATUS_PROMISE_WAIT);
 }
 
 void BlockUtility::stopAll() {

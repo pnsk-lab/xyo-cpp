@@ -35,6 +35,9 @@ public:
     void stopAll();
     void shutdown();
     bool ok() const { return dev_ != 0; }
+    // Diagnostic: mixed SDL output peak, distinct from Scratch microphone.
+    float outputPeak() const;
+
 
     // --- SoundBankAPI ---
     void playSound(Target*, int soundId) override;
@@ -48,6 +51,7 @@ public:
 
     // --- AudioAPI ---
     double getLoudness() const override;
+    void playMusicNote(int, int, double, double, bool) override;
 
 private:
     struct Sample {
@@ -109,6 +113,12 @@ private:
     std::vector<Voice> voices_;
     std::deque<Voice> done_;      // 完了済み（wait 解決待ち）
     float peak_ = 0.0f;
+    void* musicSettings_ = nullptr;
+    void* musicSynth_ = nullptr; // FluidSynth, explicit backend only
+    void* musicTsf_ = nullptr;   // MIT TinySoundFont, default SF2 backend
+    struct MusicVoice { int channel, key, framesLeft; };
+    std::vector<MusicVoice> musicVoices_;
+    std::vector<float> musicScratch_;
 };
 
 } // namespace xyo

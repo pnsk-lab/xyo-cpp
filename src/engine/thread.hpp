@@ -5,11 +5,14 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "../core/value.hpp"
+#include "../ir/source_typed_ssa.hpp"
+#include "../ir/gc_value_handles.hpp"
 #include "../model/blocks.hpp"
 #include "../model/variable.hpp"
 #include "timer.hpp"
@@ -22,6 +25,13 @@ struct Blocks;
 struct Fiber;
 struct JitCtx;
 namespace ir { class NativeProcedureFrameSession; }
+namespace ir {
+struct SourceListReadEvents;
+struct SourceListReadCheckpointAudit;
+struct SourceScalarReadEvents;
+struct SourceScalarPrefixAudit;
+struct SourceReportedPrefixPlan;
+}
 
 struct Runtime;
 namespace ir { struct NumericThreadSession; }
@@ -136,6 +146,126 @@ struct NestedWasmBindingCache {
     std::vector<Variable*> variables;
 };
 
+// RT-001: a detached, strictly diagnostic copy of representable LLVM
+// integer and floating SSA results plus raw integer/float arguments.
+// Descriptors carry pre-optimization instruction IDs and tagged widths.
+// i64 may contain opaque/GC-bearing bits: these are NOT GC roots and
+// must NEVER be interpreted as object addresses or executable state.
+struct NativeRtSsaCapture {
+    uint64_t sourceRevision = 0;
+    uint64_t digestLo = 0, digestHi = 0;
+    uint64_t sourcePc = 0, procedureId = 0, siteId = 0;
+    uint64_t fingerprint = 0;
+    uint32_t unsupported = 0;
+    uint32_t unresolvedPointers = 0, unresolvedOther = 0;
+    // Counts-only LLVM pointer origins, copied from compiler-provided
+    // metadata. Never raw native addresses, never a GC root.
+    std::array<uint32_t, 7> pointerOrigins{};
+    // Counts only: LLVM pointer values ultimately anchored to exactly
+    // one native AllocaInst and distinct native stack allocation roots.
+    // These pointers are INVALID after Fiber destruction and are not
+    // GC roots or portable Scratch interpreter values.
+    uint32_t stackDerivedPointers = 0;
+    uint32_t distinctStackAllocas = 0;
+    // 'numericComplete' means all compiler-live numeric/floating
+    // instructions and numeric arguments were represented. It still
+    // does NOT prove GC-root or effect replay safety.
+    bool numericComplete = false;
+    std::vector<uint64_t> descriptors;
+    std::vector<uint64_t> words;
+    // RT-001: original compiler-created exact i64 argument ancestry
+    // per descriptor; zero = no proof. Keep the compiler copy separate
+    // from the diagnostic copy to catch rewritten provenance even when
+    // the local integrity fingerprint is recomputed. These are ONLY
+    // source arg indices, never GC addresses or handles.
+    std::vector<uint32_t> compilerAliasArguments;
+    std::vector<uint32_t> aliasArguments;
+    // A DIFFERENT compiler proof: the i64 slot comes from a trusted
+    // boxed Scratch string producer in this native function (including
+    // PHI/SELECT only when every branch has such a producer).
+    // Bit 1 is the sole supported value; zero means unproven.
+    // These masks never encode GC addresses or assume a tag is valid.
+    std::vector<uint32_t> compilerGeneratedStrings;
+    std::vector<uint32_t> generatedStrings;
+    // Each live heap SStr at a certified slot is retained using its own
+    // exact GC handle. The snapshot owns this provider across native
+    // Fiber retirement, and drops it on the next checkpoint or Thread
+    // reset. This is explicitly OPT-IN and not an executable SSA state.
+    // Shared root-provider LIFETIME preserves NativeRtSsaCapture's
+    // existing copyable diagnostic semantics: copying a frozen SSA
+    // snapshot must not silently drop its GC roots or invalidate
+    // another copy's handles. Handles themselves remain thread-confined.
+    std::shared_ptr<ir::GcValueHandles> generatedStringRoots;
+    std::vector<ir::RootedValueHandle> generatedStringHandles;
+    // Compiler-origin expectation copied separately from LLVM constant
+    // descriptors. It is NEVER derived from mutable live SSA words
+    // or mutable diagnostic descriptor storage. Unlike an extra
+    // Thread member, this preserves Thread's original ABI size.
+    std::optional<ir::SourceTypedSsaManifest> compilerManifest;
+    // IR-001: origin-owner STRUCTURAL generation at the native capture,
+    // separate from mutable SSA bits and the compiled reporter dictionary.
+    // No Variable*/list pointer or GC Value is kept. It only permits a
+    // comparison with an independently re-resolved owner on adoption.
+    bool reporterOwnerReadback = false;
+    const Target* reporterOwnerTarget = nullptr;
+    const Target* reporterOwnerStage = nullptr;
+    uint64_t reporterOwnerLocalGeneration = 0;
+    uint64_t reporterOwnerStageGeneration = 0;
+    // IR-001: individually checked GC roots for ACTUAL source reporter
+    // heap-string SSA words retained at the native checkpoint. Separate
+    // from compiler-known generated strings and source CallFrame args.
+    // These roots protect the historical value, not its interpreter slot.
+    std::shared_ptr<ir::GcValueHandles> reporterInputRoots;
+    std::vector<ir::RootedValueHandle> reporterInputHandles;
+    // IR-001: independent, source-evaluation-time INDEX/result evidence.
+    // Root provider is owned by the snapshot; no raw GC pointers in events.
+    std::shared_ptr<const ir::SourceListReadCheckpointAudit>
+        reporterListReadEvidence;
+    // Actual historical scalar reporter reads, INCLUDING values whose
+    // LLVM SSA is dead before the physical checkpoint. No StackFrame write.
+    std::shared_ptr<const ir::SourceScalarPrefixAudit>
+        reporterScalarPrefixEvidence;
+    // Read-only, GC-handle-backed cached interpreter reported-prefix
+    // candidates; no StackFrame/ArgValues mutation or executable restore.
+    std::shared_ptr<const ir::SourceReportedPrefixPlan>
+        reporterPrefixPlan;
+
+    uint64_t computeFingerprint() const noexcept {
+        uint64_t hash = 14695981039346656037ull;
+        auto mix = [&](uint64_t word) {
+            for (unsigned i = 0; i < 8; ++i) {
+                hash ^= (word >> (i * 8)) & 0xffu;
+                hash *= 1099511628211ull;
+            }
+        };
+        mix(sourceRevision);
+        mix(digestLo);
+        mix(digestHi);
+        mix(sourcePc);
+        mix(procedureId);
+        mix(siteId);
+        mix(unsupported);
+        mix(unresolvedPointers);
+        mix(unresolvedOther);
+        for (uint32_t originCount : pointerOrigins) mix(originCount);
+        mix(stackDerivedPointers);
+        mix(distinctStackAllocas);
+        mix(numericComplete ? 1 : 0);
+        mix(descriptors.size());
+        for (uint64_t id : descriptors) mix(id);
+        mix(words.size());
+        for (uint64_t word : words) mix(word);
+        mix(aliasArguments.size());
+        for (uint32_t argument : aliasArguments) mix(argument);
+        mix(generatedStrings.size());
+        for (uint32_t producer : generatedStrings) mix(producer);
+        // Root handle tokens are not SSA words and are intentionally
+        // excluded from the raw diagnostic fingerprint. Their exact
+        // resolved Value and lifetime are checked independently.
+        return hash;
+    }
+};
+
 class Thread {
 public:
     explicit Thread(std::string firstBlock);
@@ -234,8 +364,9 @@ public:
     bool hasCompatStackFrame = false;
     /// JIT rt 関数の変数/リスト解決キャッシュ。キーは生成モジュールに
     /// pin された id 文字列ポインタ（モジュールは JIT 生存中破棄されず
-    /// 一意・安定）。Variable* は std::map ノードで安定、target は
-    /// スレッド不変なので target 単位の解決として正しい。
+    /// 一意・安定）。Variable* は VariableMap の要素を借用する。
+    /// rehash では安定だが erase/recreate や stage shadow では無効。
+    /// RT の opt-in 保護モードは構造世代と所有者を照合して再結合する。
     std::unordered_map<JitVarCacheKey, Variable*, JitVarCacheKeyHash> jitVarCache;
     /// 変数スロット配列 — idx → Variable*（JitCtx::varSlotData が
     /// data() を指す）。スクリプトエントリで xyo_varslot_init が埋める。
@@ -261,6 +392,80 @@ public:
         uint8_t count = 0;
     };
     std::unique_ptr<AdditionalWaitDependencies> eventWatchAdditional;
+    // RT-001: actual post-Fiber root AfterLoopBody checkpoints, counted
+    // independently for each Scratch Thread. IR-001 intentionally keeps
+    // yields() as its historic *nonroot procedure* mirror statistic.
+    // Appended after JIT-visible fields to preserve their ABI offsets.
+    uint64_t nativeRootLoopYieldCount = 0;
+    // Allocated only by the RT opt-in LLVM SSA detachment experiment.
+    std::unique_ptr<NativeRtSsaCapture> nativeRtSsaCapture;
+    // RT-001 soft GC budget: only a source-certified native loop
+    // checkpoint may request retirement of a running LLVM Fiber.
+    // On rejection the original Fiber remains live and GC stays
+    // deferred; limit automatic retries to one per Scratch Thread.
+    bool nativeGcSoftBudgetYieldDue = false;
+    bool nativeGcSoftBudgetAttempted = false;
+    // RT-001 optional generation-stamped native Variable* cache. Append
+    // after all existing JIT-visible fields to keep JitCtx ABI untouched.
+    // A cache hit may borrow Variable* ONLY after comparing both local
+    // and stage generations and the current Target/stage identities.
+    // A stamp mismatch invalidates the entire borrowed-pointer map
+    // BEFORE any pointer is dereferenced (including ABA reuse).
+    const Target* nativeVarCacheTarget = nullptr;
+    const Target* nativeVarCacheStage = nullptr;
+    uint64_t nativeVarCacheLocalGeneration = 0;
+    uint64_t nativeVarCacheStageGeneration = 0;
+    bool nativeVarCacheValid = false;
+    uint64_t nativeVarCacheHits = 0;
+    uint64_t nativeVarCacheMisses = 0;
+    uint64_t nativeVarCacheInvalidations = 0;
+    // RT-001 indexed-fast variant, separate from the regular hash cache.
+    // Each slot is keyed by the exact codegen-interned (id, name, kind).
+    // Only borrow after the full owner + local/stage generation stamp
+    // matches. A stamp mismatch clears all entries before any dereference.
+    struct NativeVarIndexedEntry {
+        JitVarCacheKey key{};
+        Variable* variable = nullptr;
+    };
+    std::vector<NativeVarIndexedEntry> nativeVarIndexedSlots;
+    // RT-001 native LLVM serial-only inline guard mirror, updated by
+    // xyo_varslot_checked on every vector mutation or epoch mismatch.
+    // Never dereference these after Target/Stage owner checks fail.
+    // The live identity and map generations are checked on EVERY use.
+    const NativeVarIndexedEntry* nativeVarInlineEntries = nullptr;
+    uint64_t nativeVarInlineCount = 0;
+    uint64_t nativeVarInlineTraceHits = 0;
+    const uint64_t* nativeVarLocalGenerationAddress = nullptr;
+    const uint64_t* nativeVarStageGenerationAddress = nullptr;
+    // Opt-in async LLVM reporter: roots for *compiler-proven* live
+    // Variable::value SSA words. Owned by Thread, not the abandoned Fiber
+    // C++ stack: a cancelled/retired Fiber may skip local destructors.
+    // Never implies permission to collect with other SSA roots unresolved.
+    std::vector<std::unique_ptr<ir::GcValueHandles>> nativeAsyncVariableRoots;
+    // RT-001 diagnostic only: physical JIT call-return PC and the
+    // rooted reporter helper's own frame address. These are sampled
+    // BEFORE suspending; neither is a machine GC root or an unwind proof.
+    // A cancelled Fiber skips C++ destructors; retirement must clear both.
+    uintptr_t nativeAsyncReporterReturnPc = 0;
+    uintptr_t nativeAsyncReporterFramePtr = 0;
+    // Borrowed JIT alloca address for a paused-callsite diagnostics ONLY.
+    // The Thread-owned GcValueHandles above contain the actual GC roots.
+    // Never use this stack pointer as a heap root; clear on retirement.
+    uintptr_t nativeAsyncReporterInputBuffer = 0;
+    uint32_t nativeAsyncReporterInputWords = 0;
+    // SCHED-002: an ordinary short native receiver queued but not yet entered.
+    // Cleared at every execution/retirement boundary; never a compiled-code
+    // cache or a replacement for Thread identity. Appended after ABI fields.
+    bool pendingShortBroadcast = false;
+    // IR-001: bounded list-read records, allocated only in audit mode.
+    // APPEND-ONLY DATA: preserve pre-existing Thread member offsets
+    // required by native JIT code and scheduler probes.
+    std::unique_ptr<ir::SourceListReadEvents> nativeSourceListReads;
+    // Append only: compiled code may embed Thread member offsets.
+    std::unique_ptr<ir::SourceScalarReadEvents> nativeSourceScalarReads;
+    // Common sequence for scalar/list reporter observations, reset only
+    // on Thread completion; 0 and UINT64_MAX signal overflow.
+    uint64_t nativeSourceReporterReadSequence = 1;
     static std::string getIdFromTargetAndBlock(const Target* target,
                                              const std::string& topBlock);
     /// target.id&topBlock — target セット後は不変なので遅延キャッシュ
@@ -287,6 +492,7 @@ public:
     StackFrame* peekParentStackFrame();
     /// undefined → 報告なし（JS: undefined は null 化される）
     void pushReportedValue(Value v) {
+        pendingShortBroadcast = false;
         justReported = v.isUndefined() ? Value::undefined() : v;
     }
     void initParams();

@@ -165,6 +165,8 @@ double mod(double n, double m) {
 
 double tanDeg(double angle) {
     angle = std::fmod(angle, 360.0);
+    // toFixed(10) in Scratch removes -0's sign for a zero angle.
+    if (angle == 0.0) return 0.0;
     if (angle == -270.0 || angle == 90.0) return std::numeric_limits<double>::infinity();
     if (angle == -90.0 || angle == 270.0) return -std::numeric_limits<double>::infinity();
     return jsnum::jsRound(std::tan((M_PI * angle) / 180.0) * 1e10) / 1e10;

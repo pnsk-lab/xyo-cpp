@@ -10,6 +10,7 @@
 #include "dlss_gl_vk_sync.hpp"
 #include "dlss_vk_optical_flow.hpp"
 #include "dlss_vk_motion_converter.hpp"
+#include "dlss_vk_bias_mask.hpp"
 #include <SDL.h>
 #include <vulkan/vulkan.h>
 #include <string>
@@ -31,7 +32,12 @@ public:
     // The main renderer uses it only under XYO_DLSS_ALPHA_SAFE=1.
     SDL_Texture* apply(SDL_Renderer* renderer, SDL_Texture* input,
                        int outputWidth, int outputHeight,
-                       bool forceHistoryReset = false);
+                       bool forceHistoryReset = false,
+                       std::span<const DlssBiasRect> biasRects = {},
+                       std::span<const DlssRigidMotionRect> rigidRects = {},
+                       float jitterX = 0, float jitterY = 0,
+                       float opticalJitterDeltaX = 0,
+                       float opticalJitterDeltaY = 0);
     void reset();
     // Diagnostic: last Optical Flow confidence assessment, updated
     // after GPU synchronization. Useful for real-GPU regression tests.
@@ -75,6 +81,7 @@ private:
     DlssVkFrameTargets images_;
     DlssVkOpticalFlow optical_;
     DlssVkMotionConverter motionConverter_;
+    DlssVkBiasMask biasMask_;
     DlssGlSharedTexture glColor_;
     DlssGlSharedTexture glOutput_;
     DlssGlVkSync sync_;

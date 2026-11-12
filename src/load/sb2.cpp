@@ -720,12 +720,18 @@ Target* parseScratchObject(Sb2Ctx& ctx, const JsonValue& object,
         for (Block& b : flat) spritePtr->blocks->createBlock(std::move(b));
     }
 
+    // Stage/sprite opcode compatibility is a source edit. Even if
+    // source JIT is initialized during a future incremental import,
+    // publish exactly one revision after all conversions.
+    {
+    Blocks::StructuralEdit edit(*spritePtr->blocks);
     // ステージ固有ブロック変換（sprite↔stage clicked）
-    for (auto& [id, b] : spritePtr->blocks->allBlocks()) {
+    for (auto& [id, b] : edit.allBlocks()) {
         if (topLevel && b.opcode == "event_whenthisspriteclicked")
             b.opcode = "event_whenstageclicked";
         else if (!topLevel && b.opcode == "event_whenstageclicked")
             b.opcode = "event_whenthisspriteclicked";
+    }
     }
 
     // lists: [{listName, contents}]

@@ -72,6 +72,34 @@ unset(_xyo_asm_default)
 option(XYO_STATIC_LLVM "Link LLVM statically (static archives required)" OFF)
 set(XYO_LLVM_MODE "auto" CACHE STRING "LLVM の検出方法: auto | config | llvm-config")
 option(XYO_STATIC "Link the executable fully static (-static)" OFF)
+# Opt-in Linux system allocator for the native CLI. The Scratch runtime
+# creates many short-lived JSON/Block structures during SB3 loading.
+# Keep OFF by default: the resulting executable depends on libjemalloc.so.
+option(XYO_LINK_JEMALLOC "Link xyo CLI with jemalloc for faster SB3 startup (Linux)" OFF)
+# RT-001 experimental JITLink FDE lifecycle metadata only.
+# Never enables GC while a native Fiber is suspended.
+option(XYO_RT001_ORC_FDE_PLUGIN
+       "Build opt-in ORC/libunwind FDE lifetime diagnostic (Linux x86-64 LLVM)"
+       OFF)
+if(XYO_RT001_ORC_FDE_PLUGIN)
+  if(NOT XYO_JIT OR NOT XYO_JIT_BACKEND STREQUAL "llvm" OR
+     NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR EMSCRIPTEN OR
+     NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+    message(FATAL_ERROR "XYO_RT001_ORC_FDE_PLUGIN requires native Linux x86-64 LLVM JIT")
+  endif()
+  find_path(XYO_RT001_UNWIND_INCLUDE NAMES libunwind.h REQUIRED)
+  find_library(XYO_RT001_UNWIND_LIBRARY NAMES unwind REQUIRED)
+  find_library(XYO_RT001_UNWIND_X86_64_LIBRARY
+               NAMES unwind-x86_64 REQUIRED)
+endif()
+if(XYO_LINK_JEMALLOC)
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR EMSCRIPTEN OR
+     XYO_STATIC OR NOT XYO_BUILD_SHELL)
+    message(FATAL_ERROR "XYO_LINK_JEMALLOC requires a dynamic native Linux CLI build")
+  endif()
+  find_library(XYO_JEMALLOC_LIBRARY NAMES jemalloc REQUIRED)
+  message(STATUS "Using native jemalloc allocator: ${XYO_JEMALLOC_LIBRARY}")
+endif()
 if(APPLE AND XYO_STATIC)
   message(FATAL_ERROR "macOS does not support fully static executables; use XYO_STATIC=OFF")
 endif()
@@ -228,7 +256,37 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
   list(APPEND XYO_CORE_SOURCES src/engine/fiber_aarch64.S)
 endif()
 
+# Optional fast JSON reader for large Scratch SB3 project files.
+# The default parser remains self-contained; system yyjson is never bundled.
+option(XYO_JSON_YYJSON "Use system yyjson for native project JSON parsing" OFF)
 add_library(xyo STATIC ${XYO_CORE_SOURCES})
+if(XYO_JSON_YYJSON)
+  if(EMSCRIPTEN OR XYO_STATIC OR CMAKE_CROSSCOMPILING)
+    message(FATAL_ERROR "XYO_JSON_YYJSON requires native dynamic linking")
+  endif()
+  find_path(XYO_YYJSON_INCLUDE_DIR NAMES yyjson.h REQUIRED)
+  find_library(XYO_YYJSON_LIBRARY NAMES yyjson REQUIRED)
+  target_include_directories(xyo PRIVATE "${XYO_YYJSON_INCLUDE_DIR}")
+  target_compile_definitions(xyo PRIVATE XYO_HAVE_YYJSON=1)
+  target_link_libraries(xyo PUBLIC "${XYO_YYJSON_LIBRARY}")
+  message(STATUS "JSON: system yyjson enabled (${XYO_YYJSON_LIBRARY})")
+endif()
+# START-014: optional zero-copy read-only native AOT metadata cursor.
+# Separate from project JSON, with a runtime opt-in XYO_AOT_FAST_META=1.
+# Default builds retain the existing self-contained AOT metadata parser.
+option(XYO_AOT_YYJSON "Enable experimental system yyjson AOT metadata view" OFF)
+if(XYO_AOT_YYJSON)
+  if(NOT XYO_JIT OR NOT XYO_JIT_BACKEND STREQUAL "llvm" OR
+     EMSCRIPTEN OR XYO_STATIC OR CMAKE_CROSSCOMPILING)
+    message(FATAL_ERROR "XYO_AOT_YYJSON needs a dynamic native LLVM AOT build")
+  endif()
+  find_path(XYO_YYJSON_INCLUDE_DIR NAMES yyjson.h REQUIRED)
+  find_library(XYO_YYJSON_LIBRARY NAMES yyjson REQUIRED)
+  target_include_directories(xyo PRIVATE "${XYO_YYJSON_INCLUDE_DIR}")
+  target_compile_definitions(xyo PRIVATE XYO_AOT_YYJSON=1)
+  target_link_libraries(xyo PUBLIC "${XYO_YYJSON_LIBRARY}")
+endif()
+
 if(XYO_ASM_NUM_TO_STR)
   target_compile_definitions(xyo PRIVATE XYO_ASM_NUM_TO_STR=1)
 endif()
@@ -325,6 +383,18 @@ if(APPLE AND XYO_JIT)
 endif()
 if(XYO_JIT)
   target_compile_definitions(xyo PUBLIC XYO_JIT=1)
+  if(XYO_RT001_ORC_FDE_PLUGIN)
+    target_compile_definitions(xyo PRIVATE
+      XYO_RT001_ORC_FDE_PLUGIN=1)
+    target_include_directories(xyo PRIVATE
+      "${XYO_RT001_UNWIND_INCLUDE}")
+    # Static libxyo must propagate libunwind to native callers only for
+    # the explicit diagnostic build. Default builds add no dependency.
+    target_link_libraries(xyo PUBLIC
+      "${XYO_RT001_UNWIND_LIBRARY}"
+      "${XYO_RT001_UNWIND_X86_64_LIBRARY}"
+      ${CMAKE_DL_LIBS})
+  endif()
   target_include_directories(xyo SYSTEM PUBLIC ${LLVM_INCLUDE_DIRS})
   # LLVM 23 では Intrinsic::getDeclaration が getOrInsertDeclaration に
   # 改名された。18〜23 の差を吸収するため、宣言の有無をコンパイルで調べる。
@@ -500,7 +570,32 @@ if(NOT XYO_SDL2_LIB)
 endif()
 if(SDL2_FOUND)
   target_compile_definitions(xyo PUBLIC XYO_HAVE_SDL2=1 SDL_MAIN_HANDLED=1)
+# PLaMo 3 Translate: optional loopback-only HTTP bridge.
+# The PLaMo weights must be downloaded and started by the user, never shipped.
+option(XYO_TRANSLATE_CURL "Enable local PLaMo HTTP translation extension" ON)
+if(XYO_TRANSLATE_CURL AND NOT EMSCRIPTEN AND NOT CMAKE_CROSSCOMPILING)
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(XYO_TRANSLATE_LIBCURL QUIET IMPORTED_TARGET libcurl)
+    if(XYO_TRANSLATE_LIBCURL_FOUND)
+      target_link_libraries(xyo PUBLIC PkgConfig::XYO_TRANSLATE_LIBCURL)
+      target_compile_definitions(xyo PRIVATE XYO_HAVE_TRANSLATE_CURL=1)
+      message(STATUS "PLaMo Translate: libcurl loopback client enabled")
+    endif()
+  endif()
+endif()
+
   target_link_libraries(xyo PUBLIC ${XYO_SDL2_LIB})
+  # Optional dynamically linked FluidSynth (LGPL); no bundled soundfont.
+  option(XYO_MUSIC_FLUIDSYNTH "Enable optional LGPL FluidSynth SF3 backend" OFF)
+  if(XYO_MUSIC_FLUIDSYNTH AND PkgConfig_FOUND AND NOT CMAKE_CROSSCOMPILING)
+    pkg_check_modules(FLUIDSYNTH QUIET IMPORTED_TARGET fluidsynth)
+    if(FLUIDSYNTH_FOUND)
+      target_link_libraries(xyo PUBLIC PkgConfig::FLUIDSYNTH)
+      target_compile_definitions(xyo PRIVATE XYO_HAVE_FLUIDSYNTH=1)
+      message(STATUS "Music: system FluidSynth enabled")
+    endif()
+  endif()
   if(PkgConfig_FOUND AND XYO_RSVG)
     pkg_check_modules(RSVG QUIET IMPORTED_TARGET librsvg-2.0>=2.52)
   endif()
@@ -592,6 +687,15 @@ if(XYO_BUILD_SHELL)
                  src/blockly/geom.cpp
                  src/blockly/label.cpp src/blockly/ops.cpp)
   target_link_libraries(xyo-cli PRIVATE xyo)
+  if(XYO_LINK_JEMALLOC)
+    # Keep the allocator in DT_NEEDED even when the executable has no direct
+    # unresolved malloc symbol (the core library may hide libc references).
+    # Flag ordering is significant: restore as-needed immediately afterward.
+    target_link_libraries(xyo-cli PRIVATE
+      "-Wl,--push-state,--no-as-needed"
+      "${XYO_JEMALLOC_LIBRARY}"
+      "-Wl,--pop-state")
+  endif()
   # Native batched UI: no external UI framework, reuse SDL2 and stb.
   if(SDL2_FOUND AND NOT EMSCRIPTEN)
     target_sources(xyo-cli PRIVATE src/ui/draw.cpp src/ui/font.cpp)

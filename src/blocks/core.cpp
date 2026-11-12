@@ -190,9 +190,12 @@ int getSoundIndexByName(const std::u16string& name, Sprite* sprite) {
 int getSoundIndex(Value soundName, Target* t) {
     if (!t->sprite || t->sprite->sounds.empty()) return -1;
     size_t len = t->sprite->sounds.size();
-    std::u16string name = u16(soundName);
-    int idx = getSoundIndexByName(name, t->sprite);
-    if (idx != -1) return idx;
+    // scratch-vm matches sound names using strict string equality.
+    // A numeric reporter 2 must select sound #2, not a sound named "2".
+    if (soundName.isString()) {
+        int idx = getSoundIndexByName(u16(soundName), t->sprite);
+        if (idx != -1) return idx;
+    }
     // parseInt 相当: 先頭からの整数パース
     SStr* s = cast::toString(soundName);
     const char16_t* p = s->data();
@@ -222,7 +225,42 @@ void bounceOffEdge(Target* t, Runtime* rt) {
     if (!t || !rt) return;
     Target::Bounds bounds;
     if (!t->getBounds(bounds)) return;
-    double stageW = rt->stageWidth, stageH = rt->stageHeight;
+    // Scratch's renderer measures bounce bounds at integer drawable
+    // coordinates. For visible, fully opaque rectangular skins its convex
+    // hull joins pixel centres, inset by half a texel along each edge.
+    // Preserve the target's fractional position when moving it back inside.
+    const double stageW = rt->stageWidth, stageH = rt->stageHeight;
+    const auto measureHull = [&](Target::Bounds& bounds) {
+        const double measuredX = std::round(t->x);
+        const double measuredY = std::round(t->y);
+        if (bounds.left == 0 && bounds.right == 0 &&
+            bounds.top == 0 && bounds.bottom == 0) {
+            // A costume with no drawable texels still has point-sized bounds.
+            bounds = {measuredX, measuredX, measuredY, measuredY};
+        } else {
+            const double shiftX = measuredX - t->x;
+            const double shiftY = measuredY - t->y;
+            bounds.left += shiftX;
+            bounds.right += shiftX;
+            bounds.top += shiftY;
+            bounds.bottom += shiftY;
+            if (t->visible) {
+                const double angle = t->rotationStyle == "all around"
+                    ? (t->direction - 90.0) * M_PI / 180.0 : 0.0;
+                const double pixelInset = std::abs(t->size / 200.0) *
+                    (std::abs(std::cos(angle)) + std::abs(std::sin(angle)));
+                const double insetX = std::min(pixelInset,
+                    std::max(0.0, (bounds.right - bounds.left) / 2.0));
+                const double insetY = std::min(pixelInset,
+                    std::max(0.0, (bounds.top - bounds.bottom) / 2.0));
+                bounds.left += insetX;
+                bounds.right -= insetX;
+                bounds.top -= insetY;
+                bounds.bottom += insetY;
+            }
+        }
+    };
+    measureHull(bounds);
     double distLeft = std::max(0.0, stageW / 2 + bounds.left);
     double distTop = std::max(0.0, stageH / 2 - bounds.top);
     double distRight = std::max(0.0, stageW / 2 - bounds.right);
@@ -251,8 +289,23 @@ void bounceOffEdge(Target* t, Runtime* rt) {
     // transcendentals) to match the Scratch renderer's boundary directions.
     double newDir = std::atan2(dy, dx) * 180.0 / M_PI + 90.0;
     t->setDirection(newDir);
-    double fx, fy;
-    if (t->keepInFence(t->x, t->y, fx, fy)) t->setXY(fx, fy);
+    // Scratch computes its fencing AFTER setDirection: for off-centre
+    // costumes and left-right rotation, the new bounds can be very
+    // different from those used to choose the edge.
+    if (!t->getBounds(bounds)) return;
+    measureHull(bounds);
+    // Correct using the newly reflected, pixel-centre hull rather than
+    // the renderer's full-costume (untight) AABB.
+    double pushX = 0.0, pushY = 0.0;
+    if (bounds.left < -stageW / 2.0) pushX += -stageW / 2.0 - bounds.left;
+    if (bounds.right > stageW / 2.0) pushX += stageW / 2.0 - bounds.right;
+    if (bounds.top > stageH / 2.0) pushY += stageH / 2.0 - bounds.top;
+    if (bounds.bottom < -stageH / 2.0) pushY += -stageH / 2.0 - bounds.bottom;
+    // Avoid changing 219.6 to 219.59999999999997 when the pixel
+    // centre is exactly on the stage edge.
+    if (std::abs(pushX) < 1e-10) pushX = 0;
+    if (std::abs(pushY) < 1e-10) pushY = 0;
+    if (pushX != 0.0 || pushY != 0.0) t->setXY(t->x + pushX, t->y + pushY);
 }
 
 void startSoundPlayback(Target* target, int soundId,
@@ -454,8 +507,11 @@ Value opMathop(const ArgValues& a, BlockUtility&) {
     if (equalsAsciiLower(op, u"floor")) return V(std::floor(n));
     if (equalsAsciiLower(op, u"ceiling")) return V(std::ceil(n));
     if (equalsAsciiLower(op, u"sqrt")) return V(std::sqrt(n));
-    if (equalsAsciiLower(op, u"sin"))
+    if (equalsAsciiLower(op, u"sin")) {
+        // Scratch's toFixed(10) turns sin(-0) into +0 (unlike Math.round).
+        if (n == 0.0) return V(0.0);
         return V(jsnum::jsRound(v8math::sin((M_PI * n) / 180.0) * 1e10) / 1e10);
+    }
     if (equalsAsciiLower(op, u"cos"))
         return V(jsnum::jsRound(v8math::cos((M_PI * n) / 180.0) * 1e10) / 1e10);
     if (equalsAsciiLower(op, u"tan")) return V(rt::tanDeg(n));
@@ -501,7 +557,10 @@ Value ctlForEach(const ArgValues& a, BlockUtility& u) {
     if (!sf.hasIndex) { sf.index = 0; sf.hasIndex = true; }
     if (sf.index < cast::toNumber(v(a, "VALUE"))) {
         sf.index++;
-        if (var) var->value = V(sf.index);
+        if (var) {
+            var->value = V(sf.index);
+            u.runtime()->notifyWaitVariableWrite(*var);
+        }
         u.startBranch(1, true);
     }
     return Value::undefined();
@@ -701,6 +760,7 @@ Value dtSetVar(const ArgValues& a, BlockUtility& u) {
     Variable* var = lookupVar(a, u, "VARIABLE", false);
     if (!var) return Value::undefined();
     var->value = v(a, "VALUE");
+    u.runtime()->notifyWaitVariableWrite(*var);
     if (jitMode() == JitMode::HotSpot) var->observeValueType(var->value);
     if (var->isCloud) {
         // cloud requestUpdateVariable — 未実装（クラウド非対応）
@@ -712,6 +772,7 @@ Value dtChangeVar(const ArgValues& a, BlockUtility& u) {
     if (!var) return Value::undefined();
     double nv = cast::toNumber(var->value) + num(a, "VALUE");
     var->value = V(nv);
+    u.runtime()->notifyWaitVariableWrite(*var);
     if (jitMode() == JitMode::HotSpot) var->observeValueType(var->value);
     return Value::undefined();
 }
@@ -849,8 +910,8 @@ Value looksSayOrThinkForSecs(const ArgValues& a, BlockUtility& u,
     w.bubbleTarget = t;
     w.bubbleType = type;
     w.bubbleUsageId = usageId;
-    rt->waitQueue.push_back(w);
-    u.thread->status = STATUS_PROMISE_WAIT;
+    rt->enqueueWait(w);
+    u.runtime()->transitionThread(*u.thread, STATUS_PROMISE_WAIT);
     return Value::undefined();
 }
 Value looksSayForSecs(const ArgValues& a, BlockUtility& u) {
@@ -1221,7 +1282,7 @@ Value snsAskAndWait(const ArgValues& a, BlockUtility& u) {
             rt->onQuestion(&e.question);
         }
     }
-    u.thread->status = STATUS_PROMISE_WAIT;
+    u.runtime()->transitionThread(*u.thread, STATUS_PROMISE_WAIT);
     return Value::undefined();
 }
 Value snsOf(const ArgValues& a, BlockUtility& u) {
@@ -1283,7 +1344,7 @@ Value sndPlayUntilDone(const ArgValues& a, BlockUtility& u) {
     if (!t->sprite || !t->sprite->soundBank) return Value::undefined();
     int idx = getSoundIndex(v(a, "SOUND_MENU"), t);
     if (idx >= 0) {
-        u.thread->status = STATUS_PROMISE_WAIT;
+        u.runtime()->transitionThread(*u.thread, STATUS_PROMISE_WAIT);
         startSoundPlayback(t, t->sprite->sounds[idx].soundId, u.thread);
     }
     return Value::undefined();
@@ -1624,6 +1685,8 @@ void registerCoreBlocks(Runtime& rt) {
     prim("argument_reporter_boolean", procArgBoolean);
 
     registerPenBlocks(rt);
+    registerMusicBlocks(rt);
+    registerTranslateBlocks(rt);
 }
 
 } // namespace xyo

@@ -61,6 +61,9 @@
 #include "../../third_party/stb_image.h"
 #include "../core/cast.hpp"
 #include "../core/fileio.hpp"
+#if defined(XYO_NVSDK_DLSS_VK) && defined(__linux__) && defined(XYO_HAVE_SDL2) && defined(XYO_PEN_GL)
+#include "gl_async_ppm_capture.hpp"
+#endif
 #include "../core/jsnum.hpp"
 #include "../core/slist.hpp"
 #include "../core/sstr.hpp"
@@ -72,6 +75,13 @@
 #include "text.hpp"
 
 namespace xyo {
+
+#if defined(XYO_NVSDK_DLSS_VK) && defined(__linux__) && defined(XYO_HAVE_SDL2) && defined(XYO_PEN_GL)
+void render::GlAsyncPpmCaptureDeleter::operator()(
+        render::GlAsyncPpmCapture* capture) const noexcept {
+    delete capture;
+}
+#endif
 
 // ================================================ DLSS-equivalent options ====
 // `XYO_RENDER_SCALE` selects the internal stage resolution. Values outside
@@ -296,6 +306,16 @@ struct SdlRenderer::GlPen {
     bool useRecords = false;
     GLuint recProg = 0, recVbo = 0, recVao = 0;
     GLint recUSize = -1, recUHalf = -1, recUScale = -1;
+    GLint recUJitter = -1;
+    GLuint replayPreciseProg = 0;
+    GLuint replayQuantizedProg = 0, replayQuantizedSsbo = 0;
+    GLuint replayQuantizedTilesSsbo = 0;
+    GLint replayQuantizedUTiled = -1, replayQuantizedUTileCols = -1;
+    GLint replayQuantizedUSize = -1, replayQuantizedUStage = -1;
+    GLint replayQuantizedUJitter = -1, replayQuantizedUCount = -1;
+    GLint replayPreciseUSize = -1, replayPreciseUHalf = -1;
+    GLint replayPreciseUScale = -1, replayPreciseUJitter = -1;
+    GLuint replayFbo = 0;
     GLuint stampProg = 0, stampVao = 0;
     GLint stampCanvas = -1, stampCenter = -1, stampPivot = -1;
     GLint stampSize = -1, stampRotation = -1, stampScale = -1;
@@ -464,6 +484,30 @@ bool SdlRenderer::init(Runtime& rt, int scale) {
         setRenderScale(rs.scale);
     }
 
+    // "1": window mapped nowhere but still using the desktop video driver.
+    // "offscreen": SDL's EGL offscreen video driver without X11/Wayland.
+    // Select it before SDL initializes the video subsystem. If another
+    // component already initialized a different driver, fail explicitly
+    // rather than claiming to be display-server independent.
+    const char* headlessFlag = std::getenv("XYO_HEADLESS");
+    const bool offscreenRequested =
+        headlessFlag && std::strcmp(headlessFlag, "offscreen") == 0;
+    const bool hiddenWindow =
+        offscreenRequested || (headlessFlag && headlessFlag[0] == '1');
+    if (offscreenRequested) {
+        if (SDL_WasInit(SDL_INIT_VIDEO) &&
+            SDL_strcmp(SDL_GetCurrentVideoDriver(), "offscreen") != 0) {
+            std::fprintf(stderr,
+                "XYO_HEADLESS=offscreen requires SDL's offscreen video "
+                "driver before SDL_INIT_VIDEO\n");
+            return false;
+        }
+        if (SDL_setenv("SDL_VIDEODRIVER", "offscreen", 1) != 0) {
+            std::fprintf(stderr,
+                "Cannot select SDL offscreen video driver\n");
+            return false;
+        }
+    }
     // Windows の SDL2 は SDL_MAIN_NEEDED でビルドされており、SDL_main を
     // 使わない（SDL_MAIN_HANDLED）アプリは SDL_SetMainReady() を呼ばないと
     // SDL_InitSubSystem が "Application didn't initialize properly" で失敗する。
@@ -472,9 +516,13 @@ bool SdlRenderer::init(Runtime& rt, int scale) {
         std::fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return false;
     }
+    // "1" uses a hidden desktop window. "offscreen" uses a hidden
+    // SDL window backed by EGL, with no display server connection.
+    const Uint32 windowFlags = SDL_WINDOW_RESIZABLE |
+        (hiddenWindow ? SDL_WINDOW_HIDDEN : 0u);
     window_ = SDL_CreateWindow("xyo", SDL_WINDOWPOS_CENTERED,
                                SDL_WINDOWPOS_CENTERED, stageW_ * scale_,
-                               stageH_ * scale_, SDL_WINDOW_RESIZABLE);
+                               stageH_ * scale_, windowFlags);
     if (!window_) {
         std::fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
         return false;
@@ -497,8 +545,17 @@ bool SdlRenderer::init(Runtime& rt, int scale) {
     // Native NVIDIA DLSS requires SDL's desktop OpenGL backend. Keep the
     // selected driver observable without enabling diagnostics by default.
     if (std::getenv("XYO_DLSS_REAL_DEBUG")) {
+        if (hiddenWindow)
+            std::fprintf(stderr,
+                "[real DLSS] SDL window hidden: %s\n",
+                (SDL_GetWindowFlags(window_) & SDL_WINDOW_HIDDEN)
+                    ? "yes" : "no");
         SDL_RendererInfo debugInfo{};
         SDL_GetRendererInfo(renderer_, &debugInfo);
+        std::fprintf(stderr,
+            "[real DLSS] SDL video driver=%s\n",
+            SDL_GetCurrentVideoDriver()
+                ? SDL_GetCurrentVideoDriver() : "(unknown)");
         std::fprintf(stderr,
             "[real DLSS] SDL renderer=%s, OpenGL context=%s, stage=%dx%d, "
             "requested render scale=%.3f\n",
@@ -614,6 +671,10 @@ SDL_Texture* SdlRenderer::costumeTexture(const Costume* c, double* lw,
 }
 
 SdlRenderer::~SdlRenderer() {
+    // PBO fences and mappings require an active GL context: flush before
+    // destroying SDL renderer and GL/Vulkan interop resources.
+    if (!flushPPMAsync())
+        std::fprintf(stderr, "[async PPM] pending capture failed at shutdown\n");
     SDL_StopTextInput();
     if (rt_) {
         rt_->onQuestion = nullptr;
@@ -627,6 +688,8 @@ SdlRenderer::~SdlRenderer() {
     gpuEffects_.reset();
 #if defined(XYO_NVSDK_DLSS_VK) && defined(__linux__) && defined(XYO_HAVE_SDL2)
     glDlss_.reset();
+    if (dlssPenReplayTex_) SDL_DestroyTexture(dlssPenReplayTex_);
+    if (dlssPenReplayGpuTex_) SDL_DestroyTexture(dlssPenReplayGpuTex_);
 #endif
     releaseStageTarget();
     glUpscale_.reset();
@@ -643,6 +706,11 @@ SdlRenderer::~SdlRenderer() {
             if (g.ebo) glDeleteBuffers(1, &g.ebo);
             if (g.prog) glDeleteProgram(g.prog);
             if (g.recProg) glDeleteProgram(g.recProg);
+            if (g.replayPreciseProg) glDeleteProgram(g.replayPreciseProg);
+            if (g.replayQuantizedProg) glDeleteProgram(g.replayQuantizedProg);
+            if (g.replayQuantizedSsbo) glDeleteBuffers(1, &g.replayQuantizedSsbo);
+            if (g.replayQuantizedTilesSsbo) glDeleteBuffers(1, &g.replayQuantizedTilesSsbo);
+            if (g.replayFbo) glDeleteFramebuffers(1, &g.replayFbo);
             if (g.recVbo) glDeleteBuffers(1, &g.recVbo);
             if (g.recVao) glDeleteVertexArrays(1, &g.recVao);
             if (g.stampProg) glDeleteProgram(g.stampProg);
@@ -1159,10 +1227,43 @@ SdlRenderer::Skin* SdlRenderer::decodeCostume(const Costume* c) {
     // hardware-DLSS alpha-safety mode. Legacy renderer remains unaffected.
     if (realDlssEnabled_) {
         const char* alphaSafe = std::getenv("XYO_DLSS_ALPHA_SAFE");
-        if (alphaSafe && alphaSafe[0] == '1') {
+        const char* alphaBias = std::getenv("XYO_DLSS_ALPHA_BIAS");
+        if ((alphaSafe && alphaSafe[0] == '1') ||
+            (alphaBias && alphaBias[0] == '1')) {
             skin->hasIntrinsicTranslucency =
                 render::hasInteriorTranslucency(
                     skin->px.data(), skin->w, skin->h);
+        }
+        // Geometry overrides only work for fully opaque costume texels.
+        // Cache this condition once; do not rescan during playback.
+        const char* rigid = std::getenv("XYO_DLSS_RIGID_MOTION");
+        const char* affine = std::getenv("XYO_DLSS_AFFINE_MOTION");
+        const char* coverage = std::getenv("XYO_DLSS_OPAQUE_COVERAGE");
+        if ((rigid && rigid[0] == '1') ||
+            (affine && affine[0] == '1')) {
+            skin->fullyOpaqueForRigidMotion =
+                skin->w > 0 && skin->h > 0 &&
+                skin->px.size() == size_t(skin->w) * skin->h * 4;
+            if (skin->fullyOpaqueForRigidMotion) {
+                for (size_t i = 3; i < skin->px.size(); i += 4) {
+                    if (skin->px[i] != 255) {
+                        skin->fullyOpaqueForRigidMotion = false;
+                        break;
+                    }
+                }
+            }
+            // Partial-alpha sprites are eligible only in the additional
+            // affine + coverage experiment. Cache conservative opaque tiles
+            // once per decoded costume, never per frame.
+            if (!skin->fullyOpaqueForRigidMotion &&
+                affine && affine[0] == '1' &&
+                coverage && coverage[0] == '1') {
+                auto mask = std::make_unique<render::DlssOpaqueCoverage>(
+                    render::dlssBuildOpaqueCoverage(
+                        skin->px, skin->w, skin->h));
+                if (render::dlssCoverageHasOpaqueArea(*mask))
+                    skin->dlssOpaqueCoverage = std::move(mask);
+            }
         }
     }
 #endif
@@ -1314,6 +1415,10 @@ bool SdlRenderer::skinPxAt(const Drawable& d, double px, double py,
 // 背面→前面の全レイヤ（backdrop → pen → sprite）を合成サンプル
 bool SdlRenderer::stageColorAt(double px, double py, int skipId,
                                uint8_t out[4]) const {
+    // Scratch samples color only on the 480x360 stage, never off-screen
+    // even when a partially off-stage costume has matching pixels there.
+    if (!(px >= 0.0 && px < stageW_ && py >= 0.0 && py < stageH_))
+        return false;
     // Ensure queued pen draws are visible to colour-sensing reporters.
     const_cast<SdlRenderer*>(this)->penFlushCpuBatch();
     const_cast<SdlRenderer*>(this)->penSyncCpu();
@@ -1724,6 +1829,12 @@ bool SdlRenderer::isTouchingDrawables(int drawableID, const int* others,
         const double left = std::max(ax0, bx0), right = std::min(ax1, bx1);
         const double top = std::max(ay0, by0), bottom = std::min(ay1, by1);
         if (left > right || top > bottom) continue;
+        if (left >= stageW_ || right < 0.0 ||
+            top >= stageH_ || bottom < 0.0) continue;
+        x0 = std::clamp(x0, 0, stageW_);
+        x1 = std::clamp(x1, 0, stageW_);
+        y0 = std::clamp(y0, 0, stageH_);
+        y1 = std::clamp(y1, 0, stageH_);
         if (left == right || top == bottom) {
             constexpr double eps = 1e-6;
             // At a shared boundary, sample a point infinitesimally inside
@@ -1733,6 +1844,8 @@ bool SdlRenderer::isTouchingDrawables(int drawableID, const int* others,
                 for (int x = static_cast<int>(std::floor(left)); x <= static_cast<int>(std::ceil(right)); ++x) {
                     const double px = left == right ? left : std::clamp(x + 0.5, left, right);
                     auto inside = [&](const Drawable& item) {
+                        if (!(px >= 0.0 && px < stageW_ &&
+                              py >= 0.0 && py < stageH_)) return false;
                         uint8_t color[4];
                         for (double dx : {-eps, eps}) for (double dy : {-eps, eps})
                             if (skinPxAt(item, px + dx, py + dy, color, false, true)) return true;
@@ -1777,10 +1890,10 @@ bool SdlRenderer::isTouchingColor(int drawableID, uint32_t rgb) {
     if (!d || !d->target) return false;
     double b[4];
     getDrawableBounds(drawableID, b);
-    int x0 = static_cast<int>(stageX(std::min(b[0], b[1])));
-    int x1 = static_cast<int>(std::ceil(stageX(std::max(b[0], b[1]))));
-    int y0 = static_cast<int>(stageY(std::max(b[2], b[3])));
-    int y1 = static_cast<int>(std::ceil(stageY(std::min(b[2], b[3]))));
+    int x0 = std::clamp(static_cast<int>(stageX(std::min(b[0], b[1]))), 0, stageW_);
+    int x1 = std::clamp(static_cast<int>(std::ceil(stageX(std::max(b[0], b[1])))), 0, stageW_);
+    int y0 = std::clamp(static_cast<int>(stageY(std::max(b[2], b[3]))), 0, stageH_);
+    int y1 = std::clamp(static_cast<int>(std::ceil(stageY(std::min(b[2], b[3])))), 0, stageH_);
     uint8_t self[4], behind[4];
     uint8_t tr = (rgb >> 16) & 0xFF, tg = (rgb >> 8) & 0xFF, tb = rgb & 0xFF;
     for (int y = y0; y < y1; ++y)
@@ -2199,10 +2312,17 @@ layout(location=2) in vec4 aColor;
 uniform vec2 uSize;
 uniform vec2 uHalf;
 uniform float uPenScale;
+uniform vec2 uJitter;
 out vec2 vUV;
 out vec2 vMeta;
 out vec4 vColor;
+flat out vec4 replayP0;
+flat out vec2 replayP1;
+flat out vec4 replayColor;
 void main() {
+    replayP0 = aP0;
+    replayP1 = aP1;
+    replayColor = aColor;
     float fdx = aP0.z * uPenScale, fdy = aP0.w * uPenScale;
     float L = aP1.x * uPenScale, width = aP1.y * uPenScale;
     float dx = fdx, dy = -fdy;
@@ -2221,10 +2341,147 @@ void main() {
     float vj = (c == 2 || c == 3 || c == 5) ? 1.0 : 0.0;
     float u = (ui > 0.5) ? (L + m) : -m;
     float v = (vj > 0.5) ? m : -m;
-    vec2 pos = vec2(ax, ay) + u * vec2(nx, ny) + v * vec2(-ny, nx);
+    vec2 pos = vec2(ax, ay) + u * vec2(nx, ny) + v * vec2(-ny, nx)
+             + uJitter;
     gl_Position = vec4(pos.x / uSize.x * 2.0 - 1.0,
                        1.0 - pos.y / uSize.y * 2.0, 0.0, 1.0);
     vUV = vec2(u, v); vMeta = vec2(L, radius); vColor = aColor;
+}
+)GLSL";
+
+// Experimental Pen-only GLSL 4.00 fragment program. The normal Pen GPU
+// renderer remains GLSL 3.30; this replayer computes coverage at actual
+// pixel centers, not from interpolated vUV. FP64 arithmetic better matches
+// the CPU analytic replay's distance and coverage math. Blending may still
+// differ at 8-bit target quantization boundaries.
+const char* kPenReplayPreciseFs = R"GLSL(#version 400 core
+flat in vec4 replayP0;
+flat in vec2 replayP1;
+flat in vec4 replayColor;
+uniform vec2 uSize;
+uniform vec2 uHalf;
+uniform float uPenScale;
+uniform vec2 uJitter;
+out vec4 frag;
+void main() {
+    double scale = double(uPenScale);
+    dvec2 start = dvec2(
+        (double(uHalf.x)+double(replayP0.x))*scale + double(uJitter.x),
+        (double(uHalf.y)-double(replayP0.y))*scale + double(uJitter.y));
+    dvec2 delta = dvec2(double(replayP0.z)*scale,
+                        -double(replayP0.w)*scale);
+    dvec2 point = dvec2(double(gl_FragCoord.x),
+                        double(uSize.y)-double(gl_FragCoord.y));
+    double len2 = dot(delta,delta);
+    double t = len2 > 1e-12
+        ? clamp(dot(point-start,delta)/len2,0.0,1.0) : 0.0;
+    double dist = length(point-start-t*delta);
+    double radius = double(replayP1.y)*scale*0.5;
+    double coverage = clamp(radius+0.5-dist,0.0,1.0);
+    double alpha = clamp(double(replayColor.a),0.0,1.0)*coverage;
+    vec3 rgb = clamp(replayColor.rgb,vec3(0.0),vec3(1.0));
+    frag = vec4(rgb*float(alpha),float(alpha));
+}
+)GLSL";
+
+
+// Research-only replay: one fragment per input pixel, all strokes in source
+// order, quantizing straight RGBA after EVERY stroke like the CPU replayer.
+// This deliberately trades performance for a controlled parity experiment.
+// A fullscreen pass avoids blending/ordering differences of the GPU R8 FBO.
+const char* kPenReplayQuantizedVs = R"GLSL(#version 430 core
+void main() {
+    vec2 pos = vec2(gl_VertexID == 1 ? 3.0 : -1.0,
+                    gl_VertexID == 2 ? 3.0 : -1.0);
+    gl_Position = vec4(pos, 0.0, 1.0);
+}
+)GLSL";
+
+const char* kPenReplayQuantizedFs = R"GLSL(#version 430 core
+layout(std430, binding=7) readonly buffer ReplayStrokeData {
+    vec4 records[]; // 3 vec4 per stroke: endpoints, rgba, diameter
+};
+layout(std430, binding=8) readonly buffer ReplayTileMasks {
+    uvec2 tileMasks[]; // two 32-bit source-ordered stroke masks per 16x16 tile
+};
+uniform int uTiled;
+uniform int uTileCols;
+uniform vec2 uSize;
+uniform vec2 uStage;
+uniform vec2 uJitter;
+uniform int uCount;
+out vec4 frag;
+double unit(double x) { return clamp(x, 0.0, 1.0); }
+double quantize(double x) {
+    return floor(unit(x)*255.0+0.5)/255.0;
+}
+void main() {
+    dvec2 pixel = dvec2(double(gl_FragCoord.x),
+                        double(uSize.y)-double(gl_FragCoord.y));
+    double sx = double(uSize.x)/double(uStage.x);
+    double sy = double(uSize.y)/double(uStage.y);
+    double pixelScale = min(sx,sy);
+    dvec4 dst = dvec4(0.0);
+    uvec2 remaining = uvec2(0u);
+    if (uTiled != 0) {
+        // Tile indices use the CPU replay's top-left origin.
+        ivec2 tile = ivec2(int(gl_FragCoord.x)/16,
+                          int(uSize.y-gl_FragCoord.y)/16);
+        remaining = tileMasks[tile.y*uTileCols+tile.x];
+    }
+    for (int iter=0; iter<uCount; ++iter) {
+        int i = iter;
+        if (uTiled != 0) {
+            // Extract the lowest bit first: the CPU's 8-bit rounding makes
+            // compositing order observable for translucent strokes.
+            if (remaining.x != 0u) {
+                i = findLSB(remaining.x);
+                remaining.x &= remaining.x-1u;
+            } else if (remaining.y != 0u) {
+                i = 32+findLSB(remaining.y);
+                remaining.y &= remaining.y-1u;
+            } else {
+                break;
+            }
+        }
+        vec4 xy = records[i*3];
+        vec4 color = records[i*3+1];
+        double diameter = double(records[i*3+2].x);
+        double origin = (diameter == 1.0 || diameter == 3.0) ? 0.5 : 0.0;
+        dvec2 a = dvec2((double(uStage.x)*0.5+double(xy.x)+origin)*sx+
+                        double(uJitter.x),
+                       (double(uStage.y)*0.5-double(xy.y)-origin)*sy+
+                        double(uJitter.y));
+        dvec2 b = dvec2((double(uStage.x)*0.5+double(xy.z)+origin)*sx+
+                        double(uJitter.x),
+                       (double(uStage.y)*0.5-double(xy.w)-origin)*sy+
+                        double(uJitter.y));
+        double support = diameter*pixelScale*0.5+0.5;
+        if (pixel.x < min(a.x,b.x)-support ||
+            pixel.x > max(a.x,b.x)+support ||
+            pixel.y < min(a.y,b.y)-support ||
+            pixel.y > max(a.y,b.y)+support)
+            continue;
+        dvec2 delta = b-a;
+        double len2 = dot(delta,delta);
+        dvec2 v = pixel-a;
+        double t = len2>1e-12 ? clamp(dot(v,delta)/len2,0.0,1.0) : 0.0;
+        double dist = length(v-t*delta);
+        double sa = unit(double(color.a))*clamp(support-dist,0.0,1.0);
+        if (sa<=0.0) continue;
+        double previousAlpha = dst.a;
+        double nextAlpha = sa+previousAlpha*(1.0-sa);
+        // Dynamic indexing into FP64 vectors fails to link on some NVIDIA
+        // drivers (C9999 __setVectorIndex). Keep each channel scalar.
+        dst.r = quantize((unit(double(color.r))*sa+
+                          dst.r*previousAlpha*(1.0-sa))/nextAlpha);
+        dst.g = quantize((unit(double(color.g))*sa+
+                          dst.g*previousAlpha*(1.0-sa))/nextAlpha);
+        dst.b = quantize((unit(double(color.b))*sa+
+                          dst.b*previousAlpha*(1.0-sa))/nextAlpha);
+        dst.a = quantize(nextAlpha);
+    }
+    frag=vec4(dst);
 }
 )GLSL";
 
@@ -2475,6 +2732,98 @@ bool SdlRenderer::initGlPen() {
             g.recUSize = glGetUniformLocation(g.recProg, "uSize");
             g.recUHalf = glGetUniformLocation(g.recProg, "uHalf");
             g.recUScale = glGetUniformLocation(g.recProg, "uPenScale");
+            g.recUJitter = glGetUniformLocation(g.recProg, "uJitter");
+#if defined(XYO_NVSDK_DLSS_VK) && defined(__linux__) && defined(XYO_HAVE_SDL2)
+            // Compile FP64 only on explicit request and leave the persistent
+            // Pen 3.30 path unchanged. GL 4.0 may be unavailable: ordinary
+            // GPU replay is retained if compilation/link fails.
+            const char* precise = std::getenv("XYO_DLSS_PEN_REPLAY_PRECISE");
+            if (precise && precise[0] == '1') {
+                std::string preciseVs = kPenRecVs;
+                const auto pos = preciseVs.find("#version 330 core");
+                if (pos != std::string::npos)
+                    preciseVs.replace(pos, sizeof("#version 330 core")-1,
+                                      "#version 400 core");
+                GLuint vs = penCompileShader(GL_VERTEX_SHADER, preciseVs.c_str());
+                GLuint fs = penCompileShader(GL_FRAGMENT_SHADER,
+                                             kPenReplayPreciseFs);
+                if (vs && fs) {
+                    GLuint prog = glCreateProgram();
+                    glAttachShader(prog, vs);
+                    glAttachShader(prog, fs);
+                    glBindAttribLocation(prog, 0, "aP0");
+                    glBindAttribLocation(prog, 1, "aP1");
+                    glBindAttribLocation(prog, 2, "aColor");
+                    glLinkProgram(prog);
+                    GLint linked = GL_FALSE;
+                    glGetProgramiv(prog, GL_LINK_STATUS, &linked);
+                    if (linked) {
+                        g.replayPreciseProg = prog;
+                        g.replayPreciseUSize =
+                            glGetUniformLocation(prog, "uSize");
+                        g.replayPreciseUHalf =
+                            glGetUniformLocation(prog, "uHalf");
+                        g.replayPreciseUScale =
+                            glGetUniformLocation(prog, "uPenScale");
+                        g.replayPreciseUJitter =
+                            glGetUniformLocation(prog, "uJitter");
+                    } else {
+                        if (std::getenv("XYO_DLSS_REAL_DEBUG")) {
+                            char log[1024]{};
+                            glGetProgramInfoLog(prog, sizeof(log), nullptr, log);
+                            std::fprintf(stderr,
+                                "[real DLSS] precise Pen shader link: %s\n", log);
+                        }
+                        glDeleteProgram(prog);
+                    }
+                }
+                if (vs) glDeleteShader(vs);
+                if (fs) glDeleteShader(fs);
+            }
+            // Optional CPU-rounding parity path; requires OpenGL/GLSL 4.3.
+            const char* quantized = std::getenv("XYO_DLSS_PEN_REPLAY_QUANTIZED");
+            if (quantized && quantized[0] == '1') {
+                GLuint vs = penCompileShader(GL_VERTEX_SHADER,
+                                            kPenReplayQuantizedVs);
+                GLuint fs = penCompileShader(GL_FRAGMENT_SHADER,
+                                            kPenReplayQuantizedFs);
+                if (vs && fs) {
+                    GLuint prog = glCreateProgram();
+                    glAttachShader(prog, vs);
+                    glAttachShader(prog, fs);
+                    glLinkProgram(prog);
+                    GLint linked = GL_FALSE;
+                    glGetProgramiv(prog, GL_LINK_STATUS, &linked);
+                    if (linked) {
+                        g.replayQuantizedProg = prog;
+                        g.replayQuantizedUSize = glGetUniformLocation(prog,"uSize");
+                        g.replayQuantizedUStage = glGetUniformLocation(prog,"uStage");
+                        g.replayQuantizedUJitter = glGetUniformLocation(prog,"uJitter");
+                        g.replayQuantizedUCount = glGetUniformLocation(prog,"uCount");
+                        g.replayQuantizedUTiled = glGetUniformLocation(prog,"uTiled");
+                        g.replayQuantizedUTileCols = glGetUniformLocation(prog,"uTileCols");
+                        glGenBuffers(1, &g.replayQuantizedSsbo);
+                        glGenBuffers(1, &g.replayQuantizedTilesSsbo);
+                        if (!g.replayQuantizedSsbo) {
+                            glDeleteProgram(prog);
+                            g.replayQuantizedProg = 0;
+                        }
+                    } else {
+                        char log[1024]{};
+                        glGetProgramInfoLog(prog, sizeof(log), nullptr, log);
+                        std::fprintf(stderr,
+                            "[real DLSS] quantized Pen shader link failed: %s\n", log);
+                        glDeleteProgram(prog);
+                    }
+                }
+                if (vs) glDeleteShader(vs);
+                if (fs) glDeleteShader(fs);
+                if (std::getenv("XYO_DLSS_REAL_DEBUG"))
+                    std::fprintf(stderr,
+                        "[real DLSS] quantized Pen init: program=%u buffer=%u\n",
+                        g.replayQuantizedProg, g.replayQuantizedSsbo);
+            }
+#endif
             glGenBuffers(1, &g.recVbo);
             glGenVertexArrays(1, &g.recVao);
             glBindVertexArray(g.recVao);
@@ -2754,6 +3103,7 @@ void SdlRenderer::penFlushGpu() {
         glUniform2f(g.recUSize, float(penW_), float(penH_));
         glUniform2f(g.recUHalf, float(stageW_ / 2), float(stageH_ / 2));
         glUniform1f(g.recUScale, float(penScale_));
+        glUniform2f(g.recUJitter, 0.0f, 0.0f);
         glBindBuffer(GL_ARRAY_BUFFER, g.recVbo);
         glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(g.recLen * sizeof(float)),
                      g.rec, GL_STREAM_DRAW);
@@ -2802,6 +3152,385 @@ void SdlRenderer::penFlushGpu() {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     if (sdlGlCtx_) SDL_GL_MakeCurrent(window_, sdlGlCtx_);
 }
+
+#if defined(XYO_NVSDK_DLSS_VK) && defined(__linux__) && defined(XYO_HAVE_SDL2)
+// GPU-only display layer for known Pen strokes. It uses the existing
+// instanced capsule shaders without writing a single pixel to the persistent
+// Pen FBO. The output SDL texture is a shared GL render target.
+bool SdlRenderer::penReplayOnGpu(int width, int height,
+                                 float jitterX, float jitterY) {
+    if (!penGpu() || !glPen_->shared || !sdlGlCtx_ ||
+        !glPen_->recProg || !glPen_->recVao || !glPen_->recVbo ||
+        width <= 0 || height <= 0 || width > 1024 || height > 1024 ||
+        size_t(width)*height > 1024u*1024u ||
+        dlssPenReplayStrokes_.empty() ||
+        dlssPenReplayStrokes_.size() > render::kDlssPenReplayMaxStrokes ||
+        !render::dlssPenReplayWithinBudget(
+            dlssPenReplayStrokes_, stageW_, stageH_,
+            width, height, jitterX, jitterY))
+        return false;
+    const float scale = float(width) / stageW_;
+    if (!std::isfinite(scale) || scale <= 0 ||
+        std::abs(float(height)/stageH_ - scale) > 0.001f)
+        return false;
+
+    // Reuse the exact record format and GL shader of the normal GPU pen
+    // path, but with a separately owned render-target texture.
+    const char* quantizedFlag = std::getenv("XYO_DLSS_PEN_REPLAY_QUANTIZED");
+    const bool quantizedRequested = quantizedFlag && quantizedFlag[0] == '1';
+    const bool quantizedReplay = glPen_->replayQuantizedProg &&
+        glPen_->replayQuantizedSsbo && dlssPenReplayStrokes_.size() <= 64;
+    // This mode requests CPU-equivalent quantization. If the GPU precision
+    // path is unavailable, do not silently downgrade to a different raster
+    // and alpha blending algorithm: the caller can use CPU analytic replay.
+    if (quantizedRequested && !quantizedReplay)
+        return false;
+    const char* tiledFlag = std::getenv("XYO_DLSS_PEN_REPLAY_TILED");
+    const bool tiledReplay = quantizedReplay && tiledFlag && tiledFlag[0] == '1';
+    if (tiledReplay && !glPen_->replayQuantizedTilesSsbo)
+        return false;
+    // The quantized path is a fullscreen fragment shader by design, but
+    // only the union of all capsule supports can contain nonzero output.
+    // Restrict fragment invocations to that conservative rectangle.
+    // Bounds use CPU replay's top-left coordinate convention.
+    std::array<int,4> quantizedBounds{width, height, 0, 0}; // left, top, right, bottom
+    constexpr int kReplayTileSize = 16;
+    const int replayTileCols = (width+kReplayTileSize-1)/kReplayTileSize;
+    const int replayTileRows = (height+kReplayTileSize-1)/kReplayTileSize;
+    std::vector<uint32_t> quantizedTileMasks;
+    if (tiledReplay)
+        quantizedTileMasks.resize(size_t(replayTileCols)*replayTileRows*2, 0);
+    if (quantizedReplay) {
+        const double sx = double(width)/stageW_;
+        const double sy = double(height)/stageH_;
+        const double radiusScale = std::min(sx, sy);
+        const auto coord = [](double x, int limit, bool upper) {
+            x = std::clamp(x, -1e6, 1e6);
+            return std::clamp(int(upper ? std::ceil(x) : std::floor(x)),
+                              0, limit);
+        };
+        for (size_t i=0; i<dlssPenReplayStrokes_.size(); ++i) {
+            const auto& stroke = dlssPenReplayStrokes_[i];
+            const double origin =
+                (stroke.diameter == 1 || stroke.diameter == 3) ? 0.5 : 0.0;
+            const double ax=(stageW_*0.5+double(stroke.x0)+origin)*sx+jitterX;
+            const double bx=(stageW_*0.5+double(stroke.x1)+origin)*sx+jitterX;
+            const double ay=(stageH_*0.5-double(stroke.y0)-origin)*sy+jitterY;
+            const double by=(stageH_*0.5-double(stroke.y1)-origin)*sy+jitterY;
+            const double support=double(stroke.diameter)*radiusScale*0.5+0.5;
+            const int x0=coord(std::min(ax,bx)-support-2.0,width,false);
+            const int y0=coord(std::min(ay,by)-support-2.0,height,false);
+            const int x1=coord(std::max(ax,bx)+support+2.0,width,true);
+            const int y1=coord(std::max(ay,by)+support+2.0,height,true);
+            quantizedBounds[0] = std::min(quantizedBounds[0],x0);
+            quantizedBounds[1] = std::min(quantizedBounds[1],y0);
+            quantizedBounds[2] = std::max(quantizedBounds[2],x1);
+            quantizedBounds[3] = std::max(quantizedBounds[3],y1);
+            if (tiledReplay && x1>x0 && y1>y0) {
+                const uint32_t bit = uint32_t(1) << (i%32);
+                for (int ty=y0/kReplayTileSize;
+                     ty<=(y1-1)/kReplayTileSize; ++ty) {
+                    for (int tx=x0/kReplayTileSize;
+                         tx<=(x1-1)/kReplayTileSize; ++tx) {
+                        const size_t index =
+                            (size_t(ty)*replayTileCols+tx)*2+(i/32);
+                        quantizedTileMasks[index] |= bit;
+                    }
+                }
+            }
+        }
+        // In tiled mode, each tile visits only source-ordered strokes whose
+        // conservative AABB overlaps it. Without tiling the full list runs.
+        const uint64_t boundW =
+            uint64_t(std::max(0,quantizedBounds[2]-quantizedBounds[0]));
+        const uint64_t boundH =
+            uint64_t(std::max(0,quantizedBounds[3]-quantizedBounds[1]));
+        constexpr uint64_t kMaxQuantizedFragmentVisits = 4'000'000;
+        uint64_t work = boundW*boundH*dlssPenReplayStrokes_.size();
+        if (tiledReplay) {
+            work = 0;
+            for (uint32_t mask : quantizedTileMasks)
+                work += uint64_t(__builtin_popcount(mask))*
+                        kReplayTileSize*kReplayTileSize;
+        }
+        if (work > kMaxQuantizedFragmentVisits) {
+            if (std::getenv("XYO_DLSS_REAL_DEBUG")) {
+                std::fprintf(stderr,
+                    "[real DLSS] GPU Pen quantized work budget exceeded; "
+                    "falling back to CPU analytic replay\n");
+            }
+            return false;
+        }
+    }
+    std::vector<float> records;
+    records.reserve(dlssPenReplayStrokes_.size() * 10);
+    std::vector<float> quantizedRecords;
+    if (quantizedReplay)
+        quantizedRecords.reserve(dlssPenReplayStrokes_.size() * 12);
+    for (const auto& stroke : dlssPenReplayStrokes_) {
+        const float d = stroke.diameter;
+        if (!std::isfinite(d) || d <= 0 || d > 4096 ||
+            !std::isfinite(stroke.x0) || !std::isfinite(stroke.y0) ||
+            !std::isfinite(stroke.x1) || !std::isfinite(stroke.y1))
+            return false;
+        bool colorOk = true;
+        for (float color : stroke.rgba)
+            colorOk &= std::isfinite(color);
+        if (!colorOk) return false;
+        const float origin = (d == 1 || d == 3) ? 0.5f : 0.0f;
+        const float dx = stroke.x1 - stroke.x0;
+        const float dy = stroke.y1 - stroke.y0;
+        const float length = std::hypot(dx, dy);
+        if (!std::isfinite(length)) return false;
+        records.insert(records.end(), {
+            stroke.x0 + origin, stroke.y0 + origin, dx, dy, length, d,
+            stroke.rgba[0], stroke.rgba[1],
+            stroke.rgba[2], stroke.rgba[3]
+        });
+        if (quantizedReplay)
+            quantizedRecords.insert(quantizedRecords.end(), {
+                stroke.x0, stroke.y0, stroke.x1, stroke.y1,
+                stroke.rgba[0], stroke.rgba[1], stroke.rgba[2], stroke.rgba[3],
+                stroke.diameter, 0, 0, 0
+            });
+    }
+    if (SDL_RenderFlush(renderer_) != 0 ||
+        SDL_GL_MakeCurrent(window_, sdlGlCtx_) != 0)
+        return false;
+
+    if (dlssPenReplayGpuTex_ &&
+        (dlssPenReplayGpuW_ != width || dlssPenReplayGpuH_ != height)) {
+        SDL_DestroyTexture(dlssPenReplayGpuTex_);
+        dlssPenReplayGpuTex_ = nullptr;
+    }
+    if (!dlssPenReplayGpuTex_) {
+        dlssPenReplayGpuTex_ = SDL_CreateTexture(
+            renderer_, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET,
+            width, height);
+        if (!dlssPenReplayGpuTex_) return false;
+        dlssPenReplayGpuW_ = width;
+        dlssPenReplayGpuH_ = height;
+        // GL pen writes premultiplied colors, so SDL must blend premult,
+        // not the straight alpha blend used for CPU replay.
+        SDL_BlendMode blend = SDL_ComposeCustomBlendMode(
+            SDL_BLENDFACTOR_ONE, SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+            SDL_BLENDOPERATION_ADD,
+            SDL_BLENDFACTOR_ONE, SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+            SDL_BLENDOPERATION_ADD);
+        if (blend == SDL_BLENDMODE_INVALID ||
+            SDL_SetTextureBlendMode(dlssPenReplayGpuTex_, blend) != 0)
+            return false;
+    }
+    // The quantized shader writes CPU-style straight RGBA; normal shader
+    // writes premultiplied RGBA. SDL's final composition must match each.
+    SDL_BlendMode replayBlend = quantizedReplay ? SDL_BLENDMODE_BLEND :
+        SDL_ComposeCustomBlendMode(
+            SDL_BLENDFACTOR_ONE, SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+            SDL_BLENDOPERATION_ADD,
+            SDL_BLENDFACTOR_ONE, SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+            SDL_BLENDOPERATION_ADD);
+    if (replayBlend == SDL_BLENDMODE_INVALID ||
+        SDL_SetTextureBlendMode(dlssPenReplayGpuTex_, replayBlend) != 0)
+        return false;
+    if (SDL_GL_BindTexture(dlssPenReplayGpuTex_, nullptr, nullptr) != 0)
+        return false;
+    GLint textureName = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &textureName);
+    SDL_GL_UnbindTexture(dlssPenReplayGpuTex_);
+    if (textureName <= 0) return false;
+
+    GlPen& g = *glPen_;
+    if (SDL_GL_MakeCurrent(window_, g.ctx) != 0) return false;
+    if (!g.replayFbo)
+        glGenFramebuffers(1, &g.replayFbo);
+    if (!g.replayFbo) {
+        SDL_GL_MakeCurrent(window_, sdlGlCtx_);
+        return false;
+    }
+    GLint previousFbo = 0, previousProgram = 0, previousVao = 0;
+    GLint previousViewport[4]{};
+    GLint previousScissorBox[4]{};
+    glGetIntegerv(GL_SCISSOR_BOX, previousScissorBox);
+    GLint oldBlendSource = 0, oldBlendTarget = 0;
+    GLint oldAlphaSource = 0, oldAlphaTarget = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previousFbo);
+    glGetIntegerv(GL_CURRENT_PROGRAM, &previousProgram);
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &previousVao);
+    glGetIntegerv(GL_VIEWPORT, previousViewport);
+    glGetIntegerv(GL_BLEND_SRC_RGB, &oldBlendSource);
+    glGetIntegerv(GL_BLEND_DST_RGB, &oldBlendTarget);
+    glGetIntegerv(GL_BLEND_SRC_ALPHA, &oldAlphaSource);
+    glGetIntegerv(GL_BLEND_DST_ALPHA, &oldAlphaTarget);
+    const bool wasBlending = glIsEnabled(GL_BLEND);
+    const bool wasScissor = glIsEnabled(GL_SCISSOR_TEST);
+    const bool wasDepth = glIsEnabled(GL_DEPTH_TEST);
+    const bool wasCulling = glIsEnabled(GL_CULL_FACE);
+    const bool wasStencil = glIsEnabled(GL_STENCIL_TEST);
+    GLfloat oldClearColor[4]{};
+    glGetFloatv(GL_COLOR_CLEAR_VALUE, oldClearColor);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, g.replayFbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, GLuint(textureName), 0);
+    const bool complete =
+        glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    GLsync replayFence = nullptr;
+    static const bool fenceSyncRequested = [] {
+        const char* flag = std::getenv("XYO_DLSS_PEN_REPLAY_SYNC");
+        return flag && std::strcmp(flag, "fence") == 0;
+    }();
+    if (complete) {
+        glViewport(0, 0, width, height);
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_STENCIL_TEST);
+        glClearColor(0,0,0,0);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        const bool preciseReplay = g.replayPreciseProg != 0;
+        if (quantizedReplay) {
+            glDisable(GL_BLEND);
+            glUseProgram(g.replayQuantizedProg);
+            glUniform2f(g.replayQuantizedUSize, float(width),float(height));
+            glUniform2f(g.replayQuantizedUStage,float(stageW_),float(stageH_));
+            glUniform2f(g.replayQuantizedUJitter,jitterX,jitterY);
+            glUniform1i(g.replayQuantizedUCount,
+                        GLint(dlssPenReplayStrokes_.size()));
+            glUniform1i(g.replayQuantizedUTiled, tiledReplay ? 1 : 0);
+            glUniform1i(g.replayQuantizedUTileCols, replayTileCols);
+            // Restore both the indexed SSBO slot and the ordinary target
+            // binding; the context is also used by normal Pen rendering.
+            GLint previousSsbo = 0, previousSsbo7 = 0, previousSsbo8 = 0;
+            glGetIntegerv(GL_SHADER_STORAGE_BUFFER_BINDING, &previousSsbo);
+            glGetIntegeri_v(GL_SHADER_STORAGE_BUFFER_BINDING,7,&previousSsbo7);
+            glGetIntegeri_v(GL_SHADER_STORAGE_BUFFER_BINDING,8,&previousSsbo8);
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER,g.replayQuantizedSsbo);
+            glBufferData(GL_SHADER_STORAGE_BUFFER,
+                         GLsizeiptr(quantizedRecords.size()*sizeof(float)),
+                         quantizedRecords.data(),GL_STREAM_DRAW);
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER,7,g.replayQuantizedSsbo);
+            if (tiledReplay) {
+                glBindBuffer(GL_SHADER_STORAGE_BUFFER,g.replayQuantizedTilesSsbo);
+                glBufferData(GL_SHADER_STORAGE_BUFFER,
+                             GLsizeiptr(quantizedTileMasks.size()*sizeof(uint32_t)),
+                             quantizedTileMasks.data(),GL_STREAM_DRAW);
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER,8,g.replayQuantizedTilesSsbo);
+            }
+            glBindVertexArray(g.recVao);
+            // Disable only for controlled CPU-quantized GPU benchmarks.
+            // Normal quantized replay always uses the conservative union.
+            const char* scissorFlag =
+                std::getenv("XYO_DLSS_PEN_REPLAY_SCISSOR");
+            const bool useScissor = !scissorFlag || scissorFlag[0] != '0';
+            if (!useScissor) {
+                glDrawArrays(GL_TRIANGLES,0,3);
+            } else if (quantizedBounds[2] > quantizedBounds[0] &&
+                       quantizedBounds[3] > quantizedBounds[1]) {
+                glEnable(GL_SCISSOR_TEST);
+                glScissor(quantizedBounds[0],height-quantizedBounds[3],
+                          quantizedBounds[2]-quantizedBounds[0],
+                          quantizedBounds[3]-quantizedBounds[1]);
+                glDrawArrays(GL_TRIANGLES,0,3);
+                glDisable(GL_SCISSOR_TEST);
+            }
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER,7,GLuint(previousSsbo7));
+            if (tiledReplay)
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER,8,GLuint(previousSsbo8));
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER,GLuint(previousSsbo));
+            glEnable(GL_BLEND);
+        } else {
+            glUseProgram(preciseReplay ? g.replayPreciseProg : g.recProg);
+            glUniform2f(preciseReplay ? g.replayPreciseUSize : g.recUSize,
+                        float(width), float(height));
+            glUniform2f(preciseReplay ? g.replayPreciseUHalf : g.recUHalf,
+                        float(stageW_)*0.5f, float(stageH_)*0.5f);
+            glUniform1f(preciseReplay ? g.replayPreciseUScale : g.recUScale,
+                        scale);
+            const GLint jitterUniform = preciseReplay
+                ? g.replayPreciseUJitter : g.recUJitter;
+            glUniform2f(jitterUniform, jitterX, jitterY);
+            glBindVertexArray(g.recVao);
+            glBindBuffer(GL_ARRAY_BUFFER, g.recVbo);
+            glBufferData(GL_ARRAY_BUFFER,
+                         GLsizeiptr(records.size()*sizeof(float)),
+                         records.data(), GL_STREAM_DRAW);
+            glDrawArraysInstanced(GL_TRIANGLES, 0, 6,
+                                 GLsizei(dlssPenReplayStrokes_.size()));
+            // The normal pen path must not inherit experimental jitter.
+            glUniform2f(jitterUniform, 0.0f, 0.0f);
+        }
+        if (std::getenv("XYO_DLSS_REAL_DEBUG")) {
+            static bool loggedReplay = false;
+            if (!loggedReplay) {
+                loggedReplay = true;
+                if (tiledReplay)
+                    std::fprintf(stderr,
+                        "[real DLSS] GPU Pen quantized tiled16 active\n");
+                std::fprintf(stderr,"[real DLSS] GPU Pen coverage shader: %s\n",
+                    quantizedReplay ? "FP64 CPU-quantized" :
+                    preciseReplay ? "FP64 per-pixel" : "regular interpolated");
+            }
+        }
+        // The SDL consumer uses a different shared GL context. Instead of
+        // blocking the CPU on every queued command, an optional shared
+        // GLsync fence lets SDL's context wait on the GPU for this specific
+        // pen draw. glFlush is necessary: the producing context otherwise
+        // need not submit the fence for the consumer to observe.
+        // Default remains glFinish until tested on a wide range of drivers.
+        if (fenceSyncRequested && glFenceSync && glWaitSync && glDeleteSync) {
+            replayFence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+            if (replayFence) glFlush();
+            else glFinish();
+        } else {
+            glFinish();
+        }
+    }
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, 0, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, GLuint(previousFbo));
+    glUseProgram(GLuint(previousProgram));
+    glBindVertexArray(GLuint(previousVao));
+    glViewport(previousViewport[0], previousViewport[1],
+               previousViewport[2], previousViewport[3]);
+    glScissor(previousScissorBox[0], previousScissorBox[1],
+              previousScissorBox[2], previousScissorBox[3]);
+    glBlendFuncSeparate(GLenum(oldBlendSource), GLenum(oldBlendTarget),
+                        GLenum(oldAlphaSource), GLenum(oldAlphaTarget));
+    if (!wasBlending) glDisable(GL_BLEND);
+    if (wasScissor) glEnable(GL_SCISSOR_TEST);
+    if (wasDepth) glEnable(GL_DEPTH_TEST);
+    if (wasCulling) glEnable(GL_CULL_FACE);
+    if (wasStencil) glEnable(GL_STENCIL_TEST);
+    glClearColor(oldClearColor[0], oldClearColor[1],
+                 oldClearColor[2], oldClearColor[3]);
+    const bool restored = SDL_GL_MakeCurrent(window_, sdlGlCtx_) == 0;
+    if (replayFence) {
+        if (restored) {
+            // Server-side wait in the consuming context; this orders SDL's
+            // subsequent texture sampling without waiting on the CPU.
+            glWaitSync(replayFence, 0, GL_TIMEOUT_IGNORED);
+        } else {
+            // A GLsync is shared between contexts; clean it up via the
+            // producer when we cannot make SDL's context current.
+            SDL_GL_MakeCurrent(window_, g.ctx);
+            glFinish();
+        }
+        glDeleteSync(replayFence);
+    }
+    if (complete && restored && std::getenv("XYO_DLSS_REAL_DEBUG")) {
+        static bool reportedSync = false;
+        if (!reportedSync) {
+            reportedSync = true;
+            std::fprintf(stderr,
+                "[real DLSS] GPU pen replay sync: %s\n",
+                replayFence ? "shared GL fence" : "glFinish");
+        }
+    }
+    return restored && complete;
+}
+#endif
 
 // FBO を penPx_ へ readback する（fboDirty 時のみ）。
 // GL の readback は下→上なので行を反転して CPU バッファへ。
@@ -4691,6 +5420,21 @@ void SdlRenderer::penPoint(int skin, const float rgba[4], double diameter,
                            double x, double y) {
     if (skin != penSkinId_) return;
     penEnsure();
+#if defined(XYO_NVSDK_DLSS_VK) && defined(__linux__) && defined(XYO_HAVE_SDL2)
+    if (dlssPenReplayValid_) {
+        if (g_penSkip ||
+            dlssPenReplayStrokes_.size() == render::kDlssPenReplayMaxStrokes ||
+            !std::isfinite(diameter) || !std::isfinite(x) ||
+            !std::isfinite(y) || std::abs(x)>1e6 || std::abs(y)>1e6) {
+            dlssPenReplayValid_ = false;
+            dlssPenReplayStrokes_.clear();
+        } else {
+            dlssPenReplayStrokes_.push_back({
+                {rgba[0],rgba[1],rgba[2],rgba[3]},
+                float(diameter),float(x),float(y),float(x),float(y)});
+        }
+    }
+#endif
 #if defined(XYO_PEN_GL)
     // penDown-heavy projects (3D2) submit one point per pixel. Keep that path
     // out of generic line/CPU-raster prologues, delta validation and sqrt.
@@ -4710,6 +5454,23 @@ void SdlRenderer::penLine(int skin, const float rgba[4], double diameter,
                           double x0, double y0, double x1, double y1) {
     if (skin != penSkinId_) return;
     penEnsure();
+#if defined(XYO_NVSDK_DLSS_VK) && defined(__linux__) && defined(XYO_HAVE_SDL2)
+    if (dlssPenReplayValid_) {
+        if (g_penSkip ||
+            dlssPenReplayStrokes_.size() == render::kDlssPenReplayMaxStrokes ||
+            !std::isfinite(diameter) || !std::isfinite(x0) ||
+            !std::isfinite(y0) || !std::isfinite(x1) ||
+            !std::isfinite(y1) || std::abs(x0)>1e6 || std::abs(y0)>1e6 ||
+            std::abs(x1)>1e6 || std::abs(y1)>1e6) {
+            dlssPenReplayValid_ = false;
+            dlssPenReplayStrokes_.clear();
+        } else {
+            dlssPenReplayStrokes_.push_back({
+                {rgba[0],rgba[1],rgba[2],rgba[3]},
+                float(diameter),float(x0),float(y0),float(x1),float(y1)});
+        }
+    }
+#endif
     penStroke(rgba, diameter, x0, y0, x1, y1);
     penDirty_ = true;
 }
@@ -4728,6 +5489,10 @@ bool SdlRenderer::capturePen(std::vector<uint8_t>& pixels) {
 bool SdlRenderer::restorePen(const std::vector<uint8_t>& pixels) {
     if (pixels.empty()) return true;
     penEnsure();
+#if defined(XYO_NVSDK_DLSS_VK) && defined(__linux__) && defined(XYO_HAVE_SDL2)
+    dlssPenReplayValid_ = false;
+    dlssPenReplayStrokes_.clear();
+#endif
     if (!penTex_ || pixels.size() != size_t(penW_) * size_t(penH_) * 4)
         return false;
     penBatch_.clear();
@@ -4759,6 +5524,16 @@ bool SdlRenderer::restorePen(const std::vector<uint8_t>& pixels) {
 void SdlRenderer::penClear(int skin) {
     if (skin != penSkinId_) return;
     penEnsure();
+#if defined(XYO_NVSDK_DLSS_VK) && defined(__linux__) && defined(XYO_HAVE_SDL2)
+    // A clear establishes a complete replayable history. If no clear was
+    // observed, preexisting/unknown pen contents cannot be reconstructed.
+    static const bool replayEnabled = [] {
+        const char* v=std::getenv("XYO_DLSS_PEN_PRIMITIVE_REPLAY");
+        return v && v[0]=='1';
+    }();
+    dlssPenReplayValid_ = replayEnabled;
+    dlssPenReplayStrokes_.clear();
+#endif
     penBatch_.clear();   // 消去されるので未描画バッチは破棄
     penBatchArea_ = 0;
     penImmediate_ = 0;
@@ -4791,6 +5566,11 @@ void SdlRenderer::penStamp(int skin, int drawableID) {
     PenTimer stampTimer(&g_penProf.stampMs);
     if (skin != penSkinId_) return;
     penEnsure();
+#if defined(XYO_NVSDK_DLSS_VK) && defined(__linux__) && defined(XYO_HAVE_SDL2)
+    // Stamps are arbitrary costume images, not stroke primitives.
+    dlssPenReplayValid_ = false;
+    dlssPenReplayStrokes_.clear();
+#endif
     penFlushCpuBatch();   // CPU 遅延バッチを先に反映
     Drawable* d = drawableFor(drawableID);
     if (!d || !d->target) return;
@@ -5052,7 +5832,111 @@ void SdlRenderer::drawScaledStage() {
     }
     const IRect saved = stageRect_;
     stageRect_ = IRect{0, 0, iw, ih};
+#if defined(XYO_NVSDK_DLSS_VK) && defined(__linux__) && defined(XYO_HAVE_SDL2)
+    static const bool temporalJitterEnabled = [] {
+        const char* jitter = std::getenv("XYO_DLSS_RASTER_JITTER");
+        const char* flow = std::getenv("XYO_DLSS_OPTICAL_FLOW");
+        const char* temporal = std::getenv("XYO_DLSS_TEMPORAL");
+        return jitter && jitter[0] == '1' &&
+               flow && flow[0] == '1' &&
+               temporal && temporal[0] == '1';
+    }();
+    const bool jittered = realDlssEnabled_ && temporalJitterEnabled;
+    if (jittered && (iw != dlssJitterW_ || ih != dlssJitterH_)) {
+        dlssJitterFrame_ = 0;
+        previousDlssJitter_ = {};
+        dlssJitterMotionGate_.reset();
+        dlssJitterW_ = iw;
+        dlssJitterH_ = ih;
+    }
+    static const bool adaptiveJitter = [] {
+        const char* flag = std::getenv("XYO_DLSS_ADAPTIVE_JITTER");
+        return flag && flag[0] == '1';
+    }();
+    bool allowJitter = jittered;
+    if (jittered && adaptiveJitter) {
+        std::vector<render::DlssJitterSubject> samples;
+        samples.reserve(drawables_.size());
+        const double sx = double(iw) / stageW_;
+        const double sy = double(ih) / stageH_;
+        for (const auto& [id, drawable] : drawables_) {
+            const Target* t = drawable.target;
+            if (!t || drawable.group != "sprite" || !t->visible ||
+                t->effects.get("ghost") >= 100.0)
+                continue;
+            samples.push_back({
+                drawable.id, float(stageX(t->x) * sx),
+                float(stageY(t->y) * sy), float(t->size),
+                float(t->direction), t->currentCostume});
+        }
+        static const float threshold = [] {
+            if (const char* raw = std::getenv("XYO_DLSS_JITTER_MAX_MOTION")) {
+                const float v = std::strtof(raw, nullptr);
+                if (std::isfinite(v) && v >= 0.1f && v <= 32.0f) return v;
+            }
+            return 3.0f;
+        }();
+        allowJitter = dlssJitterMotionGate_.update(samples, iw, ih,
+                                                   threshold);
+        if (!allowJitter && std::getenv("XYO_DLSS_REAL_DEBUG")) {
+            static unsigned reported = 0;
+            if (reported++ < 3)
+                std::fprintf(stderr,
+                    "[real DLSS] adaptive jitter skipped: fast sprite "
+                    "motion, abrupt state or visibility change\n");
+        }
+    }
+    const auto jitter = allowJitter
+        ? render::dlssJitter(dlssJitterFrame_)
+        : render::DlssJitterSample{};
+    const auto previousJitter = previousDlssJitter_;
+    stageRasterJitterX_ = jitter.x;
+    stageRasterJitterY_ = jitter.y;
+#endif
     drawStageContent();
+#if defined(XYO_NVSDK_DLSS_VK) && defined(__linux__) && defined(XYO_HAVE_SDL2)
+    // Debug-only pre-NGX captures: a single selected frame or the first
+    // 32 consecutive frames. The latter diagnoses whether nearly identical
+    // CPU/GPU Pen inputs diverge during temporal reconstruction. Never
+    // read back a pixel in the normal rendering path.
+    const char* captureSingle = std::getenv("XYO_DLSS_RASTER_INPUT_CAPTURE");
+    const char* captureSeries = std::getenv("XYO_DLSS_RASTER_INPUT_SERIES");
+    if ((captureSingle && *captureSingle) ||
+        (captureSeries && *captureSeries)) {
+        ++dlssInputCaptureFrame_;
+        int captureAt = 3;
+        if (const char* raw = std::getenv("XYO_DLSS_RASTER_CAPTURE_FRAME")) {
+            const int value = std::atoi(raw);
+            if (value >= 1 && value <= 10000) captureAt = value;
+        }
+        const bool single = captureSingle && *captureSingle &&
+            dlssInputCaptureFrame_ == uint64_t(captureAt);
+        const bool series = captureSeries && *captureSeries &&
+            dlssInputCaptureFrame_ <= 32;
+        if (single || series) {
+            std::vector<uint8_t> rgba(size_t(iw) * ih * 4);
+            if (SDL_RenderReadPixels(renderer_, nullptr, SDL_PIXELFORMAT_RGBA32,
+                                     rgba.data(), iw * 4) == 0) {
+                const auto savePpm = [&](const char* filename) {
+                    if (FILE* file = std::fopen(filename, "wb")) {
+                        std::fprintf(file, "P6\n%d %d\n255\n", iw, ih);
+                        for (size_t i = 0; i < rgba.size(); i += 4)
+                            std::fwrite(rgba.data() + i, 1, 3, file);
+                        std::fclose(file);
+                    }
+                };
+                if (single) savePpm(captureSingle);
+                if (series) {
+                    const std::string filename =
+                        std::string(captureSeries) + "-" +
+                        std::to_string(dlssInputCaptureFrame_) + ".ppm";
+                    savePpm(filename.c_str());
+                }
+            }
+        }
+    }
+#endif
+    stageRasterJitterX_ = stageRasterJitterY_ = 0;
     stageRect_ = saved;
     SDL_SetRenderTarget(renderer_, previous);
     if (embedded_) {
@@ -5081,8 +5965,14 @@ void SdlRenderer::drawScaledStage() {
             const char* env = std::getenv("XYO_DLSS_ALPHA_SAFE");
             return env && env[0] == '1';
         }();
+        static const bool biasAlphaTemporal = [] {
+            const char* env = std::getenv("XYO_DLSS_ALPHA_BIAS");
+            return env && env[0] == '1';
+        }();
         bool forceHistoryReset = false;
-        if (safeAlphaTemporal) {
+        std::vector<render::DlssBiasRect> biasRects;
+        if (safeAlphaTemporal || biasAlphaTemporal) {
+            if (biasAlphaTemporal) biasRects.reserve(16);
             for (const auto& [id, drawable] : drawables_) {
                 Target* target = drawable.target;
                 if (!target || drawable.group != "sprite" ||
@@ -5095,8 +5985,8 @@ void SdlRenderer::drawScaledStage() {
                     std::isfinite(ghost) && ghost > 0.0 && ghost < 100.0;
                 if (!ghostPartial && !skin->hasIntrinsicTranslucency) continue;
 
-                // Avoid resetting the entire frame for translucent sprites
-                // which are completely outside the Scratch stage viewport.
+                // AABB is in Scratch coordinates; convert to internal
+                // low-resolution render pixels and clip to stage.
                 double bounds[4]{};
                 getDrawableBounds(drawable.id, bounds);
                 const double halfW = stageW_ * 0.5;
@@ -5104,8 +5994,33 @@ void SdlRenderer::drawScaledStage() {
                 if (bounds[1] <= -halfW || bounds[0] >= halfW ||
                     bounds[2] <= -halfH || bounds[3] >= halfH)
                     continue;
-                forceHistoryReset = true;
-                break;
+                if (safeAlphaTemporal) forceHistoryReset = true;
+                if (biasAlphaTemporal) {
+                    const double lx = stageX(bounds[0]) * iw / stageW_;
+                    const double rx = stageX(bounds[1]) * iw / stageW_;
+                    const double ty = stageY(bounds[2]) * ih / stageH_;
+                    const double by = stageY(bounds[3]) * ih / stageH_;
+                    if (!std::isfinite(lx) || !std::isfinite(rx) ||
+                        !std::isfinite(ty) || !std::isfinite(by)) {
+                        forceHistoryReset = true;
+                        break;
+                    }
+                    const int x0 = std::clamp(int(std::floor(std::min(lx, rx))) - 2, 0, iw);
+                    const int x1 = std::clamp(int(std::ceil(std::max(lx, rx))) + 2, 0, iw);
+                    const int y0 = std::clamp(int(std::floor(std::min(ty, by))) - 2, 0, ih);
+                    const int y1 = std::clamp(int(std::ceil(std::max(ty, by))) + 2, 0, ih);
+                    if (x1 > x0 && y1 > y0) {
+                        if (biasRects.size() == render::DlssVkBiasMask::kMaxRects) {
+                            // Too many rectangles: fall back to the conservative
+                            // whole-frame reset instead of silently dropping some.
+                            forceHistoryReset = true;
+                            biasRects.clear();
+                            break;
+                        }
+                        biasRects.push_back({x0, y0, x1, y1});
+                    }
+                }
+                if (safeAlphaTemporal && !biasAlphaTemporal) break;
             }
         }
         if (forceHistoryReset && std::getenv("XYO_DLSS_REAL_DEBUG")) {
@@ -5118,11 +6033,133 @@ void SdlRenderer::drawScaledStage() {
                     "temporal history reset (XYO_DLSS_ALPHA_SAFE=1)\n");
             }
         }
+        static const bool affineMotionEnabled = [] {
+            const char* flag = std::getenv("XYO_DLSS_AFFINE_MOTION");
+            return flag && flag[0] == '1';
+        }();
+        static const bool opaqueCoverageEnabled = [] {
+            const char* flag = std::getenv("XYO_DLSS_OPAQUE_COVERAGE");
+            return flag && flag[0] == '1';
+        }() && affineMotionEnabled;
+        static const bool rigidMotionEnabled = [] {
+            const char* flag = std::getenv("XYO_DLSS_RIGID_MOTION");
+            return flag && flag[0] == '1';
+        }() || affineMotionEnabled;
+        std::vector<render::DlssRigidMotionRect> rigidRects;
+        if (rigidMotionEnabled) {
+            std::vector<render::DlssRigidSprite> samples;
+            samples.reserve(drawables_.size());
+            for (const auto& [id, drawable] : drawables_) {
+                Target* t = drawable.target;
+                if (!t || drawable.group != "sprite" || !t->visible ||
+                    t->effects.get("ghost") >= 100.0) continue;
+                const Skin* skin = skinForTarget(t);
+                if (!skin) continue;
+                double b[4]{};
+                getDrawableBounds(drawable.id, b);
+                render::DlssRigidSprite sample{};
+                sample.id = drawable.id;
+                sample.costume = reinterpret_cast<uintptr_t>(skin);
+                sample.centerX = float(stageX(t->x) * iw / stageW_);
+                sample.centerY = float(stageY(t->y) * ih / stageH_);
+                sample.left = float(stageX(std::min(b[0],b[1])) * iw / stageW_);
+                sample.right = float(stageX(std::max(b[0],b[1])) * iw / stageW_);
+                sample.top = float(stageY(std::max(b[2],b[3])) * ih / stageH_);
+                sample.bottom = float(stageY(std::min(b[2],b[3])) * ih / stageH_);
+                sample.size = float(t->size);
+                sample.direction = float(t->direction);
+                sample.rotationStyle = t->rotationStyle == "all around" ? 0 :
+                    t->rotationStyle == "left-right" ? 1 : 2;
+                const bool notFlipped =
+                    sample.rotationStyle != 1 || t->direction >= 0;
+                const bool unrotated = sample.rotationStyle != 0 ||
+                    std::abs(t->direction - 90.0) < 0.000001;
+                sample.opaqueUnrotated =
+                    (skin->fullyOpaqueForRigidMotion ||
+                     (opaqueCoverageEnabled && skin->dlssOpaqueCoverage)) &&
+                    !t->effects.anyActive() && notFlipped &&
+                    (affineMotionEnabled || unrotated);
+                sample.opaqueBits = opaqueCoverageEnabled
+                    ? skin->dlssOpaqueCoverage.get() : nullptr;
+
+                // Reproduce the exact integer SDL_RenderCopyEx destination
+                // and pivot used by drawDrawable(), not idealized Scratch
+                // floating-point geometry. Needed for rotation and zoom.
+                const double screenScale = double(iw) / stageW_;
+                const double k = (t->size / 100.0) / skin->scale *
+                                 screenScale;
+                const double rasterW = skin->w * k;
+                const double rasterH = skin->h * k;
+                const double rasterX = stageX(t->x) * screenScale -
+                        skin->rcx * skin->scale * k;
+                const double rasterY = stageY(t->y) * screenScale -
+                        skin->rcy * skin->scale * k;
+                if (std::isfinite(rasterW) && std::isfinite(rasterH) &&
+                    std::isfinite(rasterX) && std::isfinite(rasterY) &&
+                    rasterW > 0 && rasterH > 0 &&
+                    std::abs(rasterX) < 1.0e6 && std::abs(rasterY) < 1.0e6 &&
+                    rasterW < 8192 && rasterH < 8192) {
+                    sample.rasterX = float(std::lround(rasterX));
+                    sample.rasterY = float(std::lround(rasterY));
+                    sample.rasterW = float(std::lround(rasterW));
+                    sample.rasterH = float(std::lround(rasterH));
+                    const double px = skin->rcx * skin->scale * k;
+                    const double py = skin->rcy * skin->scale * k;
+                    if (std::isfinite(px) && std::isfinite(py) &&
+                        std::abs(px) < 1.0e6 && std::abs(py) < 1.0e6) {
+                        sample.pivotX = float(int(px));
+                        sample.pivotY = float(int(py));
+                    } else {
+                        sample.opaqueUnrotated = false;
+                    }
+                } else {
+                    sample.opaqueUnrotated = false;
+                }
+                sample.renderAngle = sample.rotationStyle == 0
+                    ? float(t->direction - 90.0) : 0.0f;
+                samples.push_back(sample);
+            }
+            rigidRects = rigidMotionTracker_.update(
+                samples, iw, ih, affineMotionEnabled);
+        }
         if (SDL_Texture* result = glDlss_->apply(renderer_, stageTarget_,
-                                                 ow, oh, forceHistoryReset)) {
+                                                 ow, oh, forceHistoryReset,
+                                                 biasRects, rigidRects,
+                                                 jitter.x, jitter.y,
+                                                 jittered
+                                                    ? previousJitter.x - jitter.x : 0,
+                                                 jittered
+                                                    ? previousJitter.y - jitter.y : 0)) {
+            if (jittered) {
+                previousDlssJitter_ = jitter;
+                if (allowJitter) ++dlssJitterFrame_;
+                if (allowJitter && std::getenv("XYO_DLSS_REAL_DEBUG") &&
+                    dlssJitterFrame_ <= 3)
+                    std::fprintf(stderr,
+                        "[real DLSS] raster jitter frame %llu: "
+                        "(%.4f, %.4f) input pixels\n",
+                        static_cast<unsigned long long>(dlssJitterFrame_),
+                        jitter.x, jitter.y);
+            }
             const SDL_Rect dst = sdlRect(saved);
             SDL_RenderCopy(renderer_, result, nullptr, &dst);
             return;
+        }
+        // Never reuse stale sprite state after a failed NGX frame.
+        rigidMotionTracker_.reset();
+        if (jittered) {
+            // NGX rejection must not leave a jittered sprite/pen image in
+            // the conventional GL upscaler fallback.
+            dlssJitterFrame_ = 0;
+            previousDlssJitter_ = {};
+            dlssJitterMotionGate_.reset();
+            SDL_Texture* oldTarget = SDL_GetRenderTarget(renderer_);
+            if (SDL_SetRenderTarget(renderer_, stageTarget_) == 0) {
+                stageRect_ = IRect{0, 0, iw, ih};
+                drawStageContent();
+                stageRect_ = saved;
+                SDL_SetRenderTarget(renderer_, oldTarget);
+            }
         }
     }
 #endif
@@ -5275,8 +6312,17 @@ void SdlRenderer::drawDrawable(Drawable& d) {
             (1.0 - std::clamp(ghost, 0.0, 100.0) / 100.0) * 255.0));
         SDL_SetTextureAlphaMod(texture, opacity);
     }
-    SDL_RenderCopyEx(renderer_, texture, nullptr, &dst, angle, &center,
-                     flip);
+    if (stageRasterJitterX_ != 0 || stageRasterJitterY_ != 0) {
+        const SDL_FRect shifted{float(dst.x) + stageRasterJitterX_,
+                                float(dst.y) + stageRasterJitterY_,
+                                float(dst.w), float(dst.h)};
+        const SDL_FPoint pivot{float(center.x), float(center.y)};
+        SDL_RenderCopyExF(renderer_, texture, nullptr, &shifted, angle,
+                          &pivot, flip);
+    } else {
+        SDL_RenderCopyEx(renderer_, texture, nullptr, &dst, angle, &center,
+                         flip);
+    }
     if (modulateGhost) SDL_SetTextureAlphaMod(texture, originalAlpha);
     if (profileActive_) {
         if (d.group == "sprite") ++frameProfile_.sprites;
@@ -5345,7 +6391,89 @@ void SdlRenderer::drawPenLayer() {
     // Pen-only FidelityFX FSR 1 (EASU + RCAS). Keep the persistent pen FBO
     // at native resolution; only its display copy is reconstructed.
     SDL_Texture* displayPen = penTex_;
-    if (penFsrEnabled_ && stageRect_.w > 0 && stageRect_.h > 0) {
+    bool replayingPenPrimitives = false;
+    bool replayingPenOnGpu = false;
+#if defined(XYO_NVSDK_DLSS_VK) && defined(__linux__) && defined(XYO_HAVE_SDL2)
+    // Optional display-only analytic rerasterization. The *persistent* pen
+    // FBO/CPU bytes remain unchanged for collision, stamps and snapshots.
+    // Only a complete, bounded stroke history since the last penClear is
+    // eligible; any stamp or restore disables it until the next clear.
+    static const bool replayPenEnabled = [] {
+        const char* flag = std::getenv("XYO_DLSS_PEN_PRIMITIVE_REPLAY");
+        return flag && flag[0]=='1';
+    }();
+    if (replayPenEnabled && realDlssEnabled_ && dlssPenReplayValid_ &&
+        !penFsrEnabled_ &&
+        (stageRasterJitterX_ != 0 || stageRasterJitterY_ != 0) &&
+        stageRect_.w > 0 && stageRect_.h > 0 &&
+        !dlssPenReplayStrokes_.empty()) {
+        const int w=stageRect_.w, h=stageRect_.h;
+        static const bool gpuPrimitiveReplay = [] {
+            const char* flag = std::getenv("XYO_DLSS_PEN_REPLAY_GPU");
+            return flag && flag[0]=='1';
+        }();
+#if defined(XYO_PEN_GL)
+        if (gpuPrimitiveReplay &&
+            penReplayOnGpu(w,h,stageRasterJitterX_,stageRasterJitterY_)) {
+            displayPen = dlssPenReplayGpuTex_;
+            replayingPenPrimitives = true;
+            replayingPenOnGpu = true;
+            if (std::getenv("XYO_DLSS_REAL_DEBUG")) {
+                static bool loggedGpuPenReplay = false;
+                if (!loggedGpuPenReplay) {
+                    loggedGpuPenReplay = true;
+                    std::fprintf(stderr,
+                        "[real DLSS] GPU pen primitive rerasterization active: "
+                        "%zu strokes at %dx%d with (%.4f, %.4f) jitter\n",
+                        dlssPenReplayStrokes_.size(),w,h,
+                        stageRasterJitterX_,stageRasterJitterY_);
+                }
+            }
+        }
+#endif
+        // Devices without compatible shared OpenGL FBO/instancing retain the
+        // existing CPU replay, not the persistent Pen texture.
+        if (!replayingPenPrimitives &&
+            render::dlssReplayPenStrokes(
+                dlssPenReplayStrokes_, stageW_, stageH_,w,h,
+                stageRasterJitterX_, stageRasterJitterY_,
+                dlssPenReplayPixels_)) {
+        if (dlssPenReplayTex_ &&
+            (w!=dlssPenReplayW_ || h!=dlssPenReplayH_)) {
+            SDL_DestroyTexture(dlssPenReplayTex_);
+            dlssPenReplayTex_ = nullptr;
+        }
+        if (!dlssPenReplayTex_) {
+            dlssPenReplayTex_=SDL_CreateTexture(
+                renderer_, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING,
+                w, h);
+            if (dlssPenReplayTex_) {
+                dlssPenReplayW_=w; dlssPenReplayH_=h;
+                SDL_SetTextureBlendMode(dlssPenReplayTex_, SDL_BLENDMODE_BLEND);
+            }
+        }
+        if (dlssPenReplayTex_ &&
+            SDL_UpdateTexture(dlssPenReplayTex_, nullptr,
+                              dlssPenReplayPixels_.data(), w*4)==0) {
+            displayPen=dlssPenReplayTex_;
+            replayingPenPrimitives=true;
+            if (std::getenv("XYO_DLSS_REAL_DEBUG")) {
+                static bool loggedPenReplay=false;
+                if (!loggedPenReplay) {
+                    loggedPenReplay=true;
+                    std::fprintf(stderr,
+                        "[real DLSS] pen primitive rerasterization active: "
+                        "%zu strokes at %dx%d with (%.4f, %.4f) jitter\n",
+                        dlssPenReplayStrokes_.size(),w,h,
+                        stageRasterJitterX_,stageRasterJitterY_);
+                }
+            }
+        }
+        }
+    }
+#endif
+    if (!replayingPenPrimitives && penFsrEnabled_ &&
+        stageRect_.w > 0 && stageRect_.h > 0) {
         double outputScale = 1.0;
         if (!embedded_ && window_) {
             int rw = 0, rh = 0, ww = 0, wh = 0;
@@ -5371,17 +6499,63 @@ void SdlRenderer::drawPenLayer() {
         }
     }
     SDL_Rect r = sdlRect(stageRect_);
+    // Fractional pen display sampling needs linear filtering; otherwise a
+    // half-pixel shift remains quantized to nearest-neighbor texels. Apply
+    // only during the opt-in jitter copy and restore the original sampler.
+    static const bool jitterPenFilter = [] {
+        const char* flag = std::getenv("XYO_DLSS_JITTER_PEN_FILTER");
+        return flag && flag[0] == '1';
+    }();
+    SDL_ScaleMode originalPenScaleMode = SDL_ScaleModeNearest;
+    const bool restorePenScaleMode =
+        !replayingPenPrimitives && jitterPenFilter &&
+        (stageRasterJitterX_ != 0 || stageRasterJitterY_ != 0) &&
+        SDL_GetTextureScaleMode(displayPen, &originalPenScaleMode) == 0 &&
+        originalPenScaleMode != SDL_ScaleModeLinear &&
+        SDL_SetTextureScaleMode(displayPen, SDL_ScaleModeLinear) == 0;
+    if (jitterPenFilter && std::getenv("XYO_DLSS_REAL_DEBUG")) {
+        static bool loggedPenSampler = false;
+        if (!loggedPenSampler &&
+            (stageRasterJitterX_ != 0 || stageRasterJitterY_ != 0)) {
+            loggedPenSampler = true;
+            std::fprintf(stderr,
+                "[real DLSS] pen subpixel sampler: previous=%d, "
+                "linear interpolation %s\n",
+                int(originalPenScaleMode),
+                restorePenScaleMode ? "active" : "already active/unavailable");
+        }
+    }
     {
         PenTimer pcopy(&g_penProf.copyMs, true);
         // interop ではペン FBO がそのまま SDL テクスチャになる。GL の
         // テクスチャ行 0 は画面下端なので、SDL 側で上下反転して描く
         // （非 interop 経路は readback 時に CPU 側で反転済み）。
-        if (gpuDirect)
+        if (replayingPenPrimitives) {
+            // Both replay paths already rasterized at the jittered location.
+            // GPU FBO RGBA is bottom-up, CPU RGBA is top-down.
+            if (replayingPenOnGpu)
+                SDL_RenderCopyEx(renderer_, displayPen, nullptr, &r,
+                                 0.0, nullptr, SDL_FLIP_VERTICAL);
+            else
+                SDL_RenderCopy(renderer_, displayPen, nullptr, &r);
+        } else if (stageRasterJitterX_ != 0 || stageRasterJitterY_ != 0) {
+            const SDL_FRect shifted{float(r.x) + stageRasterJitterX_,
+                                    float(r.y) + stageRasterJitterY_,
+                                    float(r.w), float(r.h)};
+            if (gpuDirect)
+                SDL_RenderCopyExF(renderer_, displayPen, nullptr, &shifted,
+                                  0.0, nullptr, SDL_FLIP_VERTICAL);
+            else
+                SDL_RenderCopyF(renderer_, displayPen, nullptr, &shifted);
+        } else if (gpuDirect) {
             SDL_RenderCopyEx(renderer_, displayPen, nullptr, &r, 0.0, nullptr,
                              SDL_FLIP_VERTICAL);
-        else
+        } else {
             SDL_RenderCopy(renderer_, displayPen, nullptr, &r);
+        }
     }
+    if (restorePenScaleMode)
+        SDL_SetTextureScaleMode(displayPen, originalPenScaleMode);
 }
 
 SDL_Texture* SdlRenderer::textTexture(const std::u16string& s, int px,
@@ -6087,6 +7261,66 @@ void SdlRenderer::setTitle(const char* title) {
     if (window_ && title) SDL_SetWindowTitle(window_, title);
 }
 
+bool SdlRenderer::savePPMAsync(const char* path) {
+#if defined(XYO_NVSDK_DLSS_VK) && defined(__linux__) && defined(XYO_HAVE_SDL2) && defined(XYO_PEN_GL)
+    if (!asyncPpm_)
+        asyncPpm_.reset(new render::GlAsyncPpmCapture());
+    return asyncPpm_->capture(renderer_, path);
+#else
+    (void)path;
+    return false;
+#endif
+}
+
+bool SdlRenderer::flushPPMAsync() {
+#if defined(XYO_NVSDK_DLSS_VK) && defined(__linux__) && defined(XYO_HAVE_SDL2) && defined(XYO_PEN_GL)
+    if (!asyncPpm_) return true;
+    // Fault injection: mimic the owner unbinding (but not destroying)
+    // the SDL GL context before shutdown. This must remain test-only.
+    const char* unbind = std::getenv("XYO_SHOT_ASYNC_TEST_UNBIND_CONTEXT");
+    bool testUnbindOk = true;
+    if (unbind && unbind[0] == '1' && window_ && sdlGlCtx_) {
+        testUnbindOk = SDL_GL_MakeCurrent(window_, nullptr) == 0;
+        if (!testUnbindOk)
+            std::fprintf(stderr, "[async PPM] test context unbind failed: %s\n",
+                         SDL_GetError());
+    }
+    // Optional fault injection: temporarily switch to the independent
+    // GL Pen context, verifying that cleanup does not use foreign names.
+    const char* foreign = std::getenv("XYO_SHOT_ASYNC_TEST_FOREIGN_CONTEXT");
+    if (foreign && foreign[0] == '1') {
+        if (!window_ || !glPen_ || !glPen_->ctx ||
+            SDL_GL_MakeCurrent(window_, glPen_->ctx) != 0) {
+            std::fprintf(stderr,
+                "[async PPM] test foreign context switch failed: %s\n",
+                SDL_GetError());
+            testUnbindOk = false;
+        } else {
+            std::fprintf(stderr,
+                "[async PPM] test foreign GL context made current\n");
+        }
+    }
+    // The capture stores the *actual* context that owns its PBOs, rather
+    // than assuming sdlGlCtx_ always matches SDL's active renderer.
+    const SDL_GLContext owner = asyncPpm_->ownerContext();
+    const char* skipRestore = std::getenv("XYO_SHOT_ASYNC_TEST_SKIP_RESTORE");
+    if (!(skipRestore && skipRestore[0] == '1') &&
+        window_ && owner && SDL_GL_GetCurrentContext() != owner &&
+        SDL_GL_MakeCurrent(window_, owner) != 0) {
+        std::fprintf(stderr,
+            "[async PPM] cannot restore capture GL context: %s\n",
+            SDL_GetError());
+    }
+    // finish() rejects a missing/foreign context, rather than issuing
+    // GL commands against unrelated or already invalid objects.
+    const bool result = asyncPpm_->finish();
+    asyncPpm_.reset();
+    return result && testUnbindOk;
+#else
+    return true;
+#endif
+}
+
 bool SdlRenderer::savePPM(const char* path) {
     if (!renderer_) return false;
     int w = 0, h = 0;
@@ -6098,14 +7332,24 @@ bool SdlRenderer::savePPM(const char* path) {
         return false;
     FILE* f = fopenUtf8(path, "wb");
     if (!f) return false;
-    std::fprintf(f, "P6\n%d %d\n255\n", w, h);
-    for (size_t i = 0; i < static_cast<size_t>(w) * h; ++i) {
-        fputc(px[i * 4 + 0], f);
-        fputc(px[i * 4 + 1], f);
-        fputc(px[i * 4 + 2], f);
+    // Write one RGB row at a time. Per-channel fputc costs millions of
+    // libc calls at DLSS output resolutions (and dominates capture time).
+    // Keep only a single scanline of conversion storage.
+    bool ok = std::fprintf(f, "P6\n%d %d\n255\n", w, h) >= 0;
+    std::vector<uint8_t> rgbRow(static_cast<size_t>(w) * 3);
+    for (int y = 0; y < h && ok; ++y) {
+        const uint8_t* src = px.data() + static_cast<size_t>(y) * w * 4;
+        for (int x = 0; x < w; ++x) {
+            const size_t i = static_cast<size_t>(x);
+            rgbRow[i * 3 + 0] = src[i * 4 + 0];
+            rgbRow[i * 3 + 1] = src[i * 4 + 1];
+            rgbRow[i * 3 + 2] = src[i * 4 + 2];
+        }
+        ok = std::fwrite(rgbRow.data(), 1, rgbRow.size(), f) ==
+             rgbRow.size();
     }
-    std::fclose(f);
-    return true;
+    if (std::fclose(f) != 0) ok = false;
+    return ok;
 }
 
 // ================================================================ 入力 ===

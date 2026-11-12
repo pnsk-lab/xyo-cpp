@@ -92,8 +92,10 @@ jobs:
       - name: Build
         run: cmake --build build -j"$(nproc)"
 
-      - name: Test (ctest)
-        run: ctest --test-dir build --output-on-failure
+      # Long-running nested warp/OSR and native deopt use a separate Linux job.
+      # Keep this job below its 45-minute timeout without dropping coverage.
+      - name: Test (ctest; native continuation suite runs separately)
+        run: ctest --test-dir build --output-on-failure -E '^(xyo-nested-warp-|xyo-native-simple-deopt-parity$)'
 
       - name: Smoke（run / AOT / play）
         run: |
@@ -116,6 +118,108 @@ jobs:
         with:
           name: linux-test-log
           path: build/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+
+  # The regular Linux CTest already takes ~31 minutes at 112 tests.
+  # Avoid a 45-minute timeout as nested warp/OSR and native deopt grow;
+  # run these long-running tests in a dedicated LLVM JIT + SDL2 job.
+  linux-nested-osr:
+    name: Linux / LLVM native continuation + nested warp regressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/linux-deps
+        with:
+          llvm: ${{ env.LLVM_LATEST }}
+          llvm_apt: "true"
+          extra: libsdl2-dev libgl-dev glslc
+
+      # A clean checkout must contain all 38 CTest fixtures and 9 native
+      # harness sources, not just their CMake registration.
+      - name: Self-test native continuation checkout audit
+        run: python3 tools/ci/test_native_continuation_checkout.py -v
+
+      - name: Verify committed native continuation sources
+        run: python3 tools/ci/native_continuation_checkout.py
+
+      - name: Configure (LLVM JIT + SDL2)
+        run: |
+          cmake -B build-osr -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_CONFIG="/usr/lib/llvm-${LLVM_LATEST}/bin/llvm-config" \
+            -DXYO_JIT=ON -DXYO_JIT_BACKEND=llvm \
+            -DXYO_SDL2=ON -DXYO_REQUIRE_SDL2=ON \
+            -DXYO_BUILD_SHELL=ON -DXYO_BUILD_TESTS=ON
+
+      - name: Build OSR harnesses and CLI only
+        # The OSR-specific job does not need unrelated unit-test executables.
+        run: |
+          cmake --build build-osr --parallel 2 --target \
+            xyo-cli \
+            xyo-nested-warp-silent-edit-smoke \
+            xyo-nested-warp-inflight-deopt-smoke \
+            xyo-nested-warp-inflight-body-edit-smoke \
+            xyo-nested-warp-bounded-inner-deopt-smoke \
+            xyo-nested-warp-inner-yield-deopt-smoke \
+            xyo-nested-warp-dynamic-inner-deopt-smoke \
+            xyo-nested-warp-triple-yield-deopt-smoke \
+            xyo-nested-warp-quad-yield-deopt-smoke \
+            xyo-nested-warp-topology-failclosed-smoke
+
+      - name: Verify native continuation CTest coverage
+        run: |
+          ctest --test-dir build-osr -N -R '^(xyo-nested-warp-|xyo-native-simple-deopt-parity$)' > nested-osr-tests.txt
+          cat nested-osr-tests.txt
+          count=$(sed -n 's/^Total Tests: //p' nested-osr-tests.txt)
+          test -n "$count" && test "$count" -ge 38
+          # Guard both native root deopt and the four OSR-016 registrations.
+          for name in xyo-native-simple-deopt-parity xyo-nested-warp-fractional-boundary xyo-nested-warp-fractional-boundary-fast xyo-nested-warp-fractional-boundary-late xyo-nested-warp-fractional-boundary-late-fast; do
+            grep -Eq "Test +#[0-9]+: ${name}$" nested-osr-tests.txt
+          done
+          # CTest may list a test even when its Python fixture or native
+          # executable is absent. Fail before running the expensive suite.
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import re
+          import subprocess
+          import sys
+
+          suite = re.compile(r"^(xyo-nested-warp-|xyo-native-simple-deopt-parity$)")
+          tests = json.loads(subprocess.check_output([
+              "ctest", "--test-dir", "build-osr", "--show-only=json-v1"
+          ], text=True))["tests"]
+          selected = [test for test in tests if suite.search(test["name"])]
+          missing = []
+          for test in selected:
+              for index, argument in enumerate(test.get("command", [])):
+                  path = pathlib.Path(argument)
+                  required = (
+                      index == 0
+                      or argument.endswith(".py")
+                      or (path.name == "xyo" and path.is_absolute())
+                      or (path.name.startswith("xyo-nested-warp-")
+                          and path.name.endswith("-smoke"))
+                  )
+                  if required and path.is_absolute() and not path.is_file():
+                      missing.append((test["name"], argument))
+          if missing:
+              for test_name, filename in missing:
+                  print(f"Missing dependency for {test_name}: {filename}", file=sys.stderr)
+              sys.exit(1)
+          print(f"Verified {len(selected)} native continuation tests and their executables/scripts")
+          PY
+
+      - name: Native continuation and nested warp regressions (ctest)
+        run: ctest --test-dir build-osr --output-on-failure --parallel 2 -R '^(xyo-nested-warp-|xyo-native-simple-deopt-parity$)'
+
+      - name: OSR test log on failure
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: linux-native-continuation-test-log
+          path: build-osr/Testing/Temporary/LastTest.log
           if-no-files-found: ignore
 
   # 動的依存ゼロのバイナリ（LLVM 18 の静的アーカイブ + 静的 libstdc++）。
@@ -297,7 +401,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: gradylink/scratch-bench
-          ref: cca6ab15108301bee6b7249db60f00e82f141159
+          ref: 4099437b264c56844ded45c612202815ea025a16
           path: scratch-bench
           submodules: true
           persist-credentials: false
@@ -311,6 +415,16 @@ jobs:
         run: |
           test -d parity/project
           bun install --frozen-lockfile
+
+      - name: Verify ScratchBench parity gate tests
+        run: bun test tools/ci/scratch-bench-parity-gate.test.ts
+
+      - name: Verify content-addressed AOT startup cache
+        run: bun test tools/xyo-aot-cache.test.ts
+
+      - name: Verify native AOT startup A/B measurement harness
+        run: bun test tools/bench-startup-aot-ab.test.ts
+
 
       - name: Performance (xyo-cpp, all variants)
         working-directory: scratch-bench
@@ -343,6 +457,90 @@ jobs:
           bun run bench --runtime xyo-cpp --suite parity \
             --parity-runs 1 --timeout 180 --out results/ci-parity \
             2>&1 | tee ../.bench/parity.log
+
+      # Do not use a wall-time threshold on shared runners: assert the
+      # compiler selects the cold-procedure tier for giant Eager scripts.
+      - name: Verify giant Eager startup tier
+        run: |
+          python3 tests/differential/gui_eager_startup_tier.py \
+            --native "$XYO_BIN" --project scratch-bench/.cache/build/parity.sb3
+
+      # ScratchBench silently falls back to JIT if the parity AOT compilation
+      # fails; require the actual compiled object before calling it AOT parity.
+      - name: Verify parity AOT object
+        run: |
+          sb3=scratch-bench/.cache/build/parity.sb3
+          test -s "$sb3"
+          aot="scratch-bench/.cache/runtimes/xyo-aot/parity.sb3.$(stat -c %s "$sb3").o"
+          test -s "$aot"
+          echo "Parity AOT object: $aot"
+          sha256sum "$aot"
+          python3 - "$aot" <<'PY_AOT'
+          from pathlib import Path
+          import sys
+          obj = Path(sys.argv[1]).read_bytes()
+          assert b'{"v":2,' in obj, "default parity AOT must use packed ABI v2"
+          PY_AOT
+
+      - name: Verify actual AOT load (no JIT fallback)
+        run: |
+          sb3=scratch-bench/.cache/build/parity.sb3
+          aot="scratch-bench/.cache/runtimes/xyo-aot/parity.sb3.$(stat -c %s "$sb3").o"
+          python3 tests/differential/gui_scratch_parity_regression.py \
+            --native "$XYO_BIN" --project "$sb3" \
+            --aot-object "$aot" --minimum 2656 --modes aot
+
+      # The ScratchBench AOT variant above now produces packed v2 objects.
+      # Also explicitly generate v1 and execute it against the current loader
+      # so existing legacy object caches remain supported after the ABI change.
+      - name: Build legacy AOT parity object (v1 compatibility)
+        run: |
+          sb3=scratch-bench/.cache/build/parity.sb3
+          test -s "$sb3"
+          mkdir -p .bench
+          XYO_AOT_PACKED_SLOTS=0 XYO_AOT_PROGRESS=0 \
+            "$XYO_BIN" aot "$sb3" --obj .bench/parity-legacy-v1.o
+          test -s .bench/parity-legacy-v1.o
+          python3 - <<'PY_AOT'
+          from pathlib import Path
+          obj = Path(".bench/parity-legacy-v1.o").read_bytes()
+          assert b'{"v":1,' in obj, "legacy AOT metadata v1 not emitted"
+          PY_AOT
+          readelf -sW .bench/parity-legacy-v1.o | grep -q 'xyo_aot_slot_0$'
+
+      - name: Verify legacy native AOT parity (v1; no JIT fallback)
+        run: |
+          python3 tests/differential/gui_scratch_parity_regression.py \
+            --native "$XYO_BIN" \
+            --project scratch-bench/.cache/build/parity.sb3 \
+            --aot-object .bench/parity-legacy-v1.o \
+            --minimum 2656 --modes aot
+
+      # The lazy-BlockCached ABI is still opt-in; test it without changing
+      # the default v2 and the existing v1 compatibility checks.
+      - name: Build experimental lazy AOT parity object (v3)
+        run: |
+          sb3=scratch-bench/.cache/build/parity.sb3
+          test -s "$sb3"
+          XYO_AOT_LAZY_CACHE_SLOTS=1 XYO_AOT_PROGRESS=0 \
+            "$XYO_BIN" aot "$sb3" --obj .bench/parity-lazy-v3.o
+          test -s .bench/parity-lazy-v3.o
+          python3 - <<'PY_AOT'
+          from pathlib import Path
+          obj = Path(".bench/parity-lazy-v3.o").read_bytes()
+          assert b'{"v":3,' in obj, "lazy AOT metadata v3 missing"
+          assert b'xyo_rt_aot_cached' in obj, "lazy runtime helper missing"
+          PY_AOT
+
+      - name: Verify experimental lazy native AOT parity (v3)
+        run: |
+          XYO_AOT_LAZY_DIAGNOSTIC=1 XYO_AOT_LAZY_EXPECT=1 \
+          python3 tests/differential/gui_scratch_parity_regression.py \
+            --native "$XYO_BIN" \
+            --project scratch-bench/.cache/build/parity.sb3 \
+            --aot-object .bench/parity-lazy-v3.o \
+            --minimum 2656 --modes aot
+
 
       - name: Validate results and publish summary
         if: always()

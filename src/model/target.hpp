@@ -96,6 +96,7 @@ public:
     std::string rotationStyle = "all around"; // ROTATION_STYLE_ALL_AROUND
     double volume = 100;
     double tempo = 60;                    // stage
+    int musicInstrument = 0;              // Scratch music, zero-based 21 instruments
     double videoTransparency = 50;        // stage
     std::string videoState = "on";        // stage: on/off/on-flipped
     std::string textToSpeechLanguage;     // stage

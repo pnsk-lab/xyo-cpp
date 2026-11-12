@@ -145,6 +145,28 @@ public:
         bool prev;
     };
 
+    // RT-001 opt-in companion to DeferCollect for *explicit* GC calls
+    // while a native Fiber may still hold unrooted LLVM SSA values.
+    // Unlike DeferCollect, nested scopes use a depth counter so an
+    // inner scope cannot accidentally re-enable explicit collection.
+    // Requests are remembered and serviced by collectIfNeeded() only
+    // after the outermost scope exits at a safe scheduler boundary.
+    struct DeferExplicitCollect {
+        DeferExplicitCollect() {
+            Gc::get().deferredExplicitDepth_.fetch_add(
+                1, std::memory_order_acq_rel);
+        }
+        ~DeferExplicitCollect() {
+            Gc::get().deferredExplicitDepth_.fetch_sub(
+                1, std::memory_order_acq_rel);
+        }
+        DeferExplicitCollect(const DeferExplicitCollect&) = delete;
+        DeferExplicitCollect& operator=(const DeferExplicitCollect&) = delete;
+    };
+    bool explicitCollectionPending() const {
+        return pendingExplicitCollect_.load(std::memory_order_acquire);
+    }
+
     // --- マーカ ---
     void markValue(Value v);
     void markPtr(void* p);          // 生ポインタ（obj 先頭判定）
@@ -181,6 +203,12 @@ public:
         return count;
     }
     size_t collectCount() const { return collectCount_; }
+    // IR-001 diagnostic only: atomic generation advances when each
+    // completed collection rebuilds the slab registry. Safe to read
+    // without touching non-atomic sweep/collection statistics.
+    uint64_t collectionGeneration() const {
+        return poolGen_.load(std::memory_order_acquire);
+    }
     void setThreshold(size_t b) { threshold_ = b; }
 
     /// SList の内部バッファ解放など、型別の破棄を sweep 時に行う
@@ -258,6 +286,8 @@ private:
     /// （Mutation::parseArgs → SStr::create 等）が再入するため再帰型。
     std::recursive_mutex allocMtx_;
     std::atomic<bool> deferredCollect_{false};
+    std::atomic<uint32_t> deferredExplicitDepth_{0};
+    std::atomic<bool> pendingExplicitCollect_{false};
 };
 
 } // namespace xyo

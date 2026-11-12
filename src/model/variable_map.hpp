@@ -73,6 +73,13 @@ public:
     }
 
     uint64_t generation() const noexcept { return generation_; }
+    // Serial-only native LLVM guard reads this stable address as a
+    // *volatile* i64 on every access; it never owns the VariableMap.
+    // Releasing/replacing a Target invalidates the address. The JIT
+    // must verify cached owner identity before dereferencing it.
+    const uint64_t* generationAddress() const noexcept {
+        return &generation_;
+    }
 
     template <class... Args>
     auto emplace(Args&&... args) {

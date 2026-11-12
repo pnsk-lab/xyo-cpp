@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<app version="1">
+  <name>xyo-cpp Interpreter</name>
+  <coder>pnsk-lab contributors</coder>
+  <version>0.1-experimental</version>
+  <short_description>Scratch interpreter on Nintendo Wii</short_description>
+  <long_description>Experimental xyo-cpp: read project.sb3 from SD. Text console only; stage rendering and sound are not implemented.</long_description>
+</app>

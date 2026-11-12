@@ -331,6 +331,151 @@ Block makeBlock(BlockJson&& bj) {
     return b;
 }
 
+std::string extensionIdForOpcode(const std::string& opcode);
+
+// Decode Scratch block JSON straight into the runtime Block
+// container, instead of allocating BlockJson + an extra unordered_map
+// before converting it into a second Block value.
+std::string directPrimitive(const JsonValue& desc,
+                            const std::string& parentId,
+                            bool isShadow, Blocks& output) {
+    if (!desc.isArray())
+        return desc.isString() ? desc.asString() : "";
+    const JsonArray& array = desc.asArray();
+    if (array.empty()) return "";
+    const int type = int(array[0].asNumber());
+    Block b;
+    b.id = newUid();
+    b.parent = parentId;
+    b.shadow = isShadow;
+    const char* fieldName = nullptr;
+    switch (type) {
+    case PRIM_MATH_NUM: b.opcode = "math_number"; fieldName = "NUM"; break;
+    case PRIM_POSITIVE_NUM: b.opcode = "math_positive_number"; fieldName = "NUM"; break;
+    case PRIM_WHOLE_NUM: b.opcode = "math_whole_number"; fieldName = "NUM"; break;
+    case PRIM_INTEGER: b.opcode = "math_integer"; fieldName = "NUM"; break;
+    case PRIM_ANGLE: b.opcode = "math_angle"; fieldName = "NUM"; break;
+    case PRIM_COLOR: b.opcode = "colour_picker"; fieldName = "COLOUR"; break;
+    case PRIM_TEXT: b.opcode = "text"; fieldName = "TEXT"; break;
+    case PRIM_BROADCAST: b.opcode = "event_broadcast_menu"; fieldName = "BROADCAST_OPTION"; break;
+    case PRIM_VAR: b.opcode = "data_variable"; fieldName = "VARIABLE"; break;
+    case PRIM_LIST: b.opcode = "data_listcontents"; fieldName = "LIST"; break;
+    default: return "";
+    }
+    const JsonValue& val = array.size() > 1 ? array[1] : JsonValue();
+    BlockField f;
+    if (val.isNumber()) f.value = Value::num(val.asNumber());
+    else if (val.isBool()) f.value = Value::boolean(val.asBool());
+    else if (val.isString())
+        f.value = Value::string(SStr::create(utf8ToU16(val.asString())));
+    else f.value = Value::emptyStr();
+    if (array.size() > 2 && array[2].isString())
+        f.id = array[2].asString();
+    b.fields.emplace(fieldName, std::move(f));
+    if ((type == PRIM_VAR || type == PRIM_LIST) && array.size() > 3) {
+        b.topLevel = true;
+        b.x = array[3].asNumber();
+        b.y = array.size() > 4 ? array[4].asNumber() : 0.0;
+    }
+    std::string id = b.id;
+    output.createBlock(std::move(b));
+    return id;
+}
+
+void directCompatibility(Blocks& blocks) {
+    Blocks::StructuralEdit edit(blocks);
+    for (auto& [id, b] : edit.allBlocks()) {
+        if (b.opcode == "procedures_prototype") {
+            b.shadow = true;
+        } else if (b.opcode == "argument_reporter_string_number" ||
+                   b.opcode == "argument_reporter_boolean") {
+            const Block* parent = blocks.getBlock(b.parent);
+            if (parent && parent->opcode == "procedures_prototype")
+                b.shadow = true;
+        } else if (b.opcode == "control_stop" && !b.mutation) {
+            std::u16string opt;
+            for (const auto& [n, f] : b.fields)
+                if (n == "STOP_OPTION" && f.value.isString())
+                    opt = f.value.asStrPtr()->view();
+            const bool hasNext = opt == u"other scripts in sprite" ||
+                                 opt == u"other scripts in stage";
+            Mutation m;
+            m.tagName = "mutation";
+            m.attrs["hasnext"] = hasNext ? "true" : "false";
+            b.mutation = std::move(m);
+        }
+    }
+}
+
+void decodeBlocksDirect(const JsonValue& blocksObj, Blocks& blocks,
+                        std::vector<std::string>& extIds) {
+    for (const auto& [id, value] : blocksObj.asObject()) {
+        if (value.isArray()) {
+            directPrimitive(value, "", false, blocks);
+            continue;
+        }
+        if (!value.isObject()) continue;
+        Block b;
+        b.id = id;
+        b.opcode = value.get("opcode").asString();
+        if (value.get("next").isString())
+            b.next = value.get("next").asString();
+        if (value.get("parent").isString())
+            b.parent = value.get("parent").asString();
+        b.topLevel = value.get("topLevel").asBool();
+        b.shadow = value.get("shadow").asBool();
+        b.x = value.get("x").asNumber();
+        b.y = value.get("y").asNumber();
+        for (const auto& [name, valueIn] : value.get("inputs").asObject()) {
+            if (!valueIn.isArray()) continue;
+            const JsonArray& array = valueIn.asArray();
+            if (array.empty()) continue;
+            BlockInput in;
+            const int info = int(array[0].asNumber());
+            if (info == INPUT_SAME_BLOCK_SHADOW) {
+                in.block = in.shadow = array.size() > 1
+                    ? directPrimitive(array[1], id, true, blocks) : "";
+            } else if (info == INPUT_BLOCK_NO_SHADOW) {
+                in.block = array.size() > 1
+                    ? directPrimitive(array[1], id, false, blocks) : "";
+            } else {
+                in.block = array.size() > 1
+                    ? directPrimitive(array[1], id, false, blocks) : "";
+                in.shadow = array.size() > 2
+                    ? directPrimitive(array[2], id, true, blocks) : "";
+            }
+            b.inputs.set(name, std::move(in));
+        }
+        for (const auto& [name, raw] : value.get("fields").asObject()) {
+            if (!raw.isArray() || raw.asArray().empty()) continue;
+            const JsonArray& fa = raw.asArray();
+            BlockField field;
+            const JsonValue& fv = fa[0];
+            if (fv.isNumber()) field.value = Value::num(fv.asNumber());
+            else if (fv.isBool()) field.value = Value::boolean(fv.asBool());
+            else if (fv.isString())
+                field.value = Value::string(SStr::create(utf8ToU16(fv.asString())));
+            if (fa.size() > 1 && fa[1].isString()) field.id = fa[1].asString();
+            b.fields.emplace(name, std::move(field));
+        }
+        const JsonValue& mut = value.get("mutation");
+        if (mut.isObject()) {
+            Mutation m;
+            m.tagName = mut.get("tagName").asString();
+            if (m.tagName.empty()) m.tagName = "mutation";
+            for (const auto& [name, raw] : mut.asObject())
+                if (name != "tagName") m.attrs[name] = mutationAttr(raw);
+            b.mutation = std::move(m);
+        }
+        std::string ext = extensionIdForOpcode(b.opcode);
+        if (!ext.empty() &&
+            std::find(extIds.begin(), extIds.end(), ext) == extIds.end())
+            extIds.push_back(std::move(ext));
+        blocks.createBlock(std::move(b));
+    }
+    directCompatibility(blocks);
+}
+
 /// コア opcode → monitor id 生成（getMonitored 相当）。
 /// 返り値 empty は「core でない」。
 std::string coreMonitorId(const std::string& opcode, const std::string& targetId,
@@ -483,19 +628,27 @@ Target* loadTargetObject(Runtime& runtime, const JsonValue& obj,
 
     // blocks
     if (obj.has("blocks")) {
-        std::unordered_map<std::string, BlockJson> all;
-        std::vector<std::string> order;
-        deserializeBlocks(obj.get("blocks"), all, order);
-        fixSporkCompatibility(all);
-        for (const std::string& id : order) {
-            auto it = all.find(id);
-            if (it == all.end()) continue;
-            Block b = makeBlock(std::move(it->second));
-            std::string ext = extensionIdForOpcode(b.opcode);
-            if (!ext.empty() &&
-                std::find(extIds.begin(), extIds.end(), ext) == extIds.end())
-                extIds.push_back(ext);
-            spritePtr->blocks->createBlock(std::move(b));
+        // Direct-to-Block avoids allocating a second BlockJson map and
+        // converting every intermediate block. The old importer stays
+        // available for parity bisecting and unusual legacy projects.
+        const char* directSetting = std::getenv("XYO_SB3_DIRECT_BUILD");
+        if (!directSetting || directSetting[0] != '0') {
+            decodeBlocksDirect(obj.get("blocks"), *spritePtr->blocks, extIds);
+        } else {
+            std::unordered_map<std::string, BlockJson> all;
+            std::vector<std::string> order;
+            deserializeBlocks(obj.get("blocks"), all, order);
+            fixSporkCompatibility(all);
+            for (const std::string& id : order) {
+                auto it = all.find(id);
+                if (it == all.end()) continue;
+                Block b = makeBlock(std::move(it->second));
+                std::string ext = extensionIdForOpcode(b.opcode);
+                if (!ext.empty() &&
+                    std::find(extIds.begin(), extIds.end(), ext) == extIds.end())
+                    extIds.push_back(ext);
+                spritePtr->blocks->createBlock(std::move(b));
+            }
         }
     }
 

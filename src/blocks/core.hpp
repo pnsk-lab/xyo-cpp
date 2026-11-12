@@ -17,6 +17,8 @@ void registerCoreBlocks(Runtime& rt);
 
 /// scratch3_pen 拡張（src/blocks/pen.cpp）。registerCoreBlocks から呼ばれる。
 void registerPenBlocks(Runtime& rt);
+void registerMusicBlocks(Runtime& rt);
+void registerTranslateBlocks(Runtime& rt);
 
 // --- JIT ランタイムヘルパからも再利用するブロック意味論 -------------------
 

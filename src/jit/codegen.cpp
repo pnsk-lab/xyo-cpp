@@ -3,7 +3,9 @@
 // 値は i64 の NaN ボックス bit パターンとして受け渡しする。
 // 入力・スタック双方、未 lowering のものは compat 層へ落とす。
 #include "jit.hpp"
+#include "layq.hpp"
 #include "llvm_compat.hpp"
+#include "llvm_helper_attributes.hpp"
 #include "aot_emit.hpp"
 #include "parfor.hpp"
 #include "../ir/numeric.hpp"
@@ -16,6 +18,11 @@
 #include "../ir/scratch_effect.hpp"
 #include "../ir/scratch_pipeline.hpp"
 #include "../ir/source_resume_phase.hpp"
+#include "../ir/llvm_ssa_liveness.hpp"
+#include "../ir/llvm_ssa_spill.hpp"
+#include "../ir/llvm_source_reporter_trace.hpp"
+#include "../ir/source_reporter_ssa_location_bridge.hpp"
+#include "rt_ssa_extra_capture.hpp"
 #include "../ir/scratch_source_digest.hpp"
 
 #include <llvm/IR/IRBuilder.h>
@@ -39,6 +46,9 @@
 
 #include "../analysis/type_sites.hpp"
 #include "../analysis/type_flow.hpp"
+#include "../analysis/numeric_region_lower.hpp"
+#include "../analysis/cfg_type_hint_profitability.hpp"
+#include "../analysis/cfg_type_hint_telemetry.hpp"
 #include "../blocks/pen_api.hpp"
 #include "../core/cast.hpp"
 #include "../core/jsnum.hpp"
@@ -91,6 +101,26 @@ struct Codegen {
     // asynchronous compile.
     uint64_t compiledSourceRevision = 0;
     ir::ScratchSourceDigest compiledSourceDigest;
+    // IR-001 diagnostic only: stable source-PC mapping from the frozen
+    // compilation unit, never from a mutable live Blocks traversal.
+    bool traceEffectSourcePc = false;
+    std::unordered_map<std::string, uint64_t> effectSourcePc;
+    // IR-001: opt-in actual reporter emission provenance, tracked through
+    // LLVM inlining. A Scratch reporter normally returns BOXED i64, not
+    // a certified raw numeric source-local value or GC-root proof.
+    bool traceSourceReporterValues = false;
+    // Runtime list-index hook is separate from compiler-only provenance
+    // printing; do not allocate Thread GC-root providers on trace-only runs.
+    bool captureReporterListReadEvaluation = false;
+    // Valid only for this compilation call, never persisted into native
+    // code or a scheduler-owned continuation.
+    const ir::ScratchCompilationUnit* frozenReporterSource = nullptr;
+    std::vector<ir::SourceReporterValueObservation> sourceReporterValues;
+    std::vector<ir::SourceReporterCheckpointObservation>
+        sourceReporterCheckpointSites;
+    uint32_t sourceReporterCheckpointRejected = 0;
+    uint32_t sourceReporterObservationsDropped = 0;
+    uint32_t sourceReporterRejectedEdges = 0;
 
     // Compile-time only counters. They describe opportunities before LLVM's
     // middle-end; the optimized-IR/native-code counters are measured
@@ -126,10 +156,44 @@ struct Codegen {
         ~ReporterCountGuard() { if (active) cg.emitBlockCount(); }
     };
     const bool verbose = std::getenv("XYO_JIT_VERBOSE") != nullptr;
+    // Read a cached numeric string directly when a list-item reporter is
+    // consumed numerically. Keep XYO_JIT_LIST_STRING_NUM_FAST=0 for bisecting.
+    const bool listStringNumFast = [] {
+        const char* setting = std::getenv("XYO_JIT_LIST_STRING_NUM_FAST");
+        return !setting || setting[0] != '0';
+    }();
     // Compile-time A/B switch; no branch is added to generated hot loops.
     const bool boxedMotion = std::getenv("XYO_JIT_MOTION_BOXED") != nullptr;
     const bool genericEq = std::getenv("XYO_JIT_EQ_GENERIC") != nullptr;
     const bool slotReload = std::getenv("XYO_JIT_SLOT_RELOAD") != nullptr;
+    // Experimental correctness path: every variable access is a host
+    // rebind. Neither the preexisting per-invocation slot hoist nor
+    // LLVM's loop-invariant load elimination may retain Variable*.
+    const bool guardNativeVarSlots = [] {
+        const char* flag = std::getenv("XYO_RT_GUARD_NATIVE_VAR_SLOTS");
+        return flag && flag[0] == '1';
+    }();
+    // Explicit experiment: emit a volatile native C++ generation
+    // comparison and branch to xyo_varslot_checked only on miss.
+    // Never use the borrowed Variable* until both Target/stage identity,
+    // full map epochs and the compiler's precise slot key match.
+    // The loop fast-path must NOT interfere with native async reporter
+    // SSA liveness certification. Those callsites retain the original
+    // single-C++-load path until PHI-aware GC root proofs exist.
+    bool inlineVarGuardSourceAllowed = false;
+    const bool inlineIndexedVarGuard = guardNativeVarSlots && [] {
+        auto set = [](const char* key) {
+            const char* value = std::getenv(key);
+            return value && value[0] == '1';
+        };
+        return set("XYO_RT_GUARD_NATIVE_VAR_SLOTS_FAST") &&
+               set("XYO_RT_GUARD_NATIVE_VAR_SLOTS_INDEXED") &&
+               set("XYO_JIT_VAR_GUARD_INLINE");
+    }();
+    const bool inlineVarGuardTrace = [] {
+        const char* flag = std::getenv("XYO_JIT_VAR_GUARD_INLINE_TRACE");
+        return flag && flag[0] == '1';
+    }();
     const bool genericLiteralNum = std::getenv("XYO_JIT_LITERAL_NUM_GENERIC") != nullptr;
     const bool genericMathBox = std::getenv("XYO_JIT_MATH_BOX_GENERIC") != nullptr;
     const bool typeProfileDisabled = [] {
@@ -242,8 +306,9 @@ struct Codegen {
     };
     std::vector<PendingParFor> pendingParFors;
     std::vector<Function*> parFns;
-    bool parForDisabled = std::getenv("XYO_PARFOR") != nullptr &&
-                          std::getenv("XYO_PARFOR")[0] == '0';
+    bool parForDisabled = guardNativeVarSlots ||
+                          (std::getenv("XYO_PARFOR") != nullptr &&
+                           std::getenv("XYO_PARFOR")[0] == '0');
 
     // --- ループ不変 pen setter のホイスト -------------------------------
     // warp 手続き内のループで、本体先頭に並ぶ pen 設定（サイズ/色）の引数が
@@ -264,6 +329,14 @@ struct Codegen {
     bool hoistNestedOsrArgs = false;
     // Optional bounded deopt only at a fully completed counted-loop body.
     bool nestedOsrInFlightGuard = false;
+    // OSR-010: only a source-proven static 1..8 nested repeat is allowed
+    // to omit its own yield. The outer body remains a real safe point.
+    bool nestedOsrBoundedInner = false;
+    // Native yield INSIDE one structurally proven inner counted repeat:
+    // save outer+inner source counters, not only the original outer.
+    bool nestedOsrInFlightInnerYield = false;
+    bool nestedOsrInFlightTripleYield = false;
+    bool nestedOsrInFlightQuadYield = false;
     std::map<std::u16string, llvm::Value*> hoistedNestedOsrArgs;
     /// ループ本体で書き込まれる変数/リスト（不変性判定用）
     struct LoopWriteScan {
@@ -305,7 +378,12 @@ struct Codegen {
     /// gpuProgs へ積み、所有付きポインタを返す（失敗 nullptr）。
     /// while/until では limitParent/limitInput に境界式が入る。
     const gpu::ParallelLoop* tryGpuLoopEx(Block* blk) {
-        if (!gpuProgs || gpuDisabled || runtime.blockCountEnabled) return nullptr;
+        // The GPU program can retain SList/Variable* storage without
+        // checking a native Thread binding generation. Guarded mode
+        // requires all Scratch target accesses to stay serial and local.
+        if (captureReporterListReadEvaluation ||
+            guardNativeVarSlots || !gpuProgs || gpuDisabled ||
+            runtime.blockCountEnabled) return nullptr;
         const BlockInput* sub = blk->inputs.find("SUBSTACK");
         if (!sub || sub->block.empty()) return nullptr;
         std::string why;
@@ -424,7 +502,8 @@ struct Codegen {
     /// ホイストした setter を、本体が 1 回以上実行されるガード内で emit する
     /// （guard が null なら無条件 — forever 用）。
     void emitHoistedSetters(const std::vector<Block*>& hs, llvm::Value* guard) {
-        if (hs.empty() || runtime.blockCountEnabled) return;
+        if (guardNativeVarSlots || hs.empty() ||
+            runtime.blockCountEnabled) return;
         BasicBlock* runBB = nullptr, *afterBB = nullptr;
         if (guard) {
             runBB = BasicBlock::Create(lc, "", fn);
@@ -464,7 +543,9 @@ struct Codegen {
     /// リストは反復順に slot を書くので、最終内容は逐次と完全に一致する。
     bool tryEmitParFor(Block* blk, llvm::Value* n, BasicBlock* fallback,
                        BasicBlock* merge) {
-        if (parForDisabled || runtime.blockCountEnabled || aot || !blocks) return false;
+        if (captureReporterListReadEvaluation ||
+            parForDisabled || runtime.blockCountEnabled || aot || !blocks)
+            return false;
         std::string why;
         auto planOpt = jit::analyzeParFor(*blocks, blk, &why);
         if (!planOpt) {
@@ -621,6 +702,21 @@ struct Codegen {
     llvm::Value* slotPtrAt(AotSlotKind kind, const std::string& key,
                            const void* host, IRBuilder<>& bb) {
         if (!aot) return cptr(host);
+        if (aot->packedSlots) {
+            const uint32_t index = aot->slotIndex(kind, key);
+            auto* arrayTy = ArrayType::get(ptrt, 0);
+            auto* storage = mod.getNamedGlobal("xyo_aot_slots");
+            if (!storage) {
+                storage = new GlobalVariable(mod, arrayTy, false,
+                    GlobalValue::ExternalLinkage, nullptr, "xyo_aot_slots");
+            }
+            auto* location = bb.CreateConstGEP2_32(arrayTy, storage, 0, index);
+            llvm::Value* raw = bb.CreateLoad(ptrt, location);
+            if (aot->lazyCached && kind == AotSlotKind::BlockCached)
+                return bb.CreateCall(
+                    decl("xyo_rt_aot_cached", ptrt, {ptrt}), {raw});
+            return raw;
+        }
         const std::string& gn = aot->slot(kind, key);
         GlobalVariable* g = mod.getGlobalVariable(gn);
         if (!g) {
@@ -682,7 +778,13 @@ struct Codegen {
 
         // Compat/reporters may mutate shared execution caches or invoke
         // registered primitives that static opcode memory keys cannot model.
-        if (std::string_view(name).starts_with("xyo_rt_")) mainThread = true;
+        // v3 resolver is only worker-safe after the scheduler has
+        // materialized every BlockCached slot on the caller thread.
+        // Real compatibility helpers still require caller affinity.
+        if (std::string_view(name).starts_with("xyo_rt_") &&
+            !(aot && aot->lazyCached &&
+              std::string_view(name) == "xyo_rt_aot_cached"))
+            mainThread = true;
         // Clone creation and deletion mutate the live scheduler/Target
         // arrays. The dependency analyzer already rejects parallel
         // execution for these opcodes (AccessSet::spawn), but it would
@@ -699,8 +801,10 @@ struct Codegen {
             (std::string_view(name) == "xyo_ctl_createclone" ||
              std::string_view(name) == "xyo_ctl_deleteclone"))
             mainThread = true;
-        return mod.getOrInsertFunction(
+        auto callee = mod.getOrInsertFunction(
             name, FunctionType::get(ret, args, false));
+        llvmc::applyHelperAttributes(callee, name);
+        return callee;
     }
 
     Function* fn = nullptr;
@@ -721,7 +825,8 @@ struct Codegen {
             "xyo_yield", "xyo_yield_fast", "xyo_loop_yield",
             "xyo_wait_yield", "xyo_wait_event_yield", "xyo_rt_wait", "xyo_stop_all",
             "xyo_stop_script", "xyo_broadcast_wait_v", "xyo_rt_compat",
-            "xyo_rt_reporter", "xyo_rt_nested_osr_arg_get",
+            "xyo_rt_reporter", "xyo_rt_async_reporter",
+            "xyo_rt_nested_osr_arg_get",
             "xyo_mot_glidexy", "xyo_mot_glideto",
             "xyo_looks_saysecs", "xyo_looks_thinksecs",
             "xyo_looks_switchbackdropwait", "xyo_sns_askwait",
@@ -841,6 +946,18 @@ struct Codegen {
         br->setMetadata(LLVMContext::MD_loop, loopID);
     }
 
+    // Communicate the native loop structure to LLVM. The middle-end still
+    // chooses an unroll factor; Scratch statements stay in the original loop.
+    void markLlvmUnrollEnable(llvm::BranchInst* latch) {
+        LLVMContext& context = latch->getContext();
+        llvm::MDNode* enable = llvm::MDNode::get(
+            context, {llvm::MDString::get(context, "llvm.loop.unroll.enable")});
+        llvm::MDNode* loopId = llvm::MDNode::getDistinct(
+            context, {nullptr, enable});
+        loopId->replaceOperandWith(0, loopId);
+        latch->setMetadata(LLVMContext::MD_loop, loopId);
+    }
+
     /// llvm.fptosi.sat.i64.f64 — NaN/±Inf/範囲外で未定義動作にならず
     /// INT64_MIN/MAX に飽和する。リスト索引の整数境界検査に使う。
     llvm::Value* satToI64(llvm::Value* d) {
@@ -865,14 +982,184 @@ struct Codegen {
     static constexpr uint64_t kBitsOne = 0x3FF0000000000000ULL;
     static constexpr uint32_t kYieldCheckNOff =
         uint32_t(offsetof(JitCtx, yieldCheckN));
+    // LAYQ offsets (appended JitCtx fields; older offsets unchanged).
+    static constexpr uint32_t kYieldQuantumOff =
+        uint32_t(offsetof(JitCtx, yieldQuantum));
+    static constexpr uint32_t kObservedStopEpochOff =
+        uint32_t(offsetof(JitCtx, observedStopEpoch));
+    static constexpr uint32_t kQuantumHintPtrOff =
+        uint32_t(offsetof(JitCtx, quantumHintPtr));
+    static constexpr uint32_t kStopEpochPtrOff =
+        uint32_t(offsetof(JitCtx, stopEpochPtr));
+    static constexpr uint32_t kLayqPollsOff =
+        uint32_t(offsetof(JitCtx, layqPolls));
+    static constexpr uint32_t kLayqTakenOff =
+        uint32_t(offsetof(JitCtx, layqTaken));
+    static constexpr uint32_t kLayqQSumOff =
+        uint32_t(offsetof(JitCtx, layqQSum));
+
+    // ---- LAYQ v2: push-model adaptive yield quantum (src/jit/layq.hpp) ----
+    // Off (XYO_YIELD_QMODE=off): every helper below folds to constants and
+    // the emitted IR is instruction-identical to the pre-LAYQ form
+    // (verified by IR diff in tests). Adaptive (default): per-loop
+    // power-of-two quantum from the scheduler-published hint (+ body-class
+    // clamp), stop-epoch handoff, and stats. Fixed: pinned constant.
+    static bool layqOff() { return layqMode() == LayqMode::Off; }
+    static bool layqFixed() { return layqMode() == LayqMode::Fixed; }
+    /// Current loop's quantum as IR. Off: constant 64. Fixed: the
+    /// pinned body-class constant (folds everywhere — no loop-carried
+    /// live values, unlike adaptive). Adaptive: the per-loop alloca.
+    llvm::Value* yieldQuantumNow() {
+        if (layqOff()) return ci64(64);
+        if (layqFixed()) return ci64(curYieldQPinned);
+        if (curYieldQuantum) return b.CreateLoad(i64t, curYieldQuantum);
+        return b.CreateLoad(
+            i64t, b.CreateConstGEP1_32(i8t, ctxArg, kYieldQuantumOff));
+    }
+    /// toPoll = q - (ticks & (q-1)). Constant-folds to today's
+    /// `64-(ticks&63)` when LAYQ is off.
+    llvm::Value* yieldToPoll(llvm::Value* ticks) {
+        llvm::Value* q = yieldQuantumNow();
+        return b.CreateSub(q, b.CreateAnd(ticks, b.CreateSub(q, ci64(1))));
+    }
+    /// Body-class cap for the loop being emitted (C++-side immediate).
+    /// Also refreshes the fixed-mode pinned quantum.
+    void layqApplyBodyClass(bool bodyMayAllocate) {
+        LayqConfig cfg = layqConfig();
+        curYieldQMaxVal = bodyMayAllocate ? cfg.qmaxCall : cfg.qmaxPure;
+        if (curYieldQMaxVal < cfg.qmin) curYieldQMaxVal = cfg.qmin;
+        uint64_t pinned =
+            cfg.qfixed < curYieldQMaxVal ? cfg.qfixed : curYieldQMaxVal;
+        if (pinned < cfg.qmin) pinned = cfg.qmin;
+        curYieldQPinned = pinned;
+    }
+    /// v2 push model: load the scheduler-published quantum hint (relaxed;
+    /// usually an L1-shared line since the scheduler stores only on change)
+    /// and clamp it to the loop's body-class cap. No competitor math, no
+    /// shifts, no extra atomics in generated code.
+    llvm::Value* layqHintCapped() {
+        // Load the slot as an integer, not a pointer. The RT-001 GC-root
+        // census chain-traces pointer-typed JitCtx loads through a closed
+        // allowlist (varSlotData + sampledWarpClockUs); this slot holds the
+        // address of a Runtime-embedded u32 atomic that can never reference
+        // GC memory (integer payload only), so integer load + inttoptr keeps
+        // the census output identical with exact semantics preserved (same
+        // address, same atomicity).
+        auto* hintAddr = b.CreateLoad(
+            i64t, b.CreateConstGEP1_32(i8t, ctxArg, kQuantumHintPtrOff));
+        auto* hintPtr = b.CreateIntToPtr(hintAddr, ptrt);
+        auto* hint = b.CreateLoad(i32t, hintPtr);
+        hint->setAtomic(llvm::AtomicOrdering::Monotonic);
+        llvm::Value* h64 = b.CreateZExt(hint, i64t);
+        return b.CreateSelect(b.CreateICmpULT(h64, ci64(curYieldQMaxVal)),
+                              h64, ci64(curYieldQMaxVal));
+    }
+    /// Loop-entry quantum. Fixed: store the pinned body-class constant to
+    /// the ctx field (for the runtime empty-repeat fallback); no allocas,
+    /// so everything folds. Adaptive: re-sync from the ctx field clamped
+    /// to the body cap (mirrors the yieldCheckN discipline) — emitting a
+    /// store here would clobber the adapted quantum every chunk, since this
+    /// position ends up inside the chunk dispatch for chunked loops. The
+    /// first poll then snaps to the published hint.
+    /// Preheader position only.
+    void emitLayqEntryInit() {
+        if (layqOff()) return;
+        if (layqFixed()) {
+            b.CreateStore(
+                ci64(curYieldQPinned),
+                b.CreateConstGEP1_32(i8t, ctxArg, kYieldQuantumOff));
+            return;
+        }
+        if (!curYieldQuantum || !curYieldQMask) return;
+        // Re-sync (not store): this position ends up inside the chunk
+        // dispatch for chunked loops, so emitting a store here would
+        // clobber the adapted quantum every chunk.
+        llvm::Value* qin = b.CreateLoad(
+            i64t, b.CreateConstGEP1_32(i8t, ctxArg, kYieldQuantumOff));
+        llvm::Value* qcur = b.CreateSelect(
+            b.CreateICmpULT(qin, ci64(curYieldQMaxVal)), qin,
+            ci64(curYieldQMaxVal));
+        b.CreateStore(qcur, curYieldQuantum);
+        b.CreateStore(b.CreateSub(qcur, ci64(1)), curYieldQMask);
+    }
+    /// Recompute the body-class cap after the lowering plan is chosen
+    /// (e.g. a generic repeat scope that selects a pure numeric-SSA fast
+    /// path). Preheader position only: re-initializes the quantum so the
+    /// first chunk already uses the right bound.
+    void retargetLoopQuantum(bool bodyMayAllocate) {
+        if (layqOff() || yieldStack.empty()) return;
+        // Fixed mode has no allocas (pinned const folds); adaptive needs
+        // the scope's quantum allocas live to re-seed them.
+        if (!layqFixed() && !curYieldQuantum) return;
+        layqApplyBodyClass(bodyMayAllocate);
+        yieldStack.back().qmaxVal = curYieldQMaxVal;
+        emitLayqEntryInit();
+    }
+    /// Once-per-quantum update at the top of a warp poll. Returns the
+    /// stop-epoch-change signal (i1); updates the loop quantum (alloca +
+    /// ctx) from the scheduler hint (or the fixed pin); records stats when
+    /// XYO_YIELD_QSTATS=1. Stashes the loaded epoch in layqPollEpoch for
+    /// the handoff block to sync back to observedStopEpoch.
+    llvm::Value* emitLayqPollAdaptation() {
+        LayqConfig cfg = layqConfig();
+        llvm::Value* qnew = nullptr;
+        if (layqFixed()) {
+            uint64_t pinned =
+                cfg.qfixed < curYieldQMaxVal ? cfg.qfixed : curYieldQMaxVal;
+            if (pinned < cfg.qmin) pinned = cfg.qmin;
+            qnew = ci64(pinned);
+        } else {
+            // v2 push model: the scheduler precomputes the pure-class
+            // target and publishes it (on change only); the JIT only
+            // clamps it to this loop's body-class cap. No competitor math,
+            // no shifts, no extra atomics here — danger is pinned
+            // scheduler-side, so generated code needs no danger branch.
+            qnew = layqHintCapped();
+        }
+        if (curYieldQuantum) {
+            b.CreateStore(qnew, curYieldQuantum);
+            b.CreateStore(b.CreateSub(qnew, ci64(1)), curYieldQMask);
+        }
+        b.CreateStore(
+            qnew, b.CreateConstGEP1_32(i8t, ctxArg, kYieldQuantumOff));
+        if (layqStatsEnabled()) {
+            auto* p = b.CreateLoad(i64t, b.CreateConstGEP1_32(
+                                             i8t, ctxArg, kLayqPollsOff));
+            b.CreateStore(b.CreateAdd(p, ci64(1)),
+                          b.CreateConstGEP1_32(i8t, ctxArg, kLayqPollsOff));
+            auto* qs = b.CreateLoad(i64t, b.CreateConstGEP1_32(
+                                              i8t, ctxArg, kLayqQSumOff));
+            b.CreateStore(b.CreateAdd(qs, qnew),
+                          b.CreateConstGEP1_32(i8t, ctxArg, kLayqQSumOff));
+        }
+        // Stop-epoch check: a stop (stopAll/stopThread — greenFlag routes
+        // through stopThread too) bumps Runtime::stopEpoch. A mismatch
+        // hands off, bounding stop latency at one quantum regardless of
+        // the deadline cadence. Relaxed: a stale read only delays that
+        // thread's handoff by one more poll; the handoff synchronizes.
+        // Integer load + inttoptr (not a pointer-typed JitCtx load): see
+        // layqHintCapped for why — the slot addresses a Runtime-embedded
+        // u64 atomic with integer payload, never GC memory.
+        auto* epochAddr = b.CreateLoad(
+            i64t, b.CreateConstGEP1_32(i8t, ctxArg, kStopEpochPtrOff));
+        auto* epochPtr = b.CreateIntToPtr(epochAddr, ptrt);
+        auto* epoch = b.CreateLoad(i64t, epochPtr);
+        epoch->setAtomic(llvm::AtomicOrdering::Monotonic);
+        layqPollEpoch = epoch;
+        llvm::Value* obs = b.CreateLoad(
+            i64t, b.CreateConstGEP1_32(i8t, ctxArg, kObservedStopEpochOff));
+        return b.CreateICmpNE(epoch, obs);
+    }
 
     /// ループ末尾の yield 点。non-warp は直接 xyo_yield(_fast)。
     /// warp は 500ms stuck 窓の時計読みを 64 回に 1 回へ間引く
     /// （判定遅延 << 500ms）。xyo_loop_yield 内で isWarp/isStuck を
     /// 再確認するので意味論は不変。
-    void beginLoopYieldScope(const Block* sourceLoop) {
+    void beginLoopYieldScope(const Block* sourceLoop,
+                             bool bodyMayAllocate = true) {
         yieldStack.push_back({curYieldCnt, curYieldWarp, curYieldSourceLoop,
                               curYieldRemainingF64, curYieldRemainingI32});
+        YieldScope& top = yieldStack.back();
         curYieldSourceLoop = sourceLoop;
         curYieldRemainingF64 = nullptr;
         curYieldRemainingI32 = nullptr;
@@ -882,12 +1169,36 @@ struct Codegen {
                          b.CreateConstGEP1_32(i8t, ctxArg, kYieldCheckNOff)),
             curYieldCnt);
         curYieldWarp = loadIsWarp();
+        // LAYQ state (adaptive only allocas; fixed uses the C++-side
+        // pinned constant, off leaves everything null so every quantum
+        // site folds to constant 64).
+        curYieldQuantum = nullptr;
+        curYieldQMask = nullptr;
+        curYieldQMaxVal = 64;
+        curYieldQPinned = 64;
+        layqPollEpoch = nullptr;
+        if (!layqOff()) {
+            layqApplyBodyClass(bodyMayAllocate);
+            top.qmaxVal = curYieldQMaxVal;
+            // Save the outer quantum for the nested-scope restore on exit.
+            top.savedCtxQuantum = b.CreateLoad(
+                i64t, b.CreateConstGEP1_32(i8t, ctxArg, kYieldQuantumOff));
+            if (!layqFixed()) {
+                top.quantum = curYieldQuantum = entryAlloca(i64t, 1, "qnt");
+                top.qmask = curYieldQMask = entryAlloca(i64t, 1, "qmask");
+            }
+            emitLayqEntryInit();
+        }
     }
     /// storeBack: ループが通常脱出するなら ctx へ書き戻す（global 位相を保つ）。
     void endLoopYieldScope(bool storeBack) {
         if (storeBack && curYieldCnt)
             b.CreateStore(b.CreateLoad(i64t, curYieldCnt),
                           b.CreateConstGEP1_32(i8t, ctxArg, kYieldCheckNOff));
+        if (!layqOff() && !yieldStack.empty() &&
+            yieldStack.back().savedCtxQuantum)
+            b.CreateStore(yieldStack.back().savedCtxQuantum,
+                          b.CreateConstGEP1_32(i8t, ctxArg, kYieldQuantumOff));
         YieldScope s = yieldStack.back();
         yieldStack.pop_back();
         curYieldCnt = s.cnt;
@@ -895,21 +1206,33 @@ struct Codegen {
         curYieldSourceLoop = s.sourceLoop;
         curYieldRemainingF64 = s.remainingF64;
         curYieldRemainingI32 = s.remainingI32;
+        curYieldQuantum = s.quantum;
+        curYieldQMask = s.qmask;
+        curYieldQMaxVal = s.qmaxVal;
+        layqPollEpoch = nullptr;
     }
     // Only active while lowering a proven self-append-only warp repeat.
     // The log remains GC-rooted by the immutable prefix snapshot in var.
     AllocaInst* activeTransient = nullptr;
     llvm::Value* activeTransientVariable = nullptr;
+    const BlockField* activeTransientField = nullptr;
     // Additional live append logs in a simultaneous multi-variable loop.
-    // Every log is rooted via its own published variable snapshot.
-    std::vector<std::pair<AllocaInst*, llvm::Value*>> activeExtraTransients;
+    // The dependency field is needed to publish writes at yield boundaries.
+    struct TransientActiveExtra {
+        AllocaInst* log;
+        llvm::Value* variable;
+        const BlockField* field;
+    };
+    std::vector<TransientActiveExtra> activeExtraTransients;
     void transientBeforeHandoff() {
         if (!activeTransient) return;
         llvm::Value* log = b.CreateLoad(ptrt, activeTransient);
         call2("xyo_transient_flush", voidt, log, activeTransientVariable);
+        emitWaitVariableWrite(activeTransientField);
         for (const auto& extra : activeExtraTransients) {
-            llvm::Value* other = b.CreateLoad(ptrt, extra.first);
-            call2("xyo_transient_flush", voidt, other, extra.second);
+            llvm::Value* other = b.CreateLoad(ptrt, extra.log);
+            call2("xyo_transient_flush", voidt, other, extra.variable);
+            emitWaitVariableWrite(extra.field);
         }
     }
     void transientAfterHandoff() {
@@ -919,10 +1242,10 @@ struct Codegen {
             "xyo_transient_resume", ptrt, log, activeTransientVariable);
         b.CreateStore(resumed, activeTransient);
         for (const auto& extra : activeExtraTransients) {
-            llvm::Value* other = b.CreateLoad(ptrt, extra.first);
+            llvm::Value* other = b.CreateLoad(ptrt, extra.log);
             llvm::Value* changed = call2(
-                "xyo_transient_resume", ptrt, other, extra.second);
-            b.CreateStore(changed, extra.first);
+                "xyo_transient_resume", ptrt, other, extra.variable);
+            b.CreateStore(changed, extra.log);
         }
     }
     struct PortableLoopCapture {
@@ -973,30 +1296,119 @@ struct Codegen {
             }
             b.CreateStore(bits, b.CreateConstGEP1_32(i64t, values, i));
         }
-        callN("xyo_proc_frame_checkpoint_path_phase", voidt,
-              {ctxArg, ids, values, ci32(uint32_t(path.size())),
-               ci32(uint32_t(bodyComplete
-                   ? ir::SourceResumePhase::AfterLoopBody
-                   : ir::SourceResumePhase::InsideLoopBody))});
+        const auto phase = bodyComplete
+            ? ir::SourceResumePhase::AfterLoopBody
+            : ir::SourceResumePhase::InsideLoopBody;
+        llvm::Value* nativeSite =
+            callN("xyo_proc_frame_checkpoint_path_phase", voidt,
+                  {ctxArg, ids, values, ci32(uint32_t(path.size())),
+                   ci32(uint32_t(phase))});
+        if (traceSourceReporterValues) {
+            const auto it = effectSourcePc.find(curYieldSourceLoop->id);
+            if (!frozenReporterSource ||
+                !frozenReporterSource->script.getBlock(
+                    curYieldSourceLoop->id) ||
+                it == effectSourcePc.end() ||
+                !llvm::isa<llvm::CallBase>(nativeSite) ||
+                sourceReporterCheckpointSites.size() >= 1024) {
+                ++sourceReporterCheckpointRejected;
+            } else {
+                std::vector<std::string> sourcePath;
+                sourcePath.reserve(path.size());
+                for (const auto& scope : path)
+                    sourcePath.push_back(scope.source->id);
+                sourceReporterCheckpointSites.push_back({
+                    it->second, curYieldSourceLoop->id, phase,
+                    llvm::WeakTrackingVH(nativeSite),
+                    uint32_t(path.size()), std::move(sourcePath)
+                });
+            }
+        }
+        if (traceEffectSourcePc && compiledSourceDigest) {
+            const auto it = effectSourcePc.find(curYieldSourceLoop->id);
+            if (it != effectSourcePc.end()) {
+                callN("xyo_ir001_effect_checkpoint", voidt,
+                      {ctxArg, b.CreateGlobalString(curYieldSourceLoop->id),
+                       ci64(it->second), ci64(compiledSourceRevision),
+                       ci64(compiledSourceDigest.lo),
+                       ci64(compiledSourceDigest.hi),
+                       ci32(uint32_t(phase))});
+            }
+        }
         return PortableLoopCapture{ids, values, uint32_t(path.size())};
     }
 
     void emitNestedOsrYieldCheckpoint() {
         if (!nestedOsrInFlightGuard || !osrStartLoop ||
-            curYieldSourceLoop != osrStartLoop ||
+            !curYieldSourceLoop ||
             (!curYieldRemainingF64 && !curYieldRemainingI32))
             return;
-        llvm::Value* remaining = curYieldRemainingI32
-            ? b.CreateSIToFP(
-                b.CreateLoad(i32t, curYieldRemainingI32), f64t)
-            : b.CreateLoad(f64t, curYieldRemainingF64);
-        // emitLoopYield is called at the END of a completed Scratch body
-        // but the private LLVM counter is decremented only AFTER yield.
-        // Convert to the exact count expected at the next Interpreter
-        // repeat latch. Source edits can then discard the suspended Fiber
-        // without running any more LLVM or replaying prior effects.
-        call2("xyo_rt_nested_osr_yield_checkpoint", voidt, ctxArg,
-              b.CreateFSub(remaining, cf64(1.0)));
+        const auto remaining = [&](AllocaInst* integer, AllocaInst* real) {
+            return integer
+                ? b.CreateSIToFP(b.CreateLoad(i32t, integer), f64t)
+                : b.CreateLoad(f64t, real);
+        };
+        llvm::Value* current = remaining(
+            curYieldRemainingI32, curYieldRemainingF64);
+        // A loop body has finished but LLVM still has not decremented
+        // its private counter. The interpreter repeat latch expects
+        // that already-completed body to have consumed one iteration.
+        llvm::Value* afterBody = b.CreateFSub(current, cf64(1.0));
+        if (curYieldSourceLoop == osrStartLoop) {
+            call2("xyo_rt_nested_osr_yield_checkpoint",
+                  voidt, ctxArg, afterBody);
+            return;
+        }
+        if (!nestedOsrInFlightInnerYield || yieldStack.empty())
+            return;
+        const auto& enclosing = yieldStack.back();
+        if (!enclosing.sourceLoop ||
+            (!enclosing.remainingF64 && !enclosing.remainingI32))
+            return;
+        llvm::Value* enclosingCurrent =
+            remaining(enclosing.remainingI32, enclosing.remainingF64);
+        llvm::Value* enclosingAfterBody =
+            b.CreateFSub(enclosingCurrent, cf64(1.0));
+        if (enclosing.sourceLoop == osrStartLoop) {
+            // Phase 2: this single inner loop body has completed.
+            callN("xyo_rt_nested_osr_inner_yield_checkpoint", voidt,
+                  {ctxArg, enclosingAfterBody, afterBody});
+            return;
+        }
+        if (nestedOsrInFlightQuadYield && yieldStack.size() >= 3) {
+            const auto& selected = yieldStack[yieldStack.size() - 3];
+            const auto& middle = yieldStack[yieldStack.size() - 2];
+            if (selected.sourceLoop == osrStartLoop &&
+                middle.sourceLoop &&
+                (middle.remainingF64 || middle.remainingI32) &&
+                (selected.remainingF64 || selected.remainingI32)) {
+                llvm::Value* selectedCurrent =
+                    remaining(selected.remainingI32, selected.remainingF64);
+                llvm::Value* middleCurrent =
+                    remaining(middle.remainingI32, middle.remainingF64);
+                // Phase 4: the deepest source body finished. Three
+                // enclosing bodies have not reached their latches.
+                callN("xyo_rt_nested_osr_quad_yield_checkpoint", voidt,
+                    {ctxArg, b.CreateFSub(selectedCurrent, cf64(1.0)),
+                     b.CreateFSub(middleCurrent, cf64(1.0)),
+                     enclosingAfterBody, afterBody});
+                return;
+            }
+        }
+        if (!nestedOsrInFlightTripleYield || yieldStack.size() < 2)
+            return;
+        const auto& outer = yieldStack[yieldStack.size() - 2];
+        if (outer.sourceLoop != osrStartLoop ||
+            (!outer.remainingF64 && !outer.remainingI32))
+            return;
+        llvm::Value* outerCurrent =
+            remaining(outer.remainingI32, outer.remainingF64);
+        // Phase 3: a completed LEAF source body within two unfinished
+        // lexical parent loops. Snapshot all three private counters;
+        // no source effect or enclosing prefix may be replayed.
+        callN("xyo_rt_nested_osr_triple_yield_checkpoint", voidt,
+              {ctxArg, b.CreateFSub(outerCurrent, cf64(1.0)),
+               enclosingAfterBody, afterBody});
     }
 
     // The deadline poll is shared by ordinary Scratch loops and SSA
@@ -1004,14 +1416,31 @@ struct Codegen {
     // actually exceeded (or the sampled-clock fallback is needed).
     void emitWarpDeadlineCheck(BasicBlock* chkBB, BasicBlock* done) {
         b.SetInsertPoint(chkBB);
+        // LAYQ: once-per-quantum adaptation + stop-epoch check. Off mode
+        // emits nothing here, keeping both paths below identical to before.
+        llvm::Value* layqStopDue = nullptr;
+        if (!layqOff()) layqStopDue = emitLayqPollAdaptation();
         if (!sharedWarpClock && promoted.empty() &&
             promotedLists.empty() && !activeTransient) {
+            // Fast path preserves the existing direct-helper shape. When a
+            // stop landed (layqStopDue), skip xyo_loop_yield — it would not
+            // necessarily yield for a stop — and take the full spill +
+            // scheduler handoff once instead (no double yield).
+            BasicBlock* handoff = nullptr;
+            BasicBlock* simpleDone = done;
+            if (layqStopDue) {
+                handoff = newBB("yield.handoff");
+                simpleDone = newBB("yield.simple.done");
+                b.CreateCondBr(layqStopDue, handoff, simpleDone);
+                b.SetInsertPoint(simpleDone);
+            }
             transientBeforeHandoff();
             emitPortableLoopCheckpoint();
             emitNestedOsrYieldCheckpoint();
             call1("xyo_loop_yield", voidt, ctxArg);
             transientAfterHandoff();
             b.CreateBr(done);
+            if (handoff) layqEmitHandoff(handoff, done);
         } else {
             llvm::Value* shouldYield;
             if (sharedWarpClock) {
@@ -1051,21 +1480,60 @@ struct Codegen {
                 shouldYield = b.CreateICmpNE(
                     call1("xyo_warp_yield_due", i32t, ctxArg), ci32(0));
             }
+            // RT-001 opt-in soft memory budget: even with the shared
+            // warp clock (which can bypass xyo_warp_yield_due entirely),
+            // request an ordinary source checkpoint and scheduler yield
+            // after the observed GC heap exceeds the configured budget.
+            // The actual GC is NOT run here: the scheduler must first
+            // certify a source-level continuation and RETIRE this Fiber.
+            if (std::getenv("XYO_RT_GC_SOFT_BUDGET_MB") &&
+                std::getenv("XYO_RT_REQUIRE_GENERATED_SSA_ROOTS")) {
+                auto* overBudget = b.CreateICmpNE(
+                    call1("xyo_rt_gc_soft_budget_due", i32t, ctxArg),
+                    ci32(0));
+                shouldYield = b.CreateOr(shouldYield, overBudget);
+            }
             // Neither a sampled clock read nor the fallback synchronous
             // check changes Scratch variables. Spill only on actual yield.
+            // LAYQ: a stop-epoch change also forces the handoff (bounds
+            // stop latency at one quantum regardless of deadline cadence).
+            if (!layqOff()) shouldYield = b.CreateOr(shouldYield, layqStopDue);
             BasicBlock* handoff = newBB("yield.handoff");
             hotBr(shouldYield, handoff, done, 1, 100000);
-            b.SetInsertPoint(handoff);
-            transientBeforeHandoff();
-            spillPromoted();
-            emitPortableLoopCheckpoint();
-            emitNestedOsrYieldCheckpoint();
-            call1("xyo_yield", voidt, ctxArg);
-            reloadPromoted();
-            transientAfterHandoff();
-            b.CreateBr(done);
+            layqEmitHandoff(handoff, done);
         }
         b.SetInsertPoint(done);
+        layqPollEpoch = nullptr;
+    }
+
+    /// Shared full spill + scheduler handoff. With LAYQ on, syncs the
+    /// observed stop epoch back (a stop-driven handoff does not repeat
+    /// every poll) and counts the handoff when XYO_YIELD_QSTATS=1.
+    void layqEmitHandoff(BasicBlock* handoff, BasicBlock* done) {
+        b.SetInsertPoint(handoff);
+        transientBeforeHandoff();
+        spillPromoted();
+        emitPortableLoopCheckpoint();
+        emitNestedOsrYieldCheckpoint();
+        call1("xyo_yield", voidt, ctxArg);
+        reloadPromoted();
+        transientAfterHandoff();
+        if (!layqOff()) {
+            if (layqPollEpoch) {
+                b.CreateStore(layqPollEpoch, b.CreateConstGEP1_32(
+                                                 i8t, ctxArg,
+                                                 kObservedStopEpochOff));
+            }
+            if (layqStatsEnabled()) {
+                auto* t = b.CreateLoad(
+                    i64t,
+                    b.CreateConstGEP1_32(i8t, ctxArg, kLayqTakenOff));
+                b.CreateStore(b.CreateAdd(t, ci64(1)),
+                              b.CreateConstGEP1_32(i8t, ctxArg,
+                                                   kLayqTakenOff));
+            }
+        }
+        b.CreateBr(done);
     }
 
     void emitLoopYield() {
@@ -1101,8 +1569,19 @@ struct Codegen {
         transientAfterHandoff();
         b.CreateBr(done);
         b.SetInsertPoint(warpBB);
-        llvm::Value* due =
-            b.CreateICmpEQ(b.CreateAnd(n, ci64(63)), ci64(0));
+        // LAYQ: off (default) keeps the exact 64-iteration gate; fixed uses
+        // a constant mask (folds — no extra live values); adaptive uses the
+        // per-loop mask (mem2reg-promoted register, same per-iteration op
+        // count: and + compare).
+        llvm::Value* due = nullptr;
+        if (layqOff()) {
+            due = b.CreateICmpEQ(b.CreateAnd(n, ci64(63)), ci64(0));
+        } else {
+            llvm::Value* mask = curYieldQMask
+                ? b.CreateLoad(i64t, curYieldQMask)
+                : b.CreateSub(yieldQuantumNow(), ci64(1));
+            due = b.CreateICmpEQ(b.CreateAnd(n, mask), ci64(0));
+        }
         hotBr(due, chkBB, done, 1, 63);
         emitWarpDeadlineCheck(chkBB, done);
     }
@@ -1157,8 +1636,7 @@ struct Codegen {
         b.CreateCondBr(b.CreateICmpEQ(remaining, ci64(0)), done, body);
         b.SetInsertPoint(body);
         llvm::Value* ticks = b.CreateLoad(i64t, tickPtr);
-        llvm::Value* toPoll = b.CreateSub(
-            ci64(64), b.CreateAnd(ticks, ci64(63)));
+        llvm::Value* toPoll = yieldToPoll(ticks);
         b.CreateCondBr(b.CreateICmpULT(remaining, toPoll), partial, poll);
         b.SetInsertPoint(partial);
         b.CreateStore(b.CreateAdd(ticks, remaining), tickPtr);
@@ -1378,6 +1856,178 @@ struct Codegen {
             };
         return walk(*input, 0);
     }
+    // For a PHI already merged at the previous statement, preserve its
+    // immutable numeric SSA value on the true edge of a second IF only if
+    // the entire body is an explicitly known, non-yielding straight-line
+    // Scratch chain. This walk is intentionally stricter than general
+    // promotability: unknown reporters, nested loops, effectful controls
+    // and list mutations are barriers. Recursively checked pure IFs are
+    // permitted, but no proof is attached to the mutable source variable.
+    bool readonlyPhiBranch(const BlockInput* substack,
+                           std::string_view protectedId) const {
+        if (!blocks || !substack || substack->block.empty()) return false;
+        static const std::unordered_set<std::string_view> safeReporters = {
+            "math_number", "math_integer", "math_whole_number",
+            "math_positive_number", "math_angle", "math_boolean",
+            "text", "colour_picker", "data_variable",
+            "data_itemoflist", "data_lengthoflist",
+            "operator_add", "operator_subtract", "operator_multiply",
+            "operator_divide", "operator_mod", "operator_round",
+            "operator_mathop", "operator_lt", "operator_gt",
+            "operator_equals", "operator_and", "operator_or",
+            "operator_not"
+        };
+        // Allow a recursively checked, yield-free conditional below an IF
+        // only in this isolated experiment. The entire descendant subtree
+        // must stay within the same pure/no-protected-write proof boundary.
+        const char* nestedSetting =
+            std::getenv("XYO_JIT_PHI_NESTED_BRANCH_FORWARD");
+        // Default on after successful targeted speedup, fallback checks,
+        // full GUI parity and unrelated-benchmark A/B verification.
+        // Explicit 0 restores the prior proof boundary.
+        const bool allowNested = !nestedSetting || nestedSetting[0] != '0';
+        std::vector<std::string> todo{substack->block};
+        std::unordered_set<std::string> seen;
+        bool usedProtected = false;
+        while (!todo.empty()) {
+            if (seen.size() >= 256) return false;
+            std::string id = std::move(todo.back());
+            todo.pop_back();
+            if (id.empty() || !seen.insert(id).second) return false;
+            const Block* node = blocks->getBlock(id);
+            if (!node) return false;
+            const auto& op = node->opcode;
+            const bool write = op == "data_setvariableto" ||
+                               op == "data_changevariableby";
+            const bool nestedIf = op == "control_if" ||
+                                  op == "control_if_else";
+            if (!write && !safeReporters.contains(op) &&
+                !(allowNested && nestedIf)) return false;
+            if (nestedIf && (!allowNested ||
+                !readonlyCondition(node->inputs.find("CONDITION"))))
+                return false;
+            if (op == "data_variable") {
+                const auto variable = node->fields.find("VARIABLE");
+                if (variable == node->fields.end()) return false;
+                usedProtected |= variable->second.id == protectedId;
+            }
+            if (write) {
+                const auto field = node->fields.find("VARIABLE");
+                if (field == node->fields.end() || field->second.id.empty() ||
+                    field->second.id == protectedId)
+                    return false;
+                // Reject distinct IDs resolving to the same Scratch slot.
+                // The enclosing promotion also performs alias checks, but
+                // this is a separate, local proof boundary.
+                const Variable* changed = target
+                    ? target->lookupVariableById(field->second.id) : nullptr;
+                const Variable* protectedVar = target
+                    ? target->lookupVariableById(std::string(protectedId))
+                    : nullptr;
+                if (!changed || !protectedVar || changed == protectedVar)
+                    return false;
+            }
+            if (!node->next.empty()) todo.push_back(node->next);
+            for (const auto& [name, input] : node->inputs.items) {
+                if (name.rfind("SUBSTACK", 0) == 0 &&
+                    (!nestedIf || (name != "SUBSTACK" &&
+                                   name != "SUBSTACK2") ||
+                     (name == "SUBSTACK2" && op != "control_if_else")))
+                    return false;
+                if (!input.block.empty()) todo.push_back(input.block);
+                else if (!input.shadow.empty()) todo.push_back(input.shadow);
+            }
+        }
+        return usedProtected;
+    }
+
+    // Only a direct scalar reporter compared against an exact numeric
+    // literal may constrain an existing canonical integer PHI. Dynamic
+    // strings, coercions and arithmetic conditions must keep the old path.
+    struct DirectIntegerComparison {
+        std::string variableId;
+        int64_t bound;
+        bool less;
+    };
+    std::optional<DirectIntegerComparison> directIntegerComparison(
+            const BlockInput* condition) const {
+        if (!condition || !blocks) return std::nullopt;
+        const auto resolve = [&](const BlockInput* in) -> const Block* {
+            if (!in) return nullptr;
+            const std::string& id = in->block.empty() ? in->shadow : in->block;
+            return id.empty() ? nullptr : blocks->getBlock(id);
+        };
+        const Block* cmp = resolve(condition);
+        if (!cmp || (cmp->opcode != "operator_lt" &&
+                     cmp->opcode != "operator_gt")) return std::nullopt;
+        const Block* lhs = resolve(cmp->inputs.find("OPERAND1"));
+        const Block* rhs = resolve(cmp->inputs.find("OPERAND2"));
+        if (!lhs || !rhs) return std::nullopt;
+        // Scratch numeric comparisons can have the immutable literal on
+        // either side. Inverting < and > is valid for these finite exact
+        // integer operands, but never invert a coercible/opaque expression.
+        const bool swapped = rhs->opcode == "data_variable";
+        const Block* variable = swapped ? rhs : lhs;
+        const Block* number = swapped ? lhs : rhs;
+        if (variable->opcode != "data_variable" ||
+            (number->opcode != "math_number" &&
+             number->opcode != "math_integer" &&
+             number->opcode != "math_whole_number" &&
+             number->opcode != "math_positive_number"))
+            return std::nullopt;
+        const auto var = variable->fields.find("VARIABLE");
+        const auto literal = number->fields.find("NUM");
+        if (var == variable->fields.end() || var->second.id.empty() ||
+            literal == number->fields.end() || !number->shadow ||
+            number->fields.size() != 1 ||
+            cast::isWhiteSpace(literal->second.value))
+            return std::nullopt;
+        // Serialized Scratch numeric shadows are commonly String Values
+        // (for example [4,"0"]), but cast::compare uses numeric ordering
+        // for a valid numeric string against a canonical numeric operand.
+        // Match the existing literalNumber() classification exactly.
+        const double d = cast::toNumberOrNaN(literal->second.value);
+        if (!std::isfinite(d) || std::trunc(d) != d ||
+            d < -2147483647.0 || d > 2147483647.0)
+            return std::nullopt;
+        return DirectIntegerComparison{var->second.id,
+            static_cast<int64_t>(d),
+            (cmp->opcode == "operator_lt") != swapped};
+    }
+
+    // Profitability only: do not refine a branch index if the same scalar
+    // is read again after its join. The later boxed read can lengthen the
+    // live-range/dependency path enough to outweigh the i32 conversion
+    // reduction. A bounded walk errs on the side of returning true.
+    bool followingScalarRead(const Block* control,
+                             std::string_view variableId) const {
+        if (!blocks || !control || control->next.empty()) return false;
+        std::vector<std::string> todo{control->next};
+        std::unordered_set<std::string> seen;
+        while (!todo.empty()) {
+            if (seen.size() >= 256) return true;
+            std::string id = std::move(todo.back());
+            todo.pop_back();
+            if (id.empty()) continue;
+            if (!seen.insert(id).second) return true;
+            const Block* node = blocks->getBlock(id);
+            if (!node) return true;
+            if (node->opcode == "data_variable") {
+                auto field = node->fields.find("VARIABLE");
+                if (field == node->fields.end()) return true;
+                if (field->second.id == variableId) return true;
+            }
+            if (node->opcode == "procedures_call") return true;
+            if (!node->next.empty()) todo.push_back(node->next);
+            for (const auto& [name, input] : node->inputs.items) {
+                (void)name;
+                if (!input.block.empty()) todo.push_back(input.block);
+                else if (!input.shadow.empty()) todo.push_back(input.shadow);
+            }
+        }
+        return false;
+    }
+
     struct PhiDemand {
         bool boxed = false;
         bool numeric = false;
@@ -1486,6 +2136,9 @@ struct Codegen {
     std::vector<ReadNumberMemo> readNumberMemos;
     std::unordered_map<llvm::Value*, llvm::Value*> finiteMemoPaths;
     std::unordered_set<llvm::Value*> memoizableListReads;
+    // A numeric consumer of data_itemoflist may bypass the general numeric
+    // Value tag cascade when the element is a cached numeric SStr.
+    std::unordered_set<llvm::Value*> listNumericStringCandidates;
     // A loaded item carries a list-level numeric type guard. Only consumed
     // by explicit numeric conversion; generic Value reads stay untouched.
     std::unordered_map<llvm::Value*, llvm::Value*> numericListReadGuards;
@@ -1506,6 +2159,13 @@ struct Codegen {
         const Block* sourceLoop;
         llvm::AllocaInst* remainingF64;
         llvm::AllocaInst* remainingI32;
+        // LAYQ (adaptive/fixed modes only): per-loop poll quantum state.
+        // quantum/qmask are mem2reg-promoted (register in the hot loop);
+        // qmaxVal is the C++-side body-class cap immediate.
+        llvm::AllocaInst* quantum = nullptr;
+        llvm::AllocaInst* qmask = nullptr;
+        llvm::Value* savedCtxQuantum = nullptr;
+        uint64_t qmaxVal = 64;
     };
     std::vector<YieldScope> yieldStack;
     llvm::AllocaInst* curYieldCnt = nullptr;
@@ -1514,6 +2174,20 @@ struct Codegen {
     const Block* curYieldSourceLoop = nullptr;
     llvm::AllocaInst* curYieldRemainingF64 = nullptr;
     llvm::AllocaInst* curYieldRemainingI32 = nullptr;
+    // LAYQ: current loop's quantum state. Null allocas when LAYQ is off
+    // (or no scope is open) — all quantum sites then fold to constant 64
+    // and the emitted IR is identical to the pre-LAYQ form. In fixed mode
+    // the allocas also stay null: the pinned quantum is a C++-side
+    // constant (curYieldQPinned) that folds everywhere, so fixed mode
+    // carries zero extra loop-carried live values (unlike adaptive, whose
+    // dynamic quantum must ride in registers).
+    llvm::AllocaInst* curYieldQuantum = nullptr;
+    llvm::AllocaInst* curYieldQMask = nullptr;
+    uint64_t curYieldQMaxVal = 64;
+    uint64_t curYieldQPinned = 64;
+    // Epoch value loaded by the current poll (handover block syncs it to
+    // observedStopEpoch after a stop-driven handoff). Null outside polls.
+    llvm::Value* layqPollEpoch = nullptr;
     bool promotingLoop = false;   // このループが write-back を持つ（最外）
     // Resume-epoch guard: compare the actual boxed value after a yield,
     // reusing its numeric shadow when unchanged. A GC collection invalidates
@@ -1742,6 +2416,52 @@ struct Codegen {
             result->addIncoming(fallback, slowEnd);
             return result;
         }
+        // Experimental: a list element used as a number is frequently an
+        // immutable numeric string. Try its numeric cache first, without
+        // changing the original boxed list element or assuming list type.
+        // Non-strings and uncached strings retain the complete Scratch cast.
+        if (listStringNumFast && listNumericStringCandidates.erase(bits)) {
+            BasicBlock* strBB = newBB("list.strnum.string");
+            BasicBlock* hitBB = newBB("list.strnum.cached");
+            BasicBlock* slowBB = newBB("list.strnum.fallback");
+            const char* directMissMode = std::getenv("XYO_JIT_LIST_STRING_MISS_DIRECT");
+            const bool directMiss = directMissMode && directMissMode[0] == '1';
+            BasicBlock* missBB = directMiss
+                ? newBB("list.strnum.unparsed") : slowBB;
+            BasicBlock* doneBB = newBB("list.strnum.done");
+            llvm::Value* strTag = b.CreateICmpEQ(
+                b.CreateLShr(bits, ci64(48)), ci64(val::kTagStr >> 48));
+            hotBr(strTag, strBB, slowBB, 200, 1);
+            b.SetInsertPoint(strBB);
+            llvm::Value* sp = b.CreateIntToPtr(
+                b.CreateAnd(bits, ci64(val::kPtrMask)), ptrt);
+            llvm::Value* state = loadSStrCache(i32t, sp, kSStrNumStateOff, true);
+            hotBr(b.CreateICmpNE(state, ci32(0)), hitBB, missBB, 200, 1);
+            b.SetInsertPoint(hitBB);
+            llvm::Value* cached = loadSStrCache(
+                f64t, sp, kSStrNumCacheOff, false);
+            llvm::Value* n = b.CreateSelect(
+                b.CreateICmpEQ(state, ci32(2)), cf64(0.0), cached);
+            b.CreateBr(doneBB);
+            llvm::Value* uncached = nullptr;
+            if (directMiss) {
+                b.SetInsertPoint(missBB);
+                // Tag and cache state have both been checked. Avoid repeating
+                // them in the boxed conversion on this uncommon path.
+                uncached = call1("xyo_to_num_uncached", f64t, sp);
+                b.CreateBr(doneBB);
+            }
+            b.SetInsertPoint(slowBB);
+            llvm::Value* generic = emitToNumF64(bits);
+            BasicBlock* slowEnd = b.GetInsertBlock();
+            b.CreateBr(doneBB);
+            b.SetInsertPoint(doneBB);
+            PHINode* result = b.CreatePHI(f64t, directMiss ? 3 : 2);
+            result->addIncoming(n, hitBB);
+            result->addIncoming(generic, slowEnd);
+            if (directMiss) result->addIncoming(uncached, missBB);
+            return result;
+        }
         if (likelyNumLoads.count(bits)) {
             // Monomorphic numeric variables use a small fast path. A change
             // by a different script/clone/monitor falls through to Scratch's
@@ -1915,6 +2635,149 @@ struct Codegen {
     static constexpr uint32_t kSStrRgbCacheOff =
         uint32_t(offsetof(SStr, rgbCache));
 
+    // RT-001: exact indexed generation check in the LLVM hot path.
+    // Owner and generation pointers are borrowed from a serial
+    // Thread; they are invalidated BEFORE Target/Stage rebinding.
+    // Every host-visible epoch read is volatile to prevent LICM across
+    // a yield, editor event, or a call not modeled by the optimizer.
+    llvm::Value* guardedIndexedVarSlot(
+        uint64_t idx, llvm::Value* id, llvm::Value* name, bool isList) {
+        auto* fallback = BasicBlock::Create(lc, "var.index.miss", fn);
+        auto* check = BasicBlock::Create(lc, "var.index.check", fn);
+        auto* hit = BasicBlock::Create(lc, "var.index.hit", fn);
+        auto* done = BasicBlock::Create(lc, "var.index.done", fn);
+        auto* thread = b.CreateLoad(
+            ptrt, b.CreateConstGEP1_32(i8t, ctxArg,
+                                       uint32_t(offsetof(JitCtx, thread))));
+        auto loadPtr = [&](uint32_t off) -> llvm::Value* {
+            auto* ld = b.CreateLoad(
+                ptrt, b.CreateConstGEP1_32(i8t, thread, off));
+            ld->setVolatile(true);
+            return ld;
+        };
+        auto loadI64 = [&](uint32_t off) -> llvm::Value* {
+            auto* ld = b.CreateLoad(
+                i64t, b.CreateConstGEP1_32(i8t, thread, off));
+            ld->setVolatile(true);
+            return ld;
+        };
+        llvm::Value* currentTarget = b.CreateLoad(
+            ptrt, b.CreateConstGEP1_32(
+                i8t, ctxArg, uint32_t(offsetof(JitCtx, target))));
+        llvm::Value* cachedOwner = loadPtr(
+            uint32_t(offsetof(Thread, nativeVarCacheTarget)));
+        llvm::Value* cachedStage = loadPtr(
+            uint32_t(offsetof(Thread, nativeVarCacheStage)));
+        // Stage identity may change even if a former Stage pointer's
+        // generation has not. Lightweight C++ owner query is mandatory
+        // for sprite/clone paths; it never dereferences stale pointers.
+        llvm::Value* currentStage = b.CreateCall(
+            decl("xyo_varslot_guard_stage", ptrt, {ptrt}), {ctxArg});
+        llvm::Value* cachedValid = b.CreateLoad(
+            i8t, b.CreateConstGEP1_32(
+                i8t, thread,
+                uint32_t(offsetof(Thread, nativeVarCacheValid))));
+        llvm::Value* data = loadPtr(
+            uint32_t(offsetof(Thread, nativeVarInlineEntries)));
+        llvm::Value* count = loadI64(
+            uint32_t(offsetof(Thread, nativeVarInlineCount)));
+        llvm::Value* localGenAddress = loadPtr(
+            uint32_t(offsetof(Thread, nativeVarLocalGenerationAddress)));
+        llvm::Value* stageGenAddress = loadPtr(
+            uint32_t(offsetof(Thread, nativeVarStageGenerationAddress)));
+        llvm::Value* hasStage = b.CreateIsNotNull(currentStage);
+        llvm::Value* eligible = b.CreateAnd(
+            b.CreateICmpEQ(currentTarget, cachedOwner),
+            b.CreateICmpEQ(currentStage, cachedStage));
+        eligible = b.CreateAnd(
+            eligible, b.CreateICmpNE(
+                cachedValid, llvm::ConstantInt::get(i8t, 0)));
+        eligible = b.CreateAnd(eligible, b.CreateIsNotNull(data));
+        eligible = b.CreateAnd(eligible, b.CreateIsNotNull(localGenAddress));
+        eligible = b.CreateAnd(
+            eligible, b.CreateICmpULT(ci64(idx), count));
+        eligible = b.CreateAnd(
+            eligible, b.CreateOr(
+                b.CreateNot(hasStage), b.CreateIsNotNull(stageGenAddress)));
+        hotBr(eligible, check, fallback);
+
+        b.SetInsertPoint(check);
+        // Select a known non-null pointer when the stage is absent.
+        llvm::Value* stageAddress = b.CreateSelect(
+            hasStage, stageGenAddress, localGenAddress);
+        auto* localNow = b.CreateLoad(i64t, localGenAddress);
+        auto* stageNow = b.CreateLoad(i64t, stageAddress);
+        localNow->setVolatile(true);
+        stageNow->setVolatile(true);
+        llvm::Value* localBefore = loadI64(
+            uint32_t(offsetof(Thread, nativeVarCacheLocalGeneration)));
+        llvm::Value* stageBefore = loadI64(
+            uint32_t(offsetof(Thread, nativeVarCacheStageGeneration)));
+        llvm::Value* epochOk = b.CreateAnd(
+            b.CreateICmpEQ(localNow, localBefore),
+            b.CreateOr(b.CreateNot(hasStage),
+                       b.CreateICmpEQ(stageNow, stageBefore)));
+        // Memory-backed entry is loaded only after the owning vector
+        // address and bounds check. Compiler-interned id/name pointers
+        // prevent the same index in another function binding a wrong
+        // Variable* while the map generation remains unchanged.
+        llvm::Value* entryAddress = b.CreateGEP(
+            i8t, data,
+            ci64(idx * sizeof(Thread::NativeVarIndexedEntry)));
+        auto readEntryPtr = [&](uint32_t off) -> llvm::Value* {
+            auto* ld = b.CreateLoad(
+                ptrt, b.CreateConstGEP1_32(i8t, entryAddress, off));
+            ld->setVolatile(true);
+            return ld;
+        };
+        llvm::Value* cachedId = readEntryPtr(
+            uint32_t(offsetof(Thread::NativeVarIndexedEntry, key) +
+                     offsetof(JitVarCacheKey, id)));
+        llvm::Value* cachedName = readEntryPtr(
+            uint32_t(offsetof(Thread::NativeVarIndexedEntry, key) +
+                     offsetof(JitVarCacheKey, name)));
+        auto* cachedKind = b.CreateLoad(
+            i32t, b.CreateConstGEP1_32(
+                i8t, entryAddress,
+                uint32_t(offsetof(Thread::NativeVarIndexedEntry, key) +
+                         offsetof(JitVarCacheKey, list))));
+        cachedKind->setVolatile(true);
+        llvm::Value* variable = readEntryPtr(
+            uint32_t(offsetof(Thread::NativeVarIndexedEntry, variable)));
+        llvm::Value* matchesKey = b.CreateAnd(
+            b.CreateICmpEQ(cachedId, id),
+            b.CreateICmpEQ(cachedName, name));
+        matchesKey = b.CreateAnd(
+            matchesKey, b.CreateICmpEQ(
+                cachedKind, ci32(isList ? 1 : 0)));
+        hotBr(b.CreateAnd(epochOk, b.CreateAnd(
+            matchesKey, b.CreateIsNotNull(variable))), hit, fallback);
+
+        b.SetInsertPoint(hit);
+        if (inlineVarGuardTrace) {
+            auto* tracePtr = b.CreateConstGEP1_32(
+                i8t, thread,
+                uint32_t(offsetof(Thread, nativeVarInlineTraceHits)));
+            auto* trace = b.CreateLoad(i64t, tracePtr);
+            trace->setVolatile(true);
+            auto* inc = b.CreateStore(b.CreateAdd(trace, ci64(1)),
+                                      tracePtr);
+            inc->setVolatile(true);
+        }
+        b.CreateBr(done);
+        b.SetInsertPoint(fallback);
+        llvm::Value* rebound = b.CreateCall(
+            decl("xyo_varslot_checked", ptrt,
+                 {ptrt, i64t, ptrt, ptrt, i32t}),
+            {ctxArg, ci64(idx), id, name, ci32(isList ? 1 : 0)});
+        b.CreateBr(done);
+        b.SetInsertPoint(done);
+        auto* result = b.CreatePHI(ptrt, 2, "var.index.value");
+        result->addIncoming(variable, hit);
+        result->addIncoming(rebound, fallback);
+        return result;
+    }
+
     /// ctx->varSlotData[idx] から Variable* を直接 load して返す。
     /// 初出の (id,isList) にはエントリ関数先頭へ xyo_varslot_init を
     /// 挿入（全使用点を支配。proc 呼出しでは init は再実行されない）。
@@ -1939,6 +2802,26 @@ struct Codegen {
                      {ptrt, i64t, ptrt, ptrt, i32t}),
                 {entryFn->getArg(0), ci64(it->second), varIdCAt(f, ib),
                  varNameU16(f), ci32(isList ? 1 : 0)});
+        }
+        if (guardNativeVarSlots) {
+            // Validate ownership at the exact use. The base guarded
+            // mode re-resolves; the stamped FAST submode only borrows a
+            // cached node after both local and stage epochs match.
+            // Neither mode permits a hoisted pointer across a yield.
+            // Keep a genuine side-effecting external call: it must not be
+            // hoisted outside a loop by LLVM alias optimizations.
+            llvm::Value* id = varIdC(f);
+            llvm::Value* name = varNameU16(f);
+            if (inlineIndexedVarGuard && inlineVarGuardSourceAllowed &&
+                !aot && mod.getDataLayout().getPointerSize() == sizeof(void*) &&
+                it->second <= UINT32_MAX)
+                return guardedIndexedVarSlot(
+                    it->second, id, name, isList);
+            return b.CreateCall(
+                decl("xyo_varslot_checked", ptrt,
+                     {ptrt, i64t, ptrt, ptrt, i32t}),
+                {ctxArg, ci64(it->second), id, name,
+                 ci32(isList ? 1 : 0)});
         }
         llvm::Value* arr = b.CreateLoad(
             ptrt, b.CreateConstGEP1_32(i8t, ctxArg, kVarSlotDataOff));
@@ -2143,6 +3026,10 @@ struct Codegen {
     }
     /// ループ本体の直前（preheader）で呼ぶ。このループが昇格を所有したら true。
     bool beginLoopPromotion(Block* loopBlk, bool gpuHandled) {
+        // A promoted scalar/list can retain a Variable::value/list
+        // address across host callbacks or yield. Disable all such
+        // borrows in the opt-in fresh-binding correctness path.
+        if (guardNativeVarSlots) return false;
         if (!promoted.empty() || promotingLoop || gpuHandled) return false;
         readMemoAllowed = true;
         const BlockInput* in = loopBlk->inputs.find("SUBSTACK");
@@ -2216,12 +3103,44 @@ struct Codegen {
         // type check is removed: the numeric shadow always maintains
         // toNumber(boxed) plus Scratch comparison eligibility.
         const char* cfgTypeHints = std::getenv("XYO_JIT_CFG_TYPE_HINTS");
-        if (cfgTypeHints && cfgTypeHints[0] == '1' &&
-            localFactsAliasSafe && !dynamicWriteSites.empty()) {
+        // PROF-007: Optional early profitability filter. For unprofitable
+        // loops, skip constructing the CFG entirely. This filter never
+        // claims a runtime type; the existing flow proof remains mandatory.
+        const char* selectiveEnv =
+            std::getenv("XYO_JIT_CFG_TYPE_HINTS_SELECTIVE");
+        const bool selectiveCfg = selectiveEnv && selectiveEnv[0] == '1';
+        const auto worthChecking = [&](const std::string& id,
+                                        const std::vector<std::string>& writes) {
+            if (!selectiveCfg) return true;
+            const auto demand = numericDemand.find(id);
+            return promotionReads.count(id) != 0 &&
+                demand != numericDemand.end() &&
+                analysis::cfgNumericShadowWorthAnalyzing(
+                    demand->second, writes.size());
+        };
+        const bool hasCandidate = !selectiveCfg ||
+            std::any_of(dynamicWriteSites.begin(), dynamicWriteSites.end(),
+                [&](const auto& pair) {
+                    return worthChecking(pair.first, pair.second);
+                });
+        const bool wantsCfgAnalysis =
+            cfgTypeHints && cfgTypeHints[0] == '1' &&
+            localFactsAliasSafe && !dynamicWriteSites.empty();
+        const bool measureCfg = analysis::CfgTypeHintTelemetry::enabled();
+        if (wantsCfgAnalysis && measureCfg)
+            analysis::CfgTypeHintTelemetry::get().noteEligible(!hasCandidate);
+        if (wantsCfgAnalysis && hasCandidate) {
+            const auto started = measureCfg
+                ? analysis::CfgTypeHintTelemetry::Clock::now()
+                : analysis::CfgTypeHintTelemetry::Clock::time_point{};
             const auto flow = analysis::analyzeTypeFlow(*blocks, loopBlk->id,
                                                          8192, target);
+            if (measureCfg)
+                analysis::CfgTypeHintTelemetry::get().noteAnalysis(
+                    started, flow.cfg.nodes.size(), flow.cfg.truncated);
             if (!flow.cfg.truncated) {
                 for (const auto& [variableId, writes] : dynamicWriteSites) {
+                    if (!worthChecking(variableId, writes)) continue;
                     bool numericAtAllWrites = !writes.empty();
                     for (const std::string& write : writes) {
                         auto positions = flow.cfg.blockNodes.find(write);
@@ -2244,6 +3163,8 @@ struct Codegen {
                     }
                     if (numericAtAllWrites) {
                         nonNumericVars.erase(variableId);
+                        if (measureCfg)
+                            analysis::CfgTypeHintTelemetry::get().notePromotion();
                         if (verbose)
                             std::fprintf(stderr,
                                 "xyo-jit: cfg numeric-shadow %s\n",
@@ -2366,10 +3287,53 @@ struct Codegen {
         readMemoPreheader = promotingLoop ? b.GetInsertBlock() : nullptr;
         return promotingLoop;
     }
+    // A list item/length reporter does not mutate Scratch's for-each index.
+    // Permit it in the typed induction proof only when the list already
+    // exists and resolves by the exact ID to a list on this target. This
+    // excludes malformed/missing aliases that could trigger lazy slot setup.
+    // Other reporters, list writes, nested controls and yield sites still
+    // invalidate the proof. No type assumption is made about list elements.
+    bool inductionReadOnlyList(Block* node, const std::string& indexId) {
+        const char* option = std::getenv("XYO_JIT_LIST_PROVEN_I32_INDEX");
+        if ((option && option[0] == '0') || aot || !target || !node ||
+            (node->opcode != "data_itemoflist" &&
+             node->opcode != "data_lengthoflist")) return false;
+        const BlockField* f = findField(node, "LIST");
+        if (!f || f->id.empty() || f->id == indexId) return false;
+        const Variable* v = target->lookupVariableById(f->id);
+        return v && v->type == Variable::kListType && v->list;
+    }
+
+    // A regular IF/IF-ELSE has no native yield of its own. A subsequent
+    // recursive walk MUST still reject every yield/call, index write,
+    // side-effecting reporter and unrecognized nested block.
+    bool inductionPureIf(Block* node) {
+        if (!node) return false;
+        const std::string& op = node->opcode;
+        if (op != "control_if" && op != "control_if_else") return false;
+        const char* enabled = std::getenv("XYO_JIT_COMPARE_PROVEN_NUM");
+        if (enabled && (enabled[0] == '0' ||
+                        (enabled[0] != '1' && enabled[0] != '2' &&
+                         enabled[0] != '3'))) return false;
+        // Default =3 restricts the proof to ordered comparisons. =1 and =2
+        // preserve the broader experimental branch-typing modes for A/B.
+        // Equality and Boolean composites have distinct CFG shapes and
+        // regressed in the paired tests, so they remain on the old path.
+        if (!enabled || enabled[0] == '3') {
+            const BlockInput* input = node->inputs.find("CONDITION");
+            if (!input) return false;
+            const std::string& source = input->block.empty()
+                ? input->shadow : input->block;
+            Block* cond = source.empty() ? nullptr : getBlock(source);
+            return cond && (cond->opcode == "operator_lt" ||
+                            cond->opcode == "operator_gt");
+        }
+        return true;
+    }
+
     // A pure, uninterrupted for-each body that never writes its induction
     // variable will always observe the loop header's finite i+1. Reject
-    // nested control structures, procedures, and all opaque blocks rather
-    // than assuming that they cannot yield or mutate state.
+    // unverified control structures, procedures, and opaque blocks.
     bool finiteIndexBody(const BlockInput* body, const std::string& indexId) {
         if (!body || body->block.empty()) return false;
         std::vector<std::string> todo{body->block};
@@ -2385,7 +3349,9 @@ struct Codegen {
                 op != "data_variable" &&
                 op != "data_setvariableto" &&
                 op != "data_changevariableby" &&
-                op.rfind("operator_", 0) != 0)
+                op.rfind("operator_", 0) != 0 &&
+                !inductionPureIf(node) &&
+                !inductionReadOnlyList(node, indexId))
                 return false;
             if (op == "data_setvariableto" ||
                 op == "data_changevariableby") {
@@ -2405,7 +3371,8 @@ struct Codegen {
     // proves a finite delta. A *typed interval* is stronger: reject opaque,
     // extension, random, and potentially side-effecting reporters. The
     // compiler never substitutes a profile prediction for this structural
-    // proof. It also rejects all nested control constructs and index writes.
+    // proof. Only verified, recursively inspected pure IFs can nest; any
+    // index write, other control or yield still rejects the proof.
     bool strictInductionBody(const BlockInput* body,
                              const BlockField* indexField) {
         if (!indexField || !indexField->value.isString() ||
@@ -2430,7 +3397,9 @@ struct Codegen {
             if (id.empty() || !visited.insert(id).second) continue;
             Block* node = getBlock(id);
             if (!node) return false;
-            if (!node->shadow && !kPure.count(node->opcode)) return false;
+            if (!node->shadow && !kPure.count(node->opcode) &&
+                !inductionPureIf(node) &&
+                !inductionReadOnlyList(node, indexId)) return false;
             if (node->opcode == "data_setvariableto" ||
                 node->opcode == "data_changevariableby") {
                 const BlockField* written = findField(node, "VARIABLE");
@@ -2618,8 +3587,9 @@ struct Codegen {
         // loop-invariant. hoistVarSlotPointers lifts it to the function entry
         // together with the Variable* load; without that every list access
         // pays a 3-deep dependent load chain (slot -> Variable -> SList).
-        load->setMetadata("xyo.varlist", MDNode::get(lc,
-            {ConstantAsMetadata::get(ci64(idx))}));
+        if (!guardNativeVarSlots)
+            load->setMetadata("xyo.varlist", MDNode::get(lc,
+                {ConstantAsMetadata::get(ci64(idx))}));
         return load;
     }
 
@@ -2676,8 +3646,31 @@ struct Codegen {
     /// (bits, d) の整合ペアを書き込む。NaN は bits=kNan / d=0 に落とす
     /// （Scratch の正準表現 + toNum(NaN)=0 を、読み出し側の検査なしで保つ）。
     /// ok は「比較に d を使えるか」— 省略時は (bits, d) から判定する。
+    // IR-001: only emit the additional content-write callback in
+    // opted-in native SSA auditing, not for normal JIT hot loops.
+    void beginListContentWrite() {
+        if (captureReporterListReadEvaluation)
+            callN("xyo_ir001_list_content_write_begin", voidt, {});
+    }
+    void endListContentWrite() {
+        if (captureReporterListReadEvaluation)
+            callN("xyo_ir001_list_content_write_end", voidt, {});
+    }
+
+    // Shared conservative VM-write barrier for native optimized paths.
+    // Includes numeric promotion, loop reductions and fast list writes
+    // which do NOT necessarily run emitStackBlock per mutation.
+    void notePossibleNativeVmWrite() {
+        if (traceEffectSourcePc && !aot)
+            call1("xyo_ir001_vm_write", voidt, ctxArg);
+    }
+
     void storeNumericPair(PromotedVar& p, llvm::Value* bits,
                           llvm::Value* d, llvm::Value* ok = nullptr) {
+        notePossibleNativeVmWrite();
+        // Some SSA reductions and for-each fast paths bypass emitVarSet().
+        // Publish their scalar writes to the opt-in dependency registry too.
+        emitWaitVariableWrite(p.field);
         b.CreateStore(bits, p.slot);
         b.CreateStore(d, p.dslot);
         llvm::Value* o = ok ? ok : numericCmpOk(bits, d);
@@ -2765,7 +3758,23 @@ struct Codegen {
         }
         return bits;
     }
+    // Notify the reverse wait dependency registry for direct LLVM variable
+    // stores. Only generate code for opt-in native JITs: the standard hot
+    // path remains instruction-identical. The registry only records wake
+    // candidates and does not dereference watched variables.
+    void emitWaitVariableWrite(const BlockField* f) {
+        static const bool enabled = [] {
+            const char* env = std::getenv("XYO_WAIT_WAKE_REGISTRY");
+            return env && env[0] == '1';
+        }();
+        if (!enabled || aot || !f || !varOverride.empty() &&
+            varOverride.count(f->id)) return;
+        llvm::Value* variable = varSlot(f, false);
+        b.CreateCall(decl("xyo_wait_notify_var_store", voidt,
+                          {ptrt, ptrt}), {ctxArg, variable});
+    }
     void emitVarSet(const BlockField* f, llvm::Value* val) {
+        notePossibleNativeVmWrite();
         if (PromotedVar* p = findPromoted(f)) {
             if (p->numeric) {
                 // 影の不変条件: d == toNum(bits)。bits は代入された値そのもの
@@ -2775,6 +3784,7 @@ struct Codegen {
                 return;
             }
         }
+        emitWaitVariableWrite(f);
         struct SlotLowerer {
             IRBuilder<>& builder;
             void storeSlot(llvm::Value* address, llvm::Value* bits) {
@@ -2801,6 +3811,7 @@ struct Codegen {
     }
     void emitVarChange(const BlockField* f, llvm::Value* delta,
                        bool sameScalarDelta = false) {
+        notePossibleNativeVmWrite();
         if (f) localVarFacts.erase(f->id);
         llvm::Value* vp = varValuePtr(f);
         // A direct reporter reading this exact scalar was evaluated before
@@ -2896,8 +3907,10 @@ struct Codegen {
             emitVarSet(f, finiteDelta ? emitCanonKnownNonNaN(s)
                                      : emitCanon(s));
         } else if (finiteDelta) {
+            emitWaitVariableWrite(f);
             b.CreateStore(b.CreateBitCast(s, i64t), vp);
         } else {
+            emitWaitVariableWrite(f);
             b.CreateStore(emitCanon(s), vp);
         }
     }
@@ -3038,6 +4051,100 @@ struct Codegen {
                 std::trunc(m) == m) {
                 if (auto range = intInterval(fa);
                     range && range->lo > 0 && range->hi <= 2147483647LL) {
+                    // A proven positive exact-integer dividend in (0,2*m]
+                    // can be reduced by only subtraction and comparisons.
+                    // No floating modulo, i32 conversion, or division is
+                    // needed; Sterbenz guarantees exact fa-m in [m,2*m].
+                    // The upper endpoint 2*m must reduce to positive zero.
+                    // Proven bounded 1..3m extension: two unsigned
+                    // comparisons, two conditional subtractions.
+                    // For x == 2m the first subtract gives zero; for x == 3m
+                    // the second subtract gives zero. No division or
+                    // remainder is emitted. 3*m <= 12285 fits unsigned i32.
+                    // Only a proven exact positive integer SSA is eligible.
+                    const char* tripleMode = std::getenv(
+                        "XYO_JIT_MOD_PROVEN_TRIPLE_WRAP");
+                    const uint32_t divisor = static_cast<uint32_t>(m);
+                    // 8 paired long-run Scratch measurements all improved
+                    // for non-power-of-two moduli [31,4095]. Large moduli
+                    // had much less reliable/smaller benefit. Default ON;
+                    // explicit =0 retains LLVM's integer remainder path.
+                    if ((!tripleMode || tripleMode[0] != '0') &&
+                        m >= 31.0 && m <= 4095.0 &&
+                        (divisor & (divisor - 1u)) != 0 &&
+                        range->hi > static_cast<int64_t>(2.0*m) &&
+                        range->hi <= static_cast<int64_t>(3.0*m)) {
+                        llvm::Value* index = b.CreateFPToUI(
+                            fa, i32t, "mod.triple.index");
+                        llvm::Value* removeTwo = b.CreateSelect(
+                            b.CreateICmpUGE(index, ci32(divisor * 2u)),
+                            b.CreateSub(index, ci32(divisor * 2u)),
+                            index);
+                        llvm::Value* rem = b.CreateSelect(
+                            b.CreateICmpUGE(removeTwo, ci32(divisor)),
+                            b.CreateSub(removeTwo, ci32(divisor)),
+                            removeTwo);
+                        llvm::Value* number = b.CreateUIToFP(
+                            rem, f64t, "mod.triple.result");
+                        llvm::Value* boxed = emitCanonKnownNonNaN(number);
+                        recordIntInterval(boxed,
+                            IntInterval{0, static_cast<int64_t>(m) - 1});
+                        return boxed;
+                    }
+                    const char* provenWrap = std::getenv(
+                        "XYO_JIT_MOD_PROVEN_SMALL_WRAP");
+                    // LLVM already reduces small constant remainders and
+                    // power-of-two moduli exceptionally well. Measured
+                    // positive-value loop families with non-power-of-two
+                    // moduli >=31 consistently prefer the subtract/select
+                    // IR, particularly 127, 254, 511 and 1023. Leave the
+                    // other modulus families on LLVM's native remainder
+                    // path. Explicit =0 restores the old implementation.
+                    const bool candidate = m >= 31.0 && m <= 65536.0 &&
+                        (uint32_t(m) & (uint32_t(m) - 1u)) != 0 &&
+                        range->hi <= static_cast<int64_t>(2.0 * m);
+                    const bool useWrap =
+                        (!provenWrap || provenWrap[0] != '0') && candidate;
+                    if (useWrap) {
+                        const char* nativeMode = std::getenv(
+                            "XYO_JIT_MOD_PROVEN_I32_WRAP");
+                        // i32 SSA gives LLVM the original induction
+                        // value and avoids repeated conversions. The prior
+                        // f64 select version remains an A/B control at =0.
+                        const bool nativeI32 = !nativeMode ||
+                            nativeMode[0] != '0';
+                        llvm::Value* number = nullptr;
+                        if (nativeI32) {
+                            // The proven integer is in [1,2m], thus well
+                            // within unsigned i32. This exposes native
+                            // induction SSA and integer selection to LLVM.
+                            llvm::Value* index = b.CreateFPToUI(
+                                fa, i32t, "mod.proven.index");
+                            llvm::Value* difference = b.CreateSub(
+                                index, ci32(uint32_t(m)));
+                            llvm::Value* wrapped = b.CreateSelect(
+                                b.CreateICmpUGE(
+                                    index, ci32(uint32_t(m))),
+                                difference, index);
+                            llvm::Value* remainder = b.CreateSelect(
+                                b.CreateICmpEQ(
+                                    index, ci32(uint32_t(2.0*m))),
+                                ci32(0), wrapped);
+                            number = b.CreateUIToFP(
+                                remainder, f64t, "mod.proven.i32.result");
+                        } else {
+                            llvm::Value* wrapped = b.CreateSelect(
+                                b.CreateFCmpOGE(fa, cf64(m)),
+                                b.CreateFSub(fa, cf64(m)), fa);
+                            number = b.CreateSelect(
+                                b.CreateFCmpOEQ(fa, cf64(2.0 * m)),
+                                cf64(0.0), wrapped);
+                        }
+                        llvm::Value* boxed = emitCanonKnownNonNaN(number);
+                        recordIntInterval(boxed,
+                            IntInterval{0, static_cast<int64_t>(m) - 1});
+                        return boxed;
+                    }
                     // Positive, exact signed-i32 dividend is statically
                     // proven. Remove all modulo range/integer/NaN branches.
                     llvm::Value* n = b.CreateFPToSI(fa, i32t);
@@ -3059,6 +4166,53 @@ struct Codegen {
                 BasicBlock* smallFast = BasicBlock::Create(lc, "mod.c32.fast", fn);
                 BasicBlock* widePath = BasicBlock::Create(lc, "mod.c32.wide", fn);
                 BasicBlock* finalMerge = BasicBlock::Create(lc, "mod.c32.done", fn);
+                // Guarded fast path for a positive finite dividend at most
+                // twice a small constant modulus. On the default real path,
+                // Sterbenz's lemma makes fa-m exact whenever m <= fa <= 2*m;
+                // integrality need not be tested. Older integer-only mode
+                // remains available as an A/B control. Negative, signed-zero
+                // and out-of-range inputs retain the original fallback.
+                // At 2*m, the result must be +0 (not m).
+                const char* wrapMode = std::getenv("XYO_JIT_MOD_SMALL_WRAP");
+                const bool wrapEnabled = (!wrapMode || wrapMode[0] != '0') &&
+                    m >= 2.0 && m <= 65536.0;
+                // An exact positive real dividend in (0, 2*m] does not
+                // require the legacy trunc-based integer proof. Floating
+                // subtraction is exact throughout the subtracting interval.
+                const char* realWrapMode = std::getenv("XYO_JIT_MOD_REAL_WRAP");
+                const bool realWrap = !realWrapMode || realWrapMode[0] != '0';
+                llvm::Value* wrapResult = nullptr;
+                BasicBlock* wrapEnd = nullptr;
+                if (wrapEnabled) {
+                    BasicBlock* wrapCheck = newBB("mod.wrap.check");
+                    BasicBlock* wrapFast = newBB("mod.wrap.fast");
+                    BasicBlock* oldRange = newBB("mod.wrap.fallback");
+                    llvm::Value* range = b.CreateAnd(
+                        b.CreateFCmpOGT(fa, cf64(0.0)),
+                        b.CreateFCmpOLE(fa, cf64(2.0 * m)));
+                    if (realWrap) {
+                        b.CreateCondBr(range, wrapFast, oldRange);
+                        // Keep the legacy integer-only branch as an A/B
+                        // control without emitting an unreachable block.
+                        wrapCheck->eraseFromParent();
+                    } else {
+                        b.CreateCondBr(range, wrapCheck, oldRange);
+                        b.SetInsertPoint(wrapCheck);
+                        llvm::Value* integral = b.CreateFCmpOEQ(
+                            fa, b.CreateUnaryIntrinsic(Intrinsic::trunc, fa));
+                        b.CreateCondBr(integral, wrapFast, oldRange);
+                    }
+                    b.SetInsertPoint(wrapFast);
+                    llvm::Value* oneWrap = b.CreateSelect(
+                        b.CreateFCmpOGE(fa, cf64(m)),
+                        b.CreateFSub(fa, cf64(m)), fa);
+                    wrapResult = b.CreateSelect(
+                        b.CreateFCmpOGE(fa, cf64(2.0 * m)),
+                        cf64(0.0), oneWrap);
+                    wrapEnd = b.GetInsertBlock();
+                    b.CreateBr(finalMerge);
+                    b.SetInsertPoint(oldRange);
+                }
                 llvm::Value* smallRange = b.CreateAnd(
                     b.CreateFCmpOGT(fa, cf64(0.0)),
                     b.CreateFCmpOLE(fa, cf64(2147483647.0)));
@@ -3124,13 +4278,15 @@ struct Codegen {
                 }
                 b.CreateBr(finalMerge);
                 b.SetInsertPoint(finalMerge);
-                PHINode* merged = b.CreatePHI(f64t, 2);
+                PHINode* merged = b.CreatePHI(f64t, wrapEnabled ? 3 : 2);
                 merged->addIncoming(res32, smallFast);
                 merged->addIncoming(result, merge);
+                if (wrapEnabled) merged->addIncoming(wrapResult, wrapEnd);
                 if (splitModNan) {
-                    auto* phi = b.CreatePHI(b.getInt1Ty(), 2);
+                    auto* phi = b.CreatePHI(b.getInt1Ty(), wrapEnabled ? 3 : 2);
                     phi->addIncoming(b.getInt1(false), smallFast);
                     phi->addIncoming(nanWide, merge);
+                    if (wrapEnabled) phi->addIncoming(b.getInt1(false), wrapEnd);
                     modNan = phi;
                 }
                 r = merged;
@@ -3452,6 +4608,15 @@ struct Codegen {
         // （numericCmpOk）、書き込み側で更新しておく — 比較のたびに
         // タグ検査を出すと分岐が増えてループが伸びる。
         if (auto it = knownNumD.find(bits); it != knownNumD.end()) {
+            const char* setting = std::getenv("XYO_JIT_COMPARE_PROVEN_NUM");
+            // A *canonical numeric* SSA producer with a proven bounded
+            // integral interval cannot be NaN, string, or Boolean. Retain
+            // full Scratch comparison for unproven/loaded values.
+            if (setting && setting[0] == '1' && knownNum.count(bits) &&
+                intInterval(it->second)) {
+                *okOut = b.getTrue();
+                return it->second;
+            }
             auto ok = knownNumOk.find(bits);
             *okOut = ok != knownNumOk.end()
                          ? ok->second
@@ -3578,7 +4743,12 @@ struct Codegen {
                 decl(fn == 4 ? "sin" : "cos", f64t, {f64t}), {rad});
             v = b.CreateUnaryIntrinsic(Intrinsic::round,
                                        b.CreateFMul(v, cf64(1e10)));
-            return b.CreateFDiv(v, cf64(1e10));
+            llvm::Value* rounded = b.CreateFDiv(v, cf64(1e10));
+            // Scratch mathop sin(-0) uses toFixed(10), which yields +0.
+            return fn == 4
+                ? b.CreateSelect(b.CreateFCmpOEQ(x, cf64(0.0)),
+                                 cf64(0.0), rounded)
+                : rounded;
         }
         case 7: case 8: case 9: {
             // Scratch: (asin(x) * 180) / pi。定数を先に畳まない。
@@ -4737,8 +5907,18 @@ struct Codegen {
         // result through numeric/boolean/string tests and a helper edge.
         // The shadow is cast::toNumber(value), so canonical NaN is already 0.
         if (knownNum.count(bits)) {
-            if (auto it = knownNumD.find(bits); it != knownNumD.end())
+            if (auto it = knownNumD.find(bits); it != knownNumD.end()) {
+                const char* setting = std::getenv("XYO_JIT_COMPARE_PROVEN_NUM");
+                if (setting && setting[0] == '1') {
+                    if (auto range = intInterval(it->second)) {
+                        if (range->lo > 0 || range->hi < 0)
+                            return b.getTrue();
+                        if (range->lo == 0 && range->hi == 0)
+                            return b.getFalse();
+                    }
+                }
                 return b.CreateFCmpONE(it->second, cf64(0.0));
+            }
             return b.CreateFCmpONE(emitAsF64(bits), cf64(0.0));
         }
         // Feedback is a prediction, not a proof. Only plain IEEE-754
@@ -4960,6 +6140,22 @@ struct Codegen {
     // This avoids both poison and the multi-instruction fptosi.sat lowering.
     std::pair<llvm::Value*, llvm::Value*> emitListBounds(
             llvm::Value* d, llvm::Value* len) {
+        // An immutable f64 SSA producer may carry a proven exact integer
+        // interval from induction/arithmetic analysis. In [1, INT32_MAX],
+        // narrowing to i32 and subtracting one cannot wrap. Hand LLVM a
+        // native i32 bounds check; do not repeat this conversion for indexes
+        // without a proof (strings, mutable variables, overflow, negatives).
+        const char* provenMode = std::getenv("XYO_JIT_LIST_PROVEN_I32_INDEX");
+        if (!provenMode || provenMode[0] != '0') {
+            if (auto range = intInterval(d);
+                range && range->lo >= 1 && range->hi <= 2147483647LL) {
+                llvm::Value* idx = b.CreateFPToUI(d, i32t, "list.idx.i32");
+                llvm::Value* zeroBased = b.CreateSub(
+                    idx, ci32(1), "list.idx.zero", true, true);
+                llvm::Value* inRange = b.CreateICmpULT(zeroBased, len);
+                return {inRange, b.CreateZExt(zeroBased, i64t)};
+            }
+        }
 #if defined(__x86_64__) || defined(_M_X64)
         auto* vt = llvm::FixedVectorType::get(f64t, 2);
         llvm::Value* vec = b.CreateInsertElement(
@@ -5016,13 +6212,47 @@ struct Codegen {
         return plausible;
     }
 
+    // IR-001 opt-in: observe the EXACT runtime INDEX and item result
+    // after listGet/inlined PHI evaluation. This does not evaluate the
+    // INDEX twice, choose a randomized index twice or modify Scratch state.
+    llvm::Value* traceListItemEvaluation(
+        Block* source, const BlockField* listField,
+        llvm::Value* index, llvm::Value* result,
+        llvm::Value* epochBeforeRead) {
+        if (!captureReporterListReadEvaluation || aot || !source ||
+            !listField || !result || !index)
+            return result;
+        const auto it = effectSourcePc.find(source->id);
+        if (it == effectSourcePc.end() || !it->second)
+            return result;
+        const auto listId = b.CreateGlobalString(
+            listField->id, "ir001.list.owner");
+        auto fn = decl("xyo_ir001_list_read_eval", voidt,
+            {ptrt, i64t, ptrt, i64t, i64t, i64t});
+        b.CreateCall(fn,
+            {ctxArg, ci64(it->second), listId, index, result,
+             epochBeforeRead});
+        return result;
+    }
+
+    // This call occurs AFTER INDEX evaluation and BEFORE the actual
+    // helper/inlined list load, so source side effects aren't replayed.
+    llvm::Value* beginListReadObservation() {
+        return captureReporterListReadEvaluation
+            ? callN("xyo_ir001_list_read_epoch", i64t, {})
+            : ci64(0);
+    }
+
     llvm::Value* emitListItem(Block* blk, const BlockField* f) {
         if (xyo_list_storage_mode >= 4 && xyo_list_storage_mode <= 6) {
             llvm::Value* idx = emitInputOf(blk, "INDEX");
-            return callN("xyo_list_item", i64t,
-                         {ctxArg, varSlot(f, true), idx});
+            llvm::Value* epoch = beginListReadObservation();
+            auto* result = callN("xyo_list_item", i64t,
+                                 {ctxArg, varSlot(f, true), idx});
+            return traceListItemEvaluation(blk, f, idx, result, epoch);
         }
         llvm::Value* idx = emitInputOf(blk, "INDEX");
+        llvm::Value* epoch = beginListReadObservation();
         const PromotedList* pl = findPromotedList(f->id);
         llvm::Value* l = varListPtr(f);   // null 可（list 非保有）
         llvm::Value* nonNull = b.CreateICmpNE(
@@ -5081,6 +6311,8 @@ struct Codegen {
         phi->addIncoming(v, fastBB);
         phi->addIncoming(ci64(Value::emptyStr().bits), emptyBB);
         phi->addIncoming(s, slowBB);
+        if (listStringNumFast)
+            listNumericStringCandidates.insert(phi);
         // Only emit the extra list-wide type guard when compile-time feedback
         // suggests numeric reads. Slow/empty reads still use Scratch coercion.
         if (const char* env = std::getenv("XYO_JIT_NUMERIC_LIST");
@@ -5096,10 +6328,11 @@ struct Codegen {
         // remains valid even when adaptive storage is demoted to flat.
         if (promotingLoop && readMemoAllowed && readMemoPreheader)
             memoizableListReads.insert(phi);
-        return phi;
+        return traceListItemEvaluation(blk, f, idx, phi, epoch);
     }
 
     void emitListReplace(Block* blk, const BlockField* f) {
+        notePossibleNativeVmWrite();
         if (xyo_list_storage_mode >= 4 && xyo_list_storage_mode <= 6) {
             llvm::Value* idx = emitInputOf(blk, "INDEX");
             llvm::Value* item = emitInputOf(blk, "ITEM");
@@ -5154,7 +6387,9 @@ struct Codegen {
         llvm::Value* items = pl ? b.CreateLoad(ptrt, pl->items) : b.CreateLoad(
             ptrt, b.CreateConstGEP1_32(i8t, l, kListItemsOff));
         invalidateNumericList(l, item, true);
+        beginListContentWrite();
         b.CreateStore(item, b.CreateGEP(i64t, items, i0));
+        endListContentWrite();
         b.CreateStore(b.getInt8(1),
                       b.CreateConstGEP1_32(i8t, l, kListDirtyOff));
         b.CreateBr(merge);
@@ -5177,6 +6412,7 @@ struct Codegen {
     /// par-for の本体では「base+iter 番目のスロット書き込み」に置き換える
     /// （len は並列領域の前に確保済み）。
     void emitListAdd(Block* blk, const BlockField* f) {
+        notePossibleNativeVmWrite();
         if (xyo_list_storage_mode >= 4 && xyo_list_storage_mode <= 6) {
             llvm::Value* item = emitInputOf(blk, "ITEM");
             callN("xyo_list_add", voidt,
@@ -5206,7 +6442,9 @@ struct Codegen {
                 if (inlineParSlot) {
                     llvm::Value* items = b.CreateLoad(
                         ptrt, b.CreateConstGEP1_32(i8t, l, kListItemsOff));
+                    beginListContentWrite();
                     b.CreateStore(item, b.CreateGEP(i64t, items, idx));
+                    endListContentWrite();
                 } else {
                     callN("xyo_par_slot", voidt, {l, idx, item});
                 }
@@ -5239,6 +6477,7 @@ struct Codegen {
         llvm::Value* items = b.CreateLoad(
             ptrt, b.CreateConstGEP1_32(i8t, l, kListItemsOff));
         invalidateNumericList(l, item);
+        beginListContentWrite();
         b.CreateStore(item,
                       b.CreateGEP(i64t, items,
                                   b.CreateZExt(len, i64t)));
@@ -5246,6 +6485,7 @@ struct Codegen {
                       b.CreateConstGEP1_32(i8t, l, kListLenOff));
         b.CreateStore(b.getInt8(1),
                       b.CreateConstGEP1_32(i8t, l, kListDirtyOff));
+        endListContentWrite();
         b.CreateBr(merge);
         b.SetInsertPoint(slowBB);
         callN("xyo_list_add", voidt,
@@ -5461,7 +6701,42 @@ struct Codegen {
             if (!in->shadow.empty()) childId = in->shadow;
             else return ci64(Value::num(0).bits);
         }
-        return emitInputBlock(childId);
+        llvm::Value* result = emitInputBlock(childId);
+        if (traceSourceReporterValues && result) {
+            auto site = effectSourcePc.find(childId);
+            // The entire source PC dictionary comes from the frozen
+            // ScratchCompilationUnit. Parent may itself be a reporter,
+            // so this is a provenance observation, not a resumable
+            // Scratch statement/local slot proof.
+            if (site != effectSourcePc.end()) {
+                if (!frozenReporterSource ||
+                    !ir::frozenSourceReporterInputEdge(
+                        frozenReporterSource->script, parent->id,
+                        name, childId)) {
+                    ++sourceReporterRejectedEdges;
+                } else if (sourceReporterValues.size() < 4096) {
+                    const auto slot = ir::frozenReporterInputSlot(
+                        frozenReporterSource->script, parent->id,
+                        name, childId);
+                    if (!slot) {
+                        ++sourceReporterRejectedEdges;
+                    } else {
+                        sourceReporterValues.push_back({
+                            site->second, childId, parent->id, name,
+                            llvm::WeakTrackingVH(result),
+                            ir::classifyFrozenReporter(
+                                frozenReporterSource->script, childId),
+                            ir::frozenSourceReporterStorage(
+                                frozenReporterSource->script, childId),
+                            slot->ordinal, slot->selectedShadow
+                        });
+                    }
+                } else {
+                    ++sourceReporterObservationsDropped;
+                }
+            }
+        }
+        return result;
     }
 
     llvm::Value* hoistedNestedOsrArg(const std::u16string& name) {
@@ -5483,6 +6758,24 @@ struct Codegen {
         return peek;
     }
 
+    // IR-001 opt-in scalar source observer. Emits a C ABI call AFTER
+    // the real LLVM load/forwarded result; any later LLVM DCE cannot
+    // delete the historical observation or replay the Scratch read.
+    llvm::Value* traceScalarRead(Block* source, const BlockField* field,
+                                 llvm::Value* bits) {
+        if (!captureReporterListReadEvaluation || aot || !source ||
+            !field || field->id.empty() || !bits)
+            return bits;
+        const auto it = effectSourcePc.find(source->id);
+        if (it == effectSourcePc.end() || !it->second) return bits;
+        llvm::Value* varId = b.CreateGlobalString(
+            field->id, "ir001.scalar.owner");
+        auto fn = decl("xyo_ir001_scalar_read_eval", voidt,
+                       {ptrt, i64t, ptrt, i64t});
+        b.CreateCall(fn, {ctxArg, ci64(it->second), varId, bits});
+        return bits;
+    }
+
     llvm::Value* emitInputBlock(const std::string& id) {
         Block* blk = getBlock(id);
         if (!blk) return ci64(Value::undefined().bits);
@@ -5497,7 +6790,8 @@ struct Codegen {
             const BlockField* f = findField(blk, "VARIABLE");
             if (!f) return call3("xyo_var_get", i64t, ctxArg, varIdC(f),
                                  varNameU16(f));
-            return emitVarGet(f);
+            auto* result = emitVarGet(f);
+            return traceScalarRead(blk, f, result);
         }
         if (blk->shadow) {
             llvm::Value* c = shadowConstant(blk);
@@ -5571,6 +6865,23 @@ struct Codegen {
             return emitArgGet(it->second);
         }
 
+        // Experimental translation reporter: native LLVM callsite
+        // preserves SSA across an actual Fiber suspension. The only
+        // interpreter execution is the asynchronous reporter itself.
+        if (op == "translate_getTranslate" && !aot) {
+            const char* flag = std::getenv("XYO_JIT_PLAMO_FIBER");
+            const char* roots =
+                std::getenv("XYO_RT_REQUIRE_GENERATED_SSA_ROOTS");
+            // Native reporter suspension requires global GC protection
+            // until every uncheckpointed LLVM activation has retired.
+            if (flag && flag[0] == '1' &&
+                roots && roots[0] == '1') {
+                countGuard.active = false;
+                return call2("xyo_rt_async_reporter", i64t, ctxArg,
+                             b.CreateGlobalString(id));
+            }
+        }
+
         // --- 演算 ---
         // 注意: call1/call2/call3 の引数式に emitInputOf を複数書くと
         // C++ 引数評価順（未規定・実際は右→左）に IR emit 順が依存し、
@@ -5612,6 +6923,15 @@ struct Codegen {
         }
         if (op == "operator_round") {
             llvm::Value* x = emitToNumF64(emitInputOf(blk, "NUM"));
+            // Only an immutable, bounded exact-integer SSA producer carries
+            // this interval. JS rounding of those values preserves the same
+            // interval; the operation itself is still lowered normally, so
+            // LLVM can decide whether to eliminate it with InstCombine.
+            // Default on for exact-integer SSA, opt-out for A/B parity.
+            const char* rangeOption = std::getenv("XYO_JIT_UNARY_INTEGER_RANGE");
+            const bool unaryRanges = !rangeOption || rangeOption[0] != '0';
+            const auto provenRange = unaryRanges ? intInterval(x)
+                                                  : std::nullopt;
             // JS Math.round は .5 を +Infinity 方向へ丸め、-0 を保持する。
             // llvm.round + 0.0 は負の .5 と -0 で Scratch と違う。
             // Baseline AOT must not emit an external roundeven libcall:
@@ -5627,6 +6947,7 @@ struct Codegen {
             // Math.round always produces an exact integral double or +/-inf;
             // canonical NaN repair also produces an exact integer zero.
             noteIntegralBox(result);
+            if (provenRange) recordIntInterval(result, *provenRange);
             return result;
         }
         if (op == "operator_mathop") {
@@ -5649,6 +6970,15 @@ struct Codegen {
             auto it = ops.find(fname);
             if (it != ops.end()) fn = it->second;
             llvm::Value* x = emitToNumF64(emitInputOf(blk, "NUM"));
+            // Default on for exact-integer SSA, opt-out for A/B parity.
+            const char* rangeOption = std::getenv("XYO_JIT_UNARY_INTEGER_RANGE");
+            const bool unaryRanges = !rangeOption || rangeOption[0] != '0';
+            // Only verified exact-integer values retain an interval through
+            // floor/ceiling. Let LLVM simplify the operation itself. The
+            // abs and divided-integer variants were measured and rolled back
+            // after their extra conversion path regressed performance.
+            auto integerArgument = unaryRanges && (fn == 1 || fn == 2)
+                ? intInterval(x) : std::nullopt;
             if (fn < 0) {
                 llvm::Value* zero = cf64(0.0);
                 return genericMathBox ? call1("xyo_num", i64t, zero)
@@ -5704,10 +7034,39 @@ struct Codegen {
                     ? emitCanonKnownNonNaN(r) : emitCanon(r);
             if (!genericMathBox && (fn == 1 || fn == 2))
                 noteIntegralBox(result); // floor and ceiling
+            if (integerArgument && !genericMathBox)
+                recordIntInterval(result, *integerArgument);
             return result;
         }
 
         // --- sensing 軽量 ---
+        // Optional exact synchronous days clock. Both paths sample
+        // rt::daysSince2000() on every reporter evaluation. This one returns
+        // f64 from the helper and records a known numeric SSA producer,
+        // removing redundant Value tag checks in subsequent arithmetic.
+        // Default ON after exact-parity and stable paired throughput checks.
+        // =0 restores the historical boxed Value helper.
+        static const bool daysF64 = [] {
+            const char* env = std::getenv("XYO_JIT_DAYS_F64");
+            return !env || env[0] != '0';
+        }();
+        if (op == "sensing_dayssince2000" && daysF64 &&
+            !sharedDaysClock) {
+            llvm::Value* days = call1(
+                "xyo_sns_dayssince2000_f64", f64t, ctxArg);
+            // rt::daysSince2000 uses integer milliseconds from
+            // system_clock::now; the converted double is always finite.
+            // Propagate that stronger fact into arithmetic so a subtraction
+            // such as daysSince2000() - startTime can skip its redundant
+            // unordered/NaN canonicalization. No fast-math or reassociation.
+            // Keep this independent of DAYS_F64 for controlled A/B.
+            static const bool daysFiniteSsa = [] {
+                const char* env = std::getenv("XYO_JIT_DAYS_FINITE_SSA");
+                return env && env[0] == '1';
+            }();
+            if (daysFiniteSsa) finiteArithmetic.insert(days);
+            return emitCanonKnownNonNaN(days);
+        }
         if (op == "sensing_timer") {
             llvm::Value* d = call1("xyo_timer", f64t, ctxArg);
             return call1("xyo_num", i64t, d);
@@ -6420,6 +7779,9 @@ struct Codegen {
     }
 
     std::optional<TransientRepeat> transientRepeatPattern(Block* loop) {
+        // Transient append may keep Variable::value* across a native
+        // yield. It cannot use a per-access pointer stamp.
+        if (guardNativeVarSlots) return std::nullopt;
         // Strict flat storage must not be bypassed by the transient
         // append-log loop optimization. Keep the existing rope/default
         // optimization unchanged for normal production workloads.
@@ -6692,9 +8054,11 @@ struct Codegen {
 
         activeTransient = currentLog;
         activeTransientVariable = varPtr;
+        activeTransientField = plan.variable;
         emitLoopYield();
         activeTransient = nullptr;
         activeTransientVariable = nullptr;
+        activeTransientField = nullptr;
         if (counted) {
             llvm::Value* next = b.CreateLoad(f64t, remaining);
             b.CreateStore(b.CreateFSub(
@@ -6710,6 +8074,7 @@ struct Codegen {
         b.CreateCondBr(b.CreateIsNull(last), leave, publish);
         b.SetInsertPoint(publish);
         call2("xyo_transient_finish", voidt, last, varPtr);
+        emitWaitVariableWrite(plan.variable);
         b.CreateBr(leave);
         b.SetInsertPoint(leave);
         endLoopYieldScope(true);
@@ -6725,6 +8090,7 @@ struct Codegen {
     };
     std::optional<std::vector<MultiTransientVar>>
     multiTransientPattern(Block* loop) {
+        if (guardNativeVarSlots) return std::nullopt;
         // Strict flat storage must not be bypassed by the transient
         // append-log loop optimization. Keep the existing rope/default
         // optimization unchanged for normal production workloads.
@@ -6881,12 +8247,15 @@ struct Codegen {
 
         activeTransient = logs[0];
         activeTransientVariable = variablePointers[0];
+        activeTransientField = vars[0].field;
         for (size_t i = 1; i < vars.size(); ++i)
-            activeExtraTransients.push_back({logs[i], variablePointers[i]});
+            activeExtraTransients.push_back(
+                {logs[i], variablePointers[i], vars[i].field});
         emitLoopYield();
         activeExtraTransients.clear();
         activeTransient = nullptr;
         activeTransientVariable = nullptr;
+        activeTransientField = nullptr;
         llvm::Value* old = b.CreateLoad(f64t, remaining);
         b.CreateStore(b.CreateFSub(
             old, b.CreateUIToFP(logicalCount, f64t)), remaining);
@@ -6901,6 +8270,7 @@ struct Codegen {
             b.SetInsertPoint(publish);
             call2("xyo_transient_finish", voidt, log,
                   variablePointers[i]);
+            emitWaitVariableWrite(vars[i].field);
             b.CreateBr(next);
             b.SetInsertPoint(next);
         }
@@ -6962,7 +8332,10 @@ struct Codegen {
     }
 
     std::optional<WarpInductionPlan> warpInductionPlan(Block* loop) {
-        if (promotingLoop || !promoted.empty()) return std::nullopt;
+        // Native induction keeps the raw address of the index and
+        // optional bound across emitSsaChunkScheduler() yields.
+        if (guardNativeVarSlots || promotingLoop || !promoted.empty())
+            return std::nullopt;
         const char* enabled = std::getenv("XYO_JIT_WARP_INDUCTION");
         if (enabled && enabled[0] == '0') return std::nullopt;
         const BlockInput* condition = loop->inputs.find("CONDITION");
@@ -7103,7 +8476,9 @@ struct Codegen {
         BasicBlock* finish = newBB("induction.finish");
         b.CreateCondBr(b.CreateICmpNE(loadIsWarp(), ci32(0)), prepare, fallback);
         b.SetInsertPoint(prepare);
-        beginLoopYieldScope(sourceLoop);
+        // LAYQ: warp induction is a call-free numeric recurrence by plan
+        // construction; open the scope at the pure body cap directly.
+        beginLoopYieldScope(sourceLoop, false);
         llvm::Value* real = realVarValuePtr(plan.index);
         llvm::Value* boundPtr = plan.boundVariable
             ? realVarValuePtr(plan.boundVariable) : nullptr;
@@ -7147,8 +8522,7 @@ struct Codegen {
         b.CreateCondBr(go, update, finish);
         b.SetInsertPoint(update);
         llvm::Value* ticks = b.CreateLoad(i64t, curYieldCnt);
-        llvm::Value* toPoll = b.CreateSub(
-            ci64(64), b.CreateAnd(ticks, ci64(63)));
+        llvm::Value* toPoll = yieldToPoll(ticks);
         llvm::Value* chunk = b.CreateSelect(
             b.CreateICmpULT(remaining, toPoll), remaining, toPoll);
 
@@ -7495,8 +8869,7 @@ struct Codegen {
         b.CreateCondBr(valid, fast, slow);
         b.SetInsertPoint(fast);
         llvm::Value* ticks = b.CreateLoad(i64t, curYieldCnt);
-        llvm::Value* toPoll = b.CreateSub(
-            ci64(64), b.CreateAnd(ticks, ci64(63)));
+        llvm::Value* toPoll = yieldToPoll(ticks);
         llvm::Value* remaining = b.CreateZExt(remaining32, i64t);
         llvm::Value* chunk = b.CreateSelect(
             b.CreateICmpULT(remaining, toPoll), remaining, toPoll);
@@ -7645,8 +9018,7 @@ struct Codegen {
         b.CreateCondBr(valid, fast, slow);
         b.SetInsertPoint(fast);
         llvm::Value* ticks = b.CreateLoad(i64t, curYieldCnt);
-        llvm::Value* untilPoll = b.CreateSub(
-            ci64(64), b.CreateAnd(ticks, ci64(63)));
+        llvm::Value* untilPoll = yieldToPoll(ticks);
         llvm::Value* left = b.CreateZExt(
             b.CreateSub(ci32(tripCount), zeroIndex), i64t);
         llvm::Value* chunk = b.CreateSelect(
@@ -7719,6 +9091,22 @@ struct Codegen {
                           });
         }
         const std::string& op = blk->opcode;
+        if (traceEffectSourcePc && !aot &&
+            (op == "data_setvariableto" ||
+             op == "data_changevariableby" ||
+             op == "data_addtolist" ||
+             op == "data_deleteoflist" ||
+             op == "data_deletealloflist" ||
+             op == "data_insertatlist" ||
+             op == "data_replaceitemoflist")) {
+            // A potential VM write is enough to expire evidence from
+            // an earlier delivered observable effect. Emit this before
+            // input evaluation (which can itself have side effects);
+            // no-op writes may conservatively invalidate diagnostics.
+            // This opt-in, ordinary-statement path does not cover
+            // every specialized loop lowerer or interpreter execution.
+            call1("xyo_ir001_vm_write", voidt, ctxArg);
+        }
         const bool repeatedControl =
             op == "control_repeat" || op == "control_forever" ||
             op == "control_while" || op == "control_repeat_until" ||
@@ -7732,16 +9120,111 @@ struct Codegen {
             const char* ifPhiSetting = std::getenv("XYO_JIT_IF_PHI");
             // Keep this optional until an independent workload corpus
             // establishes a speedup beyond startup/compile-time noise.
+            // Unlike general IF-PHI promotion, the new narrow forwarding
+            // only runs when the *preceding block* owns an immutable boxed
+            // numeric SSA producer with a proved signed-i32 interval, and
+            // the target appears in a fully scanned, no-yield true body.
+            // This permits default use without making generic IF-PHI ON.
+            BasicBlock* conditionStart = b.GetInsertBlock();
+            const char* branchSetting =
+                std::getenv("XYO_JIT_PHI_RANGE_BRANCH_FORWARD");
+            const bool branchRequested =
+                !branchSetting || branchSetting[0] != '0';
+            // The two arms are checked independently. An IF-ELSE may read
+            // the protected PHI on just one side, or on both; no assumption
+            // about the other arm is needed for *branch-local* forwarding.
+            // Reuse only those exact-integer PHIs proven safe on each arm;
+            // the original plain IF forwarding remains independently gated.
+            const char* elseSetting =
+                std::getenv("XYO_JIT_PHI_RANGE_IFELSE_FORWARD");
+            // Default on after standalone Eager/HotSpot parity and paired
+            // workload verification. Explicit =0 is the rollback switch.
+            const bool elseRequested = !elseSetting || elseSetting[0] != '0';
+            std::unordered_set<std::string> thenCandidates;
+            std::unordered_set<std::string> elseCandidates;
+            if (branchRequested &&
+                (op == "control_if" ||
+                 (op == "control_if_else" && elseRequested)) &&
+                localForwardEnabled && localFactsAliasSafe && promotingLoop) {
+                const BlockInput* thenBody = blk->inputs.find("SUBSTACK");
+                const BlockInput* elseBody = op == "control_if_else"
+                    ? blk->inputs.find("SUBSTACK2") : nullptr;
+                for (const auto& [id, fact] : localVarFacts) {
+                    if (fact.block != conditionStart || fact.fromLoad ||
+                        !knownNum.count(fact.bits)) continue;
+                    const auto numeric = knownNumD.find(fact.bits);
+                    if (numeric == knownNumD.end() ||
+                        !intInterval(numeric->second)) continue;
+                    if (readonlyPhiBranch(thenBody, id))
+                        thenCandidates.insert(id);
+                    if (elseBody && readonlyPhiBranch(elseBody, id))
+                        elseCandidates.insert(id);
+                }
+            }
+            const bool branchRange =
+                (!thenCandidates.empty() || !elseCandidates.empty()) &&
+                readonlyCondition(blk->inputs.find("CONDITION"));
             const bool ifPhi = op == "control_if" &&
-                ifPhiSetting && ifPhiSetting[0] == '1' &&
+                ((ifPhiSetting && ifPhiSetting[0] == '1') || branchRange) &&
                 localForwardEnabled && localFactsAliasSafe && promotingLoop &&
                 readonlyCondition(blk->inputs.find("CONDITION"));
-            // The fact is defined BEFORE evaluating the condition. A
-            // read-only condition can split into arbitrarily many BBs without
-            // invalidating the incoming SSA value or its dominance.
-            BasicBlock* conditionStart = b.GetInsertBlock();
-            const auto priorFacts = ifPhi ? localVarFacts
-                                         : decltype(localVarFacts){};
+            const auto priorFacts = (ifPhi || branchRange)
+                ? localVarFacts : decltype(localVarFacts){};
+            // The range map describes immutable numeric SSA values. Restrict
+            // a fact while compiling exactly one successor, then restore it
+            // before emitting its sibling and before emitting the join.
+            // This prevents an assumption made under a conditional edge
+            // from leaking to an unrelated successor or later statement.
+            struct ConditionalRange {
+                std::string variableId;
+                llvm::Value* number;
+                IntInterval original;
+                IntInterval positiveArm;
+            };
+            std::optional<ConditionalRange> conditionalRange;
+            const char* rangeOption =
+                std::getenv("XYO_JIT_PHI_CONDITION_RANGE");
+            // Measured single-arm and post-IF narrowing regressed on
+            // real Scratch kernels even though their IR was smaller.
+            // Require both successors of a real IF-ELSE to read the same
+            // proven immutable numeric SSA. This reduces duplicated
+            // conversion without changing the single-arm dependency path.
+            // Default on for verified two-arm numeric index consumers;
+            // explicit =0 restores the old conservative conversion.
+            if (branchRange && op == "control_if_else" &&
+                (!rangeOption || rangeOption[0] != '0')) {
+                if (auto cmp = directIntegerComparison(
+                        blk->inputs.find("CONDITION"))) {
+                    auto fact = priorFacts.find(cmp->variableId);
+                    if (fact != priorFacts.end() &&
+                        thenCandidates.contains(cmp->variableId) &&
+                        elseCandidates.contains(cmp->variableId) &&
+                        // Only x > K with K >= 0 creates the profitable,
+                        // positive true-arm range. For x < K the false-arm
+                        // refinement was neutral or slower in paired tests.
+                        !cmp->less && cmp->bound >= 0 &&
+                        !followingScalarRead(blk, cmp->variableId) &&
+                        knownNum.count(fact->second.bits)) {
+                        auto num = knownNumD.find(fact->second.bits);
+                        if (num != knownNumD.end()) {
+                            auto old = integerValueRanges.find(num->second);
+                            if (old != integerValueRanges.end() &&
+                                old->second.lo <= 0 &&
+                                old->second.hi > cmp->bound) {
+                                // Old range crosses zero; only this true
+                                // branch proves a 1-based positive index.
+                                IntInterval positive = old->second;
+                                positive.lo = std::max(
+                                    positive.lo, cmp->bound + 1);
+                                conditionalRange = ConditionalRange{
+                                    cmp->variableId, num->second,
+                                    old->second, positive
+                                };
+                            }
+                        }
+                    }
+                }
+            }
             llvm::Value* cond = emitInputOf(blk, "CONDITION");
             llvm::Value* isT = emitTruthyV(cond);
             BasicBlock* thenBB = BasicBlock::Create(lc, "", fn);
@@ -7759,6 +9242,19 @@ struct Codegen {
             if (mergeFacts) localVarFacts.clear();
             b.CreateCondBr(isT, thenBB, elseBB);
             b.SetInsertPoint(thenBB);
+            if (conditionalRange &&
+                thenCandidates.contains(conditionalRange->variableId))
+                integerValueRanges[conditionalRange->number] =
+                    conditionalRange->positiveArm;
+            if (branchRange) {
+                for (const auto& [id, fact] : priorFacts) {
+                    if (!thenCandidates.contains(id)) continue;
+                    // The old PHI dominates this true successor and the
+                    // condition cannot modify it. Only this branch-local SSA
+                    // producer is reused; the merge has its own proof.
+                    localVarFacts[id] = {thenBB, fact.bits};
+                }
+            }
             if (op == "control_if" && promotingLoop) {
                 const char* e = std::getenv("XYO_BRANCH_IF");
                 if (!e || e[0] != '0') {
@@ -7774,10 +9270,19 @@ struct Codegen {
             BasicBlock* thenEnd = b.GetInsertBlock();
             auto thenFacts = mergeFacts ? std::move(localVarFacts)
                                         : decltype(localVarFacts){};
+            if (conditionalRange)
+                integerValueRanges[conditionalRange->number] =
+                    conditionalRange->original;
             localVarFacts.clear();
             const bool thenReachesMerge = !bbDone(thenEnd);
             if (thenReachesMerge) b.CreateBr(merge);
             b.SetInsertPoint(elseBB);
+            if (branchRange && op == "control_if_else") {
+                for (const auto& [id, fact] : priorFacts) {
+                    if (!elseCandidates.contains(id)) continue;
+                    localVarFacts[id] = {elseBB, fact.bits};
+                }
+            }
             if (op == "control_if_else") {
                 const BlockInput* in = blk->inputs.find("SUBSTACK2");
                 if (in) emitChainBlocks(chainOf(in->block), true);
@@ -7785,6 +9290,9 @@ struct Codegen {
             BasicBlock* elseEnd = b.GetInsertBlock();
             auto elseFacts = mergeFacts ? std::move(localVarFacts)
                                         : decltype(localVarFacts){};
+            if (conditionalRange)
+                integerValueRanges[conditionalRange->number] =
+                    conditionalRange->original;
             if (ifPhi && op == "control_if") {
                 // This false edge preserves the value from before the IF.
                 // No unknown effects exist along the condition's lowering;
@@ -7887,6 +9395,27 @@ struct Codegen {
                         }
                         knownNumD[phi] = numeric;
                         knownNumOk[phi] = eligible;
+                        // The PHI carries only path-local, canonical number
+                        // producers. A signed-i32 interval is retained only
+                        // when both predecessors were independently proved
+                        // exact integral and finite. The joined interval is
+                        // the conservative union, not an assertion about a
+                        // mutable Scratch variable or future VM writes.
+                        const char* phiRange =
+                            std::getenv("XYO_JIT_PHI_INTEGER_RANGE");
+                        if ((!phiRange || phiRange[0] != '0') &&
+                            knownNum.count(fromThen.bits) &&
+                            knownNum.count(fromElse->second.bits)) {
+                            const auto left = intInterval(tn->second);
+                            const auto right = intInterval(en->second);
+                            if (left && right) {
+                                knownNum.insert(phi);
+                                knownNumOk[phi] = b.getTrue();
+                                recordIntInterval(phi, IntInterval{
+                                    std::min(left->lo, right->lo),
+                                    std::max(left->hi, right->hi)});
+                            }
+                        }
                     }
                 }
             }
@@ -7895,20 +9424,34 @@ struct Codegen {
 
         if (op == "control_repeat") {
             const bool osrFirstLoop = blk == osrStartLoop;
-            const auto conditionalRepeat = (osrFirstLoop || runtime.blockCountEnabled)
+            const bool boundedNativeInner =
+                nestedOsrInFlightGuard && nestedOsrBoundedInner &&
+                !osrFirstLoop;
+            // A real inner-yield deopt needs every logical inner latch
+            // observable. Disable all opaque inner repeat batching and
+            // GPU/parfor paths as with bounded mode, but KEEP emitLoopYield.
+            const bool protectedNativeInner =
+                boundedNativeInner ||
+                (nestedOsrInFlightGuard && nestedOsrInFlightInnerYield &&
+                 !osrFirstLoop);
+            const auto conditionalRepeat = (osrFirstLoop ||
+                protectedNativeInner || runtime.blockCountEnabled)
                 ? std::optional<ConditionalRepeatPlan>{}
                 : conditionalRepeatPlan(blk);
-            const auto repeatCopies = (osrFirstLoop || runtime.blockCountEnabled)
+            const auto repeatCopies = (osrFirstLoop ||
+                protectedNativeInner || runtime.blockCountEnabled)
                 ? std::nullopt : repeatCopyPlan(blk);
             if (verbose && repeatCopies)
                 std::fprintf(stderr, "xyo-jit: repeat SSA copies %s\n",
                              blk->id.c_str());
-            const auto repeatAffine = (osrFirstLoop || runtime.blockCountEnabled)
+            const auto repeatAffine = (osrFirstLoop ||
+                protectedNativeInner || runtime.blockCountEnabled)
                 ? std::nullopt : repeatAffinePlan(blk);
             if (verbose && repeatAffine)
                 std::fprintf(stderr, "xyo-jit: repeat SSA affine %s\n",
                              blk->id.c_str());
-            if (!osrFirstLoop && !runtime.blockCountEnabled) {
+            if (!osrFirstLoop && !protectedNativeInner &&
+                !runtime.blockCountEnabled) {
                 if (auto plan = multiTransientPattern(blk)) {
                     emitTransientMultiRepeat(blk, *plan);
                     return;
@@ -7921,7 +9464,8 @@ struct Codegen {
             // for (i = toNum(TIMES); i >= 0.5; i--) { body; loopYield }
             // Fixed-count straight-line bodies are eligible for bounded
             // strip-mining into groups of at most 512 logical iterations.
-            if (auto plan = (osrFirstLoop || runtime.blockCountEnabled)
+            if (auto plan = (osrFirstLoop || protectedNativeInner ||
+                runtime.blockCountEnabled)
                     ? std::optional<RepeatUnrollPlan>{}
                     : repeatUnrollPlan(blk)) {
                 // Evaluate TIMES once, exactly as in the ordinary lowering.
@@ -7978,9 +9522,24 @@ struct Codegen {
                 const bool directNested = directPoll && directPoll[0] == '1';
                 if ((!curYieldCnt || directNested) &&
                     (!inlineScheduler || inlineScheduler[0] != '0') &&
-                    !runtime.blockCountEnabled && !std::getenv("XYO_PROF"))
+                    !runtime.blockCountEnabled && !std::getenv("XYO_PROF")) {
+                    // LAYQ: an empty body performs no calls and no
+                    // allocation, so the pure body cap is sound here
+                    // (mirrors xyo_empty_repeat_warp's pureCap and the
+                    // call-free fast-loop retargeting below). Without this
+                    // the inline scheduler inherits the default 64 cap —
+                    // polling up to 256x more often than necessary and
+                    // silently ignoring XYO_YIELD_QFIXED. Save/restore the
+                    // enclosing scope's cap: this point may sit inside an
+                    // outer loop's scope (directNested) or before a new
+                    // scope opens (which re-applies its own cap).
+                    const uint64_t savedQMax = curYieldQMaxVal;
+                    const uint64_t savedPinned = curYieldQPinned;
+                    if (!layqOff()) layqApplyBodyClass(false);
                     emitInlineEmptyWarpRepeat(n);
-                else
+                    curYieldQMaxVal = savedQMax;
+                    curYieldQPinned = savedPinned;
+                } else
                     call2("xyo_empty_repeat_warp", voidt, ctxArg, n);
                 b.CreateBr(emptyDone);
                 b.SetInsertPoint(emptySlow);
@@ -7993,7 +9552,8 @@ struct Codegen {
             // 本体が GPU 並列実行可能なら xyo_gpu_repeat へ委譲し、
             // 失敗時のみ従来の CPU ループへ進む分岐を emit する。
             const gpu::Program* gp =
-                (osrFirstLoop && nestedOsrInFlightGuard) || promotedLoop
+                (nestedOsrInFlightGuard &&
+                 (osrFirstLoop || protectedNativeInner)) || promotedLoop
                     ? nullptr : tryGpuLoop(blk);
             // With a compile-time fixed nonnegative count <= INT32_MAX, the
             // existing IEEE test i >= 0.5 followed by i -= 1 performs exactly
@@ -8042,7 +9602,8 @@ struct Codegen {
             // 「カウンタ + append」ループなら par-for を試す（warp 実行中のみ）。
             // 失敗（0 返却）時は従来の CPU ループへ落ちる。
             const bool triedParFor =
-                osrFirstLoop && nestedOsrInFlightGuard
+                nestedOsrInFlightGuard &&
+                (osrFirstLoop || protectedNativeInner)
                     ? false : tryEmitParFor(blk, n, head, merge);
             if (!triedParFor) {
                 if (gp) {
@@ -8082,6 +9643,13 @@ struct Codegen {
             }
             b.CreateCondBr(go, bodyBB, merge);
             b.SetInsertPoint(bodyBB);
+            // LAYQ: numeric-SSA fast loops are call-free by plan
+            // construction (arithmetic region graph / affine induction), so
+            // they may use the pure body cap. List-copy plans may grow the
+            // list (allocation) and stay may-allocate. Verified per kernel
+            // via XYO_JIT_DUMP2 fast-loop call audits.
+            if ((conditionalRepeat || repeatAffine) && !repeatCopies)
+                retargetLoopQuantum(false);
             if (conditionalRepeat && intIv)
                 emitConditionalRepeatChunk(*conditionalRepeat,
                     b.CreateLoad(i32t, intIv), intIv, head);
@@ -8096,15 +9664,36 @@ struct Codegen {
                 if (in) emitChainBlocks(chainOf(in->block), true);
             }
             if (!bbDone(b.GetInsertBlock())) {
-                emitLoopYield();
+                if (!boundedNativeInner) emitLoopYield();
                 if (intIv) {
                     llvm::Value* remaining = b.CreateLoad(i32t, intIv);
-                    b.CreateStore(b.CreateSub(remaining, ci32(1)), intIv);
+                    // exactTrips is a compile-time nonnegative i32, and the
+                    // header executes this latch only while remaining != 0.
+                    // The private counter cannot be written by Scratch.
+                    // Expose both no-wrap facts to LLVM SCEV rather than
+                    // manually expanding the loop into repeated statements.
+                    const char* noWrapEnv = std::getenv("XYO_JIT_REPEAT_COUNTER_NOWRAP");
+                    const bool noWrap = noWrapEnv && noWrapEnv[0] == '1';
+                    b.CreateStore(b.CreateSub(remaining, ci32(1),
+                                             "rep.i32.dec", noWrap, noWrap),
+                                  intIv);
                 } else {
                     llvm::Value* i2 = b.CreateLoad(f64t, iv);
                     b.CreateStore(b.CreateFSub(i2, cf64(1.0)), iv);
                 }
-                b.CreateBr(head);
+                llvm::BranchInst* backedge = b.CreateBr(head);
+                const char* llvmHint = std::getenv("XYO_JIT_LLVM_REPEAT_HINT");
+                // Mode 1 retains the original 2..64 experiment; mode 2
+                // passes only tiny 2..4 fixed-count loops to LLVM's unroller.
+                // The optimizer (not the Scratch frontend) chooses whether
+                // and how much to unroll each hinted loop.
+                const unsigned hintLimit = llvmHint && llvmHint[0] == '2'
+                    ? 4u : llvmHint && llvmHint[0] == '1' ? 64u : 0u;
+                if (hintLimit && exactTrips &&
+                    *exactTrips >= 2 && *exactTrips <= hintLimit &&
+                    !runtime.blockCountEnabled && !osrFirstLoop &&
+                    !protectedNativeInner && !boundedNativeInner)
+                    markLlvmUnrollEnable(backedge);
             }
             b.SetInsertPoint(merge);
             endLoopYieldScope(true);
@@ -8204,10 +9793,15 @@ struct Codegen {
             b.SetInsertPoint(bodyBB);
             // MATH-004: guarded side-effect-free until loops; the slow
             // successor retains the entire original Scratch body.
+            // LAYQ: numeric/affine until fast loops are call-free by plan
+            // construction (see the repeat-case note); retarget to pure.
             if (op == "control_repeat_until") {
-                if (auto affine = affineUntilPlan(blk))
+                const auto affinePlan = affineUntilPlan(blk);
+                const auto numericPlan = numericUntilPlan(blk);
+                if (affinePlan || numericPlan) retargetLoopQuantum(false);
+                if (auto affine = affinePlan)
                     emitAffineUntilChunk(*affine, head);
-                if (auto numeric = numericUntilPlan(blk))
+                if (auto numeric = numericPlan)
                     emitNumericUntilChunk(*numeric, head);
             }
             {
@@ -8316,6 +9910,9 @@ struct Codegen {
                 : b.CreateFCmpOLT(i, bound);
             b.CreateCondBr(go, bodyBB, merge);
             b.SetInsertPoint(bodyBB);
+            // LAYQ: the foreach-sum fast loop is a call-free numeric
+            // reduction by plan construction; retarget to pure.
+            if (ssaSum && intTripCount && iv32) retargetLoopQuantum(false);
             if (ssaSum && intTripCount && iv32)
                 emitForEachSumChunk(*ssaSum, integralIndex, *intTripCount,
                                     iv32, head);
@@ -8371,7 +9968,17 @@ struct Codegen {
                     llvm::Value* i2 = b.CreateLoad(f64t, iv);
                     b.CreateStore(b.CreateFAdd(i2, cf64(1.0)), iv);
                 }
-                b.CreateBr(head);
+                llvm::BranchInst* latch = b.CreateBr(head);
+                // A literal for-each trip count is already proven exact.
+                // Preserve Scratch's increment and yield sites in canonical
+                // LLVM loop form, letting LoopUnroll decide the expansion.
+                // Dynamic and long loops retain the original lowering.
+                const char* foreachHint = std::getenv(
+                    "XYO_JIT_LLVM_FOREACH_HINT");
+                if (foreachHint && foreachHint[0] == '1' &&
+                    intTripCount && *intTripCount >= 2 &&
+                    *intTripCount <= 64 && !runtime.blockCountEnabled)
+                    markUnroll(latch, 2);
             }
             b.SetInsertPoint(merge);
             endLoopYieldScope(true);
@@ -8473,6 +10080,20 @@ struct Codegen {
 
         if (op == "event_broadcast") {
             llvm::Value* v = emitInputOf(blk, "BROADCAST_INPUT");
+            if (traceEffectSourcePc && !aot) {
+                const auto pc = effectSourcePc.find(blk->id);
+                if (pc != effectSourcePc.end() && compiledSourceDigest) {
+                    // Wrapper delegates to the ORIGINAL synchronous
+                    // broadcast helper and only logs host journal deltas.
+                    // No effect is replayed or deferred by IR-001.
+                    callN("xyo_ir001_broadcast_v_source", voidt, {
+                        ctxArg, v, b.CreateGlobalString(blk->id),
+                        ci64(pc->second), ci64(compiledSourceRevision),
+                        ci64(compiledSourceDigest.lo),
+                        ci64(compiledSourceDigest.hi)});
+                    return;
+                }
+            }
             call2("xyo_broadcast_v", voidt, ctxArg, v);
             return;
         }
@@ -8555,7 +10176,21 @@ struct Codegen {
         if (op == "pen_penUp")   { emitPenUp(); return; }
         if (op == "pen_penDown") { emitPenDown(); return; }
         if (op == "pen_clear")   { call1("xyo_pen_clear", voidt, ctxArg); return; }
-        if (op == "pen_stamp")   { call1("xyo_pen_stamp", voidt, ctxArg); return; }
+        if (op == "pen_stamp") {
+            if (traceEffectSourcePc && !aot) {
+                const auto pc = effectSourcePc.find(blk->id);
+                if (pc != effectSourcePc.end() && compiledSourceDigest) {
+                    callN("xyo_ir001_pen_stamp_source", voidt, {
+                        ctxArg, b.CreateGlobalString(blk->id),
+                        ci64(pc->second), ci64(compiledSourceRevision),
+                        ci64(compiledSourceDigest.lo),
+                        ci64(compiledSourceDigest.hi)});
+                    return;
+                }
+            }
+            call1("xyo_pen_stamp", voidt, ctxArg);
+            return;
+        }
         if (op == "pen_setPenColorToColor") {
             emitPenSetColor(blk);
             return;
@@ -8936,6 +10571,9 @@ struct Codegen {
     /// native procedures reuse this script's slots, and yield resumes the same
     /// fiber. This is NOT value/list-pointer hoisting and makes no alias claim.
     void hoistVarSlotPointers() {
+        // Hoisting Variable* or Variable::list* from a checked call
+        // would invalidate our per-use rebinding guarantee.
+        if (guardNativeVarSlots) return;
         // Indices belong to this script, NOT the shared AOT Module. Restrict
         // ownership explicitly, also excluding any earlier failed AOT emit.
         std::set<Function*> owned{entryFn};
@@ -9183,6 +10821,27 @@ bool jitEmitScript(llvm::Module& mod, llvm::LLVMContext& lc, Runtime& runtime,
         const char* proof =
             std::getenv("XYO_JIT_OSR_NESTED_SOURCE_PROOF");
         cg.nestedOsrInFlightGuard = proof && proof[0] == '1';
+        const char* realInnerYield =
+            std::getenv("XYO_JIT_OSR_NESTED_INNER_YIELD_DEOPT");
+        cg.nestedOsrInFlightInnerYield =
+            cg.nestedOsrInFlightGuard && realInnerYield &&
+            realInnerYield[0] == '1';
+        const char* tripleInner =
+            std::getenv("XYO_JIT_OSR_NESTED_TRIPLE_YIELD");
+        cg.nestedOsrInFlightTripleYield =
+            cg.nestedOsrInFlightInnerYield && tripleInner &&
+            tripleInner[0] == '1';
+        const char* quadInner =
+            std::getenv("XYO_JIT_OSR_NESTED_QUAD_YIELD");
+        cg.nestedOsrInFlightQuadYield =
+            cg.nestedOsrInFlightTripleYield && quadInner &&
+            quadInner[0] == '1';
+        if (const char* bounded =
+                std::getenv("XYO_JIT_OSR_NESTED_INNER_BOUNDED");
+            cg.nestedOsrInFlightGuard &&
+            !cg.nestedOsrInFlightInnerYield &&
+            bounded && bounded[0] == '1')
+            cg.nestedOsrBoundedInner = true;
     }
     // Validate a lossless snapshot of the selected source script. Capturing
     // only this script avoids copying the entire Scratch project on every
@@ -9198,8 +10857,107 @@ bool jitEmitScript(llvm::Module& mod, llvm::LLVMContext& lc, Runtime& runtime,
     const auto& sharedUnit = source ? *source : captured;
     if (!sharedUnit.valid() || sharedUnit.script.topId != topBlockId)
         return false;
+    // Scratch Translate is an asynchronous reporter: a native compat
+    // expression cannot suspend and resume halfway through its evaluation.
+    // The top-level snapshot does NOT include procedure definitions reached
+    // by a procedures_call; follow those edges explicitly. Otherwise a
+    // translation buried in a called procedure could be compiled unsafely.
+    //
+    // This is a bounded, compile-time-only graph scan. Snapshots are short-
+    // lived: no GC-managed values or procedure pointers escape this function.
+    bool asyncTranslate = false;
+    bool invalidProcedureGraph = false;
+    std::set<std::string> visitedProcedures;
+    std::vector<std::string> reachableProcedures;
+    auto scanAsyncNodes = [&](const std::vector<Block>& nodes) {
+        for (const Block& node : nodes) {
+            if (node.opcode == "translate_getTranslate") {
+                asyncTranslate = true;
+                return;
+            }
+            if (node.opcode == "procedures_call") {
+                if (!node.mutation) {
+                    invalidProcedureGraph = true;
+                    return;
+                }
+                const std::string code = node.mutation->attr("proccode");
+                if (code.empty()) {
+                    invalidProcedureGraph = true;
+                    return;
+                }
+                if (visitedProcedures.insert(code).second)
+                    reachableProcedures.push_back(code);
+            }
+        }
+    };
+    scanAsyncNodes(sharedUnit.script.nodes);
+    for (size_t i = 0; !asyncTranslate && !invalidProcedureGraph &&
+                        i < reachableProcedures.size(); ++i) {
+        // Guard even malicious or deeply nested procedure call graphs.
+        if (i >= 1024) { invalidProcedureGraph = true; break; }
+        const std::string defId =
+            blocks->getProcedureDefinition(reachableProcedures[i]);
+        // Missing definitions already have interpreter no-op semantics.
+        if (defId.empty()) continue;
+        const Block* def = blocks->getBlock(defId);
+        if (!def) { invalidProcedureGraph = true; break; }
+        const auto procedure = ir::ScratchScript::capture(*blocks, def);
+        if (!procedure.valid()) { invalidProcedureGraph = true; break; }
+        scanAsyncNodes(procedure.nodes);
+    }
+    const char* asyncFiberFlag = std::getenv("XYO_JIT_PLAMO_FIBER");
+    const char* nativeGcProtection =
+        std::getenv("XYO_RT_REQUIRE_GENERATED_SSA_ROOTS");
+    const bool experimentalAsyncFiber = !aot && asyncFiberFlag &&
+        asyncFiberFlag[0] == '1' && nativeGcProtection &&
+        nativeGcProtection[0] == '1';
+    if (invalidProcedureGraph ||
+        (asyncTranslate && !experimentalAsyncFiber)) {
+        if (std::getenv("XYO_JIT_VERBOSE"))
+            std::fprintf(stderr,
+                "xyo-jit: async translate or invalid procedure graph -> interpreter fallback\n");
+        return false;
+    }
+    cg.inlineVarGuardSourceAllowed = !asyncTranslate &&
+        !invalidProcedureGraph;
     cg.compiledSourceRevision = sharedUnit.sourceRevision;
-    if (cg.portableCallFrames() && !aot) {
+    if (!aot) {
+        const char* reporterTrace =
+            std::getenv("XYO_IR001_TRACE_SOURCE_VALUES");
+        const char* runtimeAudit =
+            std::getenv("XYO_IR001_RUNTIME_REPORTER_AUDIT");
+        const char* requireAudit =
+            std::getenv("XYO_RT_REQUIRE_REPORTER_SSA_AUDIT");
+        cg.traceSourceReporterValues =
+            (reporterTrace && reporterTrace[0] == '1') ||
+            (runtimeAudit && runtimeAudit[0] == '1') ||
+            (requireAudit && requireAudit[0] == '1');
+        if (cg.traceSourceReporterValues)
+            cg.frozenReporterSource = &sharedUnit;
+        const char* captureSsa = std::getenv(
+            "XYO_RT_CAPTURE_LLVM_SSA");
+        cg.captureReporterListReadEvaluation =
+            ((runtimeAudit && runtimeAudit[0] == '1') ||
+             (requireAudit && requireAudit[0] == '1')) &&
+            captureSsa && captureSsa[0] == '1';
+        const char* effectTrace = std::getenv("XYO_IR001_TRACE_EFFECT_PC");
+        cg.traceEffectSourcePc = effectTrace && effectTrace[0] == '1';
+        if (cg.traceEffectSourcePc || cg.traceSourceReporterValues) {
+            std::vector<std::string> sourceIds;
+            sourceIds.reserve(sharedUnit.script.nodes.size());
+            for (const Block& node : sharedUnit.script.nodes)
+                sourceIds.push_back(node.id);
+            std::sort(sourceIds.begin(), sourceIds.end());
+            if (std::adjacent_find(sourceIds.begin(), sourceIds.end()) !=
+                sourceIds.end()) return false;
+            // SourceFrameSymbols uses this exact one-based sorted ID
+            // ordering. Do not use DFS traversal indices.
+            for (size_t i = 0; i < sourceIds.size(); ++i)
+                cg.effectSourcePc.emplace(sourceIds[i], uint64_t(i + 1));
+        }
+    }
+    if ((cg.portableCallFrames() || cg.traceEffectSourcePc ||
+         cg.traceSourceReporterValues) && !aot) {
         cg.compiledSourceDigest = ir::scratchSourceDigest(sharedUnit);
         if (!cg.compiledSourceDigest) return false;
     }
@@ -9303,6 +11061,54 @@ bool jitEmitScript(llvm::Module& mod, llvm::LLVMContext& lc, Runtime& runtime,
     cg.hoistVarSlotPointers();
     if (cg.fail) return false;
 
+    if (cg.traceSourceReporterValues) {
+        const auto diagnostic = ir::traceSourceReporterValues(
+            mod, cg.sourceReporterValues, true,
+            cg.sourceReporterCheckpointSites);
+        // Persist compiler-owned, pre-spill metadata in the actual
+        // CompiledScript (whose lifetime spans every native Fiber).
+        // Never manufacture this table from RT's mutable SSA image.
+        const auto reporterAuditEnabled = [](const char* name) {
+            const char* value = std::getenv(name);
+            return value && value[0] == '1';
+        };
+        if (!aot &&
+            (reporterAuditEnabled("XYO_IR001_RUNTIME_REPORTER_AUDIT") ||
+             reporterAuditEnabled("XYO_RT_REQUIRE_REPORTER_SSA_AUDIT"))) {
+            auto sites = std::make_shared<ir::SourceReporterRuntimeSites>();
+            for (const auto& gap : diagnostic.checkpointGaps) {
+                if (!gap.physicalSiteId || !gap.sourcePc ||
+                    gap.liveReporterObservations !=
+                        gap.reporterSsaBindings.size() ||
+                    sites->find(gap.physicalSiteId))
+                    return false;
+                ir::SourceReporterCompiledSite frozen{
+                    cg.compiledSourceRevision,
+                    cg.compiledSourceDigest.lo,
+                    cg.compiledSourceDigest.hi,
+                    gap.physicalSiteId, gap.sourcePc, gap.phase,
+                    gap.sourceLoopBlock, gap.portableLoopPathDepth,
+                    gap.sourceLoopPath, gap.reporterSsaBindings
+                };
+                sites->sites.push_back({gap, std::move(frozen)});
+            }
+            out.nativeReporterSites = std::move(sites);
+        }
+        std::fprintf(stderr,
+            "[ir001-source-reporter-compiler] source_revision=%llu "
+            "source_digest=%016llx:%016llx dropped=%u "
+            "edge_rejected=%u checkpoint_rejected=%u "
+            "source_complete=%d executable=%d\n",
+            (unsigned long long)cg.compiledSourceRevision,
+            (unsigned long long)cg.compiledSourceDigest.lo,
+            (unsigned long long)cg.compiledSourceDigest.hi,
+            cg.sourceReporterObservationsDropped,
+            cg.sourceReporterRejectedEdges,
+            cg.sourceReporterCheckpointRejected,
+            int(diagnostic.sourceEnvironmentComplete()),
+            int(diagnostic.executable()));
+    }
+
     if (const char* stats = std::getenv("XYO_JIT_DUPLICATE_SCALAR_STATS");
         stats && stats[0] == '1') {
         std::fprintf(stderr, "[jit-duplicate-scalar] %s pairs=%llu self_changes=%llu\n",
@@ -9339,6 +11145,731 @@ bool jitEmitScript(llvm::Module& mod, llvm::LLVMContext& lc, Runtime& runtime,
     }
     if (verifyFunction(*f, &llvm::errs())) return false;
 
+    // Translation suspension census: classify LLVM values live after the
+    // exact reporter callsite. This is intentionally a diagnostic only:
+    // an i64 boxed Value can still contain an unrooted GC string, even
+    // when the number of pointer-typed SSA words is zero. Never authorize
+    // collection on the strength of these static counts.
+    if (const char* audit = std::getenv("XYO_JIT_PLAMO_SSA_AUDIT");
+        audit && audit[0] == '1' && !cg.aot) {
+        for (llvm::Function& generated : mod) {
+            if (generated.isDeclaration()) continue;
+            for (llvm::BasicBlock& block : generated) {
+                for (llvm::Instruction& instruction : block) {
+                    auto* call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+                    if (!call || !call->getCalledFunction() ||
+                        call->getCalledFunction()->getName() !=
+                            "xyo_rt_async_reporter")
+                        continue;
+                    const auto live = ir::analyzeLlvmCheckpointLiveness(
+                        generated, *call);
+                    const auto extra = rt::analyzeExtraLiveSsa(
+                        generated, *call,
+                        !generated.arg_empty() &&
+                            generated.getArg(0)->getType()->isPointerTy()
+                            ? generated.getArg(0) : nullptr);
+                    // Never print GC pointer addresses or actual SSA bits.
+                    std::fprintf(stderr,
+                        "[plamo-ssa-audit] function=%s "
+                        "numeric=%zu float=%u numeric_args=%u "
+                        "float_args=%u pointer=%u other=%u "
+                        "stack_ptr=%u stack_allocas=%u "
+                        "ptr_stack=%u ptr_host=%u ptr_static=%u "
+                        "ptr_unknown=%u classification_complete=%d "
+                        "gc_safe=0\n",
+                        generated.getName().str().c_str(),
+                        live.numeric.size(), extra.capturedFloat,
+                        extra.capturedIntegerArgs, extra.capturedFloatArgs,
+                        extra.unresolvedPointer, extra.unresolvedOther,
+                        extra.stackDerivedPointers,
+                        extra.distinctStackAllocas,
+                        extra.pointerRegions[0], extra.pointerRegions[1],
+                        extra.pointerRegions[2], extra.pointerRegions[3],
+                        int(live.validCheckpoint && extra.valid &&
+                            live.unsupported ==
+                                extra.representedPreviouslyUnsupported() +
+                                extra.remainingUnsupported()));
+                    // i64 is NOT equivalent to pointer-free numeric SSA:
+                    // a Scratch boxed string can be carried in its bits.
+                    // Reuse the existing bounded alias/string-producer
+                    // proofs, classifying every remaining i64 as unknown.
+                    // Include live i64 function args from the extra census,
+                    // which the original instruction-only report omits.
+                    rt::LiveI64ProvenanceCensus i64Census;
+                    const llvm::Argument* trustedContext =
+                        !generated.arg_empty() &&
+                        generated.getArg(0)->getType()->isPointerTy()
+                            ? generated.getArg(0) : nullptr;
+                    for (const auto& value : live.numeric)
+                        if (value.width == 64)
+                            i64Census.observe(
+                                value.definition, trustedContext,
+                                offsetof(JitCtx, varSlotData),
+                                offsetof(Variable, value));
+                    for (const auto& value : extra.values)
+                        if (value.kindWidth == 0x200u + 64u)
+                            i64Census.observe(value.definition);
+                    std::fprintf(stderr,
+                        "[plamo-ssa-i64] function=%s total=%u "
+                        "arg_alias=%u generated_string=%u "
+                        "var_slot=%u var_checked=%u reporter=%u "
+                        "unclassified=%u complete=%d gc_safe=0\n",
+                        generated.getName().str().c_str(),
+                        i64Census.total, i64Census.argumentAliases,
+                        i64Census.generatedStrings,
+                        i64Census.variableSlotValues,
+                        i64Census.checkedVariableValues,
+                        i64Census.asyncReporterValues,
+                        i64Census.unclassified, int(i64Census.complete()));
+                    // Distinguish loads of unproven values from calls,
+                    // foreign arguments and merges. Counts are based on
+                    // compiler provenance, not runtime GC ownership.
+                    std::fprintf(stderr,
+                        "[plamo-ssa-unknown] function=%s "
+                        "load_stack=%u load_host=%u load_static=%u "
+                        "load_unknown=%u call_return=%u addr_cast=%u "
+                        "foreign_arg=%u phi_select=%u other=%u\n",
+                        generated.getName().str().c_str(),
+                        extra.unknownPointerCauses[0],
+                        extra.unknownPointerCauses[1],
+                        extra.unknownPointerCauses[2],
+                        extra.unknownPointerCauses[3],
+                        extra.unknownPointerCauses[4],
+                        extra.unknownPointerCauses[5],
+                        extra.unknownPointerCauses[6],
+                        extra.unknownPointerCauses[7],
+                        extra.unknownPointerCauses[8]);
+                    // The existing IR-001 backwards load-chain walker
+                    // identifies where *addresses* are obtained. It
+                    // never proves the loaded object's GC ownership.
+                    // Bound per-site diagnostics to avoid unbounded
+                    // output from large generated Scratch scripts.
+                    // Resolve only exact field-start offsets in the
+                    // compiler's JitCtx ABI. Never dereference a loaded
+                    // pointer or treat the field name as GC ownership.
+                    const auto contextField = [](std::optional<uint64_t> offset) {
+                        if (!offset) return "unresolved";
+#define PLAMO_CTX_FIELD(name) \
+    if (*offset == offsetof(JitCtx, name)) return #name
+                        PLAMO_CTX_FIELD(thread);
+                        PLAMO_CTX_FIELD(target);
+                        PLAMO_CTX_FIELD(runtime);
+                        PLAMO_CTX_FIELD(sequencer);
+                        PLAMO_CTX_FIELD(fiber);
+                        PLAMO_CTX_FIELD(args);
+                        PLAMO_CTX_FIELD(compatEc);
+                        PLAMO_CTX_FIELD(varSlotData);
+                        PLAMO_CTX_FIELD(joinRefs);
+                        PLAMO_CTX_FIELD(sampledWarpClockUs);
+                        PLAMO_CTX_FIELD(sampledWarpDeadlineUs);
+                        PLAMO_CTX_FIELD(sampledUnixMs);
+                        PLAMO_CTX_FIELD(blockCounter);
+                        PLAMO_CTX_FIELD(sampledUnixDaysBits);
+#undef PLAMO_CTX_FIELD
+                        return "interior_or_unmapped";
+                    };
+                    uint32_t chainCount = 0;
+                    uint32_t hostTerminals = 0;
+                    uint32_t stackTerminals = 0;
+                    uint32_t unknownTerminals = 0;
+                    uint32_t hostOffsetsKnown = 0;
+                    uint32_t maxDereferences = 0;
+                    for (const auto& item : extra.unknownLoadChains) {
+                        const auto& chain = item.chain;
+                        ++chainCount;
+                        hostOffsetsKnown +=
+                            chain.hostContextFieldOffset.has_value();
+                        maxDereferences =
+                            std::max(maxDereferences, chain.dereferences);
+                        using Terminal = rt::PointerLoadTerminal;
+                        hostTerminals +=
+                            chain.terminal == Terminal::HostContext;
+                        stackTerminals +=
+                            chain.terminal == Terminal::NativeStack;
+                        unknownTerminals +=
+                            chain.terminal != Terminal::HostContext &&
+                            chain.terminal != Terminal::NativeStack;
+                        if (chainCount > 16) continue;
+                        std::fprintf(stderr,
+                            "[plamo-ssa-load-path] function=%s "
+                            "id=%u derefs=%u derivations=%u terminal=%s "
+                            "host_offset_known=%d ctx_field=%s\n",
+                            generated.getName().str().c_str(),
+                            item.instructionId, chain.dereferences,
+                            chain.addressDerivations,
+                            rt::pointerLoadTerminalName(chain.terminal),
+                            int(chain.hostContextFieldOffset.has_value()),
+                            contextField(chain.hostContextFieldOffset));
+                    }
+                    std::fprintf(stderr,
+                        "[plamo-ssa-load-summary] function=%s "
+                        "total=%u shown=%u terminal_host=%u "
+                        "terminal_stack=%u terminal_other=%u "
+                        "host_offsets_known=%u max_derefs=%u gc_safe=0\n",
+                        generated.getName().str().c_str(),
+                        chainCount, std::min(chainCount, uint32_t{16}),
+                        hostTerminals, stackTerminals, unknownTerminals,
+                        hostOffsetsKnown, maxDereferences);
+                }
+            }
+        }
+    }
+
+    // RT-001 opt-in: root exact Variable::value words BEFORE an async
+    // reporter suspends the LLVM Fiber. The compiler proves only the
+    // load address; the runtime validates exact GC heap membership
+    // before retaining any string. These roots do NOT authorize GC:
+    // other live i64/ptr values, machine locations and effects remain
+    // unproven. Default code generation is unchanged.
+    if (!cg.aot && [] {
+            const char* mode =
+                std::getenv("XYO_JIT_PLAMO_ROOT_LIVE_VARS");
+            const char* reporter =
+                std::getenv("XYO_JIT_PLAMO_FIBER");
+            const char* existingGcGuard =
+                std::getenv("XYO_RT_REQUIRE_GENERATED_SSA_ROOTS");
+            return mode && mode[0] == '1' &&
+                   reporter && reporter[0] == '1' &&
+                   existingGcGuard && existingGcGuard[0] == '1';
+        }()) {
+        struct AsyncRootSite {
+            llvm::CallInst* reporter = nullptr;
+            std::vector<llvm::Value*> words;
+        };
+        std::vector<AsyncRootSite> sites;
+        // Freeze analyses BEFORE adding stores/calls: SSA instruction IDs
+        // must remain coherent with the original debug census.
+        for (llvm::Function& generated : mod) {
+            if (generated.isDeclaration() || generated.arg_empty() ||
+                !generated.getArg(0)->getType()->isPointerTy())
+                continue;
+            const llvm::Argument* context = generated.getArg(0);
+            for (llvm::BasicBlock& block : generated)
+                for (llvm::Instruction& instruction : block) {
+                    auto* call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+                    if (!call || !call->getCalledFunction() ||
+                        call->getCalledFunction()->getName() !=
+                            "xyo_rt_async_reporter" ||
+                        call->arg_size() != 2 ||
+                        call->getArgOperand(0) != context)
+                        continue;
+                    const auto live =
+                        ir::analyzeLlvmCheckpointLiveness(generated, *call);
+                    if (!live.validCheckpoint) continue;
+                    AsyncRootSite site;
+                    site.reporter = call;
+                    for (const auto& word : live.numeric) {
+                        if (word.width != 64) continue;
+                        // Two independently audited sources: an exact
+                        // Variable::value load, or a join-produced boxed
+                        // string whose incoming PHI/SELECT arms are all
+                        // compiler-proven. The runtime still rejects an
+                        // invalid GC heap pointer before retaining it.
+                        const bool variableValue =
+                            rt::classifyNativeVariableValueLoad(
+                                word.definition, context,
+                                offsetof(JitCtx, varSlotData),
+                                offsetof(Variable, value)) !=
+                            rt::NativeVariableValueOrigin::Unknown;
+                        const bool generatedString =
+                            rt::trustedGeneratedStringSource(
+                                word.definition);
+                        const bool reporterValue =
+                            rt::trustedAsyncReporterValueSource(
+                                word.definition, context);
+                        if (variableValue || generatedString || reporterValue)
+                            site.words.push_back(const_cast<llvm::Instruction*>(
+                                word.definition));
+                    }
+                    if (!site.words.empty() && site.words.size() <= 64)
+                        sites.push_back(std::move(site));
+                }
+        }
+        if (!sites.empty()) {
+            auto rootedHelper = mod.getOrInsertFunction(
+                "xyo_rt_async_reporter_rooted",
+                llvm::FunctionType::get(
+                    cg.i64t, {cg.ptrt, cg.ptrt, cg.ptrt, cg.i32t},
+                    false));
+            for (auto& site : sites) {
+                auto* oldCall = site.reporter;
+                // Allocate once per native activation, not per loop
+                // iteration: an alloca at a repeated reporter callsite
+                // would leak native stack space until Fiber retirement.
+                llvm::Function* owner = oldCall->getFunction();
+                llvm::IRBuilder<> entry(
+                    &owner->getEntryBlock(),
+                    owner->getEntryBlock().getFirstInsertionPt());
+                llvm::Value* storage = entry.CreateAlloca(
+                    cg.i64t, entry.getInt32(site.words.size()),
+                    "async.root.words");
+                llvm::IRBuilder<> at(oldCall);
+                for (size_t i = 0; i < site.words.size(); ++i) {
+                    llvm::Value* address = at.CreateGEP(
+                        cg.i64t, storage, at.getInt32(i));
+                    at.CreateStore(site.words[i], address);
+                }
+                auto* rootedCall = at.CreateCall(rootedHelper,
+                    {oldCall->getArgOperand(0),
+                     oldCall->getArgOperand(1), storage,
+                     at.getInt32(site.words.size())});
+                rootedCall->setDebugLoc(oldCall->getDebugLoc());
+                // Frozen later sites may reference this reporter result.
+                // Repair borrowed SSA pointers before deleting oldCall.
+                for (auto& pending : sites)
+                    for (auto*& word : pending.words)
+                        if (word == oldCall) word = rootedCall;
+                oldCall->replaceAllUsesWith(rootedCall);
+                oldCall->eraseFromParent();
+                std::fprintf(stderr,
+                    "[plamo-async-var-root-codegen] function=%s "
+                    "words=%zu gc_safe=0\n",
+                    owner->getName().str().c_str(),
+                    site.words.size());
+            }
+        }
+    }
+
+    // IR-001 compiler-only liveness and native alloca spills. The
+    // RT-001 experimental bridge can additionally copy the raw integer
+    // words into a detached per-Thread diagnostic image at the precise
+    // source checkpoint. Neither proof covers GC pointers/effects or
+    // permits arbitrary SSA deoptimization.
+    if (const char* flag = std::getenv("XYO_JIT_SSA_LIVENESS");
+        flag && flag[0] == '1' && !cg.aot) {
+        const bool rtDetachedCapture = [] {
+            const char* v = std::getenv("XYO_RT_CAPTURE_LLVM_SSA");
+            return v && v[0] == '1';
+        }();
+        const bool spillDiagnostic = [] {
+            const char* v = std::getenv("XYO_JIT_SSA_SPILL_DIAGNOSTIC");
+            return v && v[0] == '1';
+        }();
+        // Freeze ALL physical CallBase analyses before emitting the
+        // first spill. Native SSA IDs are the original function IR
+        // ordinals; inserting instructions for an earlier checkpoint
+        // otherwise silently renumbers subsequent sites. The source
+        // reporter trace uses these same pre-spill IDs.
+        struct FrozenCheckpointAnalysis {
+            ir::LlvmCheckpointLiveness live;
+            std::optional<rt::ExtraLiveSsaReport> extra;
+        };
+        std::unordered_map<const llvm::CallBase*, FrozenCheckpointAnalysis>
+            frozenCheckpoints;
+        for (llvm::Function& generated : mod) {
+            if (generated.isDeclaration()) continue;
+            for (llvm::BasicBlock& block : generated)
+                for (llvm::Instruction& instruction : block) {
+                    auto* call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+                    if (!call || !call->getCalledFunction() ||
+                        call->getCalledFunction()->getName() !=
+                            "xyo_proc_frame_checkpoint_path_phase")
+                        continue;
+                    FrozenCheckpointAnalysis analysis;
+                    analysis.live = ir::analyzeLlvmCheckpointLiveness(
+                        generated, *call);
+                    if (rtDetachedCapture)
+                        analysis.extra = rt::analyzeExtraLiveSsa(
+                            generated, *call,
+                            !generated.arg_empty() &&
+                                generated.getArg(0)->getType()->isPointerTy()
+                                ? generated.getArg(0) : nullptr);
+                    if (!frozenCheckpoints.emplace(
+                            call, std::move(analysis)).second)
+                        return false;
+                }
+        }
+        uint64_t siteId = 0;
+        for (llvm::Function& generated : mod) {
+            if (generated.isDeclaration()) continue;
+            for (llvm::BasicBlock& block : generated)
+                for (llvm::Instruction& instruction : block) {
+                    auto* call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+                    if (!call || !call->getCalledFunction() ||
+                        call->getCalledFunction()->getName() !=
+                            "xyo_proc_frame_checkpoint_path_phase")
+                        continue;
+                    // Every physical checkpoint gets a stable ID, even
+                    // if its capture is unsupported and omitted.
+                    // This equals the compiler-only reporter trace's
+                    // module-order physicalSiteId.
+                    if (siteId == UINT64_MAX) return false;
+                    ++siteId;
+                    const auto frozen = frozenCheckpoints.find(call);
+                    if (frozen == frozenCheckpoints.end()) return false;
+                    const auto& live = frozen->second.live;
+                    const auto& extraBefore = frozen->second.extra;
+                    std::optional<ir::LlvmSsaSpill> saved;
+                    if (spillDiagnostic || rtDetachedCapture) {
+                        saved = ir::emitLlvmNumericSsaSpill(*call, live);
+                        std::fprintf(stderr,
+                            "[ir001-ssa-spill] saved=%zu complete=%d\n",
+                            saved ? saved->ids.size() : size_t(0),
+                            int(saved && saved->complete));
+                    }
+                    if (rtDetachedCapture && saved && siteId < UINT64_MAX) {
+                        const auto& extra = *extraBefore;
+                        // Both analyses must agree on the original
+                        // unsupported-value population. A discrepancy
+                        // denotes an unaccounted SSA candidate, NOT
+                        // permission to silently discard its type.
+                        const bool classified = extra.valid &&
+                            uint64_t(extra.representedPreviouslyUnsupported()) +
+                            uint64_t(extra.remainingUnsupported()) ==
+                            uint64_t(live.unsupported);
+                        if (!classified) {
+                            std::fprintf(stderr,
+                                "[rt001-ssa-extra] unsupported-mismatch "
+                                "function=%s original=%u classified=%u\n",
+                                generated.getName().str().c_str(),
+                                live.unsupported,
+                                extra.representedPreviouslyUnsupported() +
+                                extra.remainingUnsupported());
+                        } else {
+                            // One composite descriptor stream: original
+                            // numeric instruction IDs, representable
+                            // float instructions, and numeric/floating
+                            // arguments in a disjoint high ID range.
+                            struct Candidate {
+                                uint32_t id = 0, kind = 0;
+                                llvm::Value* liveValue = nullptr;
+                                int32_t previousNumericSlot = -1;
+                                // Exact i64 argument ancestry, not a
+                                // general GC/SSA value type certificate.
+                                uint32_t sameRootedArgument = 0;
+                                uint32_t generatedString = 0;
+                            };
+                            std::vector<Candidate> candidates;
+                            candidates.reserve(
+                                saved->ids.size() + extra.values.size());
+                            for (size_t i = 0; i < saved->ids.size(); ++i) {
+                                // IR-001 numeric report and emitted spill
+                                // must have the SAME pre-mutation ordering.
+                                if (i >= live.numeric.size() ||
+                                    saved->ids[i] != live.numeric[i].id)
+                                    return false;
+                                candidates.push_back({
+                                    saved->ids[i], saved->widths[i],
+                                    nullptr, int32_t(i),
+                                    rt::sameBoxedArgumentRoot(
+                                        live.numeric[i].definition),
+                                    uint32_t(rt::trustedGeneratedStringSource(
+                                        live.numeric[i].definition))});
+                            }
+                            for (const auto& value : extra.values)
+                                candidates.push_back({
+                                    value.id, value.kindWidth,
+                                    value.definition, -1,
+                                    rt::sameBoxedArgumentRoot(
+                                        value.definition),
+                                    uint32_t(rt::trustedGeneratedStringSource(
+                                        value.definition))});
+                            std::sort(candidates.begin(), candidates.end(),
+                                [](const Candidate& a, const Candidate& b) {
+                                    return a.id < b.id;
+                                });
+                            // The runtime sidecar hard-limits frame size;
+                            // fail closed rather than truncating live SSA.
+                            if (candidates.empty() ||
+                                candidates.size() > 256 ||
+                                (candidates.size() > 1 &&
+                                 std::adjacent_find(candidates.begin(),
+                                     candidates.end(),
+                                     [](const Candidate& a,
+                                        const Candidate& b) {
+                                         return a.id == b.id;
+                                     }) != candidates.end())) {
+                                std::fprintf(stderr,
+                                    "[rt001-ssa-extra] invalid-count-or-ids "
+                                    "count=%zu\n", candidates.size());
+                            } else {
+                                std::vector<uint64_t> descriptors;
+                                descriptors.reserve(candidates.size());
+                                for (const auto& item : candidates)
+                                    descriptors.push_back(
+                                        uint64_t(item.id) |
+                                        (uint64_t(item.kind) << 32));
+                                auto* constant = llvm::ConstantDataArray::get(
+                                    lc, llvm::ArrayRef<uint64_t>(descriptors));
+                                auto* global = new llvm::GlobalVariable(
+                                    mod, constant->getType(), true,
+                                    llvm::GlobalValue::PrivateLinkage,
+                                    constant, "rt001.native.ssa.typed.ids");
+                                global->setUnnamedAddr(
+                                    llvm::GlobalValue::UnnamedAddr::Global);
+
+                                llvm::IRBuilder<> entry(
+                                    &*generated.getEntryBlock()
+                                          .getFirstInsertionPt());
+                                auto* combined = entry.CreateAlloca(
+                                    cg.i64t,
+                                    entry.getInt32(uint32_t(candidates.size())),
+                                    "rt001.native.ssa.typed.words");
+                                llvm::IRBuilder<> after(call->getNextNode());
+                                for (size_t i = 0; i < candidates.size(); ++i) {
+                                    const auto& item = candidates[i];
+                                    llvm::Value* bits = item.liveValue;
+                                    if (item.previousNumericSlot >= 0) {
+                                        auto* ptr = after.CreateConstGEP1_32(
+                                            cg.i64t, saved->storage,
+                                            uint32_t(item.previousNumericSlot));
+                                        auto* loaded = after.CreateLoad(
+                                            cg.i64t, ptr);
+                                        loaded->setVolatile(true);
+                                        bits = loaded;
+                                    } else {
+                                        // Only i1/i32/i64 and float/double
+                                        // are converted to raw, zero-padded
+                                        // words. Pointer/GC-bearing values
+                                        // are NEVER bitcast to integers.
+                                        if (bits->getType()->isFloatingPointTy())
+                                            bits = after.CreateBitCast(
+                                                bits,
+                                                item.kind % 256 == 32
+                                                    ? cg.i32t : cg.i64t);
+                                        if (bits->getType()->isIntegerTy(1) ||
+                                            bits->getType()->isIntegerTy(32))
+                                            bits = after.CreateZExt(bits,cg.i64t);
+                                    }
+                                    auto* dst = after.CreateConstGEP1_32(
+                                        cg.i64t, combined, uint32_t(i));
+                                    after.CreateStore(bits, dst)
+                                        ->setVolatile(true);
+                                }
+                                auto* descPtr = after.CreateInBoundsGEP(
+                                    constant->getType(), global,
+                                    {after.getInt32(0), after.getInt32(0)});
+                                // Compiler-only exact argument ancestry
+                                // for *each* detached native SSA word.
+                                // Nonzero is allowed for a direct i64
+                                // Argument or for an unchanged i64
+                                // PHI/SELECT with all arms equal to
+                                // that exact argument. Zero is unknown.
+                                std::vector<uint32_t> aliases;
+                                aliases.reserve(candidates.size());
+                                for (const auto& item : candidates)
+                                    aliases.push_back(
+                                        item.sameRootedArgument);
+                                auto* aliasConst =
+                                    llvm::ConstantDataArray::get(
+                                        lc, llvm::ArrayRef<uint32_t>(aliases));
+                                auto* aliasGlobal = new llvm::GlobalVariable(
+                                    mod, aliasConst->getType(), true,
+                                    llvm::GlobalValue::PrivateLinkage,
+                                    aliasConst, "rt001.ssa.rooted.aliases");
+                                aliasGlobal->setUnnamedAddr(
+                                    llvm::GlobalValue::UnnamedAddr::Global);
+                                auto* aliasPtr = after.CreateInBoundsGEP(
+                                    aliasConst->getType(), aliasGlobal,
+                                    {after.getInt32(0), after.getInt32(0)});
+                                // Separate, readonly compiler proof for
+                                // known host-created boxed strings (or an
+                                // all-proven PHI/SELECT). No addresses here.
+                                std::vector<uint32_t> generatedStrings;
+                                generatedStrings.reserve(candidates.size());
+                                for (const auto& item : candidates)
+                                    generatedStrings.push_back(
+                                        item.generatedString);
+                                auto* generatedConst =
+                                    llvm::ConstantDataArray::get(
+                                        lc, llvm::ArrayRef<uint32_t>(
+                                            generatedStrings));
+                                auto* generatedGlobal =
+                                    new llvm::GlobalVariable(
+                                        mod, generatedConst->getType(), true,
+                                        llvm::GlobalValue::PrivateLinkage,
+                                        generatedConst, "rt001.ssa.generated.strings");
+                                generatedGlobal->setUnnamedAddr(
+                                    llvm::GlobalValue::UnnamedAddr::Global);
+                                auto* generatedPtr =
+                                    after.CreateInBoundsGEP(
+                                        generatedConst->getType(),
+                                        generatedGlobal,
+                                        {after.getInt32(0), after.getInt32(0)});
+                                // Static counts-only provenance for each
+                                // UNCAPTURED live LLVM pointer. The global
+                                // contains no addresses/GC values, and the
+                                // helper immediately copies these counts.
+                                static_assert(rt::kPointerOriginCount == 7);
+                                auto* originsConst = llvm::ConstantDataArray::get(
+                                    lc, llvm::ArrayRef<uint32_t>(
+                                        extra.pointerOrigins.data(),
+                                        extra.pointerOrigins.size()));
+                                auto* originsGlobal = new llvm::GlobalVariable(
+                                    mod, originsConst->getType(), true,
+                                    llvm::GlobalValue::PrivateLinkage,
+                                    originsConst, "rt001.ssa.pointer.origins");
+                                originsGlobal->setUnnamedAddr(
+                                    llvm::GlobalValue::UnnamedAddr::Global);
+                                auto* originsPtr = after.CreateInBoundsGEP(
+                                    originsConst->getType(), originsGlobal,
+                                    {after.getInt32(0), after.getInt32(0)});
+                                auto helper = mod.getOrInsertFunction(
+                                    "xyo_rt_capture_llvm_ssa",
+                                    llvm::FunctionType::get(
+                                        llvm::Type::getVoidTy(lc),
+                                        {cg.ptrt, cg.ptrt, cg.ptrt, cg.i32t,
+                                         cg.i32t, cg.i32t, cg.i64t, cg.i64t,
+                                         cg.i64t, cg.i64t, cg.i32t,
+                                         cg.i32t, cg.ptrt, cg.i32t,
+                                         cg.i32t, cg.ptrt,
+                                         cg.ptrt}, false));
+                                if (generated.arg_empty()) return false;
+                                after.CreateCall(helper, {
+                                    &*generated.arg_begin(), combined,
+                                    descPtr,
+                                    after.getInt32(
+                                        uint32_t(candidates.size())),
+                                    after.getInt32(
+                                        extra.remainingUnsupported()),
+                                    after.getInt32(
+                                        extra.remainingUnsupported() == 0 ? 1
+                                            : 0),
+                                    cg.ci64(cg.compiledSourceRevision),
+                                    cg.ci64(cg.compiledSourceDigest.lo),
+                                    cg.ci64(cg.compiledSourceDigest.hi),
+                                    after.getInt64(siteId),
+                                    after.getInt32(extra.unresolvedPointer),
+                                    after.getInt32(extra.unresolvedOther),
+                                    originsPtr,
+                                    after.getInt32(extra.stackDerivedPointers),
+                                    after.getInt32(extra.distinctStackAllocas),
+                                    aliasPtr,
+                                    generatedPtr,
+                                });
+                                std::fprintf(stderr,
+                                    "[rt001-ssa-extra] fn=%s floats=%u "
+                                    "integer_args=%u float_args=%u "
+                                    "unresolved_ptrs=%u other=%u "
+                                    "stack_derived=%u stack_roots=%u "
+                                    "captured=%zu aliasable=%zu generated=%zu\n",
+                                    generated.getName().str().c_str(),
+                                    extra.capturedFloat,
+                                    extra.capturedIntegerArgs,
+                                    extra.capturedFloatArgs,
+                                    extra.unresolvedPointer,
+                                    extra.unresolvedOther,
+                                    extra.stackDerivedPointers,
+                                    extra.distinctStackAllocas,
+                                    candidates.size(),
+                                    std::count_if(
+                                        candidates.begin(), candidates.end(),
+                                        [](const Candidate& item) {
+                                            return item.sameRootedArgument
+                                                != 0 && item.kind == 64;
+                                        }),
+                                    std::count_if(
+                                        candidates.begin(), candidates.end(),
+                                        [](const Candidate& item) {
+                                            return item.generatedString != 0 &&
+                                                item.kind == 64;
+                                        }));
+                                // Compiler-only origin census: raw pointer
+                                // words are NEVER exported or treated as
+                                // valid GC handles. This report cannot
+                                // relax the native Fiber sweep veto.
+                                const auto& regions = extra.pointerRegions;
+                                std::fprintf(stderr,
+                                    "[rt001-ssa-pointer-regions] fn=%s "
+                                    "native_stack=%u host_ctx=%u "
+                                    "static_global=%u unknown=%u "
+                                    "unresolved_total=%u gc_safe=0\n",
+                                    generated.getName().str().c_str(),
+                                    regions[size_t(rt::PointerRegion::NativeStack)],
+                                    regions[size_t(rt::PointerRegion::HostContext)],
+                                    regions[size_t(rt::PointerRegion::StaticGlobal)],
+                                    regions[size_t(rt::PointerRegion::Unknown)],
+                                    extra.unresolvedPointer);
+                                // Each Unknown is assigned a single
+                                // conservative explanation. Printed IDs
+                                // are compiler IR IDs, never addresses.
+                                const auto& causes = extra.unknownPointerCauses;
+                                std::fprintf(stderr,
+                                    "[rt001-ssa-pointer-unknown] fn=%s "
+                                    "load_stack=%u load_host=%u "
+                                    "load_static=%u load_unknown=%u "
+                                    "call=%u cast=%u foreign_arg=%u "
+                                    "phi_select=%u other=%u total=%u "
+                                    "gc_safe=0\n",
+                                    generated.getName().str().c_str(),
+                                    causes[size_t(rt::UnknownPointerCause::LoadStack)],
+                                    causes[size_t(rt::UnknownPointerCause::LoadHost)],
+                                    causes[size_t(rt::UnknownPointerCause::LoadStatic)],
+                                    causes[size_t(rt::UnknownPointerCause::LoadUnknown)],
+                                    causes[size_t(rt::UnknownPointerCause::CallReturn)],
+                                    causes[size_t(rt::UnknownPointerCause::IntOrAddressCast)],
+                                    causes[size_t(rt::UnknownPointerCause::ForeignArgument)],
+                                    causes[size_t(rt::UnknownPointerCause::PhiSelect)],
+                                    causes[size_t(rt::UnknownPointerCause::Other)],
+                                    regions[size_t(rt::PointerRegion::Unknown)]);
+                                for (const auto& detail : extra.unknownPointerDetails)
+                                    std::fprintf(stderr,
+                                        "[rt001-ssa-pointer-unknown-id] "
+                                        "fn=%s id=%u cause=%s\n",
+                                        generated.getName().str().c_str(),
+                                        detail.instructionId,
+                                        rt::unknownPointerCauseName(detail.cause));
+                                // Match ONLY exact JitCtx field-start
+                                // offsets, using the native ABI's real
+                                // offsetof values. Never claim GC ownership
+                                // from a field name or an interior address.
+                                const auto ctxFieldName = [](
+                                    std::optional<uint64_t> offset) {
+                                    if (!offset) return "unresolved";
+#define RT_CTX_FIELD(name) \
+    if (*offset == offsetof(JitCtx, name)) return #name
+                                    RT_CTX_FIELD(thread);
+                                    RT_CTX_FIELD(target);
+                                    RT_CTX_FIELD(runtime);
+                                    RT_CTX_FIELD(sequencer);
+                                    RT_CTX_FIELD(fiber);
+                                    RT_CTX_FIELD(args);
+                                    RT_CTX_FIELD(compatEc);
+                                    RT_CTX_FIELD(varSlotData);
+                                    RT_CTX_FIELD(joinRefs);
+                                    RT_CTX_FIELD(sampledWarpClockUs);
+                                    RT_CTX_FIELD(sampledWarpDeadlineUs);
+                                    RT_CTX_FIELD(sampledUnixMs);
+                                    RT_CTX_FIELD(blockCounter);
+                                    RT_CTX_FIELD(sampledUnixDaysBits);
+#undef RT_CTX_FIELD
+                                    return "interior_or_unmapped";
+                                };
+                                for (const auto& detail : extra.unknownLoadChains)
+                                    std::fprintf(stderr,
+                                        "[rt001-ssa-pointer-load-chain] "
+                                        "fn=%s id=%u loads=%u derivations=%u "
+                                        "terminal=%s ctx_field=%s "
+                                        "ctx_offset=%llu gc_safe=0\n",
+                                        generated.getName().str().c_str(),
+                                        detail.instructionId,
+                                        detail.chain.dereferences,
+                                        detail.chain.addressDerivations,
+                                        rt::pointerLoadTerminalName(
+                                            detail.chain.terminal),
+                                        ctxFieldName(
+                                            detail.chain.hostContextFieldOffset),
+                                        static_cast<unsigned long long>(
+                                            detail.chain.hostContextFieldOffset
+                                                .value_or(UINT64_MAX)));
+                            }
+                        }
+                    }
+                    std::fprintf(stderr,
+                        "[ir001-ssa-live] fn=%s numeric=%zu "
+                        "unsupported=%u complete=%d\n",
+                        generated.getName().str().c_str(),
+                        live.numeric.size(), live.unsupported,
+                        int(live.numericComplete()));
+                }
+        }
+    }
+
+    // The optional post-lowering IR instrumentation runs after the
+    // normal verifier, so explicitly verify newly inserted calls too.
+    if (const char* v = std::getenv("XYO_RT_CAPTURE_LLVM_SSA");
+        v && v[0] == '1' && verifyModule(mod, &llvm::errs()))
+        return false;
     pendingFnNames.push_back(f->getName().str());
     out.entry = nullptr;  // JIT アドレス解決後に埋める
     out.mainThread = cg.mainThread;

@@ -31,6 +31,9 @@ struct NumericRepeatPlan {
     bool integer32SignedSafe = false;
     bool integer32SignedPreferred = false;
     bool fastFloat = false;
+    // A backend-neutral SSA CFG, rather than a recognized statement shape.
+    std::shared_ptr<analysis::NumericRegion> region;
+    ir::region::Analysis regionAnalysis;
 };
 
 std::optional<NumericRepeatPlan> numericRepeatPlan(Block* loop, bool forceFloat = false) {
@@ -43,6 +46,35 @@ std::optional<NumericRepeatPlan> numericRepeatPlan(Block* loop, bool forceFloat 
     const BlockInput* sub = loop->inputs.find("SUBSTACK");
     if (!sub || sub->block.empty()) return std::nullopt;
     NumericRepeatPlan plan;
+    const char* regionMode = std::getenv("XYO_JIT_NUMERIC_REGION");
+    const bool numericRegionEnabled = !regionMode || regionMode[0] != '0';
+    if (!forceFloat && numericRegionEnabled && blocks && target) {
+        const char* costMode = std::getenv("XYO_JIT_NUMERIC_REGION_COST_SELECT");
+        // Keep the already profitable affine lowering when it exists; calls
+        // and richer CFGs not recognized there still use the common region.
+        if (costMode && costMode[0] == '1' && repeatAffinePlan(loop))
+            return std::nullopt;
+        analysis::NumericRegionOptions regionOptions;
+        const char* listMode = std::getenv("XYO_JIT_NUMERIC_REGION_READ_LIST");
+        regionOptions.allowListReads = !listMode || listMode[0] != '0';
+        if (auto region = analysis::lowerNumericRegion(*blocks, *target, loop, regionOptions);
+            region && ir::region::verify(region->graph)) {
+            if (region->graph.listSlots) {
+                // Short list loops do not amortize entry/type guards. This is
+                // a general trip-count cost floor, not a workload-name rule.
+                const auto trips = literalNumber(loop, "TIMES");
+                if (!trips || !std::isfinite(*trips) || *trips < 16.0)
+                    return std::nullopt;
+                const char* finite = std::getenv("XYO_JIT_NUMERIC_REGION_LIST_FINITE");
+                region->graph.listElementsFinite = !finite || finite[0] != '0';
+            }
+            plan.regionAnalysis = ir::region::analyze(region->graph);
+            for (size_t i = 0; i < region->fields.size(); ++i)
+                plan.variables.push_back({region->fields[i], region->graph.written[i]});
+            plan.region = std::make_shared<analysis::NumericRegion>(std::move(*region));
+            return plan;
+        }
+    }
     const auto resolve = [&](const BlockField* f) -> std::optional<unsigned> {
         if (!f || f->id.empty() || !f->value.isString() ||
             !f->value.asStrPtr() || !target) return std::nullopt;
@@ -121,8 +153,65 @@ std::optional<NumericRepeatPlan> numericRepeatPlan(Block* loop, bool forceFloat 
         plan.exprs.push_back(result);
         return int(plan.exprs.size() - 1);
     };
-    Block* node = getBlock(sub->block);
-    while (node) {
+    // Keep an otherwise eligible numeric
+    // repeat on the SSA path when it also copies a scalar. The expression
+    // emitter returns the source's exact (bits, number, integer) tuple, and
+    // chunk-entry guards still reject nonnumeric values. Do not admit
+    // literal/shadow assignments: their original textual tags matter.
+    const char* copyMode = std::getenv("XYO_JIT_NUMERIC_REPEAT_COPY");
+    // Enabled by default; explicit 0 disables repeat copies. Numeric-until
+    // keeps its pre-existing copy support regardless of this repeat toggle.
+    const bool allowScalarCopy = forceFloat || !copyMode || copyMode[0] != '0';
+    // Planning-time expansion, before LLVM inlining can hide the call. Only
+    // zero-argument warp helpers with a straight numeric body are admitted.
+    // Do not change until/OSR region shapes through this repeat experiment.
+    const char* inlineMode = std::getenv("XYO_JIT_NUMERIC_REPEAT_INLINE");
+    const bool inlineHelpers = !forceFloat && inlineMode && inlineMode[0] == '1';
+    std::vector<Block*> statements;
+    unsigned visitedStatements = 0;
+    std::function<bool(Block*, bool)> collect;
+    collect = [&](Block* current, bool inHelper) -> bool {
+        while (current) {
+            if (++visitedStatements > 64) return false; // cyclic/oversized graph
+            if (current->opcode == "procedures_call") {
+                if (!inlineHelpers || inHelper || !current->mutation ||
+                    current->mutation->isReporterCall() ||
+                    !current->inputs.items.empty()) return false;
+                const std::string pc = current->mutation->attr("proccode");
+                std::vector<std::u16string> names;
+                std::vector<std::string> ids;
+                std::vector<Value> defaults;
+                if (!blocks->getProcedureParamNamesIdsAndDefaults(
+                        pc, names, ids, defaults) || !ids.empty() ||
+                    !names.empty() || !defaults.empty()) return false;
+                const std::string defId = blocks->getProcedureDefinition(pc);
+                Block* def = defId.empty() ? nullptr : getBlock(defId);
+                if (!def || def->opcode != "procedures_definition") return false;
+                const BlockInput* custom = def->inputs.find("custom_block");
+                Block* proto = custom ? getBlock(custom->block) : nullptr;
+                if (!proto || proto->opcode != "procedures_prototype" ||
+                    !proto->mutation || !proto->mutation->warp() ||
+                    proto->mutation->attr("proccode") != pc) return false;
+                Block* body = def->next.empty() ? nullptr : getBlock(def->next);
+                if ((!def->next.empty() && !body) || !collect(body, true))
+                    return false;
+            } else {
+                // No nested control, arguments, sensing, yields, list writes,
+                // recursion or opaque effects may cross this planning boundary.
+                if (current->opcode != "data_setvariableto" &&
+                    current->opcode != "data_changevariableby") return false;
+                if (statements.size() >= 20) return false;
+                statements.push_back(current);
+            }
+            if (current->next.empty()) break;
+            current = getBlock(current->next);
+            if (!current) return false;
+        }
+        return true;
+    };
+    Block* first = getBlock(sub->block);
+    if (!first || !collect(first, false)) return std::nullopt;
+    for (Block* node : statements) {
         if (plan.stmts.size() >= 20) return std::nullopt;
         const bool change = node->opcode == "data_changevariableby";
         if (!change && node->opcode != "data_setvariableto")
@@ -139,18 +228,16 @@ std::optional<NumericRepeatPlan> numericRepeatPlan(Block* loop, bool forceFloat 
             rhs->opcode != "operator_mod" &&
             rhs->opcode != "operator_mathop" &&
             rhs->opcode != "operator_round" &&
-            // A plain variable assignment copies the exact numeric bits;
-            // only the numeric-until path may admit this additional shape.
-            !(forceFloat && rhs->opcode == "data_variable"))
+            // Exact scalar copies keep all existing chunk-entry guards;
+            // ordinary repeats may explicitly opt out for regression checks.
+            !(allowScalarCopy && rhs->opcode == "data_variable"))
             return std::nullopt;
         const auto expression = parse(rhs, 0);
         if (!expression) return std::nullopt;
         plan.stmts.push_back({*dst, *expression, change});
         plan.variables[*dst].written = true;
-        if (node->next.empty()) break;
-        node = getBlock(node->next);
     }
-    if (!node || plan.stmts.empty()) return std::nullopt;
+    if (plan.stmts.empty()) return std::nullopt;
 
     // A costly, side-effect-free floating recurrence can use plain double
     // PHIs and defer Scratch boxing to each 64-tick checkpoint. Runtime
@@ -396,10 +483,15 @@ NativeNumericValue emitNumericRepeatExpr(
     return {bits, emitToNumF64(bits)};
 }
 #include "numeric_repeat_float_ssa.inc"
+#include "numeric_region_ssa.inc"
 
 void emitNumericRepeatChunk(const NumericRepeatPlan& plan,
                             llvm::Value* remaining32,
                             AllocaInst* countdown, BasicBlock* loopHead) {
+    if (plan.region) {
+        emitNumericRegionChunk(plan, remaining32, countdown, loopHead);
+        return;
+    }
     if (plan.fastFloat) {
         emitFloatRepeatChunk(plan, remaining32, countdown, loopHead);
         return;
@@ -408,15 +500,34 @@ void emitNumericRepeatChunk(const NumericRepeatPlan& plan,
     BasicBlock* slow = newBB("rep.numeric.slow");
     llvm::Value* valid = b.CreateICmpNE(curYieldWarp, ci32(0));
     std::vector<NativeNumericValue> initial;
+    const char* readonlyMode = std::getenv("XYO_JIT_NUMERIC_REPEAT_READONLY_STRING");
+    const bool readonlyStrings = readonlyMode && readonlyMode[0] == '1';
     for (size_t index = 0; index < plan.variables.size(); ++index) {
         const auto& var = plan.variables[index];
+        // Arithmetic coercion is safe only when the original String bits can
+        // never escape through an exact scalar copy. Preserve the original
+        // variable in memory and resample it at every ordinary chunk entry.
+        const bool exactCopySource = std::any_of(
+            plan.stmts.begin(), plan.stmts.end(), [&](const auto& stmt) {
+                const auto& expr = plan.exprs[size_t(stmt.expression)];
+                return !stmt.change && expr.kind == NumericRepeatExpr::Kind::Variable &&
+                    expr.variable == index;
+            });
+        const bool coerceReadonly = readonlyStrings && !var.written &&
+            !plan.integerVars.empty() && plan.integerVars[index] && !exactCopySource;
         llvm::Value* bits = emitVarGet(var.field);
-        // No unsafe coercion from a String/Boolean/NaN to a raw Number:
-        // such inputs continue through the unchanged normal JIT body.
         llvm::Value* plain = b.CreateICmpSLT(bits, ci64(val::kNan));
-        llvm::Value* number = b.CreateBitCast(bits, f64t);
+        llvm::Value* number = coerceReadonly
+            ? emitToNumF64(bits) : b.CreateBitCast(bits, f64t);
+        llvm::Value* acceptedTag = plain;
+        if (coerceReadonly) {
+            llvm::Value* stringTag = b.CreateOr(
+                b.CreateICmpEQ(bits, ci64(val::kEmptyStr)),
+                b.CreateICmpEQ(b.CreateLShr(bits, ci64(48)), ci64(val::kTagStr >> 48)));
+            acceptedTag = b.CreateOr(plain, stringTag, "rep.readonly.accepted");
+        }
         valid = b.CreateAnd(valid,
-            b.CreateAnd(plain, b.CreateFCmpORD(number, number)));
+            b.CreateAnd(acceptedTag, b.CreateFCmpORD(number, number)));
         llvm::Value* integer = nullptr;
         if (!plan.integerVars.empty() && plan.integerVars[index]) {
             llvm::Value* eligible = b.CreateAnd(
@@ -426,7 +537,8 @@ void emitNumericRepeatChunk(const NumericRepeatPlan& plan,
                     b.CreateFCmpOEQ(number,
                         b.CreateUnaryIntrinsic(Intrinsic::trunc, number))));
             eligible = b.CreateAnd(eligible, b.CreateICmpNE(
-                bits, ci64(0x8000000000000000ull)));
+                coerceReadonly ? b.CreateBitCast(number, i64t) : bits,
+                ci64(0x8000000000000000ull)));
             valid = b.CreateAnd(valid, eligible);
             integer = b.CreateFPToUI(
                 b.CreateSelect(eligible, number, cf64(0.0)),
@@ -437,8 +549,7 @@ void emitNumericRepeatChunk(const NumericRepeatPlan& plan,
     b.CreateCondBr(valid, fast, slow);
     b.SetInsertPoint(fast);
     llvm::Value* ticks = b.CreateLoad(i64t, curYieldCnt);
-    llvm::Value* untilPoll =
-        b.CreateSub(ci64(64), b.CreateAnd(ticks, ci64(63)));
+    llvm::Value* untilPoll = yieldToPoll(ticks);
     llvm::Value* available = b.CreateZExt(remaining32, i64t);
     llvm::Value* chunk = b.CreateSelect(
         b.CreateICmpULT(available, untilPoll), available, untilPoll);

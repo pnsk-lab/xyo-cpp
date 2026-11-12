@@ -12,6 +12,7 @@
 #include "list_storage.hpp"
 #include "gc.hpp"
 #include "value.hpp"
+#include "../ir/source_list_content_epoch.hpp"
 
 namespace xyo {
 
@@ -100,6 +101,7 @@ struct SList {
     }
     Value get0(uint32_t i) const { return extra ? extra->get(i) : items[i]; }
     void write0(uint32_t i, Value v) {
+        ir::ScopedSourceListContentWrite write;
         if (extra) extra->set(i, v);
         else items[i] = v;
     }
@@ -174,6 +176,7 @@ struct SList {
 
     void push(Value v) {
         if (xyo_list_limit && len >= xyo_list_limit) return;
+        ir::ScopedSourceListContentWrite write;
         ensure(len + 1);
         numericOnly &= v.isNumber();
         if (extra) extra->insert(len++, v);
@@ -181,6 +184,7 @@ struct SList {
     }
     void insert0(uint32_t i, Value v) {
         if (i > len) return;
+        ir::ScopedSourceListContentWrite write;
         noteAdaptiveEdit(i);
         ensure(len + 1);
         if (!extra)
@@ -202,12 +206,15 @@ struct SList {
     }
     void erase0(uint32_t i) {
         if (i >= len) return;
+        ir::ScopedSourceListContentWrite write;
         noteAdaptiveEdit(i);
         if (extra) extra->erase(i);
         else std::memmove(items + i, items + i + 1, (len - i - 1) * sizeof(Value));
         --len;
     }
     void clear() {
+        const bool hadContents = len != 0;
+        if (hadContents) ir::beginSourceListContentWrite();
         if (xyo_list_storage_mode == 7 && extra) {
             delete extra;
             extra = nullptr;
@@ -220,6 +227,7 @@ struct SList {
         }
         len = 0;
         if (xyo_list_storage_mode == 7) resetAdaptiveFeedback();
+        if (hadContents) ir::endSourceListContentWrite();
     }
     SList* clone() const {
         // Adaptive non-flat storage has cap=0; allocate a sufficiently

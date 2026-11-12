@@ -129,18 +129,23 @@ inline void snapshotEventWaitDependency(Thread& thread, uintptr_t site) {
     thread.eventWatchValid = true;
 }
 
-inline bool canSkipEventWaitByDependency(const Thread& thread) {
+// Check the ownership/version of snapshot identities without dereferencing
+// any saved Variable*. Safe even when an embedder directly erases a variable.
+inline bool eventWaitBindingSnapshotCurrent(const Thread& thread) {
     if (!thread.eventWatchValid || !thread.target || !thread.blockContainer ||
         !thread.eventWatchVariable) return false;
-    // Validate binding and revision before dereferencing the remembered
-    // variable: editor and clone maps may have replaced its storage.
     if (thread.blockContainer->revision() != thread.eventWatchSourceRevision)
         return false;
     const auto stamp = thread.target->variableBindingStamp();
-    if (stamp.stage != thread.eventWatchStage ||
-        stamp.localGeneration != thread.eventWatchLocalGeneration ||
-        stamp.stageGeneration != thread.eventWatchStageGeneration)
-        return false;
+    return stamp.stage == thread.eventWatchStage &&
+        stamp.localGeneration == thread.eventWatchLocalGeneration &&
+        stamp.stageGeneration == thread.eventWatchStageGeneration;
+}
+
+inline bool canSkipEventWaitByDependency(const Thread& thread) {
+    // Never dereference a saved Variable* until both binding generations and
+    // the block source revision are verified.
+    if (!eventWaitBindingSnapshotCurrent(thread)) return false;
     if (thread.eventWatchVariable->value.bits != thread.eventWatchBits)
         return false;
     if (thread.eventWatchAdditional) {

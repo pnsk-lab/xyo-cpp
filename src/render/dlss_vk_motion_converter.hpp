@@ -4,6 +4,8 @@
 #pragma once
 #if defined(XYO_NVSDK_DLSS_VK)
 #include <vulkan/vulkan.h>
+#include "dlss_rigid_motion.hpp"
+#include <span>
 #include <cstdint>
 #include <string>
 
@@ -21,11 +23,15 @@ public:
     // The buffer must remain valid while this converter exists.
     bool create(VkPhysicalDevice physical, VkDevice device,
                 VkBuffer packedVectors, uint32_t width, uint32_t height,
-                uint32_t gridSize = 4, VkBuffer packedCosts = VK_NULL_HANDLE);
+                uint32_t gridSize = 4, VkBuffer packedCosts = VK_NULL_HANDLE,
+                bool enableRigid = false);
     // Record GPU work into a compute-capable queue command buffer.
     // Input must be synchronized from the preceding optical-flow transfer.
     // Output ends in VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL for NGX.
-    void record(VkCommandBuffer commandBuffer, uint32_t costLimit = 0);
+    void record(VkCommandBuffer commandBuffer, uint32_t costLimit = 0,
+                std::span<const DlssRigidMotionRect> rigid = {},
+                float opticalJitterDeltaX = 0,
+                float opticalJitterDeltaY = 0);
     void destroy();
 
     VkImage image() const { return image_; }
@@ -51,6 +57,10 @@ private:
     uint32_t gridWidth_ = 0, gridHeight_ = 0, gridSize_ = 4;
     VkImageLayout layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     bool hasCosts_ = false;
+    bool hasRigid_ = false;
+    VkBuffer rigidBuffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory rigidMemory_ = VK_NULL_HANDLE;
+    void* rigidMapped_ = nullptr;
     std::string error_;
 };
 

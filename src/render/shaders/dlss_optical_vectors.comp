@@ -20,6 +20,22 @@ layout(std430, binding = 2) readonly buffer FlowCosts {
     uint words[];
 } costs;
 
+// Optional geometry-derived motion for fully opaque sprites.
+// mode=0: exact rigid translation; mode=1: inverse affine current quad ->
+// prior image, using the SDL-rounded raster transform, guarded by source UV.
+struct RigidRect {
+    ivec4 bounds;
+    vec4 delta;  // translation x/y, mode z=1 for affine
+    vec4 previousX; // (m00,m01,m02, UV inset x)
+    vec4 previousY; // (m10,m11,m12, UV inset y)
+    vec4 currentU; // normalized current image coordinate from pixel x/y
+    vec4 currentV;
+    uint opaqueBits[512]; // 128x128 conservative bitmask, source UV space
+};
+layout(std430, binding = 3) readonly buffer RigidOverrides {
+    RigidRect entries[];
+} rigid;
+
 layout(push_constant) uniform GridParams {
     int outputWidth;
     int outputHeight;
@@ -27,6 +43,11 @@ layout(push_constant) uniform GridParams {
     int gridHeight;
     int gridSize;
     int costLimit;
+    int rigidCount;
+    // Optical Flow sees both camera jitter and true scene motion.
+    // Remove (previous jitter - current jitter) before NGX consumes MVs.
+    float jitterDeltaX;
+    float jitterDeltaY;
 } params;
 
 void main() {
@@ -49,6 +70,43 @@ void main() {
             vy = 0;
         }
     }
-    imageStore(dlssMotion, p, vec4(float(vx) / 32.0,
-                                  float(vy) / 32.0, 0.0, 0.0));
+    vec2 motion = vec2(float(vx), float(vy)) / 32.0 -
+                  vec2(params.jitterDeltaX, params.jitterDeltaY);
+    for (int i = 0; i < params.rigidCount; ++i) {
+        ivec4 b = rigid.entries[i].bounds;
+        if (p.x >= b.x && p.y >= b.y && p.x < b.z && p.y < b.w) {
+            if (rigid.entries[i].delta.z < 0.5) {
+                motion = rigid.entries[i].delta.xy;
+                break;
+            }
+            // Half-pixel is the sampling center of the actual rasterized
+            // SDL_RenderCopyEx quad; do not overwrite its AABB background.
+            vec2 center = vec2(p) + vec2(0.5);
+            vec3 q = vec3(center, 1.0);
+            vec2 uv = vec2(dot(rigid.entries[i].currentU.xyz,q),
+                           dot(rigid.entries[i].currentV.xyz,q));
+            vec2 inset = vec2(rigid.entries[i].previousX.w,
+                              rigid.entries[i].previousY.w);
+            if (all(greaterThanEqual(uv,inset)) &&
+                all(lessThanEqual(uv,vec2(1.0)-inset))) {
+                // Only opt-in coverage masks can replace optical flow on
+                // partly transparent costumes. The CPU precomputes each
+                // 128x128 tile conservatively (source texel alpha 255 plus
+                // a one-pixel guard border, including antialiasing).
+                if (rigid.entries[i].delta.w > 0.5) {
+                    ivec2 texel = clamp(ivec2(floor(uv*128.0)),
+                                        ivec2(0), ivec2(127));
+                    uint bitIndex = uint(texel.y * 128 + texel.x);
+                    if ((rigid.entries[i].opaqueBits[bitIndex >> 5] &
+                         (1u << (bitIndex & 31u))) == 0u)
+                        continue;
+                }
+                vec2 previous = vec2(dot(rigid.entries[i].previousX.xyz,q),
+                                     dot(rigid.entries[i].previousY.xyz,q));
+                motion = previous-center;
+                break;
+            }
+        }
+    }
+    imageStore(dlssMotion, p, vec4(motion, 0.0, 0.0));
 }

@@ -79,8 +79,9 @@ void main() {
         float factor = max(1.0 - length(offset) / 0.5, 0.0);
         float angle = uA.z * factor * factor;
         float cs = cos(angle), sn = sin(angle);
-        uv = vec2(cs * offset.x - sn * offset.y,
-                  sn * offset.x + cs * offset.y) + 0.5;
+        // Scratch's mat2(cos,-sin,sin,cos) is column-major.
+        uv = vec2(cs * offset.x + sn * offset.y,
+                  -sn * offset.x + cs * offset.y) + 0.5;
     }
     if (uA.y != 1.0) {
         vec2 v = (uv - 0.5) * 2.0;
@@ -261,7 +262,12 @@ bool GlEffects::apply(SDL_Renderer* renderer, SDL_Texture* source,
         const auto get = [&](const char* name) {
             return effects.get(name);
         };
-        const float color = std::fmod(get("color") / 200.0, 1.0);
+        const double rawColor = get("color");
+        float color = std::fmod(rawColor / 200.0, 1.0);
+        // The shader variant is enabled by rawColor != 0, not color != 0.
+        // A full hue turn still saturates gray pixels in Scratch.
+        if (rawColor != 0.0 && color == 0.0f)
+            color = rawColor > 0.0 ? 1.0f : -1.0f;
         const float fisheye = std::max(0.0, (get("fisheye") + 100.0) / 100.0);
         const float whirl = -get("whirl") * 3.14159265358979323846 / 180.0;
         const float pixelate = std::abs(get("pixelate")) / 10.0;

@@ -35,6 +35,12 @@ struct FiberRegs {
     uint64_t sp;
     uint64_t d8, d9, d10, d11, d12, d13, d14, d15;
 };
+#elif defined(XYO_WII)
+// Interpreter-only Wii build: the native fiber/JIT path is unavailable.
+// Keep a minimal record to preserve the runtime ABI, but fail loudly if used.
+struct FiberRegs {
+    uintptr_t rsp = 0, rip = 0, r15 = 0;
+};
 #elif defined(__wasm32__) || defined(__EMSCRIPTEN__)
 // WASM（Emscripten）: ネイティブの context switch は不可能。Phase A は
 // interp 専用で fiber は実行されないため、コンパイル・リンクを通すための
@@ -78,6 +84,7 @@ public:
     void yield();
 
     bool finished() const { return finished_; }
+    bool started() const { return started_; }
 
     /// GC root 走査用: 中断中の使用済みスタック区間 [sp, stackBase)。
     void* suspendedSp() const;
@@ -114,6 +121,18 @@ struct FiberPool {
     static Fiber* acquire(FiberEntry entry, void* arg);
     /// 返却（容量超過分は delete）。nullptr 可。
     static void release(Fiber* f);
+    // Number of leased (not idle/pool-owned) native Fiber activations.
+    // In RT-001's experimental GC mode, ANY such Fiber may have live
+    // LLVM SSA values that conservative stack/register scanning misses.
+    static size_t activeCount();
+    // Diagnostic: count attempts to acquire a native stack in an explicitly
+    // fiberless process. Must remain zero in the migration smoke suite.
+    static size_t fiberlessAcquires();
+    // Started activations that can still resume LLVM code. Merely
+    // allocated (never entered) and completed-but-unreleased Fibers
+    // cannot own live SSA. This is a conservative GC gate, NOT proof
+    // that a suspended activation's SSA is rooted.
+    static size_t unsafeCount();
 };
 
 namespace detail {

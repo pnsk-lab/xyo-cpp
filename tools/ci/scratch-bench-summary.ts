@@ -7,6 +7,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import { EXPECTED_PARITY_CHECKS, parityGate } from "./scratch-bench-parity-gate.ts";
 
 type Run = { ok: boolean; error?: string };
 type Summary = { median?: number };
@@ -34,9 +35,6 @@ const resultDirs = [
   { suite: "parity", dir: "scratch-bench/results/ci-parity", optional: false },
 ] as const;
 
-// 既知の差異を理由に 100% を要求しない。急激な意味論回帰は検出する。
-// scratch-bench の fixture / 採点方法を更新する場合はこの基準も再評価する。
-const MIN_PARITY_RATE = 0.96;
 const XYO_VARIANTS = ["hotspot", "interpreter", "eager", "aot"] as const;
 const TURBOWARP_VARIANTS = ["compiler", "interpreter"] as const;
 
@@ -69,8 +67,14 @@ const metric = (result: BenchResult, report: (message: string) => void): string 
       return "invalid";
     }
     const rate = passed / total;
-    if (result.runtime.id === "xyo-cpp" && rate < MIN_PARITY_RATE) {
-      report(`Parity below ${(MIN_PARITY_RATE * 100).toFixed(0)}%: ${result.runtime.variant?.id} ${passed}/${total}`);
+    if (result.runtime.id === "xyo-cpp") {
+      const reason = parityGate({
+        variant: result.runtime.variant?.id ?? "hotspot",
+        verdict: parity.verdict as "passed" | "failed",
+        passed,
+        total,
+      });
+      if (reason) report(reason);
     }
     return `${passed}/${total} (${(rate * 100).toFixed(2)}%)`;
   }
@@ -161,7 +165,7 @@ const markdown = [
   "| --- | --- | --- | ---: | ---: |",
   ...rows.sort(),
   "",
-  `Parity gate: ≥ ${(MIN_PARITY_RATE * 100).toFixed(0)}%. Performance is reported only (not a noisy timing gate).`,
+  `Parity gate: interpreter/HotSpot/Eager/AOT = ${EXPECTED_PARITY_CHECKS}/${EXPECTED_PARITY_CHECKS}. AOT object is verified separately. Performance is reported only (not a noisy timing gate).`,
   "",
   ...completeReport,
   ...(errors.length ? ["### Errors", "", ...errors.map((error) => `- ${error}`), ""] : []),

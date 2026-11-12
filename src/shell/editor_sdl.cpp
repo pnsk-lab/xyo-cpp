@@ -398,12 +398,13 @@ struct Editor {
         b.x = wx;
         b.y = wy;
         std::string id = b.id;
+        Blocks::StructuralEdit sourceEdit(*blocks);
         blocks->createBlock(b);
         if (argTexts) {
             for (auto& [inm, txt] : *argTexts) {
                 if (txt.empty()) continue;   // bool 引数は空ソケット
                 std::string sid = makeShadowBlock(blocks, "text", "TEXT", txt, id);
-                if (Block* nb = blocks->getBlock(id)) {
+                if (Block* nb = sourceEdit.getBlock(id)) {
                     BlockInput bi;
                     bi.block = sid;
                     bi.shadow = sid;
@@ -418,15 +419,16 @@ struct Editor {
         if (!t || !t->blocks || id.empty()) return;
         Blocks* blocks = t->blocks;
         pushUndo();
+        Blocks::StructuralEdit edit(*blocks);
         // 前ブロックの next を切ってチェーンごと消す
         std::string prev = bl::prevOf(blocks, id);
         std::string parent;
-        if (Block* b = blocks->getBlock(id)) {
+        if (Block* b = edit.getBlock(id)) {
             parent = b->parent;
             if (!prev.empty()) {
-                if (Block* p = blocks->getBlock(prev)) p->next.clear();
+                if (Block* p = edit.getBlock(prev)) p->next.clear();
             } else if (!parent.empty()) {
-                if (Block* p = blocks->getBlock(parent)) {
+                if (Block* p = edit.getBlock(parent)) {
                     for (auto& [nm, in] : p->inputs.items)
                         if (in.block == id) in.block.clear();
                 }
@@ -434,7 +436,6 @@ struct Editor {
             if (b->topLevel) { blocks->deleteScript(id); }
         }
         blocks->deleteBlock(id);
-        blocks->resetCache();
         if (selBlock == id) selBlock.clear();
     }
     /// 単一ブロック削除（next 側を残す）
@@ -445,17 +446,19 @@ struct Editor {
         pushUndo();
         Blocks* blocks = t->blocks;
         const std::string delId = selBlock;
-        Block* sb = blocks->getBlock(delId);
-        if (sb) {
+        const Block* source = blocks->getBlock(delId);
+        if (source) {
+            Blocks::StructuralEdit edit(*blocks);
+            Block* sb = edit.getBlock(delId);
             const std::string nxt = sb->next;
             const bool wasTop = sb->topLevel;
             std::string parentId = bl::prevOf(blocks, delId);
             sb->next.clear();
             if (!parentId.empty()) {
-                if (Block* pb = blocks->getBlock(parentId)) pb->next = nxt;
+                if (Block* pb = edit.getBlock(parentId)) pb->next = nxt;
             }
             if (!nxt.empty()) {
-                if (Block* nb = blocks->getBlock(nxt)) {
+                if (Block* nb = edit.getBlock(nxt)) {
                     nb->parent = parentId;
                     if (wasTop) { nb->topLevel = true; blocks->addScript(nxt); }
                 }
@@ -470,7 +473,7 @@ struct Editor {
                        bool head) {
         auto it = map.find(srcId);
         if (it != map.end()) return it->second;
-        Block* sp = blocks->getBlock(srcId);
+        const Block* sp = blocks->getBlock(srcId);
         if (!sp) return "";
         Block nb = *sp;
         std::string oldNext = nb.next;
@@ -503,8 +506,8 @@ struct Editor {
         Blocks* blocks = t->blocks;
         pushUndo();
         std::unordered_map<std::string, std::string> map;
+        Blocks::StructuralEdit edit(*blocks);
         std::string nid = dupRec(blocks, id, map, true);
-        blocks->resetCache();
         if (!nid.empty()) selBlock = nid;
     }
 
@@ -518,8 +521,8 @@ struct Editor {
             auto it = b->fields.find(a.name);
             if (it != b->fields.end()) cur = it->second.value.asBool();
             pushUndo();
-            b->fields[a.name] = BlockField{Value::boolean(!cur)};
-            t->blocks->resetCache();
+            t->blocks->setBlockField(
+                b->id, a.name, BlockField{Value::boolean(!cur)});
         }
     }
     /// ドロップダウンを実メニューで開く（Dropdown の選択肢 / Variable の変数名）。
@@ -580,12 +583,13 @@ struct Editor {
                     if (vid == menu_.ids[i]) { nm = utf16ToUtf8(v.name); break; }
                 BlockField f{Value::string(SStr::fromUtf8(nm))};
                 f.id = menu_.ids[i];
-                b->fields[menu_.fieldName] = f;
+                t->blocks->setBlockField(
+                    menu_.blockId, menu_.fieldName, std::move(f));
             } else {
-                b->fields[menu_.fieldName] =
-                    BlockField{Value::string(SStr::fromUtf8(menu_.ids[i]))};
+                t->blocks->setBlockField(
+                    menu_.blockId, menu_.fieldName,
+                    BlockField{Value::string(SStr::fromUtf8(menu_.ids[i]))});
             }
-            t->blocks->resetCache();
         }
         menu_.open = false;
     }
@@ -663,19 +667,19 @@ struct Editor {
         if (t && t->blocks && edit_.active) {
             if (Block* b = t->blocks->getBlock(edit_.blockId)) {
                 pushUndo();
+                BlockField value;
                 if (edit_.numeric) {
                     char* end = nullptr;
                     double dv = std::strtod(edit_.buf.c_str(), &end);
                     if (end != edit_.buf.c_str() && *end == 0)
-                        b->fields[edit_.field] = BlockField{Value::num(dv)};
+                        value.value = Value::num(dv);
                     else
-                        b->fields[edit_.field] =
-                            BlockField{Value::string(SStr::fromUtf8(edit_.buf))};
+                        value.value = Value::string(SStr::fromUtf8(edit_.buf));
                 } else {
-                    b->fields[edit_.field] =
-                        BlockField{Value::string(SStr::fromUtf8(edit_.buf))};
+                    value.value = Value::string(SStr::fromUtf8(edit_.buf));
                 }
-                t->blocks->resetCache();
+                t->blocks->setBlockField(
+                    edit_.blockId, edit_.field, std::move(value));
             }
         }
         edit_.active = false;
@@ -773,10 +777,11 @@ struct Editor {
         JsonValue frag = jsonParse(backpack[i].json);
         if (!frag.isObject()) return;
         pushUndo();
+        Blocks::StructuralEdit sourceEdit(*t->blocks);
         std::string head;
         loadBlocksFragment(*t->blocks, frag, &head);
         if (head.empty()) return;
-        if (Block* h = t->blocks->getBlock(head)) {
+        if (Block* h = sourceEdit.getBlock(head)) {
             h->topLevel = true;
             h->parent.clear();
             // ドロップ位置はビュー中央
@@ -786,7 +791,6 @@ struct Editor {
             h->y = wy;
             t->blocks->addScript(head);
         }
-        t->blocks->resetCache();
         selBlock = head;
     }
     int backpackAt(float mx, float my) {
@@ -1242,8 +1246,10 @@ struct Editor {
         Target* t = selected();
         if (!t || !t->blocks) return;
         Blocks* blocks = t->blocks;
-        Block* b = blocks->getBlock(drag.headId);
-        if (!b) return;
+        const Block* found = blocks->getBlock(drag.headId);
+        if (!found) return;
+        Blocks::StructuralEdit edit(*blocks);
+        Block* b = edit.getBlock(drag.headId);
         drag.shape = blockShape(drag.headId);
         bool isReporter = drag.shape == edit::Shape::Reporter ||
                           drag.shape == edit::Shape::Boolean;
@@ -1261,14 +1267,14 @@ struct Editor {
             return -1;
         };
         drag.tailId = bl::chainTail(blocks, drag.headId);
-        Block* tl = blocks->getBlock(drag.tailId);
+        Block* tl = edit.getBlock(drag.tailId);
         drag.tailNext = tl ? tl->next : "";
 
         if (isReporter) {
             if (!b->parent.empty()) {
                 drag.kind = DragKind::ValueInput;
                 drag.prevParent = b->parent;
-                if (Block* p = blocks->getBlock(drag.prevParent)) {
+                if (Block* p = edit.getBlock(drag.prevParent)) {
                     for (auto& [iname, bi] : p->inputs.items)
                         if (bi.block == drag.headId) {
                             drag.prevInput = iname;
@@ -1285,14 +1291,14 @@ struct Editor {
             drag.prevId = bl::prevOf(blocks, drag.headId);
             if (!drag.prevId.empty()) {
                 drag.kind = DragKind::Chain;
-                if (Block* px = blocks->getBlock(drag.prevId)) px->next = drag.tailNext;
+                if (Block* px = edit.getBlock(drag.prevId)) px->next = drag.tailNext;
             } else if (!b->parent.empty() &&
-                       substackBranch(blocks->getBlock(b->parent)) >= 0) {
+                       substackBranch(edit.getBlock(b->parent)) >= 0) {
                 drag.kind = DragKind::Substack;
                 drag.prevParent = b->parent;
-                drag.prevInput = substackBranch(blocks->getBlock(b->parent)) == 0
+                drag.prevInput = substackBranch(edit.getBlock(b->parent)) == 0
                                      ? "SUBSTACK" : "SUBSTACK2";
-                if (Block* p = blocks->getBlock(b->parent)) {
+                if (Block* p = edit.getBlock(b->parent)) {
                     BlockInput* in = p->inputs.find(drag.prevInput);
                     if (in) in->block = drag.tailNext;
                 }
@@ -1302,11 +1308,10 @@ struct Editor {
             }
             if (tl) tl->next.clear();
             if (!drag.tailNext.empty())
-                if (Block* g = blocks->getBlock(drag.tailNext))
+                if (Block* g = edit.getBlock(drag.tailNext))
                     g->parent = drag.prevId.empty() ? b->parent : drag.prevId;
             b->parent.clear();
         }
-        blocks->resetCache();
         wsDirty_ = true;
     }
 
@@ -1406,6 +1411,7 @@ struct Editor {
         Target* t = selected();
         if (!t || !t->blocks) { drag.active = false; return; }
         Blocks* blocks = t->blocks;
+        Blocks::StructuralEdit edit(*blocks);
         std::string id;
         if (drag.fromFlyout) {
             id = instBlock(blocks, drag.opcode, drag.initFields,
@@ -1436,10 +1442,9 @@ struct Editor {
                                 drag.tailId.empty() ? id : drag.tailId,
                                 drag.targetId);
         } else {
-            if (Block* b = blocks->getBlock(id)) { b->x = drag.mx; b->y = drag.my; }
+            if (Block* b = edit.getBlock(id)) { b->x = drag.mx; b->y = drag.my; }
             bl::makeTopLevel(blocks, id);
         }
-        blocks->resetCache();
         wsDirty_ = true;
         selBlock = id;
         drag.active = false;
@@ -1451,42 +1456,42 @@ struct Editor {
         Target* t = selected();
         if (t && t->blocks && !drag.fromFlyout) {
             Blocks* blocks = t->blocks;
+            Blocks::StructuralEdit edit(*blocks);
             if (drag.kind == DragKind::ValueInput) {
                 if (!drag.prevParent.empty() && !drag.prevInput.empty()) {
-                    if (Block* p = blocks->getBlock(drag.prevParent)) {
+                    if (Block* p = edit.getBlock(drag.prevParent)) {
                         BlockInput* in = p->inputs.find(drag.prevInput);
                         if (in) in->block = drag.headId;
                     }
-                    if (Block* h = blocks->getBlock(drag.headId)) h->parent = drag.prevParent;
+                    if (Block* h = edit.getBlock(drag.headId)) h->parent = drag.prevParent;
                 }
             } else if (drag.kind == DragKind::Substack) {
                 if (!drag.prevParent.empty() && !drag.prevInput.empty()) {
-                    if (Block* p = blocks->getBlock(drag.prevParent)) {
+                    if (Block* p = edit.getBlock(drag.prevParent)) {
                         BlockInput* in = p->inputs.find(drag.prevInput);
                         if (in) in->block = drag.headId;
                     }
-                    if (Block* h = blocks->getBlock(drag.headId)) h->parent = drag.prevParent;
+                    if (Block* h = edit.getBlock(drag.headId)) h->parent = drag.prevParent;
                 }
-                if (Block* tl = blocks->getBlock(drag.tailId)) tl->next = drag.tailNext;
+                if (Block* tl = edit.getBlock(drag.tailId)) tl->next = drag.tailNext;
                 if (!drag.tailNext.empty())
-                    if (Block* g = blocks->getBlock(drag.tailNext)) g->parent = drag.tailId;
+                    if (Block* g = edit.getBlock(drag.tailNext)) g->parent = drag.tailId;
             } else if (drag.kind == DragKind::Chain) {
                 if (!drag.prevId.empty()) {
-                    if (Block* px = blocks->getBlock(drag.prevId)) px->next = drag.headId;
-                    if (Block* h = blocks->getBlock(drag.headId)) h->parent = drag.prevId;
+                    if (Block* px = edit.getBlock(drag.prevId)) px->next = drag.headId;
+                    if (Block* h = edit.getBlock(drag.headId)) h->parent = drag.prevId;
                 } else if (drag.wasTop) {
-                    if (Block* h = blocks->getBlock(drag.headId)) {
+                    if (Block* h = edit.getBlock(drag.headId)) {
                         h->topLevel = true;
                         blocks->addScript(drag.headId);
                     }
                 }
-                if (Block* tl = blocks->getBlock(drag.tailId)) tl->next = drag.tailNext;
+                if (Block* tl = edit.getBlock(drag.tailId)) tl->next = drag.tailNext;
                 if (!drag.tailNext.empty())
-                    if (Block* g = blocks->getBlock(drag.tailNext)) g->parent = drag.tailId;
+                    if (Block* g = edit.getBlock(drag.tailNext)) g->parent = drag.tailId;
             } else if (drag.kind == DragKind::TopLevel) {
                 if (drag.wasTop) bl::makeTopLevel(blocks, drag.headId);
             }
-            blocks->resetCache();
         }
         drag.active = false;
         drag.pending = false;
@@ -1621,6 +1626,7 @@ struct Editor {
         if (!t || !t->blocks) return;
         Blocks* blocks = t->blocks;
         pushUndo();
+        Blocks::StructuralEdit sourceEdit(*blocks);
         // proccode を parts から合成（被りは番号付け）
         std::string proccode = mb_.proccode();
         if (proccode.empty()) proccode = "my block";
@@ -1702,11 +1708,10 @@ struct Editor {
         }
         blocks->createBlock(def);
         blocks->createBlock(proto);
-        if (Block* dp = blocks->getBlock(def.id)) {
+        if (Block* dp = sourceEdit.getBlock(def.id)) {
             dp->topLevel = true;
             blocks->addScript(def.id);
         }
-        blocks->resetCache();
         wsDirty_ = true;
         flyDirty_ = true;
     }
@@ -1722,9 +1727,9 @@ struct Editor {
         }
         rec.visible = !rec.visible;
         rt->monitorState.dirty = true;
-        if (Block* b = rt->monitorBlocks->getBlock(varId))
+        Blocks::StructuralEdit sourceEdit(*rt->monitorBlocks);
+        if (Block* b = sourceEdit.getBlock(varId))
             b->isMonitored = rec.visible;
-        rt->monitorBlocks->resetCache();
     }
 
     // ---- 実行中スクリプト（グロウ）-------------------------------------------
@@ -3622,6 +3627,17 @@ struct Editor {
             Block* sh = in ? blocks->getBlock(in->block) : nullptr;
             check(sh && sh->opcode == "math_number", "STEPS shadow is math_number");
             check(sh && bl::fieldStr(sh, "NUM") == "10", "STEPS NUM == 10");
+            if (sh) {
+                const uint64_t before = blocks->revision();
+                startEditingInputOf(bb);
+                check(edit_.active && edit_.numeric, "numeric shadow edit started");
+                edit_.buf = "24";
+                applyEdit();
+                check(blocks->revision() != before,
+                      "numeric shadow edit invalidates AOT source");
+                check(bl::fieldStr(sh, "NUM") == "24",
+                      "numeric shadow edit committed");
+            }
         }
         selBlock = b;
         deleteSelectedBlock();
@@ -3636,8 +3652,11 @@ struct Editor {
             Block* cc = blocks->getBlock(c);
             startEditingInputOf(cc);
             check(edit_.active && edit_.field == "TEXT", "editing C TEXT");
+            const uint64_t before = blocks->revision();
             edit_.buf = "Edited!";
             applyEdit();
+            check(blocks->revision() != before,
+                  "text shadow edit invalidates AOT source");
             const BlockInput* in = cc ? cc->inputs.find("MESSAGE") : nullptr;
             Block* sh = in && !in->block.empty() ? blocks->getBlock(in->block) : nullptr;
             check(sh && bl::fieldStr(sh, "TEXT") == "Edited!", "MESSAGE updated");
@@ -3650,21 +3669,27 @@ struct Editor {
             std::string d3 = addBlock("looks_say");
             drag.headId = d3; drag.shape = blockShape(d3);
             detachDrag();
+            const uint64_t beforeInsert = blocks->revision();
             bl::insertBefore(blocks, d3, drag.tailId, d2);
-            blocks->resetCache();
+            check(blocks->revision() != beforeInsert,
+                  "standalone insertBefore publishes source revision");
             check(blocks->getBlock(d1)->next == d3 &&
                   blocks->getBlock(d3)->next == d2, "drag before");
             drag.headId = d2; drag.shape = blockShape(d2);
             detachDrag();
+            const uint64_t beforeAfter = blocks->revision();
             bl::insertAfter(blocks, d2, drag.tailId, d1);
-            blocks->resetCache();
+            check(blocks->revision() != beforeAfter,
+                  "standalone insertAfter publishes source revision");
             check(blocks->getBlock(d1)->next == d2 &&
                   blocks->getBlock(d2)->next == d3, "drag after");
             std::string rep = addBlock("operator_add");
             drag.headId = rep; drag.shape = blockShape(rep);
             detachDrag();
+            const uint64_t beforeAttach = blocks->revision();
             bl::attachToValue(blocks, rep, d2, "STEPS");
-            blocks->resetCache();
+            check(blocks->revision() != beforeAttach,
+                  "standalone attachToValue publishes source revision");
             {
                 Block* d2b = blocks->getBlock(d2);
                 const BlockInput* in = d2b ? d2b->inputs.find("STEPS") : nullptr;
@@ -3673,7 +3698,6 @@ struct Editor {
             drag.headId = rep; drag.shape = blockShape(rep);
             detachDrag();
             cancelDrag();
-            blocks->resetCache();
             {
                 Block* d2c = blocks->getBlock(d2);
                 const BlockInput* in = d2c ? d2c->inputs.find("STEPS") : nullptr;
@@ -3727,8 +3751,13 @@ struct Editor {
                     std::vector<std::string> vals;
                     for (size_t i = 1; i < a.options.size(); i += 2)
                         vals.push_back(a.options[i]);
-                    bb->fields[a.name] = BlockField{
-                        Value::string(SStr::fromUtf8("not draggable"))};
+                    const uint64_t oldRevision = blocks->revision();
+                    check(blocks->setBlockField(
+                              dd, a.name, BlockField{
+                                  Value::string(SStr::fromUtf8("not draggable"))}),
+                          "dropdown committed");
+                    check(blocks->revision() != oldRevision,
+                          "dropdown invalidates AOT source revision");
                     check(bl::fieldStr(bb, "DRAG_MODE") == "not draggable",
                           "dropdown changed");
                 }

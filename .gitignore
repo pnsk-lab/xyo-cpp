@@ -68,6 +68,13 @@ tests/bench/algos/v8out/
 # 過去の調査で使ったソースのコピー（正本は src/ 以下）
 /board/nested-osr-wip/
 
+# --- ローカル調査・プロファイル用の一時出力 ---
+/.ir001-check/
+/opt-audit/
+/jit.ll
+/target.ll
+/log.txt
+
 # User-managed translation model weights (not redistributed)
 /models/
 *.gguf

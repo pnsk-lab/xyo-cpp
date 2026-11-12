@@ -4,17 +4,34 @@
 #include "../jit/jit.hpp"
 #include "numeric_thread.hpp"
 #include "../jit/procedure_frame_state.hpp"
+#include "../ir/source_effect_runtime_trace.hpp"
+#include "../ir/source_list_read_events.hpp"
+#include "../ir/source_scalar_read_events.hpp"
 #include "../model/target.hpp"
 #include "fiber.hpp"
 #include "runtime.hpp"
 
 namespace xyo {
 
+namespace {
+bool ir001SourceTraceEnabled() {
+    // The IR-001 instrumentation flag is fixed per process. Keep default
+    // Scratch Thread creation/retirement free of registry locks/allocations.
+    static const bool enabled = [] {
+        const char* value = std::getenv("XYO_IR001_TRACE_EFFECT_PC");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+} // namespace
+
 Thread::Thread(std::string firstBlock) : topBlock(std::move(firstBlock)) {
     // warpTimer は遅延 init（stepThread で初めて必要になったとき start）
 }
 
 Thread::~Thread() {
+    if (ir001SourceTraceEnabled())
+        ir::NativeSourceEffectTimelineRegistry::get().erase(this);
     FiberPool::release(fiber);
     delete jitCtx;
 }
@@ -30,6 +47,21 @@ const std::string& Thread::getId() const {
 }
 
 void Thread::releaseFinished() {
+    pendingShortBroadcast = false;
+    if (ir001SourceTraceEnabled())
+        ir::NativeSourceEffectTimelineRegistry::get().erase(this);
+    nativeAsyncVariableRoots.clear();
+    nativeAsyncReporterReturnPc = 0;
+    nativeAsyncReporterFramePtr = 0;
+    nativeAsyncReporterInputBuffer = 0;
+    nativeAsyncReporterInputWords = 0;
+    nativeRtSsaCapture.reset();
+    nativeSourceListReads.reset();
+    nativeSourceScalarReads.reset();
+    nativeSourceReporterReadSequence = 1;
+    nativeGcSoftBudgetYieldDue = false;
+    nativeGcSoftBudgetAttempted = false;
+    nativeRootLoopYieldCount = 0;
     if (nativeProcedureFrames) {
         if (std::getenv("XYO_JIT_CALLFRAME_STATS"))
             nativeProcedureFrames->report(topBlock.c_str());
@@ -64,9 +96,24 @@ void Thread::releaseFinished() {
     hasCompatStackFrame = false;
     jitVarCache.clear();
     jitVarSlots.clear();
+    nativeVarCacheTarget = nullptr;
+    nativeVarCacheStage = nullptr;
+    nativeVarCacheLocalGeneration = 0;
+    nativeVarCacheStageGeneration = 0;
+    nativeVarCacheValid = false;
+    nativeVarCacheHits = 0;
+    nativeVarCacheMisses = 0;
+    nativeVarCacheInvalidations = 0;
+    nativeVarIndexedSlots.clear();
+    nativeVarInlineEntries = nullptr;
+    nativeVarInlineCount = 0;
+    nativeVarInlineTraceHits = 0;
+    nativeVarLocalGenerationAddress = nullptr;
+    nativeVarStageGenerationAddress = nullptr;
 }
 
 void Thread::pushStack(const std::string& blockId) {
+    pendingShortBroadcast = false;
     // A tiny native script can begin with only its root block ID. If it
     // unexpectedly enters a procedure or compatibility frame, materialize
     // the missing root frame before pushing the nested frame.
@@ -87,6 +134,7 @@ void Thread::pushStack(const std::string& blockId) {
 }
 
 void Thread::reuseStackForNextBlock(const std::string& blockId) {
+    pendingShortBroadcast = false;
     // JS では stack が空でも stack[-1]=id は無害な代入、
     // stackFrames[length-1] は残った最終フレームを再利用する。
     // retireThread 直後（edge-activated hat 不発火）にここへ来る場合がある。
@@ -95,6 +143,7 @@ void Thread::reuseStackForNextBlock(const std::string& blockId) {
 }
 
 std::string Thread::popStack() {
+    pendingShortBroadcast = false;
     while (stackFrames.size() < stack.size())
         stackFrames.emplace_back(std::make_unique<StackFrame>());
     std::string id = stack.back();
@@ -217,6 +266,25 @@ bool Thread::isRecursiveCall(const std::string& procedureCode) const {
 
 void Thread::tryCompile(const Block* topHint) {
     triedToCompile = true;
+    // Count deliberately interpreted suspending scripts, so every
+    // fiberless smoke run can distinguish "no Fiber was needed" from
+    // "the migration accidentally still allocated native stacks".
+    static std::atomic<uint64_t> yieldingFallbacks{0};
+    static const bool stats = [] {
+        const char* flag = std::getenv("XYO_JIT_FIBERLESS_STATS");
+        if (!jitFiberlessEnabled() || !flag || flag[0] != '1')
+            return false;
+        std::atexit([] {
+            std::fprintf(stderr,
+                "[fiberless-migration] interpreted_yield_scripts=%llu "
+                "fiber_acquires=%zu\n",
+                static_cast<unsigned long long>(
+                    yieldingFallbacks.load(std::memory_order_relaxed)),
+                FiberPool::fiberlessAcquires());
+        });
+        return true;
+    }();
+    (void)stats;
     Runtime* rt = target ? target->runtime : nullptr;
     if (!rt || !rt->jit || !jitEnabled() || !blockContainer) return;
 #if defined(__EMSCRIPTEN__)
@@ -230,6 +298,31 @@ void Thread::tryCompile(const Block* topHint) {
     topBlockPtr = top;
     static const bool verbose = std::getenv("XYO_JIT_VERBOSE") != nullptr;
 
+    // For a clone-start hat, the source script is immutable across
+    // separately created clone Targets sharing a Sprite/Blocks container.
+    // JitEngine::decideCompile and ::compile otherwise repeat two hash
+    // lookups for *each* clone even when the code is already published.
+    // Reuse only an already-ready native script, under exactly the same
+    // native/CFG preconditions as the usual cached-compile path.
+    // Enabled by default after paired benchmark and parity validation.
+    // XYO_JIT_READY_CLONE=0 restores the original decideCompile/compile
+    // path without changing any of the surrounding JIT mode semantics.
+    static const bool cloneReadyFast = [] {
+        const char* env = std::getenv("XYO_JIT_READY_CLONE");
+        return !env || env[0] != '0';
+    }();
+    const char* cfg = std::getenv("XYO_JIT_COMMON_CFG");
+    const bool numericCfg = cfg && cfg[0] == '1' && cfg[1] == '\0';
+    if (cloneReadyFast && !numericCfg &&
+        top->opcode == "control_start_as_clone" &&
+        !rt->blockCountEnabled) {
+        if (const CompiledScript* ready = rt->jit->readyScript(top, blockContainer);
+            ready && (!jitFiberlessEnabled() || !ready->mayYield || ready->wasm)) {
+            compiled = ready;
+            isCompiled = true;
+            return;
+        }
+    }
     // A short non-yielding native broadcast listener has no per-thread
     // compilation decision left to make once the JIT cache is populated.
     // Keep the normal HotSpot/numeric CFG path for all other scripts.
@@ -238,11 +331,9 @@ void Thread::tryCompile(const Block* topHint) {
         const char* env = std::getenv("XYO_JIT_READY_CACHE_FAST");
         return !env || env[0] != '0';
     }();
-    const char* cfg = std::getenv("XYO_JIT_COMMON_CFG");
-    const bool numericCfg = cfg && cfg[0] == '1' && cfg[1] == '\0';
     if (readyCacheFast && !numericCfg &&
         top->opcode == "event_whenbroadcastreceived") {
-        if (const CompiledScript* ready = rt->jit->readyScript(top);
+        if (const CompiledScript* ready = rt->jit->readyScript(top, blockContainer);
             ready && ready->shortSync && !ready->mayYield &&
             !ready->mainThread) {
             compiled = ready;
@@ -285,9 +376,11 @@ void Thread::tryCompile(const Block* topHint) {
         ++cp.n;
     }
 #endif
-    if (cs) {
+    if (cs && (!jitFiberlessEnabled() || !cs->mayYield || cs->wasm)) {
         compiled = cs;
         isCompiled = true;
+    } else if (cs && jitFiberlessEnabled() && cs->mayYield) {
+        yieldingFallbacks.fetch_add(1, std::memory_order_relaxed);
     }
 }
 

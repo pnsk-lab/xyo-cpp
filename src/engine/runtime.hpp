@@ -1,16 +1,20 @@
 // xyo-cpp: engine/runtime.js 相当 — ランタイム中核。
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "../core/json.hpp"
@@ -20,6 +24,7 @@
 #include "../model/variable.hpp"
 #include "io_devices.hpp"
 #include "thread.hpp"
+#include "wait_resume_audit.hpp"
 
 namespace xyo {
 
@@ -30,6 +35,7 @@ bool blockCountEnabledFromEnv();
 
 class Gc;
 class JitEngine;
+class TranslationService;
 namespace ir {
 class CommitOnceEffects;
 enum class ObservableOp : uint8_t;
@@ -133,6 +139,12 @@ struct RendererAPI {
 struct AudioAPI {
     virtual ~AudioAPI() = default;
     virtual double getLoudness() const { return -1; }
+    // A non-owning real-time music output. Implementations may be silent
+    // (headless/no SoundFont); Scratch timing remains independent of audio.
+    virtual void playMusicNote(int program, int note, double seconds,
+                               double volume, bool drum) {
+        (void)program; (void)note; (void)seconds; (void)volume; (void)drum;
+    }
 };
 
 /// monitorBlocks 内のモニターレコード（MonitorRecord 移植）。
@@ -233,6 +245,74 @@ public:
     /// 完了スレッドを解放する。broadcast-and-wait が startedThreads を
     /// 生ポインタで保持している間は残す（ABA 回避）。
     void reclaimThreads();
+    // Changes to runnable membership or external promise resolution.
+    // Future indexed scheduler passes may use this to invalidate their
+    // ready-set cache. This is not a replacement for direct status writes.
+    std::atomic<uint64_t> schedulerMutationEpoch{0};
+    // Structural edits invalidate cached slot identities; status-only edits
+    // may be replayed from a bounded list of affected Thread pointers.
+    std::atomic<uint64_t> schedulerStructureEpoch{0};
+    void invalidateSchedulerReadySet() noexcept {
+        schedulerStructureEpoch.fetch_add(1, std::memory_order_relaxed);
+        schedulerMutationEpoch.fetch_add(1, std::memory_order_relaxed);
+    }
+    std::vector<Thread*> takeSchedulerStatusChanges();
+    // Scheduler-observable status transitions. Keep fast intra-Fiber yields
+    // direct for now; waking a sleeping Thread must pass through here.
+    void transitionThread(Thread& thread, int newStatus) noexcept;
+    // Opt-in reverse index for validated pure wait-until dependencies.
+    // Membership contains identities only: never dereference a Variable*
+    // from this index. Script mutations or retirements untrack watchers.
+    void trackWaitDependencies(Thread& thread);
+    void untrackWaitDependencies(Thread& thread);
+    void notifyWaitVariableWrite(const Variable& variable);
+    // Call before variable storage is erased, so cached watcher pointers
+    // are detached without ever dereferencing a stale Variable.
+    void invalidateWaitVariableBinding(const Variable& variable);
+    // Optional verifier for direct container/source mutations that bypass
+    // Target::deleteVariable(). Returns the number of stale subscriptions.
+    size_t validateWaitDependencyBindings();
+    // Diagnostic comparison of the conservative dependency snapshot against
+    // notifications recorded since the last wait registration. A changed
+    // snapshot without a notification is a candidate missed write.
+    struct WaitNotifyAudit {
+        uint64_t coveredChanges = 0;
+        uint64_t missedChanges = 0;
+        uint64_t unchangedNotified = 0;
+        uint64_t unchangedQuiet = 0;
+        uint64_t changedUntracked = 0;
+        uint64_t invalidBindings = 0;
+    };
+    void auditWaitDependencyDecision(const Thread& thread);
+    WaitNotifyAudit waitNotifyAuditSnapshot();
+
+    struct WaitResumeAudit {
+        static constexpr size_t kOutcomes =
+            static_cast<size_t>(WaitResumeOutcome::Count);
+        std::array<uint64_t, kOutcomes> notified{};
+        std::array<uint64_t, kOutcomes> quiet{};
+    };
+    bool waitNotificationPending(const Thread& thread);
+    void auditWaitResumeOutcome(WaitResumeOutcome outcome, bool notified);
+    WaitResumeAudit waitResumeAuditSnapshot();
+    std::vector<Thread*> takeWaitWakeups();
+    // Non-destructive snapshot for the experimental sparse ready index.
+    // Unlike takeWaitWakeups, this preserves pending evidence for the
+    // wait-resume audit until the waiter is unregistered/rearmed.
+    std::vector<Thread*> snapshotWaitWakeups();
+    // Main scheduler drains under the lock; worker threads only publish.
+    // These entries do not own Thread objects (Runtime retains their storage).
+    std::mutex schedulerStatusChangesMutex;
+    std::vector<Thread*> schedulerStatusChanges;
+    std::mutex waitDependencyMutex;
+    std::unordered_map<const Variable*, std::unordered_set<Thread*>>
+        variableWaiters;
+    std::unordered_map<Thread*, std::vector<const Variable*>>
+        threadWaitVariables;
+    std::unordered_set<Thread*> pendingVariableWakeups;
+    // Protected by waitDependencyMutex; only populated in diagnostic mode.
+    WaitNotifyAudit waitNotifyAudit;
+    WaitResumeAudit waitResumeAudit;
     std::vector<Thread*> threads;
     std::unordered_map<std::string, Thread*> threadMap;
     std::unique_ptr<Blocks> monitorBlocks;
@@ -272,6 +352,30 @@ public:
     /// **実行開始（最初の spawn/コンパイル）前に決めること** — JIT は
     /// このフラグを前提に warp ループの yield 点を落としたコードを吐く。
     bool dangerMode = dangerModeFromEnv();
+
+    // --- LAYQ v2 (push model, src/jit/layq.hpp) ---
+    /// Scheduler-published recommended warp-poll quantum (power of two).
+    /// Written by the scheduler thread once per pass, and only when the
+    /// computed value changes (release store). JIT poll/entry blocks read
+    /// it with a relaxed load. The scheduler derives it from its own
+    /// just-computed active-thread count, so the JIT performs no contention
+    /// math, no shifts, and no extra atomics of its own: the per-poll cost
+    /// is one (usually L1-shared) load plus a clamp to the loop body class.
+    /// Heuristic input only: staleness (<= 1 pass + 1 quantum) costs
+    /// efficiency, never correctness — every poll still runs the full
+    /// deadline/stop/GC check suite. Initialized to the pure-class maximum
+    /// (solo is the common case; the scheduler corrects it downward within
+    /// one pass if loaded, and JIT clamps every use to the loop's body-class
+    /// cap, so a stale-high initial can only widen the first chunk).
+    alignas(64) std::atomic<uint32_t> yieldQuantumHint{16384};
+    /// Monotonic stop generation. Bumped by stopThread (stopAll routes
+    /// through it). JIT warp polls snapshot this into the thread's
+    /// JitCtx and hand off on change, bounding stop latency at one
+    /// quantum regardless of the deadline cadence. Single logical writer
+    /// path (stop paths are rare); relaxed on both sides — a stale read
+    /// only delays a stop by one more poll, and the handoff itself
+    /// synchronizes with the scheduler.
+    std::atomic<uint64_t> stopEpoch{0};
 
     // --- 外部インターフェース ---
     RendererAPI* renderer = nullptr;
@@ -314,7 +418,22 @@ public:
         int bubbleUsageId = 0;
     };
     std::deque<WaitEntry> waitQueue;
+    // Deadline registry: monotone lower bound on the earliest queued timer.
+    // A direct public deque append/erase is detected by its size at polling.
+    // Entries are never reordered (the old FIFO resolution order is retained).
+    double earliestWaitDeadlineMs = std::numeric_limits<double>::infinity();
+    size_t indexedWaitCount = 0;
+    void enqueueWait(WaitEntry entry);
+    void clearWaitQueue();
+    void rebuildWaitDeadlineIndex();
     void processWaitQueue();
+
+    // Offline-by-default translation extension. Text is copied into a worker;
+    // Scratch thread/GC references remain exclusively on the main thread.
+    std::unique_ptr<TranslationService> translationService;
+    void requestTranslation(Thread* thread, std::string text,
+                            std::string language);
+
 
     /// GC ルートプロバイダ — Runtime 配下の全 Value/SList* をマーク
     void markRoots(Gc& g);
@@ -415,6 +534,11 @@ public:
         const std::string& requestedHatOpcode,
         const std::map<std::string, std::u16string>* optMatchFields,
         Target* optTarget);
+    // A freshly allocated clone has no active hats when no creation
+    // callback can start them. Preserve script order and interpreter
+    // hat initialization without probing unrelated active Threads.
+    void startFreshCloneHats(Target* clone);
+
 
     // Fast non-waiting broadcast path: avoids constructing a transient
     // fields map and a returned thread vector for compiled receivers.

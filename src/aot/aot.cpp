@@ -15,6 +15,7 @@
 #include <llvm/TargetParser/Host.h>
 #include <llvm/TargetParser/Triple.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -76,6 +77,8 @@ struct ScriptMeta {
     int ti = 0;   // Runtime::targets 順のターゲット index
     bool mayYield = true;
     bool mainThread = true;
+    std::vector<uint32_t> lazySlots; // v3 only, transitive references
+    bool gpuSlots = false;
     std::map<std::string, std::string> procs;
 };
 
@@ -115,7 +118,9 @@ std::string buildMeta(uint64_t hash, const std::vector<ScriptMeta>& scripts,
                       const AotEmit& emit) {
     std::string s;
     s.reserve(256 + scripts.size() * 128 + emit.slots.size() * 48);
-    s += "{\"v\":1,\"hash\":\"";
+    s += emit.lazyCached ? "{\"v\":3,\"hash\":\"" :
+         emit.packedSlots ? "{\"v\":2,\"hash\":\"" :
+                            "{\"v\":1,\"hash\":\"";
     char hb[32];
     std::snprintf(hb, sizeof(hb), "%016llx",
                   (unsigned long long)hash);
@@ -135,6 +140,15 @@ std::string buildMeta(uint64_t hash, const std::vector<ScriptMeta>& scripts,
         s += m.mayYield ? "true" : "false";
         s += ",\"mainThread\":";
         s += m.mainThread ? "true" : "false";
+        if (emit.lazyCached) {
+            s += ",\"lazySlots\":[";
+            for (size_t i = 0; i < m.lazySlots.size(); ++i) {
+                if (i) s += ',';
+                s += std::to_string(m.lazySlots[i]);
+            }
+            s += "],\"gpuSlots\":";
+            s += m.gpuSlots ? "true" : "false";
+        }
         s += ",\"procs\":[";
         bool fp = true;
         for (const auto& [vk, sym] : m.procs) {
@@ -150,14 +164,21 @@ std::string buildMeta(uint64_t hash, const std::vector<ScriptMeta>& scripts,
     }
     s += "],\"slots\":[";
     bool fs = true;
+    size_t slotIndex = 0;
     for (const AotSlot& sl : emit.slots) {
         if (!fs) s += ',';
         fs = false;
         s += "{\"k\":";
         s += std::to_string(static_cast<int>(sl.kind));
-        s += ",\"g\":\"";
-        appendEscaped(s, sl.global);
-        s += '"';
+        if (emit.packedSlots) {
+            s += ",\"i\":";
+            s += std::to_string(slotIndex);
+        } else {
+            s += ",\"g\":\"";
+            appendEscaped(s, sl.global);
+            s += '"';
+        }
+        ++slotIndex;
         if (sl.kind == AotSlotKind::StrLit) {
             s += ",\"h\":\"";
             s += hexOf(sl.key);
@@ -238,6 +259,13 @@ bool compileProject(Runtime& rt, uint64_t projectHash, BuildResult& out,
     mod->setTargetTriple(llvmc::tripleArg(triple));
 
     AotEmit emit;
+    // v2 packed-slot objects are the new default. The v1 per-symbol format
+    // stays available for backwards-compatibility validation and bisecting.
+    const char* packedSetting = std::getenv("XYO_AOT_PACKED_SLOTS");
+    emit.packedSlots = !packedSetting || packedSetting[0] != '0';
+    // v3 is experimental and opt-in. v2 remains the default AOT object ABI.
+    const char* lazySetting = std::getenv("XYO_AOT_LAZY_CACHE_SLOTS");
+    emit.lazyCached = emit.packedSlots && lazySetting && lazySetting[0] == '1';
     std::vector<ScriptMeta> scripts;
     size_t totalScripts = 0;
     for (Target* t : rt.targets)
@@ -258,9 +286,11 @@ bool compileProject(Runtime& rt, uint64_t projectHash, BuildResult& out,
             JitPinned pinned;
             std::vector<std::string> fns;
             std::map<std::string, std::string> procs;
+            emit.beginScript();
             const bool compiled = jitEmitScript(
                 *mod, lc, rt, t, t->blocks, sid, entry, cs,
                 pinned, fns, procs, &emit, nullptr, nullptr);
+            emit.endScript();
             // Report attempted scripts too, including unsupported ones.
             // The denominator is fixed before codegen starts.
             reportProgress(progress, ProgressStage::Codegen,
@@ -272,6 +302,14 @@ bool compileProject(Runtime& rt, uint64_t projectHash, BuildResult& out,
             m.ti = ti;
             m.mayYield = cs.mayYield;
             m.mainThread = cs.mainThread;
+            if (emit.lazyCached) {
+                m.lazySlots = emit.scriptCachedSlots;
+                std::sort(m.lazySlots.begin(), m.lazySlots.end());
+                m.lazySlots.erase(
+                    std::unique(m.lazySlots.begin(), m.lazySlots.end()),
+                    m.lazySlots.end());
+                m.gpuSlots = emit.scriptUsesGpu;
+            }
             m.procs = std::move(procs);
             scripts.push_back(std::move(m));
             ++n;
@@ -280,6 +318,25 @@ bool compileProject(Runtime& rt, uint64_t projectHash, BuildResult& out,
     if (scripts.empty()) {
         if (why) *why = "no compilable scripts";
         return false;
+    }
+
+    if (emit.packedSlots && !emit.slots.empty()) {
+        auto* declaration = mod->getNamedGlobal("xyo_aot_slots");
+        if (!declaration) {
+            if (why) *why = "AOT slot array declaration missing";
+            return false;
+        }
+        // The final slot count is only known after generating all scripts.
+        // Code uses an opaque-pointer [0 x ptr] GEP; replace its declaration
+        // with a sized, zero-initialized exported global before optimization.
+        auto* pointerType = llvm::PointerType::get(lc, 0);
+        auto* storageType = llvm::ArrayType::get(pointerType, emit.slots.size());
+        declaration->setName("xyo_aot_slots_declaration");
+        auto* storage = new llvm::GlobalVariable(
+            *mod, storageType, false, llvm::GlobalValue::ExternalLinkage,
+            llvm::ConstantAggregateZero::get(storageType), "xyo_aot_slots");
+        declaration->replaceAllUsesWith(storage);
+        declaration->eraseFromParent();
     }
 
     const std::string meta = buildMeta(projectHash, scripts, emit);

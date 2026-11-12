@@ -5,6 +5,7 @@
 #include <array>
 #include <algorithm>
 #include <climits>
+#include <cstring>
 #include <utility>
 
 namespace xyo::render {
@@ -12,6 +13,9 @@ namespace {
 struct Push {
     int32_t outputWidth, outputHeight, gridWidth, gridHeight, gridSize;
     int32_t costLimit;
+    int32_t rigidCount;
+    float jitterDeltaX;
+    float jitterDeltaY;
 };
 }
 DlssVkMotionConverter::~DlssVkMotionConverter() { destroy(); }
@@ -19,7 +23,7 @@ DlssVkMotionConverter::~DlssVkMotionConverter() { destroy(); }
 bool DlssVkMotionConverter::create(
     VkPhysicalDevice physical, VkDevice device, VkBuffer packedVectors,
     uint32_t width, uint32_t height, uint32_t gridSize,
-    VkBuffer packedCosts) {
+    VkBuffer packedCosts, bool enableRigid) {
     destroy();
     if (!physical || !device || !packedVectors || !width || !height ||
         !gridSize || width > 16384 || height > 16384) {
@@ -28,6 +32,7 @@ bool DlssVkMotionConverter::create(
     }
     device_ = device;
     hasCosts_ = packedCosts != VK_NULL_HANDLE;
+    hasRigid_ = enableRigid;
     width_ = width;
     height_ = height;
     gridSize_ = gridSize;
@@ -102,14 +107,59 @@ bool DlssVkMotionConverter::create(
         return false;
     }
 
+    if (hasRigid_) {
+        VkBufferCreateInfo info{};
+        info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        info.size = DlssRigidMotionTracker::kMaxRects * sizeof(DlssRigidMotionRect);
+        info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        if (vkCreateBuffer(device_, &info, nullptr, &rigidBuffer_) != VK_SUCCESS) {
+            error_ = "rigid motion SSBO allocation failed";
+            destroy();
+            return false;
+        }
+        VkMemoryRequirements req{};
+        vkGetBufferMemoryRequirements(device_, rigidBuffer_, &req);
+        VkPhysicalDeviceMemoryProperties mem{};
+        vkGetPhysicalDeviceMemoryProperties(physical, &mem);
+        uint32_t type = UINT32_MAX;
+        constexpr auto required = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        for (uint32_t i = 0; i < mem.memoryTypeCount; ++i) {
+            if ((req.memoryTypeBits & (1u << i)) &&
+                (mem.memoryTypes[i].propertyFlags & required) == required) {
+                type = i;
+                break;
+            }
+        }
+        if (type == UINT32_MAX) {
+            error_ = "no host-coherent rigid motion SSBO memory";
+            destroy();
+            return false;
+        }
+        VkMemoryAllocateInfo alloc{};
+        alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        alloc.allocationSize = req.size;
+        alloc.memoryTypeIndex = type;
+        if (vkAllocateMemory(device_, &alloc, nullptr,
+                             &rigidMemory_) != VK_SUCCESS ||
+            vkBindBufferMemory(device_, rigidBuffer_, rigidMemory_, 0) != VK_SUCCESS ||
+            vkMapMemory(device_, rigidMemory_, 0, req.size, 0,
+                        &rigidMapped_) != VK_SUCCESS) {
+            error_ = "rigid motion SSBO binding/mapping failed";
+            destroy();
+            return false;
+        }
+    }
+
     constexpr VkDescriptorSetLayoutBinding bindings[] = {
         {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
         {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
         {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
     };
     VkDescriptorSetLayoutCreateInfo setInfo{};
     setInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    setInfo.bindingCount = 3;
+    setInfo.bindingCount = 4;
     setInfo.pBindings = bindings;
     if (vkCreateDescriptorSetLayout(device_, &setInfo, nullptr,
                                      &descriptorLayout_) != VK_SUCCESS) {
@@ -118,7 +168,7 @@ bool DlssVkMotionConverter::create(
         return false;
     }
     const std::array<VkDescriptorPoolSize, 2> sizes{{
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3},
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
     }};
     VkDescriptorPoolCreateInfo pool{};
@@ -153,10 +203,16 @@ bool DlssVkMotionConverter::create(
     costBuffer.range = hasCosts_ ?
         VkDeviceSize((gridWidth_ * gridHeight_ + 3u) & ~3u) :
         VkDeviceSize(gridWidth_) * gridHeight_ * sizeof(uint32_t);
+    VkDescriptorBufferInfo rigidBuffer{};
+    rigidBuffer.buffer = hasRigid_ ? rigidBuffer_ : packedVectors;
+    rigidBuffer.offset = 0;
+    rigidBuffer.range = hasRigid_
+        ? sizeof(DlssRigidMotionRect) * DlssRigidMotionTracker::kMaxRects
+        : VkDeviceSize(gridWidth_) * gridHeight_ * sizeof(uint32_t);
     VkDescriptorImageInfo storageImage{};
     storageImage.imageView = view_;
     storageImage.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    VkWriteDescriptorSet writes[3]{};
+    VkWriteDescriptorSet writes[4]{};
     for (auto& write : writes) {
         write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         write.dstSet = descriptorSet_;
@@ -171,7 +227,10 @@ bool DlssVkMotionConverter::create(
     writes[2].dstBinding = 2;
     writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[2].pBufferInfo = &costBuffer;
-    vkUpdateDescriptorSets(device_, 3, writes, 0, nullptr);
+    writes[3].dstBinding = 3;
+    writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[3].pBufferInfo = &rigidBuffer;
+    vkUpdateDescriptorSets(device_, 4, writes, 0, nullptr);
 
     VkPushConstantRange range{};
     range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -217,8 +276,18 @@ bool DlssVkMotionConverter::create(
     return true;
 }
 
-void DlssVkMotionConverter::record(VkCommandBuffer cmd, uint32_t costLimit) {
+void DlssVkMotionConverter::record(VkCommandBuffer cmd, uint32_t costLimit,
+                                   std::span<const DlssRigidMotionRect> rigid,
+                                   float opticalJitterDeltaX,
+                                   float opticalJitterDeltaY) {
     if (!valid() || !cmd) return;
+    const uint32_t count = hasRigid_
+        ? static_cast<uint32_t>(std::min(rigid.size(),
+                                        size_t(DlssRigidMotionTracker::kMaxRects)))
+        : 0u;
+    if (count)
+        std::memcpy(rigidMapped_, rigid.data(),
+                    size_t(count) * sizeof(DlssRigidMotionRect));
     VkImageMemoryBarrier b{};
     b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     b.oldLayout = layout_;
@@ -240,7 +309,10 @@ void DlssVkMotionConverter::record(VkCommandBuffer cmd, uint32_t costLimit) {
                     static_cast<int32_t>(gridWidth_),
                     static_cast<int32_t>(gridHeight_),
                     static_cast<int32_t>(gridSize_),
-                    static_cast<int32_t>(hasCosts_ ? std::min(costLimit, 255u) : 0u)};
+                    static_cast<int32_t>(hasCosts_ ? std::min(costLimit, 255u) : 0u),
+                    static_cast<int32_t>(count),
+                    std::clamp(opticalJitterDeltaX, -1.0f, 1.0f),
+                    std::clamp(opticalJitterDeltaY, -1.0f, 1.0f)};
     vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(push), &push);
     vkCmdDispatch(cmd, (width_ + 15) / 16, (height_ + 15) / 16, 1);
@@ -264,6 +336,10 @@ void DlssVkMotionConverter::record(VkCommandBuffer cmd, uint32_t costLimit) {
 
 void DlssVkMotionConverter::destroy() {
     if (device_) {
+        if (rigidMemory_ && rigidMapped_)
+            vkUnmapMemory(device_, rigidMemory_);
+        if (rigidBuffer_) vkDestroyBuffer(device_, rigidBuffer_, nullptr);
+        if (rigidMemory_) vkFreeMemory(device_, rigidMemory_, nullptr);
         if (pipeline_) vkDestroyPipeline(device_, pipeline_, nullptr);
         if (shader_) vkDestroyShaderModule(device_, shader_, nullptr);
         if (pipelineLayout_) vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr);
@@ -286,6 +362,10 @@ void DlssVkMotionConverter::destroy() {
     width_ = height_ = gridWidth_ = gridHeight_ = 0;
     layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     hasCosts_ = false;
+    hasRigid_ = false;
+    rigidBuffer_ = VK_NULL_HANDLE;
+    rigidMemory_ = VK_NULL_HANDLE;
+    rigidMapped_ = nullptr;
 }
 } // namespace xyo::render
 #endif

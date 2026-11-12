@@ -56,6 +56,21 @@ public:
 
     /// 全スレッドを 1 ティック分ステップ。完了スレッドを返す。
     std::vector<Thread*> stepThreads();
+    // Stable completion compaction; never reclaims pending broadcast joins.
+    void compactFinishedThreads(std::vector<Thread*>& doneThreads);
+    // Run one order-preserving scheduler pass; retains the live thread-list
+    // iteration semantics required by broadcast restarts and stopAll().
+    size_t runSchedulerPass(bool ranFirstTick, bool eventDriven,
+                            bool isolatedWatch, bool allowParallel,
+                            std::vector<Thread*>& doneThreads);
+    struct ParFlush {
+        bool stopped = false;     // 完了/破棄スレッドあり
+        size_t active = 0;        // 実行後も RUNNING のスレッド数
+    };
+    // Dispatch one running/yielded thread without changing the order of
+    // observable Scratch effects. A queued parallel thread is counted at flush.
+    ParFlush dispatchReadyThread(Thread& thread, bool eventDriven,
+                                 bool isolatedWatch, bool allowParallel);
     /// 1 スレッドを可能な限り進める。
     void stepThread(Thread& thread);
     /// stack.size() > minDepth の間だけ進める（JIT compat 入力評価用）
@@ -94,10 +109,6 @@ public:
     /// worker-safe。yield する fiber も可）
     bool parallelEligible(Thread& t) const;
     /// flushParBatch の実行後帳簿
-    struct ParFlush {
-        bool stopped = false;     // 完了/破棄スレッドあり
-        size_t active = 0;        // 実行後も RUNNING のスレッド数
-    };
     /// 溜まった適格スレッドを実行（独立グループはワーカー並列、
     /// 衝突グループ内は spawn 順直列）
     ParFlush flushParBatch();
@@ -110,6 +121,14 @@ public:
         uint64_t chainedPasses = 0;
     };
     const ParallelStats& parallelStats() const { return parStats_; }
+
+    struct WaitReadyStats {
+        uint64_t deferredSlots = 0;
+        uint64_t sparsePasses = 0;
+        uint64_t scannedWaiters = 0;
+        uint64_t frameRechecks = 0;
+    };
+    const WaitReadyStats& waitReadyStats() const { return waitReadyStats_; }
 
 private:
     // Nested interpreter statements can be compiled independently of the
@@ -127,6 +146,22 @@ private:
     int depGraphSeq_ = 0;
     uint64_t eventSkippedPasses_ = 0;
     uint64_t eventWakeups_ = 0;
+    // Opt-in sparse passes. Slots are valid only while the Runtime mutation
+    // epoch and list length match; public status/list edits are unsupported.
+    std::vector<size_t> readySlots_;
+    uint64_t readySlotsEpoch_ = UINT64_MAX;
+    uint64_t readySlotsStructureEpoch_ = UINT64_MAX;
+    size_t readySlotsLength_ = 0;
+    // Pure native event waits can be temporarily omitted from readySlots_.
+    // Their identities are never erased from Runtime::threads. Every new
+    // Runtime::step frame reconstructs the index, even if nobody notified.
+    std::vector<size_t> waitSleepCandidates_;
+    uint64_t waitReadyLastFrame_ = UINT64_MAX;
+    uint64_t waitReadyPassSerial_ = 0;
+    // True only when a native event-wait slot is currently omitted. Keep
+    // Promise-only and pure non-wait workloads on the original fast path.
+    bool hasDeferredWaiters_ = false;
+    WaitReadyStats waitReadyStats_;
     std::unordered_map<const Block*, bool> idleSoundPollCache_;
     bool idleSoundPollFor(const Thread& thread);
 };

@@ -21,6 +21,7 @@ constexpr float kEpsilon = 1e-3f;
 // --- ShaderManager.EFFECT_INFO の converter 準拠 -------------------------
 struct FxUniforms {
     float color = 0;       // (x/200) % 1
+    bool colorEnabled = false; // shader variant is selected from raw effect
     float fisheye = 0;     // max(0,(x+100)/100)
     float whirl = 0;       // -x * PI/180
     float pixelate = 0;    // |x|/10
@@ -36,6 +37,9 @@ double eff(const GraphicEffects& e, const char* k) {
 FxUniforms toUniforms(const GraphicEffects& e) {
     FxUniforms u;
     u.color = std::fmod(eff(e, "color") / 200.0, 1.0);
+    // Scratch enables ENABLE_color for every nonzero raw effect, including
+    // 200, whose converted hue offset wraps to zero.
+    u.colorEnabled = eff(e, "color") != 0.0;
     u.fisheye = std::max(0.0, (eff(e, "fisheye") + 100.0) / 100.0);
     u.whirl = -eff(e, "whirl") * M_PI / 180.0;
     u.pixelate = std::abs(eff(e, "pixelate")) / 10.0;
@@ -134,7 +138,7 @@ void applyEffects(const uint8_t* src, int w, int h,
     // when the only change is ghost/brightness/color.
     const bool spatial = u.mosaic > 1 || u.pixelate > 0.001 ||
                          u.whirl != 0 || u.fisheye != 1.0f;
-    const bool colorize = u.color != 0 || u.brightness != 0;
+    const bool colorize = u.colorEnabled || u.brightness != 0;
     // u.ghost は alpha 乗数（ghost 0 → 1.0、ghost 100 → 0.0）。
     // 0 を「効果なし」と取り違えると ghost 100 が不透明になってしまう。
     const bool ghosted = u.ghost < 0.999f;
@@ -167,8 +171,10 @@ void applyEffects(const uint8_t* src, int w, int h,
                     double f = std::max(1.0 - m / 0.5, 0.0);
                     double a = u.whirl * f * f;
                     double sn = std::sin(a), cs = std::cos(a);
-                    tu = cs * ox - sn * oy + kC;
-                    tv = sn * ox + cs * oy + kC;
+                    // GLSL mat2(cos,-sin,sin,cos) is column-major.
+                    // Match Scratch's rotation, not the transposed matrix.
+                    tu = cs * ox + sn * oy + kC;
+                    tv = -sn * ox + cs * oy + kC;
                 }
                 if (u.fisheye != 1.0f) {
                     double vx = (tu - kC) / kC, vy = (tv - kC) / kC;
@@ -191,7 +197,7 @@ void applyEffects(const uint8_t* src, int w, int h,
             float rr = px4[0], gg = px4[1], bb = px4[2], aa = px4[3];
             if (colorize) {
                 // premult 除算相当: straight-alpha なので rgb に直接適用
-                if (u.color != 0) {
+                if (u.colorEnabled) {
                     Hsv hsv = rgb2hsv(rr / 255.f, gg / 255.f, bb / 255.f);
                     const float minL = 0.11f / 2.0f, minS = 0.09f;
                     if (hsv.v < minL) hsv = {0.f, 1.f, minL};

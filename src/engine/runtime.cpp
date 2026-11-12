@@ -5,16 +5,21 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <memory_resource>
 
 #include "../core/cast.hpp"
+#include "../core/aot_malloc_diag.hpp"
+#include "translate_service.hpp"
 #include "../rt/runtime_helpers.hpp"
 #include "fiber.hpp"
 #include "hat_thread_snapshot.hpp"
+#include "event_wait_dependency.hpp"
 #include "sequencer.hpp"
 #include "interpreter_osr_snapshot.hpp"
 #include "../jit/jit.hpp"
 #include "../jit/nested_warp_callframe_projection.hpp"
 #include "../ir/commit_once_effects.hpp"
+#include "../ir/source_effect_dispatch.hpp"
 
 namespace xyo {
 
@@ -51,6 +56,9 @@ Runtime::Runtime()
 }
 
 Runtime::~Runtime() {
+    // Cancel first, so HTTP workers can abort instead of blocking shutdown.
+    if (translationService) translationService->cancelAll();
+    translationService.reset();
     if (blockCountEnabled) {
         finishBlockCount();
         const auto elapsed = blockCountEndedAt - blockCountStartedAt;
@@ -74,6 +82,78 @@ Runtime::~Runtime() {
                      observableJournal->rootedPayloads(),
                      static_cast<unsigned long long>(observableCommittedEffects),
                      static_cast<unsigned long long>(observableImmediateEffects));
+    // START-013: only on explicit opt-in; sample real post-execution cache
+    // counts before Targets (which own Blocks) are destroyed.
+    if (const char* setting = std::getenv("XYO_AOT_WORKER_DIAG");
+        setting && setting[0] == '1') {
+        size_t cached = 0, retired = 0, activeTargets = 0;
+        for (Target* target : targets) {
+            if (!target || !target->blocks) continue;
+            ++activeTargets;
+            const auto& cache = target->blocks->cache();
+            cached += cache.executeCached.size();
+            for (const auto& oldGeneration : cache.retiredExecuteCached)
+                retired += oldGeneration.size();
+        }
+        std::fprintf(stderr,
+            "[aot-cache-diag] targets=%zu active_cached=%zu retired_cached=%zu\n",
+            activeTargets, cached, retired);
+        reportAotMallocState("before_destroy");
+    }
+    if (const char* audit = std::getenv("XYO_WAIT_NOTIFY_AUDIT");
+        audit && audit[0] == '1') {
+        const auto snapshot = waitNotifyAuditSnapshot();
+        const uint64_t probes = snapshot.coveredChanges + snapshot.missedChanges +
+            snapshot.unchangedNotified + snapshot.unchangedQuiet +
+            snapshot.changedUntracked + snapshot.invalidBindings;
+        if (probes)
+            std::fprintf(stderr,
+                "[wait-notify-audit] covered=%llu missed=%llu "
+                "unchanged_notified=%llu unchanged_quiet=%llu "
+                "changed_untracked=%llu invalid_bindings=%llu\n",
+                static_cast<unsigned long long>(snapshot.coveredChanges),
+                static_cast<unsigned long long>(snapshot.missedChanges),
+                static_cast<unsigned long long>(snapshot.unchangedNotified),
+                static_cast<unsigned long long>(snapshot.unchangedQuiet),
+                static_cast<unsigned long long>(snapshot.changedUntracked),
+                static_cast<unsigned long long>(snapshot.invalidBindings));
+    }
+    if (const char* audit = std::getenv("XYO_WAIT_NOTIFY_AUDIT");
+        audit && audit[0] == '1') {
+        const auto stats = waitResumeAuditSnapshot();
+        uint64_t total = 0;
+        for (size_t i = 0; i < WaitResumeAudit::kOutcomes; ++i)
+            total += stats.notified[i] + stats.quiet[i];
+        if (total) {
+            const auto name = [](WaitResumeOutcome outcome) {
+                return static_cast<size_t>(outcome);
+            };
+            std::fprintf(stderr,
+                "[wait-resume-audit] same=%llu/%llu exit=%llu/%llu "
+                "exit_rearmed=%llu/%llu moved=%llu/%llu "
+                "incomplete=%llu/%llu (notified/quiet)\n",
+                static_cast<unsigned long long>(
+                    stats.notified[name(WaitResumeOutcome::RewaitSame)]),
+                static_cast<unsigned long long>(
+                    stats.quiet[name(WaitResumeOutcome::RewaitSame)]),
+                static_cast<unsigned long long>(
+                    stats.notified[name(WaitResumeOutcome::Exited)]),
+                static_cast<unsigned long long>(
+                    stats.quiet[name(WaitResumeOutcome::Exited)]),
+                static_cast<unsigned long long>(
+                    stats.notified[name(WaitResumeOutcome::ExitedRearmed)]),
+                static_cast<unsigned long long>(
+                    stats.quiet[name(WaitResumeOutcome::ExitedRearmed)]),
+                static_cast<unsigned long long>(
+                    stats.notified[name(WaitResumeOutcome::ChangedSite)]),
+                static_cast<unsigned long long>(
+                    stats.quiet[name(WaitResumeOutcome::ChangedSite)]),
+                static_cast<unsigned long long>(
+                    stats.notified[name(WaitResumeOutcome::Incomplete)]),
+                static_cast<unsigned long long>(
+                    stats.quiet[name(WaitResumeOutcome::Incomplete)]));
+        }
+    }
     // Remove journal-owned GC root provider before tearing down targets.
     observableJournal.reset();
     Gc::get().removeRootProvider(this);
@@ -90,7 +170,286 @@ void Runtime::finishBlockCount() {
         blockCountEndedAt = std::chrono::steady_clock::now();
 }
 
+void Runtime::transitionThread(Thread& thread, int newStatus) noexcept {
+    if (thread.status == newStatus) return;
+    thread.status = newStatus;
+    // Keep the default scheduler free from mutexes and queue allocations.
+    // Indexed ready dispatch is experimental and explicitly opt-in.
+    static const bool recordReadyChanges = [] {
+        const char* env = std::getenv("XYO_SCHED_READY_INDEX");
+        return env && env[0] == '1';
+    }();
+    if (!recordReadyChanges) {
+        schedulerMutationEpoch.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    // Publish the changed identity before advancing the epoch. Worker and
+    // scheduler publications share this lock, but Thread::status itself
+    // remains under the existing engine's execution ownership rules.
+    {
+        std::lock_guard<std::mutex> lock(schedulerStatusChangesMutex);
+        schedulerStatusChanges.push_back(&thread);
+        schedulerMutationEpoch.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+std::vector<Thread*> Runtime::takeSchedulerStatusChanges() {
+    std::lock_guard<std::mutex> lock(schedulerStatusChangesMutex);
+    std::vector<Thread*> changes;
+    changes.swap(schedulerStatusChanges);
+    return changes;
+}
+
+
+void Runtime::untrackWaitDependencies(Thread& thread) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("XYO_WAIT_WAKE_REGISTRY");
+        return env && env[0] == '1';
+    }();
+    // Retirement is a hot path. An ordinary scheduler should never lock.
+    if (!enabled) return;
+    std::lock_guard<std::mutex> lock(waitDependencyMutex);
+    const auto it = threadWaitVariables.find(&thread);
+    if (it == threadWaitVariables.end()) return;
+    for (const Variable* variable : it->second) {
+        auto users = variableWaiters.find(variable);
+        if (users == variableWaiters.end()) continue;
+        users->second.erase(&thread);
+        if (users->second.empty()) variableWaiters.erase(users);
+    }
+    threadWaitVariables.erase(it);
+    pendingVariableWakeups.erase(&thread);
+}
+
+void Runtime::trackWaitDependencies(Thread& thread) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("XYO_WAIT_WAKE_REGISTRY");
+        return env && env[0] == '1';
+    }();
+    if (!enabled) return;
+    // Replace any previous watch; an invalid or edited source must never
+    // retain a live reverse-index membership.
+    untrackWaitDependencies(thread);
+    if (!thread.eventWaitArmed ||
+        !eventWaitBindingSnapshotCurrent(thread)) return;
+    std::vector<const Variable*> vars{thread.eventWatchVariable};
+    if (thread.eventWatchAdditional) {
+        const auto& additional = *thread.eventWatchAdditional;
+        for (size_t i = 0; i < additional.count; ++i)
+            if (additional.variables[i])
+                vars.push_back(additional.variables[i]);
+    }
+    std::lock_guard<std::mutex> lock(waitDependencyMutex);
+    for (const Variable* variable : vars)
+        variableWaiters[variable].insert(&thread);
+    threadWaitVariables.emplace(&thread, std::move(vars));
+}
+
+void Runtime::invalidateWaitVariableBinding(const Variable& variable) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("XYO_WAIT_WAKE_REGISTRY");
+        return env && env[0] == '1';
+    }();
+    if (!enabled) return;
+    std::lock_guard<std::mutex> lock(waitDependencyMutex);
+    const auto existing = variableWaiters.find(&variable);
+    if (existing == variableWaiters.end()) return;
+    // Copy identities first: removing each watcher mutates variableWaiters.
+    const std::vector<Thread*> affected(existing->second.begin(),
+                                        existing->second.end());
+    for (Thread* thread : affected) {
+        auto subscription = threadWaitVariables.find(thread);
+        if (subscription == threadWaitVariables.end()) continue;
+        for (const Variable* watched : subscription->second) {
+            auto users = variableWaiters.find(watched);
+            if (users == variableWaiters.end()) continue;
+            users->second.erase(thread);
+            if (users->second.empty()) variableWaiters.erase(users);
+        }
+        threadWaitVariables.erase(subscription);
+        // Source/binding checks must execute before the stored pointer can
+        // ever be read again; wake via the conservative live scheduler.
+        thread->eventWatchValid = false;
+        pendingVariableWakeups.insert(thread);
+    }
+    invalidateSchedulerReadySet();
+}
+
+size_t Runtime::validateWaitDependencyBindings() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("XYO_WAIT_WAKE_REGISTRY");
+        return env && env[0] == '1';
+    }();
+    if (!enabled) return 0;
+    std::lock_guard<std::mutex> lock(waitDependencyMutex);
+    // The verifier reads only source/binding generations, never a cached
+    // Variable*. A direct erase can leave stale pointer *values* in the map.
+    std::vector<Thread*> stale;
+    stale.reserve(threadWaitVariables.size());
+    for (const auto& [thread, _] : threadWaitVariables) {
+        if (!thread->eventWaitArmed ||
+            !eventWaitBindingSnapshotCurrent(*thread))
+            stale.push_back(thread);
+    }
+    for (Thread* thread : stale) {
+        auto subscription = threadWaitVariables.find(thread);
+        if (subscription == threadWaitVariables.end()) continue;
+        for (const Variable* watched : subscription->second) {
+            auto users = variableWaiters.find(watched);
+            if (users == variableWaiters.end()) continue;
+            users->second.erase(thread);
+            if (users->second.empty()) variableWaiters.erase(users);
+        }
+        threadWaitVariables.erase(subscription);
+        thread->eventWatchValid = false;
+        pendingVariableWakeups.insert(thread);
+    }
+    if (!stale.empty()) invalidateSchedulerReadySet();
+    return stale.size();
+}
+
+void Runtime::notifyWaitVariableWrite(const Variable& variable) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("XYO_WAIT_WAKE_REGISTRY");
+        return env && env[0] == '1';
+    }();
+    if (!enabled) return;
+    std::lock_guard<std::mutex> lock(waitDependencyMutex);
+    auto it = variableWaiters.find(&variable);
+    if (it == variableWaiters.end()) return;
+    for (Thread* thread : it->second)
+        pendingVariableWakeups.insert(thread);
+    // A write can happen within a scheduler pass; ensure the opt-in
+    // ready-slot cache falls back to live iteration before its next slot.
+    schedulerMutationEpoch.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Runtime::auditWaitDependencyDecision(const Thread& thread) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("XYO_WAIT_NOTIFY_AUDIT");
+        return env && env[0] == '1';
+    }();
+    if (!enabled || !thread.eventWaitArmed || !thread.eventWatchValid)
+        return;
+    // This is a shadow observation, not a second execution of the Scratch
+    // predicate. Check binding first, so stale Variable* is never read.
+    const bool bindingCurrent = eventWaitBindingSnapshotCurrent(thread);
+    const bool valueChanged = bindingCurrent &&
+        !canSkipEventWaitByDependency(thread);
+    std::lock_guard<std::mutex> lock(waitDependencyMutex);
+    if (!bindingCurrent) {
+        ++waitNotifyAudit.invalidBindings;
+        return;
+    }
+    Thread* identity = const_cast<Thread*>(&thread);
+    if (!threadWaitVariables.contains(identity)) {
+        if (valueChanged) ++waitNotifyAudit.changedUntracked;
+        return;
+    }
+    const bool notified = pendingVariableWakeups.contains(identity);
+    if (valueChanged) {
+        if (notified) ++waitNotifyAudit.coveredChanges;
+        else ++waitNotifyAudit.missedChanges;
+    } else {
+        // Includes same-value writes and notifications before a published
+        // value changes. This is not necessarily a false-positive callback.
+        if (notified) ++waitNotifyAudit.unchangedNotified;
+        else ++waitNotifyAudit.unchangedQuiet;
+    }
+}
+
+Runtime::WaitNotifyAudit Runtime::waitNotifyAuditSnapshot() {
+    std::lock_guard<std::mutex> lock(waitDependencyMutex);
+    return waitNotifyAudit;
+}
+
+bool Runtime::waitNotificationPending(const Thread& thread) {
+    std::lock_guard<std::mutex> lock(waitDependencyMutex);
+    return pendingVariableWakeups.contains(const_cast<Thread*>(&thread));
+}
+
+void Runtime::auditWaitResumeOutcome(
+        WaitResumeOutcome outcome, bool notified) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("XYO_WAIT_NOTIFY_AUDIT");
+        return env && env[0] == '1';
+    }();
+    if (!enabled) return;
+    const size_t index = static_cast<size_t>(outcome);
+    if (index >= WaitResumeAudit::kOutcomes) return;
+    std::lock_guard<std::mutex> lock(waitDependencyMutex);
+    ++(notified ? waitResumeAudit.notified[index]
+                : waitResumeAudit.quiet[index]);
+}
+
+Runtime::WaitResumeAudit Runtime::waitResumeAuditSnapshot() {
+    std::lock_guard<std::mutex> lock(waitDependencyMutex);
+    return waitResumeAudit;
+}
+
+std::vector<Thread*> Runtime::snapshotWaitWakeups() {
+    std::lock_guard<std::mutex> lock(waitDependencyMutex);
+    return {pendingVariableWakeups.begin(), pendingVariableWakeups.end()};
+}
+
+std::vector<Thread*> Runtime::takeWaitWakeups() {
+    std::lock_guard<std::mutex> lock(waitDependencyMutex);
+    std::vector<Thread*> result(
+        pendingVariableWakeups.begin(), pendingVariableWakeups.end());
+    pendingVariableWakeups.clear();
+    return result;
+}
+
 // ------------------------------------------------------------- スレッド --
+
+namespace {
+std::unique_ptr<Thread> acquireThreadStorage(
+        std::vector<std::unique_ptr<Thread>>& pool, const std::string& id,
+        bool allowReuse = true) {
+    static const bool recycleEnabled = [] {
+        const char* env = std::getenv("XYO_THREAD_REUSE");
+        return !env || env[0] != '0';
+    }();
+    if (recycleEnabled && allowReuse && !pool.empty()) {
+        // Only reclaimThreads may populate this pool, after proving that no
+        // join, scheduler snapshot or executing Fiber retains this identity.
+        // Construct a fresh logical Thread; never retain target/code/GC state.
+        std::string newId(id);
+        auto thread = std::move(pool.back());
+        pool.pop_back();
+        std::destroy_at(thread.get());
+        std::construct_at(thread.get(), std::move(newId));
+        return thread;
+    }
+    return std::make_unique<Thread>(id);
+}
+
+bool lightweightBroadcastRestartEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("XYO_LIGHT_BROADCAST_RESTART");
+        return !env || env[0] != '0';
+    }();
+    return enabled;
+}
+
+// Keep the same nonempty root-stack invariant for every native entry route,
+// including fire-and-forget receiver restarts. A non-yielding short entry
+// only needs its root ID until an interpreter/compatibility frame is asked
+// for; Thread::pushStack/peekStackFrame materialize that frame on demand.
+void initializeThreadRoot(Thread& thread) {
+    static const bool lazyRootFrame = [] {
+        const char* env = std::getenv("XYO_LAZY_ROOT_FRAME");
+        return !env || env[0] != '0';
+    }();
+    const auto* compiled = thread.isCompiled
+        ? static_cast<const CompiledScript*>(thread.compiled) : nullptr;
+    if (lazyRootFrame && compiled && compiled->entry &&
+        compiled->shortSync && !compiled->mayYield)
+        thread.stack.push_back(thread.topBlock);
+    else
+        thread.pushStack(thread.topBlock);
+}
+} // namespace
 
 Thread* Runtime::pushThread(const std::string& id, Target* target,
                             bool stackClick, bool updateMonitor,
@@ -112,23 +471,7 @@ Thread* Runtime::pushThread(const std::string& id, Target* target,
     std::chrono::steady_clock::time_point t0;
     if (pp.enabled) { t0 = now(); }
 #endif
-    static const bool recycleEnabled = [] {
-        const char* env = std::getenv("XYO_THREAD_REUSE");
-        return !env || env[0] != '0';
-    }();
-    std::unique_ptr<Thread> thread;
-    if (recycleEnabled && !reusableThreads.empty()) {
-        thread = std::move(reusableThreads.back());
-        reusableThreads.pop_back();
-        // Reconstruct rather than partially resetting: the old target,
-        // variable slots, frame owners, profile hints, and ID cache must not
-        // leak into a new logical Scratch script.
-        std::string newId(id);
-        std::destroy_at(thread.get());
-        std::construct_at(thread.get(), std::move(newId));
-    } else {
-        thread = std::make_unique<Thread>(id);
-    }
+    auto thread = acquireThreadStorage(reusableThreads, id);
     Thread* t = thread.get();
     t->target = target;
     t->stackClick = stackClick;
@@ -136,6 +479,7 @@ Thread* Runtime::pushThread(const std::string& id, Target* target,
     t->blockContainer = updateMonitor ? monitorBlocks.get() : target->blocks;
     t->runtimeIndex = threads.size();
     threads.push_back(t);
+    invalidateSchedulerReadySet();
     ownedThreads.push_back(std::move(thread));
     if (!t->stackClick && !t->updateMonitor) {
         threadMap[t->getId()] = t;
@@ -144,19 +488,7 @@ Thread* Runtime::pushThread(const std::string& id, Target* target,
     if (pp.enabled) { pp.allocNs += std::chrono::duration<double,std::nano>(now()-t0).count(); t0 = now(); }
 #endif
     if (!updateMonitor) t->tryCompile(topHint);
-    // A short synchronous native entry never needs the interpreter's root
-    // StackFrame. Defer its heap allocation until a frame is first requested.
-    // Every fallback/non-JIT script retains the eager root frame invariant.
-    static const bool lazyRootFrame = [] {
-        const char* env = std::getenv("XYO_LAZY_ROOT_FRAME");
-        return !env || env[0] != '0';
-    }();
-    const auto* compiled = t->isCompiled
-        ? static_cast<const CompiledScript*>(t->compiled) : nullptr;
-    if (lazyRootFrame && compiled && compiled->shortSync)
-        t->stack.push_back(id);
-    else
-        t->pushStack(id);
+    initializeThreadRoot(*t);
 #if !defined(XYO_DISABLE_RT_PROF)
     if (pp.enabled) { pp.compileNs += std::chrono::duration<double,std::nano>(now()-t0).count(); ++pp.n; }
 #endif
@@ -164,18 +496,40 @@ Thread* Runtime::pushThread(const std::string& id, Target* target,
 }
 
 void Runtime::stopThread(Thread* thread) {
+    if (translationService) translationService->cancelThread(thread);
     thread->isKilled = true;
+    // LAYQ: wake warp-loop polls. stopAll routes through here, so one bump
+    // covers every stop path. Relaxed: readers only need eventual
+    // visibility (a stale read delays that thread's handoff by one poll).
+    stopEpoch.fetch_add(1, std::memory_order_relaxed);
+    invalidateSchedulerReadySet();
     sequencer->retireThread(*thread);
 }
 
 Thread* Runtime::restartThread(Thread* thread, const Block* topHint) {
-    auto nt = std::make_unique<Thread>(thread->topBlock);
+    if (translationService) translationService->cancelThread(thread);
+    static const bool reuseRestartStorage = [] {
+        const char* env = std::getenv("XYO_RESTART_THREAD_REUSE");
+        return env && env[0] == '1';
+    }();
+    // The replaced Thread itself is NOT recycled here: a waiting sender or
+    // the current scheduler pass can still hold its address. Borrow only
+    // storage that has passed the ordinary reclamation retention closure.
+    auto nt = acquireThreadStorage(reusableThreads, thread->topBlock,
+                                   reuseRestartStorage);
     Thread* n = nt.get();
     n->target = thread->target;
     n->stackClick = thread->stackClick;
     n->updateMonitor = thread->updateMonitor;
     n->blockContainer = thread->blockContainer;
-    if (thread->isCompiled) {
+    const auto* restartedCode = thread->isCompiled
+        ? static_cast<const CompiledScript*>(thread->compiled) : nullptr;
+    const bool restartSourceValid = !restartedCode ||
+        !restartedCode->aotSourceRevision ||
+        (n->blockContainer == restartedCode->aotSourceBlocks &&
+         n->blockContainer &&
+         n->blockContainer->revision() == restartedCode->aotSourceRevision);
+    if (thread->isCompiled && restartSourceValid) {
         // A restarted script has exactly the same entry block and compiled
         // code. The CompiledScript is owned by JitEngine, not by the Thread.
         // Avoid repeating the JIT cache lookup and compilation decision for
@@ -185,18 +539,13 @@ Thread* Runtime::restartThread(Thread* thread, const Block* topHint) {
         n->compiled = thread->compiled;
         n->isCompiled = true;
     } else if (thread->triedToCompile) {
-        n->tryCompile(topHint);
+        // Changed AOT source is rejected by readyScript/compile; the
+        // restarted receiver falls back to the new interpreter source.
+        // A hint captured before delete/recreate may point to freed Block
+        // storage, so resolve the current top from Blocks instead.
+        n->tryCompile(restartSourceValid ? topHint : nullptr);
     }
-    const auto* compiled = n->isCompiled
-        ? static_cast<const CompiledScript*>(n->compiled) : nullptr;
-    static const bool lazyRootFrame = [] {
-        const char* env = std::getenv("XYO_LAZY_ROOT_FRAME");
-        return !env || env[0] != '0';
-    }();
-    if (lazyRootFrame && compiled && compiled->shortSync)
-        n->stack.push_back(thread->topBlock);
-    else
-        n->pushStack(thread->topBlock);
+    initializeThreadRoot(*n);
     if (!n->stackClick && !n->updateMonitor) {
         threadMap[n->getId()] = n;
     }
@@ -213,6 +562,7 @@ Thread* Runtime::restartThread(Thread* thread, const Block* topHint) {
     if (index < threads.size()) {
             n->runtimeIndex = index;
             threads[index] = n;
+            invalidateSchedulerReadySet();
             ownedThreads.push_back(std::move(nt));
             // The replaced thread will never be scheduled again. Release
             // suspended fibers and their 1 MiB stack mappings immediately.
@@ -228,6 +578,7 @@ Thread* Runtime::restartThread(Thread* thread, const Block* topHint) {
     }
     n->runtimeIndex = threads.size();
     threads.push_back(n);
+    invalidateSchedulerReadySet();
     ownedThreads.push_back(std::move(nt));
     sequencer->retireThread(*thread);
     return n;
@@ -292,6 +643,41 @@ void Runtime::updateThreadMap() {
     for (Thread* t : threads) {
         if (!t->stackClick && !t->updateMonitor) {
             threadMap[t->getId()] = t;
+        }
+    }
+}
+
+// Fast clone hat startup: caller only uses this for a never-before-exposed
+// clone with no onTargetCreated callback. No existing Thread can reference
+// that Target, so HatThreadSnapshot::contains would always return false.
+// Preserve the generic path's "spawn all, then initialize interpreter hats"
+// ordering for multiple top-level clone hats.
+void Runtime::startFreshCloneHats(Target* clone) {
+    static const std::string opcode = "control_start_as_clone";
+    if (!clone || !clone->blocks || hats.find(opcode) == hats.end()) return;
+    const auto& scripts = clone->blocks->getRuntimeScripts(opcode);
+    if (scripts.empty()) return;
+    // Nearly every Scratch clone has one start-as-clone script. Avoid a
+    // separate heap-allocated Thread* list for the dominant case.
+    if (scripts.size() == 1) {
+        const auto& script = scripts.front();
+        Thread* thread = pushThread(
+            script.blockId, clone, false, false, script.block);
+        if (!thread->isCompiled) {
+            execute(*sequencer, *thread);
+            thread->goToNextBlock();
+        }
+        return;
+    }
+    std::vector<Thread*> started;
+    started.reserve(scripts.size());
+    for (const auto& script : scripts)
+        started.push_back(pushThread(
+            script.blockId, clone, false, false, script.block));
+    for (Thread* thread : started) {
+        if (!thread->isCompiled) {
+            execute(*sequencer, *thread);
+            thread->goToNextBlock();
         }
     }
 }
@@ -471,6 +857,7 @@ void Runtime::journalBroadcast(std::u16string_view name,
                                BroadcastDelivery deliver, void* context) {
     if (!deliver) return;
     if (!observableJournal) {
+        ir::noteSourceEffectImmediate(ir::ObservableOp::Broadcast);
         deliver(context, name);
         return;
     }
@@ -481,6 +868,7 @@ void Runtime::journalBroadcast(std::u16string_view name,
         observableJournal->committing() ||
         observableSliceId == UINT64_MAX) {
         ++observableImmediateBroadcasts;
+        ir::noteSourceEffectImmediate(ir::ObservableOp::Broadcast);
         // The borrowed name may point to GC-managed SStr memory. Nested
         // delivery can collect that source; copy it before invoking hooks.
         const std::u16string owned(name);
@@ -492,30 +880,39 @@ void Runtime::journalBroadcast(std::u16string_view name,
     const std::u16string owned(name);
     const uint64_t slice = ++observableSliceId;
     auto pending = observableJournal->begin(slice);
+    const std::string stagedBlock = ir::sourceEffectStageLabel(
+        ir::ObservableOp::Broadcast, "runtime.broadcast");
     bool staged = false;
     {
         Gc::DeferCollect defer; // only until the journal has an exact root
         const Value payload = owned.empty() ? Value::emptyStr()
             : Value::string(SStr::create(owned));
         staged = pending.stage(ir::ObservableOp::Broadcast,
-                               "runtime.broadcast", payload);
+                               stagedBlock, payload);
     }
     // This path runs at a non-speculative synchronous host boundary;
     // if journaling is unavailable, execute the original immediate
     // primitive instead. No pending event was ever published on failure.
     if (!staged || !pending.commit([]() noexcept { return true; })) {
         ++observableImmediateBroadcasts;
+        ir::noteSourceEffectImmediate(ir::ObservableOp::Broadcast);
         deliver(context, owned);
         return;
     }
+    // Use the label actually staged, never a mutable active origin:
+    // a synchronous nested effect can change the active scope.
+    ir::noteSourceEffectPublished(
+        ir::ObservableOp::Broadcast, stagedBlock,
+        slice, observableJournal->revision());
     const auto result = observableJournal->drain(
-        [deliver, context](ir::ObservableOp op, const std::string&,
+        [deliver, context](ir::ObservableOp op, const std::string& eventBlock,
                            Value retained) noexcept {
             if (op != ir::ObservableOp::Broadcast) return;
             // The Value remains rooted through any nested callback or GC.
             const std::u16string message(retained.isEmptyString()
                 ? std::u16string_view{} : retained.asStrPtr()->view());
             deliver(context, message);
+            ir::noteSourceEffectDelivered(op, eventBlock);
         });
     observableCommittedBroadcasts += result.delivered;
 }
@@ -599,6 +996,7 @@ void Runtime::journalObservable(ir::ObservableOp op, Value payload,
                                 ObservableDelivery deliver, void* context) {
     if (!deliver) return;
     if (!observableJournal) {
+        ir::noteSourceEffectImmediate(op);
         deliver(context, payload);
         return;
     }
@@ -609,6 +1007,7 @@ void Runtime::journalObservable(ir::ObservableOp op, Value payload,
         observableJournal->pendingCount() != 0 ||
         observableSliceId == UINT64_MAX) {
         ++observableImmediateEffects;
+        ir::noteSourceEffectImmediate(op);
         // Reentrant effects stay depth-first, but their payload must remain
         // an exact GC root throughout callbacks that can themselves collect.
         // Never suppress collection for the entire nested callback.
@@ -629,25 +1028,35 @@ void Runtime::journalObservable(ir::ObservableOp op, Value payload,
         return;
     }
 
-    auto slice = observableJournal->begin(++observableSliceId);
+    const uint64_t sliceId = ++observableSliceId;
+    auto slice = observableJournal->begin(sliceId);
+    const std::string stagedBlock = ir::sourceEffectStageLabel(
+        op, "runtime.observable");
     bool staged = false;
     {
         Gc::DeferCollect defer;
-        staged = slice.stage(op, "runtime.observable", payload);
+        staged = slice.stage(op, stagedBlock, payload);
     }
     if (!staged || !slice.commit([]() noexcept { return true; })) {
         ++observableImmediateEffects;
+        ir::noteSourceEffectImmediate(op);
         Gc::DeferCollect defer;
         deliver(context, payload);
         return;
     }
+    ir::noteSourceEffectPublished(
+        op, stagedBlock, sliceId, observableJournal->revision());
     const auto result = observableJournal->drain(
-        [deliver, context, op](ir::ObservableOp actual, const std::string&,
+        [deliver, context, op](ir::ObservableOp actual,
+                               const std::string& eventBlock,
                                Value exactValue) noexcept {
             // This synchronous host boundary may have only its one
             // freshly committed record. If future scheduler async slices
             // are added, use typed dispatch rather than dropping effects.
-            if (actual == op) deliver(context, exactValue);
+            if (actual == op) {
+                deliver(context, exactValue);
+                ir::noteSourceEffectDelivered(actual, eventBlock);
+            }
         });
     observableCommittedEffects += result.delivered;
 }
@@ -684,14 +1093,36 @@ void Runtime::startBroadcastImmediate(std::u16string_view name) {
                         previous->isCompiled && !previous->isKilled &&
                         previous != sequencer->activeThread &&
                         (!previous->fiber || previous->fiber != currentFiber())) {
-                        sequencer->retireThread(*previous);
-                        previous->releaseFinished();
-                        previous->compatibilityStackFrame = ExecContext{};
-                        previous->status = STATUS_RUNNING;
-                        previous->isKilled = false;
-                        previous->requestScriptGlowInFrame = false;
-                        previous->hasWarpTimer = false;
-                        previous->pushStack(top);
+                        const bool lightweight = lightweightBroadcastRestartEnabled();
+                        const bool stillPending = lightweight &&
+                            previous->pendingShortBroadcast &&
+                            previous->status == STATUS_RUNNING &&
+                            previous->stack.size() == 1 &&
+                            previous->stack.front() == top &&
+                            previous->stackFrames.empty() &&
+                            !previous->fiber && !previous->jitCtx;
+                        // No Scratch/native/interpreter instruction has run
+                        // since this same ordinary receiver was queued. Its
+                        // restart is idempotent: preserve the same slot/root,
+                        // rather than repeatedly clearing pristine payloads.
+                        // Joined, started, materialized or yielding receivers
+                        // retain the full retirement/reset path below.
+                        if (!stillPending) {
+                            sequencer->retireThread(*previous);
+                            previous->releaseFinished();
+                            previous->compatibilityStackFrame = ExecContext{};
+                            transitionThread(*previous, STATUS_RUNNING);
+                            previous->isKilled = false;
+                            previous->requestScriptGlowInFrame = false;
+                            previous->hasWarpTimer = false;
+                            if (lightweight)
+                                initializeThreadRoot(*previous);
+                            else
+                                previous->pushStack(top);
+                        }
+                        // Reusing the identity also re-arms a receiver that
+                        // may have been asleep in an indexed ready set.
+                        invalidateSchedulerReadySet();
                         next = previous;
                     } else {
                         next = restartThread(previous, receiver.top);
@@ -703,6 +1134,12 @@ void Runtime::startBroadcastImmediate(std::u16string_view name) {
             }
             if (!next) next = pushThread(top, target, false, false, receiver.top);
             next->reusableBroadcastReceiver = next->isCompiled;
+            const auto* native = next->isCompiled
+                ? static_cast<const CompiledScript*>(next->compiled) : nullptr;
+            next->pendingShortBroadcast = lightweightBroadcastRestartEnabled() &&
+                native && native->entry && native->shortSync && !native->mayYield &&
+                next->status == STATUS_RUNNING && next->stack.size() == 1 &&
+                next->stackFrames.empty() && !next->fiber && !next->jitCtx;
             if (!next->isCompiled) interpreted.push_back(next);
     }
     for (Thread* t : interpreted) {
@@ -722,6 +1159,7 @@ void Runtime::stopForTarget(Target* target, Thread* optException) {
 }
 
 void Runtime::stopAll() {
+    if (translationService) translationService->cancelAll();
     invalidateBroadcastIndex();
     emitProjectStopAll();
     // クローンを廃棄（dispose が executableTargets/sprite.clones から除去）
@@ -737,7 +1175,17 @@ void Runtime::stopAll() {
         }
     }
     targets = std::move(keep);
-    if (sequencer->activeThread) stopThread(sequencer->activeThread);
+    // Every suspended native Fiber may own uncheckpointed LLVM SSA values.
+    // Clearing the scheduling vector alone leaves them alive, preventing
+    // deferred explicit GC from ever draining while Runtime stays alive.
+    // Retire all detached workers now. retireThread() already protects the
+    // *currently executing* Fiber from being released on its own stack.
+    for (Thread* thread : threads)
+        stopThread(thread);
+    if (sequencer->activeThread &&
+        std::find(threads.begin(), threads.end(), sequencer->activeThread)
+            == threads.end())
+        stopThread(sequencer->activeThread);
     // JS では this.threads = [] に留めスレッドオブジェクトは GC 任せ。
     // 実行中プリミティブ（control_stop 等）が自スレッドの参照を保持する
     // ため、ownedThreads からは ~Runtime まで解放しない。
@@ -802,6 +1250,19 @@ void Runtime::reclaimThreads() {
             epoch = ++reclaimRetentionEpoch;
         }
     }
+    // The reachable-set graph and GC/Thread liveness semantics are
+    // unchanged. For small receiver graphs, allocate the same unordered_set
+    // nodes/buckets out of a stack-backed monotonic PMR arena, avoiding many
+    // individual malloc/free calls. Overflow automatically uses the regular
+    // heap. Test with XYO_RECLAIM_INLINE_HASH=1 (default off).
+    static const bool inlineHash = [] {
+        const char* s = std::getenv("XYO_RECLAIM_INLINE_HASH");
+        return s && s[0] == '1';
+    }();
+    alignas(std::max_align_t) std::byte inlineStorage[4096];
+    std::pmr::monotonic_buffer_resource memoryArena(
+        inlineStorage, sizeof(inlineStorage));
+    std::pmr::unordered_set<const Thread*> pmrRefs{&memoryArena};
     std::unordered_set<const Thread*> refs;
     std::vector<Thread*> pending;
     const auto retain = [&](Thread* t) {
@@ -810,7 +1271,8 @@ void Runtime::reclaimThreads() {
             if (t->reclaimRetentionEpoch == epoch) return;
             t->reclaimRetentionEpoch = epoch;
             pending.push_back(t);
-        } else if (refs.insert(t).second) {
+        } else if ((inlineHash ? pmrRefs.insert(t).second
+                               : refs.insert(t).second)) {
             pending.push_back(t);
         }
     };
@@ -853,7 +1315,8 @@ void Runtime::reclaimThreads() {
     std::erase_if(ownedThreads, [&](auto& up) {
         if (!up) return true;
         if (stampedRefs ? up->reclaimRetentionEpoch == epoch
-                        : refs.contains(up.get()))
+                        : (inlineHash ? pmrRefs.contains(up.get())
+                                      : refs.contains(up.get())))
             return false;
         if (recycleEnabled && reusableThreads.size() < kMaxReusableThreads) {
             up->releaseFinished();
@@ -886,8 +1349,9 @@ void Runtime::step() {
                     (t->interpreterStarted && !osrEnabled))
                     continue;
                 const CompiledScript* ready =
-                    jit->readyScript(t->topBlockPtr);
-                if (!ready) continue;
+                    jit->readyScript(t->topBlockPtr, t->blockContainer);
+                if (!ready || (jitFiberlessEnabled() && ready->mayYield &&
+                               !ready->wasm)) continue;
                 const auto& nestedCalls = ready->nestedOsrCallPath;
                 const auto& nestedFrames = ready->nestedOsrFramePath;
                 const auto& nestedArms = ready->nestedOsrBranchArms;
@@ -1335,20 +1799,70 @@ int Runtime::runUntilDone(int maxSteps) {
 }
 
 void Runtime::updateCurrentMSecs() {
-    // scratch-vm: runtime.currentMSecs = Date.now() (1 ms 精度)。
-    // Timer::stdNow() はサブ ms を持つため、Scratch の timer 値
-    // (整数 ms / 1000) に合わせて切り捨てる。ヘッドレスの step は
-    // 実時間より速く回るので、フレームごとに最低 1ms 進める
-    // (scratch-vm の 30fps では Date.now() が毎フレーム進む)。
-    double now = std::floor(Timer::stdNow());
-    currentMSecs = std::max(now, currentMSecs + 1.0);
+    // Scratch's Date.now uses the real clock with integer-millisecond
+    // precision. An interactive SDL runtime must not advance it by one
+    // synthetic millisecond per fast frame: audio progresses in real time
+    // and play-until-done then disagrees with sensing_timer.
+    // Headless execution keeps its historical 1ms minimum to allow
+    // deterministic forward progress in tight, unthrottled test loops.
+    const double now = std::floor(Timer::stdNow());
+    const char* overrideClock = std::getenv("XYO_REAL_TIME_CLOCK");
+    const bool realClock = overrideClock
+        ? overrideClock[0] == '1'
+        : (renderer != nullptr && audioEngine != nullptr);
+    currentMSecs = realClock ? now : std::max(now, currentMSecs + 1.0);
+}
+
+void Runtime::enqueueWait(WaitEntry entry) {
+    // NaN deadlines are immediately due in the historical '>' comparison.
+    const double deadline = std::isnan(entry.deadlineMs)
+        ? -std::numeric_limits<double>::infinity() : entry.deadlineMs;
+    waitQueue.push_back(std::move(entry));
+    earliestWaitDeadlineMs = std::min(earliestWaitDeadlineMs, deadline);
+    indexedWaitCount = waitQueue.size();
+}
+
+void Runtime::clearWaitQueue() {
+    waitQueue.clear();
+    indexedWaitCount = 0;
+    earliestWaitDeadlineMs = std::numeric_limits<double>::infinity();
+}
+
+void Runtime::rebuildWaitDeadlineIndex() {
+    earliestWaitDeadlineMs = std::numeric_limits<double>::infinity();
+    for (const WaitEntry& entry : waitQueue) {
+        const double deadline = std::isnan(entry.deadlineMs)
+            ? -std::numeric_limits<double>::infinity() : entry.deadlineMs;
+        earliestWaitDeadlineMs = std::min(earliestWaitDeadlineMs, deadline);
+    }
+    indexedWaitCount = waitQueue.size();
 }
 
 void Runtime::processWaitQueue() {
-    if (waitQueue.empty()) return;
+    if (translationService) translationService->poll(*this);
+    if (waitQueue.empty()) {
+        indexedWaitCount = 0;
+        earliestWaitDeadlineMs = std::numeric_limits<double>::infinity();
+        return;
+    }
+    // All writes in-tree use enqueueWait(). Keep a size-based compatibility
+    // fallback for direct public deque edits by embedders and old tests.
+    if (indexedWaitCount != waitQueue.size())
+        rebuildWaitDeadlineIndex();
+    static const bool indexedTimers = [] {
+        const char* env = std::getenv("XYO_WAIT_DEADLINE_INDEX");
+        return env && env[0] == '1';
+    }();
+    if (indexedTimers && waitQueue.size() >= 16 &&
+        earliestWaitDeadlineMs > currentMSecs)
+        return;
+    bool removedAny = false;
     for (auto it = waitQueue.begin(); it != waitQueue.end();) {
         WaitEntry& w = *it;
-        if (!w.nextTick && w.deadlineMs > currentMSecs) { ++it; continue; }
+        // nextTick promises also require a new Date.now millisecond.
+        // Otherwise a faster-than-realtime GUI loop can resume with a
+        // frame-frozen timer unchanged.
+        if (w.deadlineMs > currentMSecs) { ++it; continue; }
         if (w.bubbleTarget) {
             // sayforsecs: usageId が変わっていなければバブルをクリア
             if (w.bubbleTarget->bubbleUsageId == w.bubbleUsageId) {
@@ -1357,11 +1871,20 @@ void Runtime::processWaitQueue() {
                 if (onSay) onSay(w.bubbleTarget, w.bubbleType, u"");
             }
         }
-        if (w.thread && w.thread->status == STATUS_PROMISE_WAIT) {
+        // An async reporter can be canceled while its next-tick fallback
+        // remains queued. Never resurrect a killed, restarted or detached
+        // script (including threads belonging to deleted clones).
+        if (w.thread && !w.thread->isKilled &&
+            w.thread->status == STATUS_PROMISE_WAIT &&
+            containsThread(w.thread)) {
             resolveWait(*sequencer, *w.thread, w.resolveValue);
         }
         it = waitQueue.erase(it);
+        removedAny = true;
     }
+    // Avoid a second full scan on ticks where nothing expired, including
+    // the default no-index configuration.
+    if (removedAny) rebuildWaitDeadlineIndex();
 }
 
 // --------------------------------------------------------------- targets --

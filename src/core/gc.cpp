@@ -527,7 +527,10 @@ void Gc::scanRange(const void* begin, const void* end) {
 void Gc::collectIfNeeded() {
     std::lock_guard<std::recursive_mutex> lk(allocMtx_);
     if (!collecting_.load(std::memory_order_relaxed) &&
-        bytesAllocated_.load(std::memory_order_relaxed) > threshold_) collect();
+        deferredExplicitDepth_.load(std::memory_order_acquire) == 0 &&
+        (pendingExplicitCollect_.load(std::memory_order_acquire) ||
+         bytesAllocated_.load(std::memory_order_relaxed) > threshold_))
+        collect();
 }
 
 void Gc::removeRootProvider(void* owner) {
@@ -538,7 +541,32 @@ void Gc::removeRootProvider(void* owner) {
 
 void Gc::collect() {
     std::lock_guard<std::recursive_mutex> lk(allocMtx_);
+    // Explicit calls from inside an opt-in native Fiber cannot safely
+    // scan its uncheckpointed LLVM SSA registers. Remember the request
+    // rather than collecting partial source state. A serial scheduler
+    // safe point may drain it after the outermost guard has ended.
+    if (deferredExplicitDepth_.load(std::memory_order_acquire) != 0) {
+        pendingExplicitCollect_.store(true, std::memory_order_release);
+        return;
+    }
     if (collecting_.load(std::memory_order_relaxed)) return;
+    // RT-001 opt-in: an unrelated suspended JIT Fiber may own live
+    // LLVM SSA words solely in its native activation. A conservative
+    // saved-stack scan does not certify all machine registers/temporaries.
+    // Only actually started, non-retired native activations can own
+    // such SSA. An unstarted/finished Fiber may be leased or pooled but
+    // cannot resume an active LLVM frame. Defer while any unsafe native
+    // activation remains, globally across Runtimes.
+    static const bool protectNativeSsa = [] {
+        const char* roots =
+            std::getenv("XYO_RT_REQUIRE_GENERATED_SSA_ROOTS");
+        return roots && roots[0] == '1';
+    }();
+    if (protectNativeSsa && FiberPool::unsafeCount() != 0) {
+        pendingExplicitCollect_.store(true, std::memory_order_release);
+        return;
+    }
+    pendingExplicitCollect_.store(false, std::memory_order_release);
     // This is still a stop-the-world operation. Workers must be joined before
     // collecting; the mutex only serializes allocator bookkeeping.
     collecting_.store(true, std::memory_order_relaxed);

@@ -52,7 +52,7 @@ std::string extForOpcode(const std::string& opcode) {
     return kCore.count(prefix) ? "" : prefix;
 }
 
-JsonObject blockToJson(Block& b) {
+JsonObject blockToJson(const Block& b) {
     JsonObject o;
     o["opcode"] = JsonValue(b.opcode);
     o["next"] = b.next.empty() ? JsonValue(nullptr) : JsonValue(b.next);

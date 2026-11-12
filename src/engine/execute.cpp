@@ -8,12 +8,35 @@
 #include "block_utility.hpp"
 #include "runtime.hpp"
 #include "sequencer.hpp"
+#include "../ir/source_effect_runtime_trace.hpp"
+#include "../ir/source_interpreter_mutations.hpp"
+
+#include <cstdlib>
 
 namespace xyo {
 
 // 並列実行対策として thread_local（通常インタプリタはメインのみだが、
 // 万一 worker で compat が走っても破壊しないようにする）
 static thread_local BlockUtility g_util;
+
+// Instrument known built-in interpreter stateful dispatch only with the
+// same IR-001 opt-in as the native JIT. The default path has no
+// registry lock. Unrecognized extensions remain unproven.
+static bool ir001TraceInterpreterWritesEnabled() {
+    static const bool enabled = [] {
+        const char* flag = std::getenv("XYO_IR001_TRACE_EFFECT_PC");
+        return flag && flag[0] == '1' && flag[1] == 0;
+    }();
+    return enabled;
+}
+
+static bool ir001TraceInterpreterWriteLogEnabled() {
+    static const bool enabled = [] {
+        const char* flag = std::getenv("XYO_IR001_TRACE_INTERP_WRITE");
+        return flag && flag[0] == '1' && flag[1] == 0;
+    }();
+    return enabled;
+}
 
 // Runtime::startHats() can synchronously execute another thread while a
 // primitive is running (e.g. switch backdrop and wait). The nested execute()
@@ -118,6 +141,7 @@ static void resolveThreadOps(Value resolvedValue, Sequencer& seq, Thread& thread
 }
 
 bool execute(Sequencer& sequencer, Thread& thread) {
+    thread.pendingShortBroadcast = false;
     Runtime& runtime = sequencer.runtime;
     ScopedBlockUtility utilityScope(sequencer, thread);
 
@@ -151,6 +175,12 @@ bool execute(Sequencer& sequencer, Thread& thread) {
             ? blockCached->nestedWasmWarpCandidate
             : blockCached->nestedWasmCandidate)) {
         std::string pastEnd;
+        // An optimized nested body may change VM state without any
+        // interpreter opcode dispatch. It is not yet a proven complete
+        // native write path; expire diagnostic evidence conservatively.
+        if (ir001TraceInterpreterWritesEnabled())
+            ir::NativeSourceEffectTimelineRegistry::get()
+                .noteNonJournalMutation(&thread);
         if (sequencer.tryNestedWasm(thread, *blockCached, pastEnd)) {
             thread.reuseStackForNextBlock(pastEnd);
             thread.recycleTrashFrames();
@@ -221,6 +251,22 @@ bool execute(Sequencer& sequencer, Thread& thread) {
         if (runtime.blockCountEnabled && opCached->blockFunction)
             runtime.executedBlocks.fetch_add(1, std::memory_order_relaxed);
 
+        // Central interpreter dispatch covers standalone blocks AND
+        // flattened reporter/statement operation sequences. Record before
+        // the primitive: even a no-op may deny source diagnostics without
+        // changing Scratch semantics. Data, motion, looks, pen, sound and
+        // known scheduler/sensing mutations are included.
+        if (opCached->blockFunction &&
+            ir001TraceInterpreterWritesEnabled() &&
+            ir::isInterpreterStateMutation(opCached->opcode)) {
+            ir::noteSourceEffectUnjournaledMutation();
+            ir::NativeSourceEffectTimelineRegistry::get()
+                .noteInterpreterMutation(&thread);
+            if (ir001TraceInterpreterWriteLogEnabled())
+                std::fprintf(stderr, "[ir001-interp-vm-write] opcode=%s\n",
+                             opCached->opcode.c_str());
+        }
+
         const Value rv = opCached->blockFunction
             ? opCached->blockFunction(opCached->argValues, g_util)
             : Value::undefined();
@@ -271,12 +317,12 @@ void resolveWait(Sequencer& seq, Thread& thread, Value resolvedValue) {
     StackFrame* sf = thread.peekStackFrame();
     const BlockCached* op = sf ? sf->op : nullptr;
     if (!op) {
-        thread.status = STATUS_RUNNING;
+        seq.runtime.transitionThread(thread, STATUS_RUNNING);
         thread.pushReportedValue(resolvedValue);
         return;
     }
     resolveThreadOps(resolvedValue, seq, thread, op, sf->suspendLast);
-    thread.status = STATUS_RUNNING;
+    seq.runtime.transitionThread(thread, STATUS_RUNNING);
     thread.recycleTrashFrames();
 }
 

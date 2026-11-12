@@ -1,9 +1,13 @@
 // Backend-neutral JIT scheduler and compiled-script cache.
 #include "jit.hpp"
+#include "compile_telemetry.hpp"
 #include "backend.hpp"
 #include "aot_emit.hpp"
+#include "aot_lazy_cache.hpp"
+#include "aot_meta_view.hpp"
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -16,6 +20,7 @@
 #include <unordered_set>
 #include <vector>
 #include "../core/gc.hpp"
+#include "../core/aot_malloc_diag.hpp"
 #include "../core/json.hpp"
 #include "../core/sstr.hpp"
 #include "../engine/runtime.hpp"
@@ -30,7 +35,7 @@ namespace xyo {
 
 namespace {
 /// AOT メタの hex 文字列（UTF-16 生バイト）をデコードする。
-std::string hexDecode(const std::string& h) {
+std::string hexDecode(std::string_view h) {
     auto nib = [](char c) -> int {
         if (c >= '0' && c <= '9') return c - '0';
         if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -57,7 +62,20 @@ struct JitEngine::Impl {
     std::unique_ptr<JitBackend> backend;
     std::deque<std::string> aotStrings;
     std::vector<void**> aotSlots;
+    std::vector<std::unique_ptr<AotLazyCachedSlot>> aotLazyCachedSlots;
     std::vector<std::unique_ptr<gpu::ParallelLoop>> aotGpuProgs;
+
+    // Caller-thread diagnostic only. No counters or timers on the default path.
+    const bool aotWorkerDiag = [] {
+        const char* setting = std::getenv("XYO_AOT_WORKER_DIAG");
+        return setting && setting[0] == '1';
+    }();
+    uint64_t prewarmCalls = 0;
+    uint64_t prewarmSlotVisits = 0;
+    uint64_t prewarmFreshSlots = 0;
+    uint64_t prewarmCachedCreated = 0;
+    uint64_t prewarmFailed = 0;
+    uint64_t prewarmTimeNs = 0;
 
     struct Work {
         const void* top = nullptr;
@@ -75,6 +93,7 @@ struct JitEngine::Impl {
     std::deque<Result> completed;
     std::thread worker;
     bool stopping = false;
+    JitCompileTelemetry telemetry;
 
     void enqueue(Work work) {
         {
@@ -95,7 +114,10 @@ struct JitEngine::Impl {
                 work = std::move(waiting.front());
                 waiting.pop_front();
             }
+            const auto started = JitCompileTelemetry::Clock::now();
             std::unique_ptr<CompiledScript> code = work.task->finish();
+            if (JitCompileTelemetry::enabled())
+                telemetry.asyncFinish.record(bool(code), started);
             work.task.reset();
             {
                 std::lock_guard lock(mutex);
@@ -104,7 +126,7 @@ struct JitEngine::Impl {
             }
         }
     }
-    ~Impl() {
+    void stopWorker() {
         {
             std::lock_guard lock(mutex);
             stopping = true;
@@ -112,6 +134,10 @@ struct JitEngine::Impl {
         }
         available.notify_all();
         if (worker.joinable()) worker.join();
+    }
+    ~Impl() {
+        stopWorker();
+        telemetry.report();
     }
 };
 
@@ -188,8 +214,31 @@ JitEngine::~JitEngine() {
                          r.jit ? "yes" : "-", r.lazy ? "yes" : "-",
                          int(r.aot), int(r.loop));
     }
-    if (impl_) Gc::get().removeRootProvider(impl_.get());
-    impl_.reset();
+    if (impl_ && impl_->aotWorkerDiag && !impl_->aotLazyCachedSlots.empty()) {
+        size_t resolved = 0;
+        for (const auto& slot : impl_->aotLazyCachedSlots)
+            resolved += slot->resolved.load(std::memory_order_acquire) != nullptr;
+        std::fprintf(stderr,
+            "[aot-worker-diag] descriptors=%zu resolved_total=%zu "
+            "prewarm_calls=%llu slot_visits=%llu fresh_slots=%llu "
+            "created_cache=%llu failed=%llu prewarm_us=%.3f\n",
+            impl_->aotLazyCachedSlots.size(), resolved,
+            static_cast<unsigned long long>(impl_->prewarmCalls),
+            static_cast<unsigned long long>(impl_->prewarmSlotVisits),
+            static_cast<unsigned long long>(impl_->prewarmFreshSlots),
+            static_cast<unsigned long long>(impl_->prewarmCachedCreated),
+            static_cast<unsigned long long>(impl_->prewarmFailed),
+            double(impl_->prewarmTimeNs) / 1000.0);
+    }
+    if (impl_) {
+        // First join background compilation so it cannot publish into the
+        // engine while caches are being destroyed. Keep the backend and AOT
+        // slot owners alive until *after* ScriptEntry / NumericJitCode
+        // destruction: impl_ is the first member and therefore naturally
+        // the last member destroyed. Resetting it here reversed that order.
+        impl_->stopWorker();
+        Gc::get().removeRootProvider(impl_.get());
+    }
 }
 
 bool JitEngine::ok() const { return impl_ && impl_->backend && impl_->backend->ok(); }
@@ -299,10 +348,17 @@ bool JitEngine::scriptStats(const void* top, ScriptStats* out) const {
 }
 
 
-const CompiledScript* JitEngine::readyScript(const Block* top) const {
+const CompiledScript* JitEngine::readyScript(
+        const Block* top, const Blocks* source) const {
     if (!top) return nullptr;
     auto it = cache_.find(top);
-    return it == cache_.end() ? nullptr : it->second.code.get();
+    if (it == cache_.end() || !it->second.code) return nullptr;
+    const CompiledScript* code = it->second.code.get();
+    if (code->aotSourceRevision &&
+        (!source || code->aotSourceBlocks != source ||
+         source->revision() != code->aotSourceRevision))
+        return nullptr; // never dereference an owner removed by the editor
+    return code;
 }
 
 void JitEngine::prefetchWarpBroadcasts(Runtime& runtime) {
@@ -401,14 +457,21 @@ void JitEngine::prefetchWarpBroadcasts(Runtime& runtime) {
         temporary.blockContainer = candidate.target->blocks;
         temporary.topBlockPtr = candidate.top;
         const auto started = std::chrono::steady_clock::now();
-        if (auto task = impl_->backend->prepareAsync(
-                temporary, runtime, candidate.top, scriptCounter_++)) {
+        auto task = impl_->backend->prepareAsync(
+            temporary, runtime, candidate.top, scriptCounter_++);
+        if (JitCompileTelemetry::enabled())
+            impl_->telemetry.asyncPrepare.record(bool(task), started);
+        if (task) {
             if (synchronous) {
                 // The prepared task contains a private ThreadSafeModule.
                 // finish() runs only on the runtime thread in this mode.
                 // Publish before greenFlag launches any Scratch thread:
                 // no active Fiber, local argument or effect can be replayed.
-                if (auto code = task->finish()) {
+                const auto finishStarted = JitCompileTelemetry::Clock::now();
+                auto code = task->finish();
+                if (JitCompileTelemetry::enabled())
+                    impl_->telemetry.asyncFinish.record(bool(code), finishStarted);
+                if (code) {
                     cache_[candidate.top].code = std::move(code);
                     ++queued;
                 }
@@ -439,9 +502,17 @@ void JitEngine::pollAsync() {
     }
     for (auto& item : completed) {
         // Never publish an object compiled for an invalidated block graph.
-        if (item.generation != asyncGeneration_) continue;
+        if (item.generation != asyncGeneration_) {
+            if (JitCompileTelemetry::enabled())
+                impl_->telemetry.asyncStaleDiscarded.fetch_add(
+                    1, std::memory_order_relaxed);
+            continue;
+        }
         compiling_.erase(item.top);
         if (!item.code) {
+            if (JitCompileTelemetry::enabled())
+                impl_->telemetry.asyncFailed.fetch_add(
+                    1, std::memory_order_relaxed);
             failed_.insert(item.top);
             continue;
         }
@@ -451,6 +522,9 @@ void JitEngine::pollAsync() {
             it != profiles_.end() && it->second.hasLoop == 1 &&
             it->second.nodeCount > 0 && it->second.nodeCount <= 8;
         cache_[item.top].code = std::move(item.code);
+        if (JitCompileTelemetry::enabled())
+            impl_->telemetry.asyncPublished.fetch_add(
+                1, std::memory_order_relaxed);
         if (std::getenv("XYO_JIT_ASYNC_TIMING"))
             std::fprintf(stderr, "[jit-async] published %p\n", item.top);
     }
@@ -479,14 +553,28 @@ bool JitEngine::tryAttachNumeric(Thread& thread, const Block* top) {
         return false;
     auto cached = numericCache_.find(key);
     if (cached == numericCache_.end()) {
-        if (numericRejected_.count(key)) return false;
+        if (numericRejected_.count(key)) {
+            if (JitCompileTelemetry::enabled())
+                impl_->telemetry.noteRefusal(JitRefusalReason::NumericRejectedCached);
+            return false;
+        }
         const ir::ScratchCompilationUnit source =
             ir::ScratchCompilationUnit::capture(*thread.blockContainer, top);
+        if (!source.valid()) {
+            if (JitCompileTelemetry::enabled())
+                impl_->telemetry.noteRefusal(JitRefusalReason::NumericSourceInvalid);
+            numericRejected_.insert(key);
+            return false;
+        }
         auto lowered = ir::lowerNumericF64Script(
             source, ir::NumericF64LoweringOptions{false, true});
         if (!lowered || !lowered->requiresLoopScheduler ||
             lowered->executable.yieldBoundaries.empty() ||
             lowered->executable.yieldBoundaries.size() > 16) {
+            if (JitCompileTelemetry::enabled())
+                impl_->telemetry.noteRefusal(!lowered
+                    ? JitRefusalReason::NumericNotLowered
+                    : JitRefusalReason::NumericLoopShape);
             if (std::getenv("XYO_JIT_VERBOSE"))
                 std::fprintf(stderr, "xyo-common-cfg: source rejected script=%s valid=%d lowered=%d\n",
                     top->id.c_str(), int(source.valid()), int(bool(lowered)));
@@ -496,6 +584,8 @@ bool JitEngine::tryAttachNumeric(Thread& thread, const Block* top) {
         auto kernel = std::make_shared<const ir::ScratchNumericKernel>(
             std::move(*lowered));
         if (!ir::NumericThreadSession::safeToAttach(thread, *kernel)) {
+            if (JitCompileTelemetry::enabled())
+                impl_->telemetry.noteRefusal(JitRefusalReason::NumericSlotGuard);
             if (std::getenv("XYO_JIT_VERBOSE"))
                 std::fprintf(stderr, "xyo-common-cfg: slot guard rejected script=%s\n", top->id.c_str());
             // A failing variable-type guard may be target-specific: do not
@@ -505,6 +595,8 @@ bool JitEngine::tryAttachNumeric(Thread& thread, const Block* top) {
         auto code = impl_->backend->compileNumeric(
             kernel, scriptCounter_++);
         if (!code || !code->run) {
+            if (JitCompileTelemetry::enabled())
+                impl_->telemetry.noteRefusal(JitRefusalReason::NumericBackendFailure);
             if (std::getenv("XYO_JIT_VERBOSE"))
                 std::fprintf(stderr, "xyo-common-cfg: backend rejected script=%s\n", top->id.c_str());
             numericRejected_.insert(key);
@@ -514,8 +606,11 @@ bool JitEngine::tryAttachNumeric(Thread& thread, const Block* top) {
     }
     // Each Scratch thread owns a separate continuation frame. The runner
     // points into backend-owned executable code (same contract as normal JIT).
-    return ir::attachNumericThread(
+    const bool attached = ir::attachNumericThread(
         thread, cached->second->kernel, cached->second->run, false);
+    if (!attached && JitCompileTelemetry::enabled())
+        impl_->telemetry.noteRefusal(JitRefusalReason::NumericAttachFailure);
+    return attached;
 }
 
 const CompiledScript* JitEngine::compile(Thread& thread, Runtime& runtime,
@@ -529,13 +624,29 @@ const CompiledScript* JitEngine::compile(Thread& thread, Runtime& runtime,
     if (!top) return nullptr;
     pollAsync();
     if (runtime.getIsEdgeActivatedHat(top->opcode)) {
+        if (JitCompileTelemetry::enabled())
+            impl_->telemetry.noteRefusal(JitRefusalReason::EdgeActivatedHat);
         failed_.insert(top);
         return nullptr;
     }
 
     ScriptEntry& entry = cache_[top];
-    if (entry.code) return entry.code.get();
-    if (failed_.count(top)) return nullptr;
+    if (entry.code) {
+        if (entry.code->aotSourceRevision &&
+            (entry.code->aotSourceBlocks != blocks ||
+             blocks->revision() != entry.code->aotSourceRevision))
+            return nullptr; // stale AOT: interpreter owns the new source
+        if (JitCompileTelemetry::enabled())
+            impl_->telemetry.compileCacheHits.fetch_add(
+                1, std::memory_order_relaxed);
+        return entry.code.get();
+    }
+    if (failed_.count(top)) {
+        if (JitCompileTelemetry::enabled())
+            impl_->telemetry.failedCacheHits.fetch_add(
+                1, std::memory_order_relaxed);
+        return nullptr;
+    }
 
     // HotSpot can execute in the interpreter while LLVM optimizes and
     // materializes the immutable IR in a worker. Never let the worker
@@ -555,9 +666,18 @@ const CompiledScript* JitEngine::compile(Thread& thread, Runtime& runtime,
         // Backpressure: do not retain an unbounded number of LLVM modules
         // when a project starts thousands of distinct event scripts.
         // The interpreter keeps running and a later spawn may retry.
-        if (compiling_.size() >= 32) return nullptr;
-        if (auto task = impl_->backend->prepareAsync(
-                thread, runtime, top, scriptCounter_++)) {
+        if (compiling_.size() >= 32) {
+            if (JitCompileTelemetry::enabled())
+                impl_->telemetry.asyncBackpressure.fetch_add(
+                    1, std::memory_order_relaxed);
+            return nullptr;
+        }
+        const auto prepareStarted = JitCompileTelemetry::Clock::now();
+        auto task = impl_->backend->prepareAsync(
+            thread, runtime, top, scriptCounter_++);
+        if (JitCompileTelemetry::enabled())
+            impl_->telemetry.asyncPrepare.record(bool(task), prepareStarted);
+        if (task) {
             compiling_.insert(top);
             impl_->enqueue({top, asyncGeneration_, std::move(task)});
             return nullptr;
@@ -566,12 +686,19 @@ const CompiledScript* JitEngine::compile(Thread& thread, Runtime& runtime,
 
     const auto source = ir::ScratchCompilationUnit::capture(*blocks, top);
     if (!source.valid()) {
+        if (JitCompileTelemetry::enabled())
+            impl_->telemetry.noteRefusal(JitRefusalReason::InvalidSource);
         failed_.insert(top);
         return nullptr;
     }
+    const auto compileStarted = JitCompileTelemetry::Clock::now();
     auto code = impl_->backend->compile(
         thread, runtime, top, scriptCounter_++, source);
+    if (JitCompileTelemetry::enabled())
+        impl_->telemetry.syncCompile.record(bool(code), compileStarted);
     if (!code) {
+        if (JitCompileTelemetry::enabled())
+            impl_->telemetry.noteRefusal(JitRefusalReason::SyncBackendFailure);
         failed_.insert(top);
         return nullptr;
     }
@@ -599,12 +726,19 @@ bool JitEngine::loadAot(Runtime& runtime, const void* object, size_t size,
     if (!impl_->aotSlots.empty()) return fail("AOT already loaded");
 
     aot::reportProgress(progress, aot::ProgressStage::LoadObject);
+    if (impl_->aotWorkerDiag) reportAotMallocState("before_object");
     if (!impl_->backend->addObjectFile(object, size))
         return fail("addObjectFile failed");
+    if (impl_->aotWorkerDiag) reportAotMallocState("after_object");
     auto* metaSym = static_cast<const char*>(impl_->backend->lookupSymbol("xyo_aot_meta"));
     if (!metaSym) return fail("xyo_aot_meta missing");
-    const JsonValue meta = jsonParse(metaSym);
+    // START-014: optional zero-copy yyjson view avoids thousands of
+    // short-lived JsonValue object/map allocations during AOT loading.
+    // The owning document outlives all slot and script cursor references.
+    const AotMetaDocument metadata(metaSym);
+    const AotMetaNode meta = metadata.root();
     if (!meta.isObject()) return fail("invalid AOT metadata");
+    if (impl_->aotWorkerDiag) reportAotMallocState("after_metadata_parse");
 
     char hb[32];
     std::snprintf(hb, sizeof(hb), "%016llx",
@@ -620,25 +754,48 @@ bool JitEngine::loadAot(Runtime& runtime, const void* object, size_t size,
     });
 
     const auto& slotEntries = meta.get("slots").asArray();
+    const int objectVersion = int(meta.get("v").asNumber());
+    if (objectVersion < 1 || objectVersion > 3)
+        return fail("unsupported AOT metadata version");
+    const bool packedSlots = objectVersion >= 2;
+    const bool lazyCached = objectVersion == 3;
+    void** packedBase = nullptr;
+    if (packedSlots && !slotEntries.empty()) {
+        packedBase = static_cast<void**>(
+            impl_->backend->lookupSymbol("xyo_aot_slots"));
+        if (!packedBase) return fail("AOT packed slots array missing");
+    }
+    std::vector<AotLazyCachedSlot*> lazyBySlot(
+        lazyCached ? slotEntries.size() : 0, nullptr);
     size_t boundSlots = 0;
     aot::reportProgress(progress, aot::ProgressStage::BindSlots,
                         0, slotEntries.size());
-    for (const JsonValue& sv : slotEntries) {
+    for (const AotMetaNode& sv : slotEntries) {
         const int kind = int(sv.get("k").asNumber());
-        const std::string g = sv.get("g").asString();
-        void** addr = static_cast<void**>(impl_->backend->lookupSymbol(g));
-        if (!addr) return fail("AOT slot symbol missing");
+        void** addr = nullptr;
+        if (packedSlots) {
+            // Generated v2 metadata enumerates slots in ascending order;
+            // fail closed for malformed indices before touching any memory.
+            const double index = sv.has("i") ? sv.get("i").asNumber() : -1.0;
+            if (index != double(boundSlots) || index >= double(slotEntries.size()))
+                return fail("AOT packed slot index invalid");
+            addr = packedBase + boundSlots;
+        } else {
+            const std::string g(sv.get("g").asString());
+            addr = static_cast<void**>(impl_->backend->lookupSymbol(g));
+            if (!addr) return fail("AOT slot symbol missing");
+        }
         void* p = nullptr;
         switch (static_cast<AotSlotKind>(kind)) {
         case AotSlotKind::VarId:
         case AotSlotKind::Name:
-            impl_->aotStrings.push_back(sv.get("s").asString());
+            impl_->aotStrings.emplace_back(sv.get("s").asString());
             p = const_cast<char*>(impl_->aotStrings.back().c_str());
             break;
         case AotSlotKind::BlockCached: {
             // キーは "targetIndex\x01blockId"（block id はターゲット間で
             // 一意とは限らない）
-            const std::string key = sv.get("s").asString();
+            const std::string key(sv.get("s").asString());
             const size_t sep = key.find('\x01');
             const size_t ti =
                 sep == std::string::npos
@@ -649,7 +806,18 @@ bool JitEngine::loadAot(Runtime& runtime, const void* object, size_t size,
                 sep == std::string::npos ? key : key.substr(sep + 1);
             if (ti < runtime.targets.size()) {
                 Blocks* b = runtime.targets[ti]->blocks;
-                if (b && b->getBlock(id)) p = b->getCachedExecute(id);
+                if (b && b->getBlock(id)) {
+                    if (lazyCached) {
+                        auto descriptor =
+                            std::make_unique<AotLazyCachedSlot>(b, id, b->revision());
+                        p = descriptor.get();
+                        lazyBySlot[boundSlots] = descriptor.get();
+                        impl_->aotLazyCachedSlots.push_back(
+                            std::move(descriptor));
+                    } else {
+                        p = b->getCachedExecute(id);
+                    }
+                }
             }
             if (!p) return fail("block for AOT slot not found");
             break;
@@ -666,7 +834,7 @@ bool JitEngine::loadAot(Runtime& runtime, const void* object, size_t size,
             // キーは "targetIndex\x01loopBlockId"。AOT 時と同じ
             // 解析を再実行して Program を作り直す（決定論的）。
             // 失敗しても nullptr のまま — 生成コードは CPU ループへ。
-            const std::string key = sv.get("s").asString();
+            const std::string key(sv.get("s").asString());
             const size_t sep = key.find('\x01');
             const size_t ti =
                 sep == std::string::npos
@@ -710,31 +878,54 @@ bool JitEngine::loadAot(Runtime& runtime, const void* object, size_t size,
         aot::reportProgress(progress, aot::ProgressStage::BindSlots,
                             ++boundSlots, slotEntries.size());
     }
+    if (impl_->aotWorkerDiag) reportAotMallocState("after_slot_bind");
 
     const auto& scriptEntries = meta.get("scripts").asArray();
     size_t scannedScripts = 0;
     aot::reportProgress(progress, aot::ProgressStage::RegisterScripts,
                         0, scriptEntries.size());
     int nScripts = 0;
-    for (const JsonValue& sj : scriptEntries) {
+    for (const AotMetaNode& sj : scriptEntries) {
         const auto scanned = [&] {
             aot::reportProgress(progress, aot::ProgressStage::RegisterScripts,
                                 ++scannedScripts, scriptEntries.size());
         };
-        const std::string topId = sj.get("top").asString();
-        auto* es = impl_->backend->lookupSymbol(sj.get("entry").asString());
+        const std::string topId(sj.get("top").asString());
+        auto* es = impl_->backend->lookupSymbol(std::string(sj.get("entry").asString()));
         if (!es) return fail("AOT script symbol missing");
         auto cs = std::make_unique<CompiledScript>();
         cs->entry = reinterpret_cast<ScriptFn>(es);
         cs->mayYield = sj.get("mayYield").asBool();
         // Older objects lack affinity metadata (and may contain plain string
         // cache loads). Keep them serial; new objects also pin compat/GPU work.
+        // Older v3 metadata has no complete per-script slot manifest.
+        // Preserve its serial fallback rather than guessing worker safety.
+        if (lazyCached && sj.has("lazySlots") != sj.has("gpuSlots"))
+            return fail("AOT lazy script manifest incomplete");
+        const bool hasManifest = lazyCached && sj.has("lazySlots") &&
+                                 sj.has("gpuSlots");
+        if (hasManifest && (!sj.get("lazySlots").isArray() ||
+                            !sj.get("gpuSlots").isBool()))
+            return fail("AOT lazy script manifest wrong type");
         cs->mainThread = !sj.has("mainThread") ||
-            sj.get("mainThread").asBool() || !impl_->aotGpuProgs.empty();
-        for (const JsonValue& pj : sj.get("procs").asArray()) {
-            auto* ps = impl_->backend->lookupSymbol(pj.at(1).asString());
+            sj.get("mainThread").asBool() ||
+            (lazyCached && !hasManifest) ||
+            (hasManifest ? sj.get("gpuSlots").asBool()
+                         : !impl_->aotGpuProgs.empty());
+        if (hasManifest) {
+            for (const AotMetaNode& iv : sj.get("lazySlots").asArray()) {
+                const double n = iv.asNumber();
+                if (!iv.isNumber() || !std::isfinite(n) ||
+                    n < 0 || n >= double(lazyBySlot.size()) ||
+                    n != std::floor(n) || !lazyBySlot[size_t(n)])
+                    return fail("AOT lazy script slot manifest invalid");
+                cs->aotLazyWorkerSlots.push_back(lazyBySlot[size_t(n)]);
+            }
+        }
+        for (const AotMetaNode& pj : sj.get("procs").asArray()) {
+            auto* ps = impl_->backend->lookupSymbol(std::string(pj.at(1).asString()));
             if (!ps) continue;
-            cs->procedures[pj.at(0).asString()] = reinterpret_cast<ScriptFn>(ps);
+            cs->procedures[std::string(pj.at(0).asString())] = reinterpret_cast<ScriptFn>(ps);
         }
         const size_t ti = size_t(sj.get("ti").asNumber());
         if (ti >= runtime.targets.size()) {
@@ -750,6 +941,10 @@ bool JitEngine::loadAot(Runtime& runtime, const void* object, size_t size,
         }
         // AOT は全スクリプトを最適化済みで事前コンパイルしたもの —
         // 通常のコンパイルキャッシュへ登録し、再コンパイルしない。
+        if (lazyCached) {
+            cs->aotSourceBlocks = owner->blocks;
+            cs->aotSourceRevision = owner->blocks->revision();
+        }
         ScriptEntry& entry = cache_[top];
         entry.code = std::move(cs);
         entry.aot = true;
@@ -757,6 +952,40 @@ bool JitEngine::loadAot(Runtime& runtime, const void* object, size_t size,
         scanned();
     }
 
+    if (impl_->aotWorkerDiag) reportAotMallocState("after_script_registration");
+    if (std::getenv("XYO_AOT_LAZY_DIAGNOSTIC")) {
+        size_t cached = 0;
+        for (Target* t : runtime.targets)
+            if (t && t->blocks)
+                cached += t->blocks->cache().executeCached.size();
+        std::fprintf(stderr,
+            "[aot-lazy] v=%d descriptors=%zu loaded_cached=%zu\n",
+            objectVersion, impl_->aotLazyCachedSlots.size(), cached);
+    }
+
+    if (impl_->aotWorkerDiag)
+        reportAotMallocState("after_load");
+#if defined(__GLIBC__)
+    // START-013: strictly opt-in experiment. When lazy cache binding
+    // leaves free chunks in glibc arenas, return reclaimable pages before
+    // script execution. This is safe only at the AOT load/scheduler boundary,
+    // and is NOT enabled by diagnostics or the default AOT v2 path.
+    if (lazyCached) {
+        const char* trim = std::getenv("XYO_AOT_LAZY_MALLOC_TRIM");
+        if (trim && trim[0] == '1') {
+            const auto started = std::chrono::steady_clock::now();
+            const int reclaimed = malloc_trim(0);
+            const auto usec = std::chrono::duration_cast<
+                std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - started).count();
+            std::fprintf(stderr,
+                "[aot-lazy-trim] reclaimed=%d time_us=%lld\n",
+                reclaimed, static_cast<long long>(usec));
+            if (impl_->aotWorkerDiag)
+                reportAotMallocState("after_trim");
+        }
+    }
+#endif
     std::fprintf(stderr, "aot: %d scripts precompiled (%zu slots)\n",
                  nScripts, impl_->aotSlots.size());
     if (std::getenv("XYO_AOT_VERBOSE"))
@@ -764,6 +993,46 @@ bool JitEngine::loadAot(Runtime& runtime, const void* object, size_t size,
                      impl_->aotSlots.size());
     aot::reportProgress(progress, aot::ProgressStage::Loaded);
     return true;
+}
+
+bool JitEngine::prepareAotWorker(const CompiledScript& script) const {
+    // Called only by the caller-thread scheduler, not from a native worker.
+    // The ordinary path is unchanged when diagnostics are disabled.
+    if (!impl_->aotWorkerDiag) {
+        for (AotLazyCachedSlot* slot : script.aotLazyWorkerSlots)
+            if (!xyo_rt_aot_cached(slot)) return false;
+        return true;
+    }
+
+    using Clock = std::chrono::steady_clock;
+    const auto start = Clock::now();
+    ++impl_->prewarmCalls;
+    impl_->prewarmSlotVisits += script.aotLazyWorkerSlots.size();
+    // A block can recursively materialize multiple BlockCached entries.
+    // Deduplicate each Blocks owner to count recursion without double counting.
+    std::unordered_map<Blocks*, size_t> before;
+    for (AotLazyCachedSlot* slot : script.aotLazyWorkerSlots) {
+        if (!before.contains(slot->blocks))
+            before.emplace(slot->blocks, slot->blocks->cache().executeCached.size());
+    }
+    bool ok = true;
+    for (AotLazyCachedSlot* slot : script.aotLazyWorkerSlots) {
+        const bool cold = !slot->resolved.load(std::memory_order_acquire);
+        if (!xyo_rt_aot_cached(slot)) {
+            ok = false;
+            break;
+        }
+        impl_->prewarmFreshSlots += cold;
+    }
+    for (const auto& [blocks, count] : before) {
+        const size_t after = blocks->cache().executeCached.size();
+        if (after >= count) impl_->prewarmCachedCreated += after - count;
+    }
+    if (!ok) ++impl_->prewarmFailed;
+    impl_->prewarmTimeNs += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            Clock::now() - start).count());
+    return ok;
 }
 
 void JitEngine::invalidate() {
@@ -776,6 +1045,16 @@ void JitEngine::invalidate() {
         std::lock_guard lock(impl_->mutex);
         impl_->waiting.clear();
         impl_->completed.clear();
+    }
+    // Keep v3 CompiledScript allocation addresses alive for suspended
+    // Fibers and already-started broadcast receivers. Moving unique_ptr
+    // ownership does not move the CompiledScript itself. Mark the source
+    // owner invalid, so every subsequent scheduling entry rejects it.
+    for (auto& [_, entry] : cache_) {
+        if (entry.aot && entry.code && entry.code->aotSourceRevision) {
+            entry.code->aotSourceBlocks = nullptr;
+            retiredAot_.push_back(std::move(entry.code));
+        }
     }
     cache_.clear();
     numericCache_.clear();

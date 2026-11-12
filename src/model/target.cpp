@@ -199,6 +199,10 @@ void Target::renameVariable(const std::string& id, const std::u16string& newName
 }
 
 void Target::deleteVariable(const std::string& id) {
+    const auto it = variables.find(id);
+    if (it == variables.end()) return;
+    // Detach wait-until watchers before the Variable's storage disappears.
+    if (runtime) runtime->invalidateWaitVariableBinding(it->second);
     variables.erase(id);
 }
 
@@ -537,6 +541,7 @@ Target* Target::makeClone() {
     c->edgeActivatedHatValues = edgeActivatedHatValues;
     c->soundEffects = soundEffects;
     // JS: _onTargetCreated — ペン状態は複製し、penDown 中なら移動フックも継承
+    c->musicInstrument = musicInstrument;
     if (penState) {
         c->penState = std::make_unique<PenState>(*penState);
         c->onTargetMoved = onTargetMoved;
@@ -545,8 +550,19 @@ Target* Target::makeClone() {
     c->updateAllDrawableProperties();
     const auto prepared = profile.enabled ? CloneClock::now() : CloneTime{};
     // JS: initDrawable — クローンはここで start_as_clone ハットを起動
-    if (!c->isOriginal)
-        runtime->startHats("control_start_as_clone", nullptr, c);
+    if (!c->isOriginal) {
+        static const bool fastCloneHats = [] {
+            const char* value = std::getenv("XYO_CLONE_NEW_HATS_FAST");
+            return value && value[0] == '1';
+        }();
+        // An external creation callback can start arbitrary scripts on the
+        // new Target before we arrive here. Retain the generic snapshot
+        // semantics in that case, including SDL / host callbacks.
+        if (fastCloneHats && !runtime->onTargetCreated)
+            runtime->startFreshCloneHats(c);
+        else
+            runtime->startHats("control_start_as_clone", nullptr, c);
+    }
     if (profile.enabled) {
         const auto ended = CloneClock::now();
         profile.created.fetch_add(1, std::memory_order_relaxed);
@@ -570,6 +586,10 @@ void Target::dispose() {
     const auto started = measure ? CloneClock::now() : CloneTime{};
     if (!isOriginal && runtime) runtime->changeCloneCounter(-1);
     if (runtime) {
+        // Clones may be disposed while their variable storage is still
+        // referenced by a paused native wait snapshot.
+        for (const auto& [_, variable] : variables)
+            runtime->invalidateWaitVariableBinding(variable);
         runtime->requestRemoveMonitorByTargetId(id);
         const auto afterMonitor = measure ? CloneClock::now() : CloneTime{};
         runtime->stopForTarget(this, nullptr);

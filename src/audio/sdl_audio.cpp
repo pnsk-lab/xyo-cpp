@@ -15,6 +15,13 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <array>
+#include <string>
+#define TSF_IMPLEMENTATION
+#include "../../third_party/tsf.h"
+#if defined(XYO_HAVE_FLUIDSYNTH)
+#include <fluidsynth.h>
+#endif
 
 // M_PI は ISO C++ 標準ではない（mingw の <cmath> では未定義）
 #ifndef M_PI
@@ -31,6 +38,9 @@ bool SdlAudioBank::init(Runtime& rt) {
     rt_ = &rt;
     // SDL_main を使わないので明示的に main ready を立てる（Windows で必須）
     SDL_SetMainReady();
+    const bool musicTrace = std::getenv("XYO_MUSIC_TRACE") != nullptr;
+    if (musicTrace) std::fprintf(stderr, "[music] SDL audio init, requested=%s\n",
+        std::getenv("SDL_AUDIODRIVER") ? std::getenv("SDL_AUDIODRIVER") : "(unset)");
     if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0)
         return false;
     SDL_AudioSpec want{}, have{};
@@ -40,9 +50,85 @@ bool SdlAudioBank::init(Runtime& rt) {
     want.samples = 1024;
     want.callback = &SdlAudioBank::audioCb;
     want.userdata = this;
+    if (musicTrace) std::fprintf(stderr, "[music] SDL audio initialized\n");
     dev_ = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
+    if (musicTrace) std::fprintf(stderr, "[music] audio device=%u\n", dev_);
     if (dev_) {
         outRate_ = have.freq;
+        const char* overrideFont = std::getenv("XYO_MUSIC_SOUNDFONT");
+        const char* backend = std::getenv("XYO_MUSIC_BACKEND");
+        const bool useFluid = backend && std::strcmp(backend, "fluidsynth") == 0;
+        if (!useFluid) {
+            // SF2 synthesizer is MIT-licensed, entirely independent of ALSA,
+            // JACK, PulseAudio and system FluidSynth. A small original CC0
+            // SF2 file is the last-resort fallback.
+            const char* base = SDL_GetBasePath();
+            const std::string exeDir = base ? base : "";
+            if (base) SDL_free(const_cast<char*>(base));
+            const std::string localFont =
+                exeDir + "assets/soundfonts/xyo-basic.sf2";
+            const std::string parentFont =
+                exeDir + "../assets/soundfonts/xyo-basic.sf2";
+            const std::string nestedFont =
+                exeDir + "../../../assets/soundfonts/xyo-basic.sf2";
+            const std::string deepFont =
+                exeDir + "../../../../assets/soundfonts/xyo-basic.sf2";
+            const std::array<const char*, 9> fonts = {
+                overrideFont, "assets/soundfonts/xyo-basic.sf2",
+                localFont.c_str(), parentFont.c_str(), nestedFont.c_str(),
+                deepFont.c_str(),
+                "/usr/share/sounds/sf2/FluidR3_GM.sf2",
+                "/usr/share/soundfonts/FluidR3_GM.sf2",
+                "/usr/share/soundfonts/default.sf2"
+            };
+            for (const char* path : fonts) {
+                if (!path || !*path) continue;
+                const size_t length = std::strlen(path);
+                if (length < 4 || std::strcmp(path + length - 4, ".sf2") != 0)
+                    continue;
+                if (musicTrace) std::fprintf(stderr, "[music] loading SF2: %s\n", path);
+                auto* synth = tsf_load_filename(path);
+                if (!synth) continue;
+                tsf_set_output(synth, TSF_STEREO_INTERLEAVED, outRate_, -3.0f);
+                tsf_set_max_voices(synth, 128);
+                // Allocate all required channel slots on the main thread.
+                for (int ch = 0; ch < 16; ++ch)
+                    tsf_channel_set_presetnumber(synth, ch, 0, ch == 9);
+                musicTsf_ = synth;
+                musicScratch_.resize(2048);
+                if (musicTrace) std::fprintf(stderr, "[music] loaded SF2\n");
+                break;
+            }
+        }
+#if defined(XYO_HAVE_FLUIDSYNTH)
+        if (useFluid) {
+            // SF3 support is explicitly opt-in; this API may enumerate host
+            // audio drivers during settings creation on some installations.
+            const std::array<const char*, 3> fonts = {
+                overrideFont, "/usr/share/mscore-4.7/sound/MS Basic.sf3",
+                "/usr/share/sounds/sf3/MS Basic.sf3"
+            };
+            for (const char* path : fonts) {
+                if (!path || !*path) continue;
+                auto* settings = new_fluid_settings();
+                if (!settings) break;
+                fluid_settings_setnum(settings, "synth.sample-rate", outRate_);
+                fluid_settings_setnum(settings, "synth.gain", 0.35);
+                fluid_settings_setint(settings, "synth.reverb.active", 0);
+                fluid_settings_setint(settings, "synth.chorus.active", 0);
+                auto* synth = new_fluid_synth(settings);
+                if (synth && fluid_synth_sfload(synth, path, 1) >= 0) {
+                    musicSettings_ = settings;
+                    musicSynth_ = synth;
+                    musicScratch_.resize(2048);
+                    if (musicTrace) std::fprintf(stderr, "[music] loaded SF3: %s\n", path);
+                    break;
+                }
+                if (synth) delete_fluid_synth(synth);
+                delete_fluid_settings(settings);
+            }
+        }
+#endif
         SDL_PauseAudioDevice(dev_, 0);
     }
     // 全 sprite に soundBank を設定（clone は Sprite* を共有）
@@ -78,6 +164,15 @@ void SdlAudioBank::shutdown() {
         SDL_CloseAudioDevice(dev_);
         dev_ = 0;
     }
+#if defined(XYO_HAVE_FLUIDSYNTH)
+    if (musicSynth_) delete_fluid_synth(static_cast<fluid_synth_t*>(musicSynth_));
+    if (musicSettings_) delete_fluid_settings(static_cast<fluid_settings_t*>(musicSettings_));
+#endif
+    musicSynth_ = musicSettings_ = nullptr;
+    if (musicTsf_) tsf_close(static_cast<tsf*>(musicTsf_));
+    musicTsf_ = nullptr;
+    musicVoices_.clear();
+    musicScratch_.clear();
     if (rt_) {
         if (rt_->audioEngine == this) rt_->audioEngine = nullptr;
         rt_->onProjectStopped = nullptr;
@@ -251,6 +346,8 @@ void SdlAudioBank::snapshotVoice(Voice& v) const {
     if (const auto it = t.soundEffects.find("pan");
         it != t.soundEffects.end()) pan = it->second;
 
+    // Scratch's PitchEffect clamps to +/-360 (three octaves).
+    pitch = std::clamp(pitch, -360.0, 360.0);
     v.step = (v.s->rate / double(outRate_)) * std::pow(2.0, pitch / 120.0);
     const double p = (std::clamp(pan, -100.0, 100.0) + 100.0) / 200.0;
     v.gainL = std::cos(p * M_PI / 2) * volume;
@@ -269,6 +366,11 @@ void SdlAudioBank::requestSound(Target* t, int soundId, Thread* wait) {
             resolveWait(*rt_->sequencer, *wait, Value::undefined());
         return;
     }
+    // A Scratch sound source is a singleton per Sprite, shared by clones.
+    // Restarting it cancels the old voice and releases play-until-done
+    // waiters. Do this before enqueueing the new request, including for
+    // sounds that are currently decoding asynchronously.
+    stop(t, soundId);
     auto existing = decoded_.find(source);
     if (existing != decoded_.end()) {
         Voice voice{&existing->second, 0, t, wait, source};
@@ -430,24 +532,23 @@ void SdlAudioBank::stopAllSounds(Target*) {
 
 void SdlAudioBank::stop(Target* t, int soundId) {
     const Sound* sound = soundFor(t, soundId);
-    const auto it = decoded_.find(sound);
-    const Sample* s = it == decoded_.end() ? nullptr : &it->second;
+    if (!sound) return;
     if (dev_) SDL_LockAudioDevice(dev_);
     for (auto& v : voices_)
-        if (v.t == t && v.s == s)
+        if (v.sound == sound)
             done_.push_back(v);
     voices_.erase(
         std::remove_if(voices_.begin(), voices_.end(),
-                       [&](const Voice& v) { return v.t == t && v.s == s; }),
+                       [&](const Voice& v) { return v.sound == sound; }),
         voices_.end());
     for (const auto& v : pendingVoices_) {
-        if (v.target == t && v.sound == sound && v.wait)
-            done_.push_back({nullptr, 0, t, v.wait});
+        if (v.sound == sound && v.wait)
+            done_.push_back({nullptr, 0, v.target, v.wait});
     }
     pendingVoices_.erase(
         std::remove_if(pendingVoices_.begin(), pendingVoices_.end(),
                        [&](const PendingVoice& v) {
-                           return v.target == t && v.sound == sound;
+                           return v.sound == sound;
                        }),
         pendingVoices_.end());
     if (dev_) SDL_UnlockAudioDevice(dev_);
@@ -455,6 +556,12 @@ void SdlAudioBank::stop(Target* t, int soundId) {
 
 void SdlAudioBank::stopAll() {
     if (dev_) SDL_LockAudioDevice(dev_);
+    if (musicTsf_) tsf_reset(static_cast<tsf*>(musicTsf_));
+#if defined(XYO_HAVE_FLUIDSYNTH)
+    if (musicSynth_) for (int ch = 0; ch < 16; ++ch)
+        fluid_synth_all_sounds_off(static_cast<fluid_synth_t*>(musicSynth_), ch);
+#endif
+    musicVoices_.clear();
     finishAllVoices();
     if (dev_) SDL_UnlockAudioDevice(dev_);
 }
@@ -477,6 +584,47 @@ void SdlAudioBank::audioCb(void* ud, unsigned char* buf, int len) {
               len / static_cast<int>(sizeof(float)) / 2);
 }
 
+void SdlAudioBank::playMusicNote(int program, int note, double seconds,
+                                 double volume, bool drum) {
+    if (!dev_ || (!musicTsf_ && !musicSynth_) ||
+        !std::isfinite(seconds) || seconds <= 0)
+        return;
+    note = std::clamp(note, 0, 127);
+    const int duration = int(std::clamp(seconds * outRate_, 1.0,
+                                        double(outRate_) * 100));
+    SDL_LockAudioDevice(dev_);
+    int channel = drum ? 9 : -1;
+    if (!drum) for (int ch = 0; ch < 16; ++ch) {
+        if (ch == 9) continue;
+        const bool used = std::any_of(musicVoices_.begin(), musicVoices_.end(),
+            [ch](const MusicVoice& v) { return v.channel == ch; });
+        if (!used) { channel = ch; break; }
+    }
+    if (channel >= 0 && musicVoices_.size() < 30) {
+        bool started = false;
+        if (musicTsf_) {
+            auto* sf = static_cast<tsf*>(musicTsf_);
+            if (tsf_channel_set_presetnumber(sf, channel,
+                                             std::clamp(program, 0, 127),
+                                             drum ? 1 : 0)) {
+                started = tsf_channel_note_on(sf, channel, note,
+                           float(std::clamp(volume, 0.0, 1.0))) != 0;
+            }
+        }
+#if defined(XYO_HAVE_FLUIDSYNTH)
+        if (musicSynth_) {
+            auto* synth = static_cast<fluid_synth_t*>(musicSynth_);
+            if (!drum) fluid_synth_program_change(
+                synth, channel, std::clamp(program, 0, 127));
+            fluid_synth_cc(synth, channel, 7,
+                           int(std::clamp(volume, 0.0, 1.0) * 127));
+            started = fluid_synth_noteon(synth, channel, note, 110) == FLUID_OK;
+        }
+#endif
+        if (started) musicVoices_.push_back({channel, note, duration});
+    }
+    SDL_UnlockAudioDevice(dev_);
+}
 void SdlAudioBank::mix(float* out, int frames) {
     std::memset(out, 0, static_cast<size_t>(frames) * 2 * sizeof(float));
     for (auto& v : voices_) {
@@ -523,6 +671,43 @@ void SdlAudioBank::mix(float* out, int frames) {
                            return v.pos >= v.s->frames;
                        }),
         voices_.end());
+    if (musicTsf_ || musicSynth_) {
+        int offset = 0;
+        while (offset < frames) {
+            int count = std::min(frames - offset, 1024);
+            for (const auto& voice : musicVoices_)
+                count = std::min(count, voice.framesLeft);
+            if (count <= 0) break;
+            if (musicTsf_) {
+                tsf_render_float(static_cast<tsf*>(musicTsf_),
+                                 musicScratch_.data(), count, 0);
+            }
+#if defined(XYO_HAVE_FLUIDSYNTH)
+            else if (musicSynth_) {
+                auto* synth = static_cast<fluid_synth_t*>(musicSynth_);
+                fluid_synth_write_float(synth, count,
+                                       musicScratch_.data(), 0, 2,
+                                       musicScratch_.data(), 1, 2);
+            }
+#endif
+            for (int i = 0; i < count * 2; ++i)
+                out[offset * 2 + i] += musicScratch_[i];
+            offset += count;
+            for (auto& voice : musicVoices_) voice.framesLeft -= count;
+            for (const auto& voice : musicVoices_) {
+                if (voice.framesLeft > 0) continue;
+                if (musicTsf_) tsf_channel_note_off(
+                    static_cast<tsf*>(musicTsf_), voice.channel, voice.key);
+#if defined(XYO_HAVE_FLUIDSYNTH)
+                if (musicSynth_) fluid_synth_noteoff(
+                    static_cast<fluid_synth_t*>(musicSynth_),
+                    voice.channel, voice.key);
+#endif
+            }
+            std::erase_if(musicVoices_,
+                [](const MusicVoice& v) { return v.framesLeft <= 0; });
+        }
+    }
     // ピーク（loudness 近似 — マイク非対応のため出力レベルを報告）
     for (int i = 0; i < frames * 2; ++i) {
         float a = std::abs(out[i]);
@@ -592,6 +777,13 @@ void SdlAudioBank::update() {
         if (audioWaiterIsLive(rt_, v.wait))
             resolveWait(*rt_->sequencer, *v.wait, Value::undefined());
     }
+}
+
+float SdlAudioBank::outputPeak() const {
+    if (dev_) SDL_LockAudioDevice(dev_);
+    const float value = peak_;
+    if (dev_) SDL_UnlockAudioDevice(dev_);
+    return value;
 }
 
 double SdlAudioBank::getLoudness() const {

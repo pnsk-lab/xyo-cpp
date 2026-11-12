@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cmath>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <string>
@@ -31,6 +32,10 @@ struct SimpleNativeInterpreterResume {
     struct Procedure {
         std::string callBlockId;
         std::unordered_map<std::u16string, Value> arguments;
+        // Original, source-verified Scratch procedure atomic/warp flag.
+        // The interpreter must not silently revert a resumed warp
+        // procedure to nonwarp scheduling after native Fiber retirement.
+        bool declaredWarp = false;
         // Source lexical stack from THIS procedure to its suspended
         // child call (or, in the leaf, the committed loop checkpoint).
         // IF and LOOP frames may alternate in either nesting order.
@@ -87,7 +92,9 @@ struct NativeSourceHandoff {
     }
 
     // Supported source subset: flag hat -> bounded nonwarp procedure
-    // chain (including direct recursion) -> leaf repeat/while/until
+    // chain, or an explicitly requested certified soft-budget warp
+    // handoff with the original procedure warp flags restored.
+    // The leaf is a repeat/while/until
     // AfterLoopBody checkpoint, or source-verified post-call NextBlock,
     // AfterBranch, LoopLatch, ProcedureExit chain, and limited root-only
     // ScriptExit. The final root call is never evaluated a second time.
@@ -598,8 +605,27 @@ struct NativeSourceHandoff {
                 thread.blockContainer->getProcedureDefinition(code);
             const auto* prototype =
                 thread.blockContainer->getProcedurePrototype(code);
-            if (actualDefinition != *defId ||
-                !prototype || prototype->warp()) return std::nullopt;
+            if (actualDefinition != *defId || !prototype)
+                return std::nullopt;
+            // RT-001 experimental budget handoff can now reconstruct
+            // a warp procedure's source-certified loop latch as long
+            // as the generated-SSA root owner is explicitly required.
+            // Otherwise preserve the old nonwarp-only restriction.
+            // Do not apply this to post-callee or unknown effect phases.
+            const bool allowWarpBudgetHandoff = [&] {
+                const char* rooted =
+                    std::getenv("XYO_RT_REQUIRE_GENERATED_SSA_ROOTS");
+                // Only the actual currently pending, one-shot budget
+                // handoff can enter warp recovery. A forged source
+                // continuation or a later forced Nth-yield test cannot
+                // reuse a stale budget setting to bypass this scope.
+                return afterLoop &&
+                    thread.nativeGcSoftBudgetYieldDue &&
+                    thread.nativeGcSoftBudgetAttempted &&
+                    rooted && rooted[0] == '1';
+            }();
+            if (prototype->warp() && !allowWarpBudgetHandoff)
+                return std::nullopt;
             prototype->parseArgs();
             call->mutation->parseArgs();
             const size_t count = snapshot.frame.arguments;
@@ -611,7 +637,8 @@ struct NativeSourceHandoff {
                 call->mutation->argumentIds != prototype->argumentIds)
                 return std::nullopt;
 
-            plan.calls.push_back({std::string(*callId), {}});
+            plan.calls.push_back({
+                std::string(*callId), {}, prototype->warp()});
             auto& arguments = plan.calls.back().arguments;
             for (size_t arg = 0; arg < count; ++arg) {
                 const auto value =

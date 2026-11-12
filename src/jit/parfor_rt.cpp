@@ -107,6 +107,9 @@ void xyo_list_reserve(void* listPtr, int64_t newLen) {
     const uint32_t n = uint32_t(newLen);
     l->numericOnly = false; // concurrent slot writers may store strings
     l->ensure(n);
+    // Reserve exposes new indexed elements as visible Scratch values.
+    // Bracket the raw batch to conservatively disqualify concurrent reads.
+    xyo::ir::ScopedSourceListContentWrite write;
     for (uint32_t i = l->len; i < n; ++i) l->items[i] = xyo::Value::num(0);
     l->len = n;
     l->monitorDirty = true;
@@ -127,6 +130,7 @@ static void reserveParForDestination(xyo::SList* list, int64_t newLen,
     }
     list->numericOnly = false;
     list->ensure(n);
+    xyo::ir::ScopedSourceListContentWrite write;
     list->len = n;
     list->monitorDirty = true;
 }
@@ -139,6 +143,7 @@ void xyo_par_slot(void* listPtr, int64_t idx, int64_t bits) {
     v.bits = uint64_t(bits);
     // Workers may write concurrently; invalidate type speculation before
     // dispatch instead of performing a racy per-worker flag update.
+    xyo::ir::ScopedSourceListContentWrite write;
     l->items[idx] = v;
 }
 

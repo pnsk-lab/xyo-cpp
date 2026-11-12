@@ -29,6 +29,9 @@ struct DlssVkFrame {
     DlssVkImage depth;          // valid scene depth, not a dummy texture
     DlssVkImage motionVectors;  // pixel-space per-frame motion vectors
     DlssVkImage output;         // destination, full display resolution
+    // Optional current-color bias, R8_UNORM, input resolution.
+    // The NGX SDK does not guarantee equivalence to a history-reset mask.
+    DlssVkImage currentColorBias;
     float jitterX = 0.0f;       // low-resolution pixel space
     float jitterY = 0.0f;
     float motionScaleX = 1.0f;  // scale vectors to pixel space

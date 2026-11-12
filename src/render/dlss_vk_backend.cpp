@@ -300,7 +300,12 @@ bool DlssVkBackend::evaluate(VkCommandBuffer cmd, const DlssVkFrame& frame) {
         frame.motionVectors.width != s.renderW ||
         frame.motionVectors.height != s.renderH ||
         frame.output.width != s.outputW ||
-        frame.output.height != s.outputH) {
+        frame.output.height != s.outputH ||
+        (frame.currentColorBias.image != VK_NULL_HANDLE &&
+         (!valid(frame.currentColorBias) ||
+          frame.currentColorBias.width != s.renderW ||
+          frame.currentColorBias.height != s.renderH ||
+          frame.currentColorBias.format != VK_FORMAT_R8_UNORM))) {
         s.error = "DLSS evaluate: source/depth/motion/output Vulkan images "
                   "are required with dimensions matching configured feature";
         return false;
@@ -310,11 +315,15 @@ bool DlssVkBackend::evaluate(VkCommandBuffer cmd, const DlssVkFrame& frame) {
     auto depth = ngxImage(frame.depth, false);
     auto motion = ngxImage(frame.motionVectors, false);
     auto output = ngxImage(frame.output, true);
+    auto bias = frame.currentColorBias.image
+        ? ngxImage(frame.currentColorBias, false) : NVSDK_NGX_Resource_VK{};
     NVSDK_NGX_VK_DLSS_Eval_Params eval{};
     eval.Feature.pInColor = &color;
     eval.Feature.pInOutput = &output;
     eval.pInDepth = &depth;
     eval.pInMotionVectors = &motion;
+    eval.pInBiasCurrentColorMask =
+        frame.currentColorBias.image ? &bias : nullptr;
     eval.InJitterOffsetX = frame.jitterX;
     eval.InJitterOffsetY = frame.jitterY;
     eval.InMVScaleX = frame.motionScaleX;

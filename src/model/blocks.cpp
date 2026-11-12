@@ -3,6 +3,7 @@
 
 #include "../core/cast.hpp"
 #include "../engine/runtime.hpp"
+#include <cassert>
 
 namespace xyo {
 
@@ -309,9 +310,22 @@ BlockCached* Blocks::getCachedExecute(const std::string& blockId) {
         self->opcode == "control_if" ||
         self->opcode == "control_if_else";
     self->fields = block->fields;
-    // getInputs: SUBSTACK* を除くコピー
-    const InputSet* ins = getInputs(block);
-    if (ins) self->inputs = *ins;
+    // Construct the filtered inputs directly instead of allocating an
+    // intermediate cache entry and then copying it. The getInputs() API
+    // remains lazy and unchanged for callers that explicitly need it.
+    // XYO_CACHE_DIRECT_FILTER_INPUTS=0 retains the legacy importer for A/B.
+    static const bool directInput = [] {
+        const char* value = std::getenv("XYO_CACHE_DIRECT_FILTER_INPUTS");
+        return !value || value[0] != '0';
+    }();
+    if (directInput) {
+        for (const auto& [name, in] : block->inputs.items)
+            if (name.compare(0, kBranchPrefix.size(), kBranchPrefix) != 0)
+                self->inputs.items.emplace_back(name, in);
+    } else {
+        const InputSet* ins = getInputs(block);
+        if (ins) self->inputs = *ins;
+    }
     if (const Mutation* mutation = getMutation(block)) {
         self->ownedMutation = *mutation;
         self->mutation = &*self->ownedMutation;
@@ -399,6 +413,28 @@ BlockCached* Blocks::getCachedExecute(const std::string& blockId) {
 
 // ------------------------------------------------------------------ mutation --
 
+bool Blocks::setBlockPosition(const std::string& blockId,
+                              double x, double y) {
+    auto it = blocks_.find(blockId);
+    if (it == blocks_.end()) return false;
+    it->second.x = x;
+    it->second.y = y;
+    // Do not reset the executable cache: x/y affect editor layout only.
+    return true;
+}
+
+bool Blocks::setBlockField(const std::string& blockId,
+                           const std::string& fieldName, BlockField field) {
+    auto it = blocks_.find(blockId);
+    if (it == blocks_.end()) return false;
+    it->second.fields[fieldName] = std::move(field);
+    // Must be part of the same editor commit as the field write.
+    // The AOT revision guard must never observe the new semantic value
+    // under the old compilation stamp on the scheduler thread.
+    resetCache();
+    return true;
+}
+
 void Blocks::createBlock(Block block) {
     if (blocks_.count(block.id)) return;
     bool top = block.topLevel;
@@ -447,7 +483,30 @@ void Blocks::restoreState(std::unordered_map<std::string, Block> blocks,
     resetCache();
 }
 
+void Blocks::beginStructuralEdit() noexcept {
+    ++structuralEditDepth_;
+    // A scope may write Block* fields or graph links without invoking an
+    // individual mutator. The outer commit must publish that edit too.
+    structuralEditPending_ = true;
+}
+
+void Blocks::endStructuralEdit() {
+    assert(structuralEditDepth_ > 0);
+    if (--structuralEditDepth_ == 0 && structuralEditPending_) {
+        structuralEditPending_ = false;
+        resetCacheNow();
+    }
+}
+
 void Blocks::resetCache() {
+    if (structuralEditDepth_ != 0) {
+        structuralEditPending_ = true;
+        return; // no intermediate partially-edited cache generations
+    }
+    resetCacheNow();
+}
+
+void Blocks::resetCacheNow() {
     revision_ = nextRevision_.fetch_add(1, std::memory_order_relaxed);
     if (runtime) runtime->invalidateBroadcastIndex();
     cache_.inputs.clear();

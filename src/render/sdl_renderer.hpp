@@ -17,7 +17,12 @@
 #include "gl_fsr_pen.hpp"
 #include "gl_upscale.hpp"
 #if defined(XYO_NVSDK_DLSS_VK) && defined(__linux__) && defined(XYO_HAVE_SDL2)
+#include "dlss_opaque_coverage.hpp"
+#endif
+#if defined(XYO_NVSDK_DLSS_VK) && defined(__linux__) && defined(XYO_HAVE_SDL2)
 #include "dlss_gl_pipeline.hpp"
+#include "dlss_jitter.hpp"
+#include "dlss_pen_replay.hpp"
 #endif
 
 struct SDL_Window;
@@ -27,6 +32,15 @@ struct SDL_Cursor;
 union SDL_Event;
 
 namespace xyo {
+
+#if defined(XYO_NVSDK_DLSS_VK) && defined(__linux__) && defined(XYO_HAVE_SDL2) && defined(XYO_PEN_GL)
+namespace render {
+class GlAsyncPpmCapture;
+struct GlAsyncPpmCaptureDeleter {
+    void operator()(GlAsyncPpmCapture* capture) const noexcept;
+};
+}
+#endif
 
 /// ピクセル矩形（SDL_Rect 相当。ヘッダで SDL 型を露出させないため独立型）
 struct IRect { int x = 0, y = 0, w = 0, h = 0; };
@@ -129,6 +143,10 @@ public:
     bool handleEvent(const SDL_Event& ev);
     /// 現在のレンダーターゲットを PPM として保存（検証用）。
     bool savePPM(const char* path);
+    /// Opt-in deferred GL PBO readback + background PPM writer.
+    bool savePPMAsync(const char* path);
+    /// Blocks until deferred GPU captures and disk writes are complete.
+    bool flushPPMAsync();
     void setTitle(const char* title);
     /// Begin/end one opt-in profile interval surrounding Runtime::step().
     void beginProfileFrame() {
@@ -186,6 +204,10 @@ private:
         std::vector<uint8_t> px;   // RGBA8（タッチ判定・スタンプ用に保持）
         // Computed once on decoded PNG/SVG, including disk-cache hits.
         bool hasIntrinsicTranslucency = false;
+        bool fullyOpaqueForRigidMotion = false; // opt-in, decoded once
+#if defined(XYO_NVSDK_DLSS_VK) && defined(__linux__) && defined(XYO_HAVE_SDL2)
+        std::unique_ptr<render::DlssOpaqueCoverage> dlssOpaqueCoverage;
+#endif
         int w = 0, h = 0;
         double scale = 1;          // テクスチャ px / 論理 px
         double rcx = 0, rcy = 0;   // 回転中心（論理 px）
@@ -388,6 +410,10 @@ private:
     SDL_Renderer* renderer_ = nullptr;
     bool embedded_ = false;   // initEmbedded: window_/renderer_ を所有しない
     std::function<void()> frameCapture_;
+#if defined(XYO_NVSDK_DLSS_VK) && defined(__linux__) && defined(XYO_HAVE_SDL2) && defined(XYO_PEN_GL)
+    std::unique_ptr<render::GlAsyncPpmCapture,
+                    render::GlAsyncPpmCaptureDeleter> asyncPpm_;
+#endif
     bool profileActive_ = false;
     mutable RenderFrameStats frameProfile_{};
     std::unordered_map<const Sprite*, SpriteProfileRow> spriteProfileTotals_;
@@ -406,7 +432,25 @@ private:
         return env && env[0] == '1';
     }();
     std::unique_ptr<render::DlssGlPipeline> glDlss_;
+    render::DlssRigidMotionTracker rigidMotionTracker_;
+    uint64_t dlssJitterFrame_ = 0;
+    uint64_t dlssInputCaptureFrame_ = 0;
+    int dlssJitterW_ = 0, dlssJitterH_ = 0;
+    render::DlssJitterSample previousDlssJitter_;
+    render::DlssJitterMotionGate dlssJitterMotionGate_;
+    // Scratch pen semantics remain in persistent penTex_/penPx_. This is
+    // separate, bounded, display-only geometry for jittered samples.
+    std::vector<render::DlssPenReplayStroke> dlssPenReplayStrokes_;
+    std::vector<uint8_t> dlssPenReplayPixels_;
+    SDL_Texture* dlssPenReplayTex_ = nullptr;
+    SDL_Texture* dlssPenReplayGpuTex_ = nullptr;
+    int dlssPenReplayGpuW_ = 0, dlssPenReplayGpuH_ = 0;
+    int dlssPenReplayW_ = 0, dlssPenReplayH_ = 0;
+    bool dlssPenReplayValid_ = false;
 #endif
+    // Nonzero only during opt-in real NGX input rasterization.
+    // SDL2 float draw calls shift the ACTUAL stage textures, not a post-blit.
+    float stageRasterJitterX_ = 0, stageRasterJitterY_ = 0;
     SDL_Texture* stageTarget_ = nullptr;
     int stageTargetW_ = 0, stageTargetH_ = 0;
 
@@ -471,6 +515,10 @@ private:
     bool initGlPen();
     bool penGpu() const;
     bool penStampGpu(const Drawable& drawable, const Skin& skin);
+#if defined(XYO_NVSDK_DLSS_VK) && defined(__linux__) && defined(XYO_HAVE_SDL2)
+    bool penReplayOnGpu(int outputW, int outputH, float jitterX,
+                        float jitterY);
+#endif
     void penFlushGpu();          // バッチを FBO へ描画（readback 無し）
     void penSyncCpu(bool forceReadback = false); // force is for GPU rollback tests
     void penStrokeGpu(const float rgba[4], float width,

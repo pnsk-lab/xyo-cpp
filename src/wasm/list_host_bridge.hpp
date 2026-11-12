@@ -265,6 +265,10 @@ struct NumericListTransaction {
         for (auto& s : stages) {
             if (!s.modified) continue;
             SList* list = s.owner->list;
+            // Raw contiguous item/len writes below bypass SList::write0.
+            // A commit is a single Scratch transaction, conservatively
+            // bracketed for the process-wide read-observation epoch.
+            ir::ScopedSourceListContentWrite write;
             if (!list->isContiguous()) {
                 if (s.materialized) {
                     list->clear();

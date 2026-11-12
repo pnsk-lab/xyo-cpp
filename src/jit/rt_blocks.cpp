@@ -37,6 +37,8 @@
 #include "../model/variable.hpp"
 #include "../rt/runtime_helpers.hpp"
 #include "../ir/host_effect_abi.hpp"
+#include "../ir/source_list_read_index_trace.hpp"
+#include "../ir/source_scalar_read_events.hpp"
 
 using namespace xyo;
 
@@ -116,8 +118,8 @@ void bubbleForSecs(JitCtx* c, const char* type, Value msg, double secs) {
     w.bubbleTarget = t;
     w.bubbleType = type;
     w.bubbleUsageId = t->bubbleUsageId;
-    rt->waitQueue.push_back(w);
-    c->thread->status = STATUS_PROMISE_WAIT;
+    rt->enqueueWait(w);
+    c->runtime->transitionThread(*c->thread, STATUS_PROMISE_WAIT);
     xyo_yield(c);
 }
 
@@ -128,16 +130,17 @@ void setMonitorVisible(JitCtx* c, const char* id, bool visible) {
     if (rec.id.empty()) rec.id = id;
     rec.visible = visible;
     rt->monitorState.dirty = true;
-    if (Block* b = rt->monitorBlocks->getBlock(id)) b->isMonitored = visible;
-    rt->monitorBlocks->resetCache();
+    Blocks::StructuralEdit edit(*rt->monitorBlocks);
+    if (Block* b = edit.getBlock(id)) b->isMonitored = visible;
 }
 
 void promiseNextTick(JitCtx* c) {
     Runtime::WaitEntry w;
     w.thread = c->thread;
     w.nextTick = true;
-    c->runtime->waitQueue.push_back(w);
-    c->thread->status = STATUS_PROMISE_WAIT;
+    w.deadlineMs = c->runtime->currentMSecs + 1.0;
+    c->runtime->enqueueWait(w);
+    c->runtime->transitionThread(*c->thread, STATUS_PROMISE_WAIT);
     xyo_yield(c);
 }
 
@@ -199,6 +202,15 @@ uint64_t xyo_strcontains(uint64_t a, uint64_t b) {
 
 // ============================================================= リスト ====
 
+// Single call target for optional LLVM-inlined list writes. The C++
+// SList primitives already report their own writes and do not call this.
+void xyo_ir001_list_content_write_begin() {
+    ir::beginSourceListContentWrite();
+}
+void xyo_ir001_list_content_write_end() {
+    ir::endSourceListContentWrite();
+}
+
 void xyo_list_add(JitCtx* c, Variable* v, uint64_t item) {
     XYO_RT_PROF(kList);
     if (SList* l = listOfVar(v)) {
@@ -225,6 +237,72 @@ void xyo_list_replace(JitCtx* c, Variable* v, uint64_t idx, uint64_t item) {
     XYO_RT_PROF(kList);
     if (SList* l = listOfVar(v)) rt::listReplace(l, toV(idx), toV(item));
 }
+// Sample before the real LLVM/helper list read, not inside the after-read
+// observer. A zero token is an in-flight/untracked mutation, never proof.
+uint64_t xyo_ir001_list_read_epoch() {
+    return ir::sourceListContentEpoch();
+}
+
+// Global ordering shared by scalar and list read observers. Exact native
+// evaluator call order, not a reconstructed Scratch opcode order.
+static uint64_t ir001NextReporterReadSequence(Thread& thread) {
+    auto& value = thread.nativeSourceReporterReadSequence;
+    if (!value || value == std::numeric_limits<uint64_t>::max())
+        return 0;
+    return value++;
+}
+
+// IR-001: retain the already evaluated native scalar reporter result.
+// Do NOT call xyo_var_get/emitVarGet or look at mutable Variable::value
+// again. An old value may differ from the one currently in the variable.
+void xyo_ir001_scalar_read_eval(JitCtx* c, uint64_t reporterPc,
+                                const char* variableId,
+                                uint64_t resultBits) {
+    if (!c || !c->thread || !c->target || !reporterPc ||
+        !variableId || !*variableId) return;
+    auto& events = c->thread->nativeSourceScalarReads;
+    if (!events) events = std::make_unique<ir::SourceScalarReadEvents>();
+    const auto* owner = c->target->lookupVariableById(variableId);
+    // Never certify a name-fallback/unknown owner as an exact scalar ID.
+    if (!owner || owner->type != Variable::kScalarType) {
+        events->overflow = true;
+        return;
+    }
+    const uint64_t sequence = ir001NextReporterReadSequence(*c->thread);
+    if (!sequence) { events->overflow = true; return; }
+    (void)events->record(reporterPc, std::string(variableId),
+                        Value{resultBits}, sequence);
+}
+
+// IR-001: a purely diagnostic observer run after the ACTUAL list read.
+ // It must not call listGet(), listIndex() or a Scratch reporter again:
+ // random/last indices, time and list mutation could then diverge.
+void xyo_ir001_list_read_eval(
+        JitCtx* c, uint64_t reporterPc, const char* listId,
+        uint64_t indexBits, uint64_t resultBits,
+        uint64_t beforeReadEpoch) {
+    if (!c || !c->thread || !c->target || !listId ||
+        !*listId || !reporterPc)
+        return;
+    auto& trace = c->thread->nativeSourceListReads;
+    if (!trace) trace = std::make_unique<ir::SourceListReadEvents>();
+    // Lookup by ID; no creating a missing list. A borrowed Variable* is
+    // NOT persisted in the event or detached snapshot.
+    Variable* variable = c->target->lookupVariableById(listId);
+    const bool typed = variable &&
+        variable->type == Variable::kListType &&
+        variable->list != nullptr;
+    const uint32_t length = typed ? variable->list->len : 0;
+    const uint64_t storageEpoch =
+        typed ? variable->list->storageEpoch : 0;
+    const uint64_t sequence = ir001NextReporterReadSequence(*c->thread);
+    if (!typed || !sequence) { trace->overflow = true; return; }
+    (void)trace->record(reporterPc, std::string(listId),
+                        Value{indexBits}, Value{resultBits},
+                        length, storageEpoch,
+                        std::optional<uint64_t>{beforeReadEpoch}, sequence);
+}
+
 uint64_t xyo_list_item(JitCtx* c, Variable* v, uint64_t idx) {
     XYO_RT_PROF(kList);
     if (SList* l = listOfVar(v)) return toB(rt::listGet(l, toV(idx)));
@@ -393,13 +471,28 @@ static void glideImpl(JitCtx* c, double secs, double endX, double endY) {
     timer.start();
     const double sx = t->x, sy = t->y;
     const double durMs = secs * 1000.0;
-    for (;;) {
-        double e = timer.timeElapsed();
-        if (e >= durMs) { t->setXY(endX, endY); break; }
-        double f = e / durMs;
-        t->setXY(sx + f * (endX - sx), sy + f * (endY - sy));
+    // A glide's starting frame records the destination and yields without
+    // moving. An independently scheduled thread in that same frame must
+    // still see the original coordinates.
+    if (!c->isWarp) {
         c->thread->status = STATUS_YIELD;
         xyo_yield(c);
+    }
+    for (;;) {
+        const double elapsed = timer.timeElapsed();
+        if (elapsed >= durMs) { t->setXY(endX, endY); break; }
+        const double fraction = elapsed / durMs;
+        t->setXY(sx + fraction * (endX - sx),
+                 sy + fraction * (endY - sy));
+        // Scratch's run-without-screen-refresh procedure keeps executing
+        // until the warp watchdog expires; a short glide is a busy wait.
+        // An unbounded (+Infinity) glide must remain interruptible so that
+        // another script can delete its clone; spinning without yielding
+        // would trap the VM even inside a Warp procedure.
+        if (!c->isWarp || !std::isfinite(secs) || isStuck(c)) {
+            c->thread->status = STATUS_YIELD;
+            xyo_yield(c);
+        }
     }
 }
 void xyo_mot_glidexy(JitCtx* c, uint64_t secs, uint64_t x, uint64_t y) {
@@ -646,6 +739,14 @@ uint64_t xyo_sns_dayssince2000(JitCtx*) {
     XYO_RT_PROF(kBlocks);
     return toB(V(rt::daysSince2000()));
 }
+// Exact synchronous wall-clock reporter. Returning f64 lets the LLVM
+// caller retain the numeric SSA fact instead of re-testing a boxed Value.
+// Scratch's millisecond precision and epoch conversion stay in the same
+// rt::daysSince2000 function used by the interpreter.
+double xyo_sns_dayssince2000_f64(JitCtx*) {
+    XYO_RT_PROF(kBlocks);
+    return rt::daysSince2000();
+}
 uint64_t xyo_sns_loudness(JitCtx* c) {
     XYO_RT_PROF(kBlocks);
     Runtime* rt = c->runtime;
@@ -689,7 +790,7 @@ void xyo_sns_askwait(JitCtx* c, uint64_t question) {
             rt->onQuestion(&e.question);
         }
     }
-    c->thread->status = STATUS_PROMISE_WAIT;
+    c->runtime->transitionThread(*c->thread, STATUS_PROMISE_WAIT);
     xyo_yield(c);
 }
 uint64_t xyo_sns_of(JitCtx* c, uint64_t obj, uint64_t prop) {
@@ -768,7 +869,7 @@ void xyo_ctl_deleteclone(JitCtx* c) {
     c->runtime->stopForTarget(t, nullptr);
     // このスレッドは削除済み — 二度と resume されないよう永久中断
     c->stopped = 1;
-    c->thread->status = STATUS_DONE;
+    c->runtime->transitionThread(*c->thread, STATUS_DONE);
     for (;;) xyo_yield(c);
 }
 
@@ -788,7 +889,7 @@ void xyo_snd_playwait(JitCtx* c, uint64_t menu) {
     if (!t->sprite || !t->sprite->soundBank) return;
     int idx = getSoundIndex(toV(menu), t);
     if (idx >= 0) {
-        c->thread->status = STATUS_PROMISE_WAIT;
+        c->runtime->transitionThread(*c->thread, STATUS_PROMISE_WAIT);
         startSoundPlayback(t, t->sprite->sounds[idx].soundId, c->thread);
         xyo_yield(c);
     }

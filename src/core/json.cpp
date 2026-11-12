@@ -1,5 +1,9 @@
 // xyo-cpp: JSON パーサ実装（再帰下降、UTF-8 入力）。
 #include "json.hpp"
+#ifdef XYO_HAVE_YYJSON
+#include <yyjson.h>
+#include <cstdlib>
+#endif
 
 #include <cctype>
 #include <charconv>
@@ -8,6 +12,86 @@
 namespace xyo {
 
 namespace {
+
+#ifdef XYO_HAVE_YYJSON
+JsonValue fromYyjson(const yyjson_val* value) {
+    if (yyjson_is_null(value)) return nullptr;
+    if (yyjson_is_bool(value)) return yyjson_get_bool(value);
+    if (yyjson_is_raw(value)) {
+        const char* begin = yyjson_get_raw(value);
+        const size_t length = yyjson_get_len(value);
+        double number = 0.0;
+        const auto parsed = std::from_chars(
+            begin, begin + length, number, std::chars_format::general);
+        if (parsed.ec == std::errc() && parsed.ptr == begin + length)
+            return number;
+        // Preserve overflow and underflow semantics of legacy strtod.
+        return std::strtod(std::string(begin, length).c_str(), nullptr);
+    }
+    if (yyjson_is_num(value)) return yyjson_get_num(value);
+    if (yyjson_is_str(value))
+        return std::string(yyjson_get_str(value), yyjson_get_len(value));
+    if (yyjson_is_arr(value)) {
+        JsonArray array;
+        array.reserve(yyjson_arr_size(value));
+        size_t index, count;
+        yyjson_val* child;
+        yyjson_arr_foreach(value, index, count, child)
+            array.push_back(fromYyjson(child));
+        return array;
+    }
+    if (yyjson_is_obj(value)) {
+        JsonObject object;
+        size_t index, count;
+        yyjson_val *key, *child;
+        yyjson_obj_foreach(value, index, count, key, child)
+            object.emplace(std::string(yyjson_get_str(key), yyjson_get_len(key)),
+                           fromYyjson(child));
+        return object;
+    }
+    return nullptr;
+}
+
+// yyjson interprets integer -0 as unsigned zero. Detect a bare -0 token
+// outside quoted strings to preserve Scratch's negative-zero semantics.
+// Ordinary projects use yyjson's faster native number conversion.
+bool hasNegativeIntegerZero(std::string_view text) {
+    auto isSpace = [](char c) {
+        return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+    };
+    bool inString = false;
+    for (size_t i = 0; i < text.size(); ++i) {
+        const char c = text[i];
+        if (inString) {
+            if (c == '\\') { ++i; continue; }
+            if (c == '"') inString = false;
+            continue;
+        }
+        if (c == '"') { inString = true; continue; }
+        if (c != '-' || i + 1 >= text.size() || text[i + 1] != '0')
+            continue;
+        const bool before = i == 0 || text[i - 1] == ':' ||
+            text[i - 1] == ',' || text[i - 1] == '[' ||
+            isSpace(text[i - 1]);
+        const bool after = i + 2 == text.size() ||
+            text[i + 2] == ',' || text[i + 2] == ']' ||
+            text[i + 2] == '}' || isSpace(text[i + 2]);
+        if (before && after) return true;
+    }
+    return false;
+}
+
+JsonValue parseYyjson(std::string_view text, bool& parsed) {
+    const auto flags = hasNegativeIntegerZero(text)
+        ? YYJSON_READ_NUMBER_AS_RAW : YYJSON_READ_NOFLAG;
+    yyjson_doc* doc = yyjson_read(text.data(), text.size(), flags);
+    if (!doc) { parsed = false; return nullptr; }
+    JsonValue value = fromYyjson(yyjson_doc_get_root(doc));
+    yyjson_doc_free(doc);
+    parsed = true;
+    return value;
+}
+#endif
 
 struct Parser {
     const char* p;
@@ -238,6 +322,15 @@ void stringifyInto(std::string& out, const JsonValue& v) {
 } // namespace
 
 JsonValue jsonParse(std::string_view text) {
+#ifdef XYO_HAVE_YYJSON
+    const char* useYyjson = std::getenv("XYO_JSON_YYJSON");
+    if (!useYyjson || useYyjson[0] != '0') {
+        bool parsed = false;
+        JsonValue value = parseYyjson(text, parsed);
+        if (parsed) return value;
+        // Existing parser decides malformed/extended legacy JSON compatibility.
+    }
+#endif
     Parser ps{text.data(), text.data() + text.size()};
     JsonValue v = ps.value();
     ps.ws();

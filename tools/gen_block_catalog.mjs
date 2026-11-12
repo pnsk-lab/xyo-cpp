@@ -588,6 +588,7 @@ function emit() {
     const EXT_COL = {
         pen:    ['0x0FBD8C', '0x0DA57A', '0x0B8E69'],
         music:  ['0xCF63CF', '0xC94FC9', '0xBD42BD'],
+        translate: ['0x5CB1D6', '0x47A8D1', '0x2E8EB8'],
     };
     const EXT_ITEMS = [
         { op: 'pen_clear', label: 'erase all', shape: 'Stack', cat: 'pen', args: [] },
@@ -618,6 +619,10 @@ function emit() {
         { op: 'music_changeTempo', label: 'change tempo by %1', shape: 'Stack', cat: 'music',
           args: [{ kind: 'Value', name: 'TEMPO', dflt: '', options: [], shadow: 'math_number', shadowField: 'NUM', shadowDefault: '20' }] },
         { op: 'music_getTempo', label: 'tempo', shape: 'Reporter', cat: 'music', args: [] },
+        { op: 'translate_getTranslate', label: 'translate %1 to %2', shape: 'Reporter', cat: 'translate',
+          args: [{ kind: 'Value', name: 'WORDS', dflt: '', options: [], shadow: 'text', shadowField: 'TEXT', shadowDefault: 'hello' },
+                 { kind: 'Value', name: 'LANGUAGE', dflt: '', options: [], shadow: 'text', shadowField: 'TEXT', shadowDefault: 'Japanese' }] },
+        { op: 'translate_getViewerLanguage', label: 'language', shape: 'Reporter', cat: 'translate', args: [] },
     ];
     for (const it of EXT_ITEMS) {
         const col = EXT_COL[it.cat];
@@ -645,6 +650,9 @@ function emit() {
     lines.push('    } },');
     lines.push('    { "music", "Music", 0xCF63CF, {');
     for (const it of EXT_ITEMS) if (it.cat === 'music') lines.push('        ' + cppStr(it.op) + ',');
+    lines.push('    } },');
+    lines.push('    { "translate", "Translate", 0x5CB1D6, {');
+    for (const it of EXT_ITEMS) if (it.cat === 'translate') lines.push('        ' + cppStr(it.op) + ',');
     lines.push('    } },');
     lines.push('};');
     lines.push('');

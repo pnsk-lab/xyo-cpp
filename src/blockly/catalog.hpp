@@ -760,6 +760,12 @@ inline const std::vector<BlockDef> kExtensionDefs = {
     } },
     { "music_getTempo", "tempo", Shape::Reporter, 0, 0xCF63CF, 0xC94FC9, 0xBD42BD, "", {
     } },
+    { "translate_getTranslate", "translate %1 to %2", Shape::Reporter, 0, 0x5CB1D6, 0x47A8D1, 0x2E8EB8, "", {
+        { ArgKind::Value, "WORDS", "", {}, "text", "TEXT", "hello" },
+        { ArgKind::Value, "LANGUAGE", "", {}, "text", "TEXT", "Japanese" },
+    } },
+    { "translate_getViewerLanguage", "language", Shape::Reporter, 0, 0x5CB1D6, 0x47A8D1, 0x2E8EB8, "", {
+    } },
 };
 
 inline const std::vector<CategoryDef> kExtensionCategories = {
@@ -781,6 +787,10 @@ inline const std::vector<CategoryDef> kExtensionCategories = {
         "music_setTempo",
         "music_changeTempo",
         "music_getTempo",
+    } },
+    { "translate", "Translate", 0x5CB1D6, {
+        "translate_getTranslate",
+        "translate_getViewerLanguage",
     } },
 };
 

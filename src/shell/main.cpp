@@ -52,6 +52,8 @@
 #include "analysis/type_flow.hpp"
 #include "analysis/procedure_effects.hpp"
 #include "engine/runtime.hpp"
+#include "engine/sequencer.hpp"
+#include "engine/translate_service.hpp"
 #include "engine/hot_start.hpp"
 #include "engine/opt_flags.hpp"
 #include "load/sb3.hpp"
@@ -449,6 +451,27 @@ static int runLoaded(Runtime& rt, const Sb3LoadResult* r, int maxFrames,
             }
         }
         if (!anyActive) { finished = true; break; }
+        // Local translation inference is I/O idle time, not a Scratch
+        // frame. Only wait when all live scripts are suspended.
+        if (fps <= 0 && rt.translationService &&
+            rt.translationService->hasPending()) {
+            bool allSuspended = true;
+            for (const Thread* thread : rt.threads) {
+                if (!thread->stack.empty() &&
+                    thread->status != STATUS_DONE &&
+                    thread->status != STATUS_PROMISE_WAIT) {
+                    allSuspended = false;
+                    break;
+                }
+            }
+            if (allSuspended) {
+                rt.translationService->waitForPending(
+                    std::chrono::milliseconds(5));
+                rt.step();  // resolve a finished request on the main thread
+                --step;     // do not consume the user-specified frame limit
+                continue;
+            }
+        }
         const auto t0 = std::chrono::steady_clock::now();
         rt.step();
         executedFrames = step + 1;
@@ -1162,6 +1185,29 @@ static int playLoaded(Runtime& rt, const std::string& title, int scale,
     if (const char* e = std::getenv("XYO_EXIT_FRAMES"))
         exitFrames = std::atoi(e);
     const char* shot = std::getenv("XYO_SHOT");
+    // Capture every Nth *presented* frame before SDL_RenderPresent, not the
+    // post-swap framebuffer (undefined on hidden/offscreen EGL surfaces).
+    // Filenames are PREFIX-000001.ppm, PREFIX-000002.ppm, ...
+    const char* shotSeries = std::getenv("XYO_SHOT_SERIES");
+    if (shotSeries && !*shotSeries) shotSeries = nullptr;
+    const bool shotAsync = shotSeries && [] {
+        const char* raw = std::getenv("XYO_SHOT_SERIES_ASYNC");
+        return raw && raw[0] == '1';
+    }();
+    long shotEvery = 1;
+    if (shotSeries) {
+        if (const char* raw = std::getenv("XYO_SHOT_EVERY")) {
+            char* end = nullptr;
+            const long value = std::strtol(raw, &end, 10);
+            if (end == raw || *end != '\0' || value < 1 ||
+                value > 1000000) {
+                std::fprintf(stderr,
+                    "XYO_SHOT_EVERY must be an integer in [1, 1000000]\n");
+                return 2;
+            }
+            shotEvery = value;
+        }
+    }
     // Opt-in benchmark automation: finish after a project's stop-all, not an
     // arbitrary frame cutoff which could interrupt a large warp batch.
     const bool exitOnStop = std::getenv("XYO_EXIT_ON_STOP") != nullptr;
@@ -1227,6 +1273,49 @@ static int playLoaded(Runtime& rt, const std::string& title, int scale,
 #endif
     };
 
+    // Save the final frame before buffer swap: readback after
+    // SDL_RenderPresent is undefined and varies with hidden windows.
+    long captureFrameIndex = -1;
+    long lastSeriesFrame = -1;
+    bool shotAttempted = false;
+    bool captureFailed = false;
+    if (shot || shotSeries) {
+        ren.setFrameCapture([&] {
+            if (shotSeries && captureFrameIndex >= 0 &&
+                captureFrameIndex != lastSeriesFrame &&
+                (captureFrameIndex + 1) % shotEvery == 0) {
+                lastSeriesFrame = captureFrameIndex;
+                char frameName[32];
+                std::snprintf(frameName, sizeof(frameName), "%06ld",
+                              captureFrameIndex + 1);
+                const std::string filename =
+                    std::string(shotSeries) + "-" + frameName + ".ppm";
+                const bool captured = shotAsync
+                    ? ren.savePPMAsync(filename.c_str())
+                    : ren.savePPM(filename.c_str());
+                if (!captured) {
+                    std::fprintf(stderr,
+                        shotAsync
+                            ? "XYO_SHOT_SERIES: cannot capture %s\n"
+                            : "XYO_SHOT_SERIES: cannot save %s\n",
+                        filename.c_str());
+                    captureFailed = true;
+                }
+            }
+            if (shot && !shotAttempted &&
+                ((exitOnStop && projectStopped) ||
+                 (exitOnDone && rt.threads.empty()) ||
+                 (exitFrames > 0 &&
+                  captureFrameIndex + 1 >= exitFrames))) {
+                shotAttempted = true;
+                if (!ren.savePPM(shot)) {
+                    std::fprintf(stderr, "XYO_SHOT: cannot save %s\n", shot);
+                    captureFailed = true;
+                }
+            }
+        });
+    }
+
     // フレーム駆動: 既定 ~30fps（JS: STEP_TIME≈33ms 周期）。
     // --fps N で step 間隔を変更（TurboWarp のカスタム fps 相当 —
     // 非 warp ループは step 毎に進むため、fps を上げると実行も速くなる）。
@@ -1234,6 +1323,7 @@ static int playLoaded(Runtime& rt, const std::string& title, int scale,
     const auto kFrame = std::chrono::microseconds(
         fps > 0 ? 1000000 / fps : 33333);
     for (long frame = 0; ; ++frame) {
+        captureFrameIndex = frame;
         auto t0 = clock::now();
         while (injectIdx < inject.size() && inject[injectIdx].frame <= frame) {
             const InjectEvent& event = inject[injectIdx++];
@@ -1306,7 +1396,13 @@ static int playLoaded(Runtime& rt, const std::string& title, int scale,
         if ((exitOnStop && projectStopped) ||
             (exitOnDone && rt.threads.empty()) ||
             (exitFrames > 0 && frame + 1 >= exitFrames)) {
-            if (shot) ren.savePPM(shot);
+            // A screenshot after SDL_RenderPresent would read undefined
+            // back-buffer contents. Report a missing frame instead.
+            if (shot && !shotAttempted) {
+                std::fprintf(stderr,
+                    "XYO_SHOT: no draw before final frame presentation\n");
+                captureFailed = true;
+            }
             break;
         }
         if (!rt.turboMode && fps > 0) {
@@ -1351,9 +1447,25 @@ done:
         }
         std::fprintf(stderr, "PLAYPROFILE finished\n");
     }
+    if (shotAsync && !ren.flushPPMAsync()) {
+        std::fprintf(stderr,
+            "XYO_SHOT_SERIES: asynchronous GPU readback or write failed\n");
+        captureFailed = true;
+    }
     if (exitOnStop) rt.onProjectStopped = std::move(previousStopped);
+    if (const char* enabled = std::getenv("XYO_WAIT_READY_STATS");
+        enabled && enabled[0] == '1' && rt.sequencer) {
+        const auto& stats = rt.sequencer->waitReadyStats();
+        std::fprintf(stderr,
+            "[wait-ready-play] deferred=%llu sparse_passes=%llu "
+            "waiter_visits=%llu full_rechecks=%llu\n",
+            static_cast<unsigned long long>(stats.deferredSlots),
+            static_cast<unsigned long long>(stats.sparsePasses),
+            static_cast<unsigned long long>(stats.scannedWaiters),
+            static_cast<unsigned long long>(stats.frameRechecks));
+    }
     dumpVarsIfRequested(rt);
-    return 0;
+    return captureFailed ? 2 : 0;
 }
 
 /// GUI からも呼ぶ再生経路（aotObjPath は事前コンパイル済み
