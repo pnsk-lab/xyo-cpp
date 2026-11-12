@@ -1,0 +1,8 @@
+{
+  "builtAt": "2026-11-09T12:07:03.410Z",
+  "sourceSha256": "60c650f515a1a8860ab1ba5c9220e8f73e3c32460ea42377c42860192d285298",
+  "binarySha256": "a2e4826d06998cb8cfa0cb3ba70ca2544e0149e20a13e964b714502988582d3d",
+  "buildDir": "board/.osr016-ci-gui-sim",
+  "target": "xyo-cli",
+  "attempts": 1
+}

@@ -1,0 +1,468 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 動的リンクの Linux ジョブは apt.llvm.org の最新版で検証する（llvm_compat が
+  # LLVM 18〜23 の API 差を吸収する）。静的リンクは Ubuntu 同梱の 18 を使う —
+  # 静的アーカイブを同梱しているのは Ubuntu の llvm-18-dev だけのため。
+  LLVM_LATEST: "23"
+  LLVM_STATIC: "18"
+
+jobs:
+  macos:
+    name: macOS / ${{ matrix.arch }} / LLVM JIT + SDL2
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: brew install llvm ninja sdl2 pkgconf
+
+      - name: Configure
+        run: |
+          LLVM_CONFIG="$(brew --prefix llvm)/bin/llvm-config"
+          cmake -S . -B build-macos -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DXYO_LLVM_MODE=llvm-config -DLLVM_CONFIG="$LLVM_CONFIG" \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix)" \
+            -DXYO_JIT=ON -DXYO_SDL2=ON -DXYO_REQUIRE_SDL2=ON \
+            -DXYO_RSVG=OFF -DXYO_FULL_BUILD=ON \
+            -DXYO_BINARYEN_C_API=OFF
+
+      - name: Build (limit parallelism on M1 runner)
+        run: cmake --build build-macos --parallel 2
+
+      - name: Unit and interpreter/JIT parity
+        run: |
+          ctest --test-dir build-macos --output-on-failure \
+            -R '^(xyo-fiber-smoke|xyo-tests|xyo-interpreter-parity-regressions|xyo-jit-lazy-integration)$'
+
+      - name: Smoke (JIT / AOT / SDL)
+        run: |
+          bash tools/ci/smoke.sh run build-macos/xyo
+          bash tools/ci/smoke.sh play build-macos/xyo
+          bash tools/ci/smoke.sh gui build-macos/xyo
+          bash tools/ci/gui_flags_smoke.sh build-macos/xyo
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: xyo-macos-${{ matrix.arch }}
+          path: build-macos/xyo
+          if-no-files-found: error
+
+  linux:
+    name: Linux / JIT + SDL2 + Vulkan + librsvg
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/linux-deps
+        with:
+          llvm: ${{ env.LLVM_LATEST }}
+          llvm_apt: "true"
+          extra: libsdl2-dev librsvg2-dev libgl-dev glslc
+
+      - name: Configure
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DLLVM_CONFIG="/usr/lib/llvm-${LLVM_LATEST}/bin/llvm-config" \
+            -DXYO_SDL2=ON -DXYO_REQUIRE_SDL2=ON -DXYO_FULL_BUILD=ON
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      # Long-running nested warp/OSR and native deopt use a separate Linux job.
+      # Keep this job below its 45-minute timeout without dropping coverage.
+      - name: Test (ctest; native continuation suite runs separately)
+        run: ctest --test-dir build --output-on-failure -E '^(xyo-nested-warp-|xyo-native-simple-deopt-parity$)'
+
+      - name: Smoke（run / AOT / play）
+        run: |
+          bash tools/ci/smoke.sh run build/xyo
+          bash tools/ci/smoke.sh play build/xyo
+          bash tools/ci/smoke.sh gui build/xyo
+          bash tools/ci/gui_flags_smoke.sh build/xyo
+
+      - name: フルビルド成果物（Linux）
+        uses: actions/upload-artifact@v5
+        with:
+          name: xyo-linux-full
+          path: build/xyo
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: 失敗時のテストログ
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: linux-test-log
+          path: build/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+
+  # The regular Linux CTest already takes ~31 minutes at 112 tests.
+  # Avoid a 45-minute timeout as nested warp/OSR and native deopt grow;
+  # run these long-running tests in a dedicated LLVM JIT + SDL2 job.
+  linux-nested-osr:
+    name: Linux / LLVM native continuation + nested warp regressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/linux-deps
+        with:
+          llvm: ${{ env.LLVM_LATEST }}
+          llvm_apt: "true"
+          extra: libsdl2-dev libgl-dev glslc
+
+      # A clean checkout must contain all 38 CTest fixtures and 9 native
+      # harness sources, not just their CMake registration.
+      - name: Self-test native continuation checkout audit
+        run: python3 tools/ci/test_native_continuation_checkout.py -v
+
+      - name: Verify committed native continuation sources
+        run: python3 tools/ci/native_continuation_checkout.py
+
+      - name: Configure (LLVM JIT + SDL2)
+        run: |
+          cmake -B build-osr -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_CONFIG="/usr/lib/llvm-${LLVM_LATEST}/bin/llvm-config" \
+            -DXYO_JIT=ON -DXYO_JIT_BACKEND=llvm \
+            -DXYO_SDL2=ON -DXYO_REQUIRE_SDL2=ON \
+            -DXYO_BUILD_SHELL=ON -DXYO_BUILD_TESTS=ON
+
+      - name: Build OSR harnesses and CLI only
+        # The OSR-specific job does not need unrelated unit-test executables.
+        run: |
+          cmake --build build-osr --parallel 2 --target \
+            xyo-cli \
+            xyo-nested-warp-silent-edit-smoke \
+            xyo-nested-warp-inflight-deopt-smoke \
+            xyo-nested-warp-inflight-body-edit-smoke \
+            xyo-nested-warp-bounded-inner-deopt-smoke \
+            xyo-nested-warp-inner-yield-deopt-smoke \
+            xyo-nested-warp-dynamic-inner-deopt-smoke \
+            xyo-nested-warp-triple-yield-deopt-smoke \
+            xyo-nested-warp-quad-yield-deopt-smoke \
+            xyo-nested-warp-topology-failclosed-smoke
+
+      - name: Verify native continuation CTest coverage
+        run: |
+          ctest --test-dir build-osr -N -R '^(xyo-nested-warp-|xyo-native-simple-deopt-parity$)' > nested-osr-tests.txt
+          cat nested-osr-tests.txt
+          count=$(sed -n 's/^Total Tests: //p' nested-osr-tests.txt)
+          test -n "$count" && test "$count" -ge 38
+          # Guard both native root deopt and the four OSR-016 registrations.
+          for name in xyo-native-simple-deopt-parity xyo-nested-warp-fractional-boundary xyo-nested-warp-fractional-boundary-fast xyo-nested-warp-fractional-boundary-late xyo-nested-warp-fractional-boundary-late-fast; do
+            grep -Eq "Test +#[0-9]+: ${name}$" nested-osr-tests.txt
+          done
+          # CTest may list a test even when its Python fixture or native
+          # executable is absent. Fail before running the expensive suite.
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import re
+          import subprocess
+          import sys
+
+          suite = re.compile(r"^(xyo-nested-warp-|xyo-native-simple-deopt-parity$)")
+          tests = json.loads(subprocess.check_output([
+              "ctest", "--test-dir", "build-osr", "--show-only=json-v1"
+          ], text=True))["tests"]
+          selected = [test for test in tests if suite.search(test["name"])]
+          missing = []
+          for test in selected:
+              for index, argument in enumerate(test.get("command", [])):
+                  path = pathlib.Path(argument)
+                  required = (
+                      index == 0
+                      or argument.endswith(".py")
+                      or (path.name == "xyo" and path.is_absolute())
+                      or (path.name.startswith("xyo-nested-warp-")
+                          and path.name.endswith("-smoke"))
+                  )
+                  if required and path.is_absolute() and not path.is_file():
+                      missing.append((test["name"], argument))
+          if missing:
+              for test_name, filename in missing:
+                  print(f"Missing dependency for {test_name}: {filename}", file=sys.stderr)
+              sys.exit(1)
+          print(f"Verified {len(selected)} native continuation tests and their executables/scripts")
+          PY
+
+      - name: Native continuation and nested warp regressions (ctest)
+        run: ctest --test-dir build-osr --output-on-failure --parallel 2 -R '^(xyo-nested-warp-|xyo-native-simple-deopt-parity$)'
+
+      - name: OSR test log on failure
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: linux-native-continuation-test-log
+          path: build-osr/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+
+  # 動的依存ゼロのバイナリ（LLVM 18 の静的アーカイブ + 静的 libstdc++）。
+  linux-static:
+    name: Linux / 完全静的（headless・依存ゼロ）
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/linux-deps
+        with:
+          llvm: ${{ env.LLVM_STATIC }}
+          extra: libzstd-dev libxml2-dev libncurses-dev
+
+      - name: Configure（-static / 静的 LLVM / SDL2 なし）
+        run: |
+          cmake -B build-static -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DXYO_LLVM_MODE=llvm-config \
+            -DLLVM_CONFIG="/usr/lib/llvm-${LLVM_STATIC}/bin/llvm-config" \
+            -DXYO_STATIC=ON -DXYO_STATIC_LLVM=ON \
+            -DXYO_SDL2=OFF -DXYO_BUILD_TESTS=OFF
+
+      - name: Build
+        run: cmake --build build-static -j"$(nproc)"
+
+      - name: 動的依存が無いことを確認
+        run: |
+          readelf -d build-static/xyo | grep NEEDED || echo "NEEDED なし = 完全静的"
+          test "$(readelf -d build-static/xyo | grep -c NEEDED)" = "0"
+          file build-static/xyo
+
+      - name: Smoke（run / AOT）
+        run: bash tools/ci/smoke.sh run build-static/xyo
+
+  # librsvg を持たないビルド = Windows と同じ SVG バックエンド（nanosvg）。
+  # Windows では実行しにくいので、レンダラ回帰を Linux で常時検証する。
+  linux-nanosvg:
+    name: Linux / nanosvg フォールバック（SDL2）
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/linux-deps
+        with:
+          llvm: ${{ env.LLVM_STATIC }}
+          extra: libgl-dev libsdl2-dev
+
+      - name: Configure（-DXYO_RSVG=OFF）
+        run: |
+          cmake -B build-norsvg -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DXYO_LLVM_MODE=llvm-config \
+            -DLLVM_CONFIG="/usr/lib/llvm-${LLVM_STATIC}/bin/llvm-config" \
+            -DXYO_RSVG=OFF -DXYO_REQUIRE_SDL2=ON
+
+      - name: Build（レンダラ回帰テスト）
+        run: cmake --build build-norsvg --target xyo-render-tests -j"$(nproc)"
+
+      # ctest 経由で回す（テスト側の ENVIRONMENT = SDL dummy + XYO_JIT_MODE=eager
+      # を効かせるため。直接実行すると HotSpot のままで isCompiled 検査が落ちる）。
+      - name: レンダラ回帰（SDL dummy / nanosvg）
+        run: ctest --test-dir build-norsvg -R xyo-render-tests --output-on-failure
+
+  # Windows の JIT は MSYS2 の mingw-w64 LLVM（静的アーカイブ同梱）で検証する。
+  windows-jit:
+    name: Windows / JIT + SDL2（MSYS2 mingw）
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-llvm
+            mingw-w64-x86_64-zlib
+            mingw-w64-x86_64-zstd
+            mingw-w64-x86_64-ncurses
+            mingw-w64-x86_64-libxml2
+            mingw-w64-x86_64-SDL2
+
+      - name: ツールチェーンの確認
+        run: |
+          llvm-config --version
+          ls /mingw64/lib/libLLVM*.a | head -3
+
+      - name: Build（JIT + SDL2、動的リンク）
+        run: |
+          cmake -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DXYO_JIT=ON -DXYO_LLVM_MODE=config \
+            -DXYO_SDL2=ON -DXYO_REQUIRE_SDL2=ON -DXYO_FULL_BUILD=ON \
+            -DXYO_BUILD_TESTS=OFF
+          cmake --build build-win -j"$(nproc)"
+          ls -l build-win/xyo.exe
+
+      - name: Smoke（run / AOT / play）
+        run: |
+          bash tools/ci/smoke.sh run build-win/xyo.exe --jit-log
+          bash tools/ci/smoke.sh play build-win/xyo.exe
+          bash tools/ci/smoke.sh gui build-win/xyo.exe
+
+      - name: Build（JIT + SDL2、完全静的）
+        run: |
+          cmake -B build-win-static -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DXYO_JIT=ON -DXYO_LLVM_MODE=llvm-config \
+            -DXYO_STATIC=ON -DXYO_STATIC_LLVM=ON \
+            -DXYO_SDL2=ON -DXYO_REQUIRE_SDL2=ON -DXYO_FULL_BUILD=ON \
+            -DXYO_BUILD_TESTS=OFF
+          cmake --build build-win-static -j"$(nproc)"
+          ls -l build-win-static/xyo.exe
+          echo "--- 依存 DLL ---"
+          objdump -p build-win-static/xyo.exe | grep -i "DLL Name" || true
+          if objdump -p build-win-static/xyo.exe | grep -qi "DLL Name: SDL2.dll"; then
+            echo "SDL2.dll に依存しています（静的リンクになっていない）"
+            exit 1
+          fi
+
+      - name: Smoke（完全静的 — run / play）
+        run: |
+          bash tools/ci/smoke.sh run build-win-static/xyo.exe
+          bash tools/ci/smoke.sh play build-win-static/xyo.exe
+          bash tools/ci/smoke.sh gui build-win-static/xyo.exe
+
+      - name: フルビルド成果物（Windows / SDL2 静的リンク）
+        uses: actions/upload-artifact@v5
+        with:
+          name: xyo-windows-full
+          path: build-win-static/xyo.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  # scratch-bench は xyo-cpp のリリースをダウンロードしてはならない。
+  # 同じ CI 実行でビルドした xyo を XYO_BIN で直接渡し、PR の実装を測る。
+  scratch-bench:
+    name: ScratchBench / performance + parity
+    needs: linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      XYO_BIN: ${{ github.workspace }}/.bench/bin/xyo
+      XYO_VIDEODRIVER: offscreen
+      SDL_AUDIODRIVER: dummy
+      LIBGL_ALWAYS_SOFTWARE: "1"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: xyo-linux-full
+          path: .bench/bin
+
+      - name: Install runtime dependencies (LLVM + renderer)
+        uses: ./.github/actions/linux-deps
+        with:
+          llvm: ${{ env.LLVM_LATEST }}
+          llvm_apt: "true"
+          extra: libsdl2-2.0-0 librsvg2-2 libgl1 xvfb fonts-liberation
+
+      - name: Check built xyo
+        run: |
+          chmod +x "$XYO_BIN"
+          ldd "$XYO_BIN"
+          if ldd "$XYO_BIN" | grep -q "not found"; then
+            echo "Missing xyo runtime library" >&2
+            exit 1
+          fi
+
+      # ベンチの内容が黙って変わると CI の比較が崩れるので、上流を固定する。
+      # 更新時は source hash と parity の合格率を確認してから ref を変更する。
+      - uses: actions/checkout@v5
+        with:
+          repository: gradylink/scratch-bench
+          ref: cca6ab15108301bee6b7249db60f00e82f141159
+          path: scratch-bench
+          submodules: true
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.4"
+
+      - name: Install scratch-bench
+        working-directory: scratch-bench
+        run: |
+          test -d parity/project
+          bun install --frozen-lockfile
+
+      - name: Performance (xyo-cpp, all variants)
+        working-directory: scratch-bench
+        run: |
+          set -o pipefail
+          bun run bench --runtime xyo-cpp --suite performance \
+            --runs 3 --timeout 180 --out results/ci-performance \
+            2>&1 | tee ../.bench/performance.log
+
+      # scratch-bench の AOT variant はコンパイル失敗時に JIT へフォールバックする。
+      # 成果物を検査し、AOT 未実行を AOT の計測結果として扱わない。
+      - name: Verify performance AOT object
+        run: |
+          find scratch-bench/.cache/runtimes/xyo-aot -maxdepth 1 -type f \
+            -name 'performance.sb3.*.o' -size +0c -print -quit | grep -q .
+      # 外部ランタイム側の問題で終了マーカーが出ない場合もある。
+      # xyo-cpp の CI 結果に影響させず、比較用ログだけ収集する。
+      - name: TurboWarp reference (best effort)
+        continue-on-error: true
+        working-directory: scratch-bench
+        run: |
+          set -o pipefail
+          bun run bench --runtime turbowarp --suite performance \
+            --runs 3 --timeout 180 --out results/ci-turbowarp \
+            2>&1 | tee ../.bench/turbowarp.log
+      - name: Parity (xyo-cpp, all variants)
+        working-directory: scratch-bench
+        run: |
+          set -o pipefail
+          bun run bench --runtime xyo-cpp --suite parity \
+            --parity-runs 1 --timeout 180 --out results/ci-parity \
+            2>&1 | tee ../.bench/parity.log
+
+      - name: Validate results and publish summary
+        if: always()
+        run: bun tools/ci/scratch-bench-summary.ts
+
+      - name: ScratchBench results and logs
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: scratch-bench-results
+          path: |
+            scratch-bench/results/ci-performance/
+            scratch-bench/results/ci-parity/
+            scratch-bench/results/ci-turbowarp/
+            .bench/performance.log
+            .bench/turbowarp.log
+            .bench/parity.log
+          if-no-files-found: warn
+          retention-days: 14

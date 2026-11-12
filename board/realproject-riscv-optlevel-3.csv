@@ -1,0 +1,2 @@
+frame,elapsed_s,frame_interval_ms,step_ms,vm_ms,draw_ms,sprite_ms,backdrop_ms,pen_ms,monitor_ms,ui_ms,present_ms,costume_decode_ms,effect_build_ms,collision_ms,sprite_copies,backdrop_copies,costume_decodes,effect_builds,effect_hits,texture_uploads,collision_calls,threads,rss_kib,gpu_effect_passes,gpu_effect_ms
+0,0.000000,0.0000,156.0253,60.9957,95.0297,0.7317,59.1234,0.0004,22.3532,0.1455,12.6191,61.1965,0.0000,0.0000,1,1,6,0,0,4,0,3,345584,0,0.0000

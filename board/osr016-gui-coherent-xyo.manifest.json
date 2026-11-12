@@ -1,0 +1,8 @@
+{
+  "builtAt": "2026-11-09T10:20:12.475Z",
+  "sourceSha256": "a43f6bea0c6d7053bc017ca939157e1d2b375c77fe01e19cd00195b9e2e34705",
+  "binarySha256": "96077672acff2c76523b716ff320187ba5df2c2247561b8ff2a0ea55f0ceed8f",
+  "buildDir": "board/.osr016-gui",
+  "target": "xyo-cli",
+  "attempts": 2
+}

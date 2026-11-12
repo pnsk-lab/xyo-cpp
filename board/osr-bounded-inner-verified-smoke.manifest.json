@@ -1,0 +1,8 @@
+{
+  "builtAt": "2026-11-09T03:47:55.452Z",
+  "sourceSha256": "d573dd514e38afd7d803119fba80bb4172d8f8b44c7ff9242ed535fda0d5eb84",
+  "binarySha256": "0f99672afb371f9010b89416ef25c705a9dc5401eea0cceabc29b1d599266d51",
+  "buildDir": "board/.osr-silent-edit-headless",
+  "target": "xyo-nested-warp-bounded-inner-deopt-smoke",
+  "attempts": 1
+}

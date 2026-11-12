@@ -1,0 +1,19 @@
+{
+  "purpose": "OSR-014 native 4-depth counted-repeat source deoptimization frozen headless test artifact",
+  "binary": "board/osr-quad-yield-verified-smoke",
+  "binary_sha256": "8d887cb4c0a79fdf768aefd2c4928da996f9b61368f84872718e7606fa223d65",
+  "source_digest_sha256": "64218ba9d2e762001f513c76d402db248d4e80ff949d4eb84c9a0f43bc3a83a1",
+  "files": [
+    "src/engine/sequencer.cpp",
+    "src/jit/backend_llvm.cpp",
+    "src/jit/codegen.cpp",
+    "src/jit/jit.hpp",
+    "src/jit/rt.cpp",
+    "tests/CMakeLists.txt",
+    "tests/platform/nested_warp_quad_yield_deopt_smoke.cpp",
+    "tests/differential/jit_nested_warp_quad_yield_deopt.py"
+  ],
+  "runtime": "SDL2 OFF, LLVM23, source runtime JIT",
+  "renderer_compilation_workaround": "Only local Ninja build.ninja forced include of src/render/dlss_opaque_coverage.hpp; no renderer source changes",
+  "date": "2026-11-09"
+}

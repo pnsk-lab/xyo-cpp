@@ -1,0 +1,8 @@
+{
+  "builtAt": "2026-11-09T09:35:06.042Z",
+  "sourceSha256": "c61963b51e43e4dac9b763b743acbdb82e0e588f1127961f2197403603449287",
+  "binarySha256": "707baaa7e5c629db14e1be92b36365fada38b7b745de475f7931cf5cc31e769d",
+  "buildDir": "board/.osr016-current-headless",
+  "target": "xyo-nested-warp-triple-yield-deopt-smoke",
+  "attempts": 1
+}

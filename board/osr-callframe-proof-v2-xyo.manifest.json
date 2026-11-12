@@ -1,0 +1,8 @@
+{
+  "builtAt": "2026-11-08T23:01:28.863Z",
+  "sourceSha256": "3d3cb940635a6d1caf1dc7c3ba064eb368a167e02dbe482792776ca98f136e4d",
+  "binarySha256": "cdabde4b691fe6d52df8bd6f6c2e2510934f7827f730cdecd47f347957ccc965",
+  "buildDir": "board/.osr-isolation",
+  "target": "xyo-cli",
+  "attempts": 1
+}

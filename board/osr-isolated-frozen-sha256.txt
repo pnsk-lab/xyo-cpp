@@ -1,0 +1,1 @@
+a3c5535cf92cb8ff3efea25b557f39e213a745d09650ade7288e36167efd124f  board/osr-isolated-frozen-xyo

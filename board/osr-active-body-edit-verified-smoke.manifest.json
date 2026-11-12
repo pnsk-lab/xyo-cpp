@@ -1,0 +1,8 @@
+{
+  "builtAt": "2026-11-09T02:31:10.815Z",
+  "sourceSha256": "4c0cd37577da6d8442c64d791557dcf68d40860d28bb8113bcdbad02cf48f291",
+  "binarySha256": "08af32d5ec1181613c42772c641772065354878f2162ad2bebc458cc905e1bb9",
+  "buildDir": "board/.osr-silent-edit-headless",
+  "target": "xyo-nested-warp-inflight-body-edit-smoke",
+  "attempts": 1
+}

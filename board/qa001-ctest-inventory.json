@@ -1,0 +1,4793 @@
+{
+  "backtraceGraph" : 
+  {
+    "commands" : 
+    [
+      "add_test",
+      "include"
+    ],
+    "files" : 
+    [
+      "/home/kicky/dev/cpp/xyo-cpp/tests/CMakeLists.txt",
+      "/home/kicky/dev/cpp/xyo-cpp/tests/differential/osr016_fractional_boundary_tests.cmake",
+      "/home/kicky/dev/cpp/xyo-cpp/tests/ui/CMakeLists.txt"
+    ],
+    "nodes" : 
+    [
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 32,
+        "parent" : 0
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 50,
+        "parent" : 2
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 72,
+        "parent" : 4
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 88,
+        "parent" : 6
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 93,
+        "parent" : 8
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 94,
+        "parent" : 10
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 97,
+        "parent" : 12
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 100,
+        "parent" : 14
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 103,
+        "parent" : 16
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 109,
+        "parent" : 18
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 112,
+        "parent" : 20
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 121,
+        "parent" : 22
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 124,
+        "parent" : 24
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 133,
+        "parent" : 26
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 140,
+        "parent" : 28
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 152,
+        "parent" : 30
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 165,
+        "parent" : 32
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 216,
+        "parent" : 34
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 223,
+        "parent" : 36
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 230,
+        "parent" : 38
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 239,
+        "parent" : 40
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 247,
+        "parent" : 42
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 254,
+        "parent" : 44
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 262,
+        "parent" : 46
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 269,
+        "parent" : 48
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 277,
+        "parent" : 50
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 284,
+        "parent" : 52
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 296,
+        "parent" : 54
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 305,
+        "parent" : 56
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 315,
+        "parent" : 58
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 322,
+        "parent" : 60
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 330,
+        "parent" : 62
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 338,
+        "parent" : 64
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 1,
+        "file" : 0,
+        "line" : 348,
+        "parent" : 66
+      },
+      {
+        "file" : 1,
+        "parent" : 67
+      },
+      {
+        "command" : 0,
+        "file" : 1,
+        "line" : 14,
+        "parent" : 68
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 1,
+        "file" : 0,
+        "line" : 348,
+        "parent" : 70
+      },
+      {
+        "file" : 1,
+        "parent" : 71
+      },
+      {
+        "command" : 0,
+        "file" : 1,
+        "line" : 19,
+        "parent" : 72
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 1,
+        "file" : 0,
+        "line" : 348,
+        "parent" : 74
+      },
+      {
+        "file" : 1,
+        "parent" : 75
+      },
+      {
+        "command" : 0,
+        "file" : 1,
+        "line" : 25,
+        "parent" : 76
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 1,
+        "file" : 0,
+        "line" : 348,
+        "parent" : 78
+      },
+      {
+        "file" : 1,
+        "parent" : 79
+      },
+      {
+        "command" : 0,
+        "file" : 1,
+        "line" : 30,
+        "parent" : 80
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 349,
+        "parent" : 82
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 357,
+        "parent" : 84
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 366,
+        "parent" : 86
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 375,
+        "parent" : 88
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 384,
+        "parent" : 90
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 392,
+        "parent" : 92
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 419,
+        "parent" : 94
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 419,
+        "parent" : 96
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 419,
+        "parent" : 98
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 419,
+        "parent" : 100
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 419,
+        "parent" : 102
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 433,
+        "parent" : 104
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 443,
+        "parent" : 106
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 450,
+        "parent" : 108
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 459,
+        "parent" : 110
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 466,
+        "parent" : 112
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 473,
+        "parent" : 114
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 480,
+        "parent" : 116
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 500,
+        "parent" : 118
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 502,
+        "parent" : 120
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 513,
+        "parent" : 122
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 531,
+        "parent" : 124
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 539,
+        "parent" : 126
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 557,
+        "parent" : 128
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 571,
+        "parent" : 130
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 584,
+        "parent" : 132
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 584,
+        "parent" : 134
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 584,
+        "parent" : 136
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 584,
+        "parent" : 138
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 595,
+        "parent" : 140
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 595,
+        "parent" : 142
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 605,
+        "parent" : 144
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 605,
+        "parent" : 146
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 605,
+        "parent" : 148
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 623,
+        "parent" : 150
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 636,
+        "parent" : 152
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 643,
+        "parent" : 154
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 654,
+        "parent" : 156
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 666,
+        "parent" : 158
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 672,
+        "parent" : 160
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 680,
+        "parent" : 162
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 688,
+        "parent" : 164
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 696,
+        "parent" : 166
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 704,
+        "parent" : 168
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 713,
+        "parent" : 170
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 720,
+        "parent" : 172
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 727,
+        "parent" : 174
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 734,
+        "parent" : 176
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 743,
+        "parent" : 178
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 752,
+        "parent" : 180
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 760,
+        "parent" : 182
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 768,
+        "parent" : 184
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 783,
+        "parent" : 186
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 793,
+        "parent" : 188
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 801,
+        "parent" : 190
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 811,
+        "parent" : 192
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 820,
+        "parent" : 194
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 830,
+        "parent" : 196
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 839,
+        "parent" : 198
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 847,
+        "parent" : 200
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 856,
+        "parent" : 202
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 863,
+        "parent" : 204
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 871,
+        "parent" : 206
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 879,
+        "parent" : 208
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 887,
+        "parent" : 210
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 897,
+        "parent" : 212
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 904,
+        "parent" : 214
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 912,
+        "parent" : 216
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 919,
+        "parent" : 218
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 927,
+        "parent" : 220
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 934,
+        "parent" : 222
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 941,
+        "parent" : 224
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 948,
+        "parent" : 226
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 955,
+        "parent" : 228
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 962,
+        "parent" : 230
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 969,
+        "parent" : 232
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 976,
+        "parent" : 234
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 984,
+        "parent" : 236
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 992,
+        "parent" : 238
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1001,
+        "parent" : 240
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1009,
+        "parent" : 242
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1015,
+        "parent" : 244
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1024,
+        "parent" : 246
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1033,
+        "parent" : 248
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1042,
+        "parent" : 250
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1055,
+        "parent" : 252
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1061,
+        "parent" : 254
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1068,
+        "parent" : 256
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1074,
+        "parent" : 258
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1082,
+        "parent" : 260
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1094,
+        "parent" : 262
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1392,
+        "parent" : 264
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1415,
+        "parent" : 266
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1437,
+        "parent" : 268
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1440,
+        "parent" : 270
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1443,
+        "parent" : 272
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1446,
+        "parent" : 274
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1449,
+        "parent" : 276
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1457,
+        "parent" : 278
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1473,
+        "parent" : 280
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1482,
+        "parent" : 282
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1490,
+        "parent" : 284
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1501,
+        "parent" : 286
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1508,
+        "parent" : 288
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1513,
+        "parent" : 290
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1535,
+        "parent" : 292
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1543,
+        "parent" : 294
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1558,
+        "parent" : 296
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1570,
+        "parent" : 298
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1584,
+        "parent" : 300
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1599,
+        "parent" : 302
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1607,
+        "parent" : 304
+      },
+      {
+        "file" : 0
+      },
+      {
+        "command" : 0,
+        "file" : 0,
+        "line" : 1616,
+        "parent" : 306
+      },
+      {
+        "file" : 2
+      },
+      {
+        "command" : 0,
+        "file" : 2,
+        "line" : 8,
+        "parent" : 308
+      },
+      {
+        "file" : 2
+      },
+      {
+        "command" : 0,
+        "file" : 2,
+        "line" : 14,
+        "parent" : 310
+      },
+      {
+        "file" : 2
+      },
+      {
+        "command" : 0,
+        "file" : 2,
+        "line" : 28,
+        "parent" : 312
+      }
+    ]
+  },
+  "kind" : "ctestInfo",
+  "tests" : 
+  [
+    {
+      "backtrace" : 1,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/num_to_str_dragonbox_node.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-v8-dragonbox-node-data",
+        "/home/kicky/.local/share/mise/installs/node/latest/bin/node",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/num_to_str_dragonbox_node.mjs"
+      ],
+      "name" : "xyo-v8-dragonbox-parity",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 120.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 3,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-v8-direct-sstr-parity"
+      ],
+      "name" : "xyo-v8-direct-sstr-parity",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 120.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 5,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-fiber-smoke"
+      ],
+      "name" : "xyo-fiber-smoke",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 7,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-scratch-variable-slots-smoke"
+      ],
+      "name" : "xyo-scratch-variable-slots-smoke",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 9,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-scratch-ir-smoke"
+      ],
+      "name" : "xyo-scratch-ir-smoke",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 11,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-scratch-ir-smoke",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/fixtures/basic.sb3"
+      ],
+      "name" : "xyo-scratch-ir-basic-sb3",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 13,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-scratch-ir-smoke",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/fixtures/calculator_tests.sb3"
+      ],
+      "name" : "xyo-scratch-ir-calculator-sb3",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 15,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-scratch-ir-smoke",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/fixtures/calculator_graph_tests.sb3"
+      ],
+      "name" : "xyo-scratch-ir-graph-sb3",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 17,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-scratch-ir-smoke",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/fixtures/parfor_fill.sb3"
+      ],
+      "name" : "xyo-scratch-ir-parfor-sb3",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 19,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-numeric-list-abi-smoke"
+      ],
+      "name" : "xyo-numeric-list-abi-smoke",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 21,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/wasm_host_list_bridge.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-numeric-list-abi-smoke",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/wasm-list-abi"
+      ],
+      "name" : "xyo-wasm-host-list-abi",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 23,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-wasm-string-bridge-smoke"
+      ],
+      "name" : "xyo-wasm-string-bridge-smoke",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 25,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/wasm_host_string_bridge.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-wasm-string-bridge-smoke",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/wasm-string-abi"
+      ],
+      "name" : "xyo-wasm-host-string-abi",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 27,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-numeric-ir-smoke"
+      ],
+      "name" : "xyo-numeric-ir-smoke",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 29,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-call-frame-abi-smoke"
+      ],
+      "name" : "xyo-call-frame-abi-smoke",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 31,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-native-callframe-revision-smoke"
+      ],
+      "name" : "xyo-native-callframe-revision-smoke",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 33,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-interpreter-osr-snapshot-smoke"
+      ],
+      "name" : "xyo-interpreter-osr-snapshot-smoke",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 35,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_silent_edit.py",
+        "--harness",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-nested-warp-silent-edit-smoke",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-silent-edit"
+      ],
+      "name" : "xyo-nested-warp-silent-edit",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 37,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_inflight_deopt.py",
+        "--harness",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-nested-warp-inflight-deopt-smoke",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-inflight-deopt"
+      ],
+      "name" : "xyo-nested-warp-inflight-deopt",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 39,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_inflight_body_edit.py",
+        "--harness",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-nested-warp-inflight-body-edit-smoke",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-inflight-body-edit"
+      ],
+      "name" : "xyo-nested-warp-inflight-body-edit",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 41,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_inflight_body_edit.py",
+        "--harness",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-nested-warp-inflight-body-edit-smoke",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-inflight-body-edit-fast",
+        "--without-block-count"
+      ],
+      "name" : "xyo-nested-warp-inflight-body-edit-fast",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 43,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_bounded_inner_deopt.py",
+        "--harness",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-nested-warp-bounded-inner-deopt-smoke",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-bounded-inner-deopt"
+      ],
+      "name" : "xyo-nested-warp-bounded-inner-deopt",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 45,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_bounded_inner_deopt.py",
+        "--harness",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-nested-warp-bounded-inner-deopt-smoke",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-bounded-inner-deopt-fast",
+        "--without-block-count"
+      ],
+      "name" : "xyo-nested-warp-bounded-inner-deopt-fast",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 47,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_inner_yield_deopt.py",
+        "--harness",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-nested-warp-inner-yield-deopt-smoke",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-inner-yield-deopt"
+      ],
+      "name" : "xyo-nested-warp-inner-yield-deopt",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 49,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_inner_yield_deopt.py",
+        "--harness",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-nested-warp-inner-yield-deopt-smoke",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-inner-yield-deopt-fast",
+        "--without-block-count"
+      ],
+      "name" : "xyo-nested-warp-inner-yield-deopt-fast",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 51,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_dynamic_inner_deopt.py",
+        "--harness",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-nested-warp-dynamic-inner-deopt-smoke",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-dynamic-inner-deopt"
+      ],
+      "name" : "xyo-nested-warp-dynamic-inner-deopt",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 53,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_dynamic_inner_deopt.py",
+        "--harness",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-nested-warp-dynamic-inner-deopt-smoke",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-dynamic-inner-deopt-fast",
+        "--without-block-count"
+      ],
+      "name" : "xyo-nested-warp-dynamic-inner-deopt-fast",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 55,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_dynamic_inner_deopt.py",
+        "--harness",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-nested-warp-dynamic-inner-deopt-smoke",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-dynamic-inner-active",
+        "--outer-count",
+        "150000",
+        "--stress-active-times"
+      ],
+      "name" : "xyo-nested-warp-dynamic-inner-active",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 57,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_dynamic_inner_deopt.py",
+        "--harness",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-nested-warp-dynamic-inner-deopt-smoke",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-dynamic-inner-active-fast",
+        "--outer-count",
+        "150000",
+        "--stress-active-times",
+        "--without-block-count"
+      ],
+      "name" : "xyo-nested-warp-dynamic-inner-active-fast",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 59,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_triple_yield_deopt.py",
+        "--harness",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-nested-warp-triple-yield-deopt-smoke",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-triple-yield-deopt"
+      ],
+      "name" : "xyo-nested-warp-triple-yield-deopt",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 61,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_triple_yield_deopt.py",
+        "--harness",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-nested-warp-triple-yield-deopt-smoke",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-triple-yield-deopt-fast",
+        "--without-block-count"
+      ],
+      "name" : "xyo-nested-warp-triple-yield-deopt-fast",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 63,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_triple_yield_deopt.py",
+        "--harness",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-nested-warp-triple-yield-deopt-smoke",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-triple-yield-fractional",
+        "--fractional"
+      ],
+      "name" : "xyo-nested-warp-triple-yield-fractional",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 65,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_triple_yield_deopt.py",
+        "--harness",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-nested-warp-triple-yield-deopt-smoke",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-triple-yield-fractional-fast",
+        "--fractional",
+        "--without-block-count"
+      ],
+      "name" : "xyo-nested-warp-triple-yield-fractional-fast",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 69,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_fractional_boundary.py",
+        "--harness",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-nested-warp-triple-yield-deopt-smoke",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-fractional-boundary",
+        "--all-cases"
+      ],
+      "name" : "xyo-nested-warp-fractional-boundary",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 73,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_fractional_boundary.py",
+        "--harness",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-nested-warp-triple-yield-deopt-smoke",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-fractional-boundary-fast",
+        "--all-cases",
+        "--without-block-count"
+      ],
+      "name" : "xyo-nested-warp-fractional-boundary-fast",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 77,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_fractional_boundary.py",
+        "--harness",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-nested-warp-triple-yield-deopt-smoke",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-fractional-boundary-late",
+        "--case",
+        "both-tie",
+        "--late"
+      ],
+      "name" : "xyo-nested-warp-fractional-boundary-late",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 81,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_fractional_boundary.py",
+        "--harness",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-nested-warp-triple-yield-deopt-smoke",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-fractional-boundary-late-fast",
+        "--case",
+        "both-tie",
+        "--late",
+        "--without-block-count"
+      ],
+      "name" : "xyo-nested-warp-fractional-boundary-late-fast",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 83,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_quad_yield_deopt.py",
+        "--harness",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-nested-warp-quad-yield-deopt-smoke",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-quad-yield-deopt",
+        "--outer-count",
+        "100000"
+      ],
+      "name" : "xyo-nested-warp-quad-yield-deopt",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 85,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_quad_yield_deopt.py",
+        "--harness",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-nested-warp-quad-yield-deopt-smoke",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-quad-yield-deopt-fast",
+        "--outer-count",
+        "100000",
+        "--without-block-count"
+      ],
+      "name" : "xyo-nested-warp-quad-yield-deopt-fast",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 87,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_quad_yield_deopt.py",
+        "--harness",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-nested-warp-quad-yield-deopt-smoke",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-quad-yield-fractional",
+        "--outer-count",
+        "100000",
+        "--fractional"
+      ],
+      "name" : "xyo-nested-warp-quad-yield-fractional",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 89,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_quad_yield_deopt.py",
+        "--harness",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-nested-warp-quad-yield-deopt-smoke",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-quad-yield-fractional-fast",
+        "--outer-count",
+        "100000",
+        "--fractional",
+        "--without-block-count"
+      ],
+      "name" : "xyo-nested-warp-quad-yield-fractional-fast",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 91,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_topology_failclosed.py",
+        "--harness",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-nested-warp-topology-failclosed-smoke",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-topology-failclosed",
+        "--outer-count",
+        "100000"
+      ],
+      "name" : "xyo-nested-warp-topology-failclosed",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 93,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_topology_failclosed.py",
+        "--harness",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-nested-warp-topology-failclosed-smoke",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-topology-failclosed-fast",
+        "--outer-count",
+        "100000",
+        "--without-block-count"
+      ],
+      "name" : "xyo-nested-warp-topology-failclosed-fast",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 95,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-host-effect-abi-smoke"
+      ],
+      "name" : "xyo-host-effect-abi-smoke",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 97,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-gc-value-handles-smoke"
+      ],
+      "name" : "xyo-gc-value-handles-smoke",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 99,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-rooted-call-stack-smoke"
+      ],
+      "name" : "xyo-rooted-call-stack-smoke",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 101,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-commit-once-effects-smoke"
+      ],
+      "name" : "xyo-commit-once-effects-smoke",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 103,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-effect-callstack-transaction-smoke"
+      ],
+      "name" : "xyo-effect-callstack-transaction-smoke",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 105,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-runtime-observable-journal-smoke"
+      ],
+      "name" : "xyo-runtime-observable-journal-smoke",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 107,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-runtime-broadcast-journal-smoke"
+      ],
+      "name" : "xyo-runtime-broadcast-journal-smoke",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 109,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/runtime_broadcast_journal.py",
+        "--native",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/runtime-broadcast-journal"
+      ],
+      "name" : "xyo-runtime-broadcast-journal-parity",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 120.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 111,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/runtime_broadcast_wait_journal.py",
+        "--native",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/runtime-broadcast-journal"
+      ],
+      "name" : "xyo-runtime-broadcast-wait-journal-parity",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 120.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 113,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/runtime_looks_journal.py",
+        "--native",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/runtime-looks-journal"
+      ],
+      "name" : "xyo-runtime-looks-journal-parity",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 120.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 115,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/runtime_pen_journal.py",
+        "--native",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/runtime-pen-journal"
+      ],
+      "name" : "xyo-runtime-pen-journal-parity",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 120.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 117,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/runtime_clone_journal.py",
+        "--native",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/runtime-clone-journal"
+      ],
+      "name" : "xyo-runtime-clone-journal-parity",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 120.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 119,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-numeric-sequencer-smoke"
+      ],
+      "name" : "xyo-numeric-sequencer-smoke",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 121,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-numeric-sequencer-smoke",
+        "--auto"
+      ],
+      "name" : "xyo-numeric-sequencer-auto",
+      "properties" : 
+      [
+        {
+          "name" : "ENVIRONMENT",
+          "value" : 
+          [
+            "XYO_JIT_COMMON_CFG=1"
+          ]
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 123,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/ir_cfg_backends.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-ir-cfg-smoke",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/ir-cfg"
+      ],
+      "name" : "xyo-ir-cfg-backends",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 125,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/string_storage_modes.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-string-storage-cli-parity",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 127,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/native_simple_resume.py",
+        "--native",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/native-simple-resume"
+      ],
+      "name" : "xyo-native-simple-deopt-parity",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 129,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/string_leaf_modes.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-string-leaf-cli-parity",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 131,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/string_short_intern.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-string-short-intern-sb3-parity",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 133,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-string-short-intern-smoke",
+        "off",
+        "utf16"
+      ],
+      "name" : "xyo-string-short-intern-off-utf16",
+      "properties" : 
+      [
+        {
+          "name" : "ENVIRONMENT",
+          "value" : 
+          [
+            "XYO_STRING_SHORT_INTERN=off"
+          ]
+        },
+        {
+          "name" : "TIMEOUT",
+          "value" : 60.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 135,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-string-short-intern-smoke",
+        "off",
+        "latin1"
+      ],
+      "name" : "xyo-string-short-intern-off-latin1",
+      "properties" : 
+      [
+        {
+          "name" : "ENVIRONMENT",
+          "value" : 
+          [
+            "XYO_STRING_SHORT_INTERN=off"
+          ]
+        },
+        {
+          "name" : "TIMEOUT",
+          "value" : 60.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 137,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-string-short-intern-smoke",
+        "on",
+        "utf16"
+      ],
+      "name" : "xyo-string-short-intern-on-utf16",
+      "properties" : 
+      [
+        {
+          "name" : "ENVIRONMENT",
+          "value" : 
+          [
+            "XYO_STRING_SHORT_INTERN=on"
+          ]
+        },
+        {
+          "name" : "TIMEOUT",
+          "value" : 60.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 139,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-string-short-intern-smoke",
+        "on",
+        "latin1"
+      ],
+      "name" : "xyo-string-short-intern-on-latin1",
+      "properties" : 
+      [
+        {
+          "name" : "ENVIRONMENT",
+          "value" : 
+          [
+            "XYO_STRING_SHORT_INTERN=on"
+          ]
+        },
+        {
+          "name" : "TIMEOUT",
+          "value" : 60.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 141,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-string-leaf-smoke",
+        "utf16"
+      ],
+      "name" : "xyo-string-leaf-utf16",
+      "properties" : 
+      [
+        {
+          "name" : "ENVIRONMENT",
+          "value" : 
+          [
+            "XYO_STRING_LEAF=utf16"
+          ]
+        },
+        {
+          "name" : "TIMEOUT",
+          "value" : 60.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 143,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-string-leaf-smoke",
+        "latin1"
+      ],
+      "name" : "xyo-string-leaf-latin1",
+      "properties" : 
+      [
+        {
+          "name" : "ENVIRONMENT",
+          "value" : 
+          [
+            "XYO_STRING_LEAF=latin1"
+          ]
+        },
+        {
+          "name" : "TIMEOUT",
+          "value" : 60.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 145,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-string-storage-smoke",
+        "rope"
+      ],
+      "name" : "xyo-string-storage-rope",
+      "properties" : 
+      [
+        {
+          "name" : "ENVIRONMENT",
+          "value" : 
+          [
+            "XYO_STRING_STORAGE=rope"
+          ]
+        },
+        {
+          "name" : "TIMEOUT",
+          "value" : 60.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 147,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-string-storage-smoke",
+        "flat"
+      ],
+      "name" : "xyo-string-storage-flat",
+      "properties" : 
+      [
+        {
+          "name" : "ENVIRONMENT",
+          "value" : 
+          [
+            "XYO_STRING_STORAGE=flat"
+          ]
+        },
+        {
+          "name" : "TIMEOUT",
+          "value" : 60.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 149,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-string-storage-smoke",
+        "append-log"
+      ],
+      "name" : "xyo-string-storage-append-log",
+      "properties" : 
+      [
+        {
+          "name" : "ENVIRONMENT",
+          "value" : 
+          [
+            "XYO_STRING_STORAGE=append-log"
+          ]
+        },
+        {
+          "name" : "TIMEOUT",
+          "value" : 60.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 151,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-tests"
+      ],
+      "name" : "xyo-tests",
+      "properties" : 
+      [
+        {
+          "name" : "ENVIRONMENT",
+          "value" : 
+          [
+            "XYO_JIT_MODE=eager"
+          ]
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 153,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/hot_start.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-hot-start",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 155,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/gui_scratch_parity_regression.py",
+        "--native",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-gui-scratch-parity",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 400.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 157,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/gui_scratch_parity_regression.py",
+        "--native",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "--project",
+        "/home/kicky/dev/cpp/xyo-cpp/scratch-bench/.cache/build/parity.sb3",
+        "--minimum",
+        "2656",
+        "--modes",
+        "off",
+        "hotspot",
+        "eager"
+      ],
+      "name" : "xyo-gui-scratch-parity-full",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 400.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 159,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/gui_async_jit_warmup_smoke.py",
+        "--native",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/gui-async-warmup"
+      ],
+      "name" : "xyo-gui-async-jit-warmup",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 150.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 161,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/gui_async_prefetch_smoke.py",
+        "--native",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/gui-async-prefetch"
+      ],
+      "name" : "xyo-gui-async-jit-prefetch",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 150.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 163,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/interpreter_osr_snapshot.py",
+        "--native",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/interpreter-osr-snapshot"
+      ],
+      "name" : "xyo-interpreter-osr-live-warp-snapshot",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 45.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 165,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_args_refusal.py",
+        "--native",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-args-osr-refusal"
+      ],
+      "name" : "xyo-nested-warp-args-osr-refusal",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 167,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_args_preserved.py",
+        "--native",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-args-preserved-osr"
+      ],
+      "name" : "xyo-nested-warp-args-preserved-osr",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 240.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 169,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_direct_args.py",
+        "--native",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-direct-arguments-osr"
+      ],
+      "name" : "xyo-nested-warp-direct-arguments-osr",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 360.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 171,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_deep_osr.py",
+        "--native",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-deep-osr"
+      ],
+      "name" : "xyo-nested-warp-deep-osr",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 540.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 173,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_stack_osr.py",
+        "--native",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-stack-osr"
+      ],
+      "name" : "xyo-nested-warp-stack-osr",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 175,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_branch_osr.py",
+        "--native",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-branch-osr"
+      ],
+      "name" : "xyo-nested-warp-branch-osr",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 177,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_parent_repeat_osr.py",
+        "--native",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-parent-repeat-osr"
+      ],
+      "name" : "xyo-nested-warp-parent-repeat-osr",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 179,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_source_proof.py",
+        "--native",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-source-proof"
+      ],
+      "name" : "xyo-nested-warp-source-proof",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 600.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 181,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_argreads.py",
+        "--native",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-argument-reads"
+      ],
+      "name" : "xyo-nested-warp-argument-reads",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 240.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 183,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_argroots_gc.py",
+        "--native",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-argument-gc"
+      ],
+      "name" : "xyo-nested-warp-argument-gc",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 240.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 185,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_nested_warp_argtimes.py",
+        "--native",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/nested-warp-argument-times"
+      ],
+      "name" : "xyo-nested-warp-argument-times",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 240.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 187,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-interpreter-parity-regressions"
+      ],
+      "name" : "xyo-interpreter-parity-regressions",
+      "properties" : 
+      [
+        {
+          "name" : "ENVIRONMENT",
+          "value" : 
+          [
+            "XYO_JIT_MODE=off"
+          ]
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 189,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_lazy_integration.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-jit-lazy-integration",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 191,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_induction_ranges.py",
+        "--binary",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/jit-induction-range-fixtures",
+        "--quick"
+      ],
+      "name" : "xyo-jit-induction-ranges",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 193,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_induction_ranges.py",
+        "--binary",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/jit-foreach-i32-fixtures",
+        "--foreach-i32",
+        "--quick"
+      ],
+      "name" : "xyo-jit-foreach-i32",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 195,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_repeat_integer_counter.py",
+        "--binary",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/jit-repeat-i32-fixtures"
+      ],
+      "name" : "xyo-jit-repeat-i32",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 197,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/bench/algos/bench_transient_extended.py",
+        "--binary",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/jit-transient-fixtures",
+        "--n",
+        "257"
+      ],
+      "name" : "xyo-jit-transient-strings",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 199,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/epoch_guard.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-jit-epoch-guard",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 201,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/event_scheduler.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-event-driven-scheduler",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 203,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/string_unicode_fast.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-string-unicode-fast",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 205,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/plain_numeric_cmp.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-jit-plain-list-compare",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 120.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 207,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/plain_numeric_sort_algos.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-jit-plain-list-sort",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 209,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_ascii_fastpaths.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-jit-ascii-fastpaths",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 211,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_warp_induction.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-jit-warp-induction",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 213,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_repeat_ssa.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-jit-repeat-ssa",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 215,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_lazy_typed_ssa.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-jit-lazy-typed-ssa",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 217,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_type_flow_safety.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-jit-type-flow-safety",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 219,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_cfg_type_hints.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-jit-cfg-type-hints",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 221,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_type_flow_fuzz.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-jit-type-flow-fuzz",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 223,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_if_phi.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-jit-if-phi",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 225,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_local_read_forward.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-jit-local-read-forward",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 227,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_duplicate_scalar_numeric.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-jit-duplicate-scalar-numeric",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 229,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_to_num_fastpath.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-jit-to-num-fastpath",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 231,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_to_num_radix.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-jit-to-num-radix",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 233,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_conditional_repeat_ssa.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-jit-conditional-repeat-ssa",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 235,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_conditional_i32_selection.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-jit-conditional-i32-selection",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 237,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_empty_inline_scheduler.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-jit-inline-empty-scheduler",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 239,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_async_compile.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-jit-async-compile",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 241,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_osr.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-jit-osr",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 243,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_ssa_scheduler.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-jit-ssa-scheduler",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 245,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_foreach_ssa.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-jit-foreach-ssa",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 247,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_repeat_copy_ssa.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-jit-repeat-copy-ssa",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 249,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_eq_numeric_cache.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-jit-eq-numeric-cache",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 251,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/jit_numeric_string_pair_cmp.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo"
+      ],
+      "name" : "xyo-jit-string-pair-compare",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 480.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 253,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-dlss-pen-replay-unit"
+      ],
+      "name" : "xyo-dlss-pen-replay-unit",
+      "properties" : 
+      [
+        {
+          "name" : "LABELS",
+          "value" : 
+          [
+            "dlss",
+            "pen",
+            "render",
+            "subpixel"
+          ]
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 255,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-dlss-jitter-unit"
+      ],
+      "name" : "xyo-dlss-jitter-unit",
+      "properties" : 
+      [
+        {
+          "name" : "LABELS",
+          "value" : 
+          [
+            "dlss",
+            "jitter",
+            "render"
+          ]
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 257,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-dlss-opaque-coverage-unit"
+      ],
+      "name" : "xyo-dlss-opaque-coverage-unit",
+      "properties" : 
+      [
+        {
+          "name" : "LABELS",
+          "value" : 
+          [
+            "alpha",
+            "coverage",
+            "dlss",
+            "render"
+          ]
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 259,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-dlss-rigid-motion-unit"
+      ],
+      "name" : "xyo-dlss-rigid-motion-unit",
+      "properties" : 
+      [
+        {
+          "name" : "LABELS",
+          "value" : 
+          [
+            "dlss",
+            "render",
+            "rigid-motion"
+          ]
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 261,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-dlss-alpha-coverage-unit"
+      ],
+      "name" : "xyo-dlss-alpha-coverage-unit",
+      "properties" : 
+      [
+        {
+          "name" : "LABELS",
+          "value" : 
+          [
+            "alpha",
+            "dlss",
+            "render"
+          ]
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 263,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-render-tests"
+      ],
+      "name" : "xyo-render-tests",
+      "properties" : 
+      [
+        {
+          "name" : "ENVIRONMENT",
+          "value" : 
+          [
+            "SDL_VIDEODRIVER=dummy",
+            "SDL_AUDIODRIVER=dummy",
+            "XYO_JIT_MODE=eager"
+          ]
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 265,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-gpu-tests"
+      ],
+      "name" : "xyo-gpu-tests",
+      "properties" : 
+      [
+        {
+          "name" : "ENVIRONMENT",
+          "value" : 
+          [
+            "SDL_VIDEODRIVER=dummy",
+            "SDL_AUDIODRIVER=dummy",
+            "XYO_JIT_MODE=eager"
+          ]
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 267,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/wasm_binaryen_backend.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+      ],
+      "name" : "xyo-wasm-binaryen-backend",
+      "properties" : 
+      [
+        {
+          "name" : "ENVIRONMENT",
+          "value" : 
+          [
+            "XYO_WASM_OPT=/usr/bin/wasm-opt",
+            "XYO_TEST_BINARYEN_NATIVE=1"
+          ]
+        },
+        {
+          "name" : "TIMEOUT",
+          "value" : 120.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 269,
+      "command" : 
+      [
+        "/usr/bin/cmake",
+        "-E",
+        "env",
+        "XYO_LIST_STORAGE=flat",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-list-backend-smoke"
+      ],
+      "name" : "xyo-list-backend-flat",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 271,
+      "command" : 
+      [
+        "/usr/bin/cmake",
+        "-E",
+        "env",
+        "XYO_LIST_STORAGE=deque",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-list-backend-smoke"
+      ],
+      "name" : "xyo-list-backend-deque",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 273,
+      "command" : 
+      [
+        "/usr/bin/cmake",
+        "-E",
+        "env",
+        "XYO_LIST_STORAGE=gap",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-list-backend-smoke"
+      ],
+      "name" : "xyo-list-backend-gap",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 275,
+      "command" : 
+      [
+        "/usr/bin/cmake",
+        "-E",
+        "env",
+        "XYO_LIST_STORAGE=chunked",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-list-backend-smoke"
+      ],
+      "name" : "xyo-list-backend-chunked",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 277,
+      "command" : 
+      [
+        "/usr/bin/cmake",
+        "-E",
+        "env",
+        "XYO_LIST_STORAGE=adaptive",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-list-backend-smoke"
+      ],
+      "name" : "xyo-list-backend-adaptive",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 279,
+      "command" : 
+      [
+        "/usr/bin/cmake",
+        "-E",
+        "env",
+        "XYO_LIST_STORAGE=adaptive",
+        "XYO_JIT_MODE=eager",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-list-epoch-smoke"
+      ],
+      "name" : "xyo-list-epoch-jit",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 281,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-blocks-cache-retirement-smoke"
+      ],
+      "name" : "xyo-blocks-cache-retirement-smoke",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 283,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-ir001-typed-ssa-manifest-smoke"
+      ],
+      "name" : "xyo-ir001-typed-ssa-manifest-smoke",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 285,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-ir001-effect-frontier-smoke"
+      ],
+      "name" : "xyo-ir001-effect-frontier-smoke",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 287,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-ir001-effect-journal-bridge-smoke"
+      ],
+      "name" : "xyo-ir001-effect-journal-bridge-smoke",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 289,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/ir001_effect_source_trace.py",
+        "--native",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/ir001-live-effects"
+      ],
+      "name" : "xyo-ir001-live-effect-source-broadcast",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 291,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/ir001_pen_effect_source_trace.py",
+        "--native",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/ir001-live-effects"
+      ],
+      "name" : "xyo-ir001-live-effect-source-pen",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 293,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-ir001-postopt-write-audit-smoke"
+      ],
+      "name" : "xyo-ir001-postopt-write-audit-smoke",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 295,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/ir001_postopt_write_audit.py",
+        "--native",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "--out",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/ir001-postopt-write-audit"
+      ],
+      "name" : "xyo-ir001-postopt-write-audit-parity",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 180.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 297,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-ir001-effect-dispatch-smoke"
+      ],
+      "name" : "xyo-ir001-effect-dispatch-smoke",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 299,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-rt001-generated-ssa-roots-smoke"
+      ],
+      "name" : "xyo-rt001-generated-ssa-roots-smoke",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 301,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-rt001-generated-producer-smoke"
+      ],
+      "name" : "xyo-rt001-generated-producer-smoke",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 303,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-rt001-native-gc-deferral-smoke"
+      ],
+      "name" : "xyo-rt001-native-gc-deferral-smoke",
+      "properties" : 
+      [
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 305,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/xyo-music-synth-smoke"
+      ],
+      "name" : "xyo-music-synth-smoke",
+      "properties" : 
+      [
+        {
+          "name" : "ENVIRONMENT",
+          "value" : 
+          [
+            "SDL_AUDIODRIVER=dummy",
+            "XYO_MUSIC_SOUNDFONT=/home/kicky/dev/cpp/xyo-cpp/assets/soundfonts/xyo-basic.sf2"
+          ]
+        },
+        {
+          "name" : "TIMEOUT",
+          "value" : 30.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 307,
+      "command" : 
+      [
+        "/usr/bin/python3.14",
+        "/home/kicky/dev/cpp/xyo-cpp/tests/differential/music_extension.py",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/music-extension"
+      ],
+      "name" : "xyo-music-extension",
+      "properties" : 
+      [
+        {
+          "name" : "TIMEOUT",
+          "value" : 120.0
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests"
+        }
+      ]
+    },
+    {
+      "backtrace" : 309,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/ui/xyo-native-ui-tests"
+      ],
+      "name" : "native-ui",
+      "properties" : 
+      [
+        {
+          "name" : "ENVIRONMENT",
+          "value" : 
+          [
+            "SDL_VIDEODRIVER=dummy",
+            "SDL_AUDIODRIVER=dummy"
+          ]
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/ui"
+        }
+      ]
+    },
+    {
+      "backtrace" : 311,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/xyo",
+        "edit",
+        "/home/kicky/dev/cpp/xyo-cpp/examples/play_demo.sb3"
+      ],
+      "name" : "native-editor-operations",
+      "properties" : 
+      [
+        {
+          "name" : "ENVIRONMENT",
+          "value" : 
+          [
+            "SDL_VIDEODRIVER=dummy",
+            "SDL_AUDIODRIVER=dummy",
+            "XYO_EDIT_TEST=1"
+          ]
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/ui"
+        }
+      ]
+    },
+    {
+      "backtrace" : 313,
+      "command" : 
+      [
+        "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/ui/xyo-native-font-tests"
+      ],
+      "name" : "native-font",
+      "properties" : 
+      [
+        {
+          "name" : "ENVIRONMENT",
+          "value" : 
+          [
+            "SDL_VIDEODRIVER=dummy",
+            "SDL_AUDIODRIVER=dummy"
+          ]
+        },
+        {
+          "name" : "WORKING_DIRECTORY",
+          "value" : "/home/kicky/dev/cpp/xyo-cpp/board/.osr016-ci-gui-sim/tests/ui"
+        }
+      ]
+    }
+  ],
+  "version" : 
+  {
+    "major" : 1,
+    "minor" : 0
+  }
+}

@@ -1,0 +1,2 @@
+f8310dfdadad47ee37811f1e5e100335ed0d03d7899ad1b93dc2aef2c1505e95  board/.osr-tests-config/xyo
+f8310dfdadad47ee37811f1e5e100335ed0d03d7899ad1b93dc2aef2c1505e95  board/osr-argreads-direct-frozen-xyo

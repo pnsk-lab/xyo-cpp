@@ -1,0 +1,41 @@
+sprite,draw_ms,copies
+"StartButton",22.3270,32
+"TowerIcon",5.5673,374
+"LoadButton",0.7985,78
+"SelectMap",0.3411,304
+"replay pointer",0.3346,110
+"PATH",0.2392,0
+"EnemyLogic",0.2221,110
+"GameManager",0.1664,110
+"AmmoLogic",0.1651,110
+"MouseManager",0.1584,110
+"Music",0.0678,0
+"WaveCome",0.0649,32
+"WaterCollision",0.0603,32
+"WaveCreator",0.0595,0
+"TowerData",0.0566,0
+"justPath",0.0435,32
+"pre-round comment",0.0410,32
+"SoundTurn",0.0404,32
+"SAVEButton",0.0398,32
+"GroundCollision",0.0393,32
+"MusicTurn",0.0364,32
+"Text",0.0351,0
+"EndGameScreen2",0.0192,0
+"Main",0.0188,0
+"SaveData",0.0181,0
+"TowerLogic",0.0181,0
+"  Upgrades",0.0167,0
+"thumb",0.0156,0
+"PlaceTower",0.0142,0
+"EndGameScreen",0.0134,0
+"UpSpr",0.0124,0
+"Cancel Button",0.0120,0
+"PauseMode",0.0118,0
+"DrawEffect",0.0114,0
+"MortarSelect",0.0111,0
+"Priority",0.0096,0
+"SellButton",0.0091,0
+"DrawAmmo",0.0084,0
+"DrawEnemies",0.0081,0
+"AutoStart",0.0067,0
