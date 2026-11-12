@@ -256,9 +256,24 @@ static void verifyPostCallNextBlock() {
         handoff->symbols->sourceDigest.hi,
         leaf->procedureId, leaf->resumePc,
         {{1, 1}, {9, 32}, {42, 64}}};
-    const uint64_t rawSsa[] = {1, 0xdeadbeefULL, 0xfedcba9876543210ULL};
-    handoff->diagnosticSsa = SourceSsaSnapshot::capture(manifest, rawSsa);
+    std::vector<uint64_t> rawSsa{
+        1, 0xdeadbeefULL, 0xfedcba9876543210ULL};
+    assert(handoff->captureDiagnosticSsa(manifest, rawSsa));
+    rawSsa[1] = 0; // native source buffer may be mutated or destroyed
     assert(handoff->matchesSsaManifest(manifest));
+    assert(handoff->diagnosticSsa->values[1] == 0xdeadbeefULL);
+    const auto preserved = handoff->diagnosticSsa->values;
+    auto wrongSource = manifest;
+    wrongSource.digestHi ^= 1;
+    assert(!handoff->captureDiagnosticSsa(wrongSource, rawSsa));
+    assert(handoff->diagnosticSsa->values == preserved);
+    auto wrongPc = manifest;
+    ++wrongPc.resumePc;
+    assert(!handoff->captureDiagnosticSsa(wrongPc, rawSsa));
+    assert(handoff->diagnosticSsa->values == preserved);
+    const uint64_t tooShort[] = {1};
+    assert(!handoff->captureDiagnosticSsa(manifest, tooShort));
+    assert(handoff->diagnosticSsa->values == preserved);
     auto badManifest = manifest;
     ++badManifest.resumePc;
     assert(!handoff->matchesSsaManifest(badManifest));
@@ -663,6 +678,63 @@ static void verifyLoopTopology() {
         Value::num(4).bits, Value::num(3).bits
     };
     good->checkpointPath(correct, counters, 2);
+    // IR-001: exact compiler inputs versus the independently read
+    // live CallFrame. All mutations below must refuse the same frame.
+    const auto readback = good->verifyLoopPathReadback(
+        correct, counters, 2, SourceResumePhase::AfterLoopBody);
+    assert(readback && readback->depth == 2 &&
+           readback->counted == 2 && readback->uncounted == 0);
+    const char* reversedIds[] = {"inner-loop", "outer-loop"};
+    const char* foreignIds[] = {"outer-loop", "loop-body"};
+    const uint64_t wrongCounter[] = {counters[0], Value::num(9).bits};
+    const uint64_t missingCounter[] = {
+        counters[0], CallFrameAbi::kNoLoopCounter};
+    assert(!good->verifyLoopPathReadback(
+        reversedIds, counters, 2, SourceResumePhase::AfterLoopBody));
+    assert(!good->verifyLoopPathReadback(
+        foreignIds, counters, 2, SourceResumePhase::AfterLoopBody));
+    assert(!good->verifyLoopPathReadback(
+        correct, wrongCounter, 2, SourceResumePhase::AfterLoopBody));
+    assert(!good->verifyLoopPathReadback(
+        correct, missingCounter, 2, SourceResumePhase::AfterLoopBody));
+    assert(!good->verifyLoopPathReadback(
+        correct, counters, 1, SourceResumePhase::AfterLoopBody));
+    assert(!good->verifyLoopPathReadback(
+        correct, counters, 2, SourceResumePhase::InsideLoopBody));
+    assert(!good->verifyLoopPathReadback(
+        correct, counters, 0, SourceResumePhase::AfterLoopBody));
+    // Missing repeat values remain valid observation-only CallFrames.
+    // They cannot prove a recovered counter but must not stop native JIT.
+    auto missing = validSession();
+    missing->enter("invoke-loops", "loops", nullptr, 0);
+    const uint64_t absent[] = {
+        counters[0], CallFrameAbi::kNoLoopCounter};
+    missing->checkpointPath(correct, absent, 2);
+    assert(missing->enabled());
+    assert(missing->sourceCheckpoint() &&
+           missing->sourceCheckpoint()->loops[1].counterBits ==
+               CallFrameAbi::kNoLoopCounter);
+    assert(!missing->verifyLoopPathReadback(
+        correct, absent, 2, SourceResumePhase::AfterLoopBody));
+    assert(missing->enabled());
+    auto missingImage = missing->exportSelfContained();
+    assert(missingImage && missingImage->valid() &&
+           !missingImage->decodeFrames()->empty());
+    // Decimal and negative-zero counter words must remain bit-exact:
+    // no integer normalization or inferred Scratch loop count.
+    auto fraction = validSession();
+    fraction->enter("invoke-loops", "loops", nullptr, 0);
+    const uint64_t fractionalBits[] = {
+        Value::num(-0.0).bits, Value::num(2.5).bits};
+    fraction->checkpointPath(correct, fractionalBits, 2);
+    const auto fractional = fraction->verifyLoopPathReadback(
+        correct, fractionalBits, 2, SourceResumePhase::AfterLoopBody);
+    assert(fractional && fractional->counted == 2);
+    const auto sourceWords = fraction->sourceCheckpoint();
+    assert(sourceWords && sourceWords->loops[0].counterBits ==
+           fractionalBits[0] && sourceWords->loops[1].counterBits ==
+           fractionalBits[1]);
+
     auto image = good->exportSelfContained();
     assert(image && image->valid());
     assert(image->deoptBoundary() == SourceDeoptBoundary::LoopLatch);

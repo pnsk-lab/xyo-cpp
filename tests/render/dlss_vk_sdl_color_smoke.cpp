@@ -256,8 +256,22 @@ int main() {
                 std::getenv("XYO_DLSS_STRESS_ALPHA_SAFE");
             const bool forceHistoryReset =
                 alphaOcclusion && alphaGuard && alphaGuard[0] == '1';
+            std::vector<xyo::render::DlssBiasRect> biasRegions;
+            const char* bias = std::getenv("XYO_DLSS_STRESS_ALPHA_BIAS");
+            if (alphaOcclusion && bias && bias[0] == '1') {
+                const char* full = std::getenv("XYO_DLSS_STRESS_ALPHA_BIAS_FULL");
+                if (full && full[0] == '1') {
+                    // Diagnostic control: if even full-frame strength 1.0
+                    // produces no effect, the mask may be ignored by NGX.
+                    biasRegions.push_back({0, 0, 480, 360});
+                } else {
+                    // Conservative mask of moving translucent object.
+                    const int left = 20 + (f % 45) * 6;
+                    biasRegions.push_back({left, 100, left + 100, 180});
+                }
+            }
             output = pipeline.apply(renderer, source, frameW, frameH,
-                                    forceHistoryReset);
+                                    forceHistoryReset, biasRegions);
             if (!output) {
                 std::fprintf(stderr, "DLSS stress frame %d failed\n", f);
                 return 4;
@@ -307,6 +321,21 @@ int main() {
                                       (20 + (f % 45) * 6 + 50) * 2) * 4];
                     if (center[0] < (alphaOcclusion ? 65 : 120))
                         pass = false;
+                }
+                if (f + 1 == count) {
+                    if (const char* capture = std::getenv("XYO_DLSS_STRESS_CAPTURE_BMP");
+                        capture && *capture) {
+                        SDL_Surface* surface = SDL_CreateRGBSurfaceWithFormatFrom(
+                            framePixels.data(), frameW, frameH, 32, frameW * 4,
+                            SDL_PIXELFORMAT_RGBA32);
+                        if (!surface || SDL_SaveBMP(surface, capture) != 0) {
+                            std::fprintf(stderr, "DLSS capture failed: %s\n",
+                                         SDL_GetError());
+                            if (surface) SDL_FreeSurface(surface);
+                            return 4;
+                        }
+                        SDL_FreeSurface(surface);
+                    }
                 }
                 SDL_SetRenderTarget(renderer, nullptr);
             }

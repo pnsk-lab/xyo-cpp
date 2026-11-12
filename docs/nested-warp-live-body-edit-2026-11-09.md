@@ -56,8 +56,8 @@ python3 tests/differential/jit_nested_warp_inflight_body_edit.py \
 
 ```text
 board/osr-active-body-edit-verified-smoke
-Source digest: 4c0cd37577da6d8442c64d791557dcf68d40860d28bb8113bcdbad02cf48f291
-Binary SHA256: 08af32d5ec1181613c42772c641772065354878f2162ad2bebc458cc905e1bb9
+Source digest: edcbd181ef412a7fbae533d0ae41c2cc1adc66e8b07d5436920066d7e124265f
+Binary SHA256: 82b210b04ff68f9f48ed8e4a2f7efcc12145a8796f60bc4cd04ef2aff9ddae67
 ```
 
 ## 制限
@@ -67,3 +67,23 @@ Binary SHA256: 08af32d5ec1181613c42772c641772065354878f2162ad2bebc458cc905e1bb9
 同時に異なるスレッドからソースグラフを改造するケース、実行中の machine PC / SSA ローカル / 一部実行済み副作用からの一般的な復帰、内側のネスト repeat の途中からの復帰は未対応である。
 
 共有ワークツリーの他エージェント変更は保持し、コミット・プッシュは行わない。
+
+## 追加：通常の高速経路（ブロック数計数なし）
+
+ブロック数計数は一部のネイティブ scalar / repeat 最適化を無効にするため、
+`--without-block-count` でも同じ 5 モードの実 native Fiber テストを実行した。
+計数なしの高速経路でも **positive / unguarded / guarded / unguarded-late / guarded-late がすべて PASS**。
+通常（編集なし）は Interpreter と全変数が一致し、実行中編集のガードありは
+`sum == sumAtEdit` と `branchCount == 48000000 - sumAtEdit` が厳密に一致した。
+ガードなしでは元 LLVM が古い `sum` へ書き込むことを対照実験で実測。
+
+追加 CTest `xyo-nested-warp-inflight-body-edit-fast` は同一バイナリで
+`--without-block-count` を実行する。
+
+```bash
+python3 tests/differential/jit_nested_warp_inflight_body_edit.py \
+  --harness board/osr-active-body-edit-verified-v2-smoke \
+  --without-block-count --out board/.osr-active-body-edit-fast-recheck
+```
+
+本体変更を扱う新規 CTest と以前の source proof 系 2 テスト、合計 3/3 PASS（33.88s、56.39s、58.30s）。

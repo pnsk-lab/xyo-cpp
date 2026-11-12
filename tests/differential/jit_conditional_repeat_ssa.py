@@ -7,6 +7,7 @@ execution. The SB3 is generated independently of ScratchBench.
 """
 import json
 import os
+import random
 import subprocess
 import sys
 from pathlib import Path
@@ -178,6 +179,32 @@ def make_fixture(path: Path, warp: bool):
     for count in (63, 64, 65, 129):
         for initial in (-1, 0, 1, 1048575, 1048576, 1048577):
             cases.append((count, num(initial), num(0), 8))
+    # Deterministic adversarial input corpus. Exercise short/long native
+    # chunks, the runtime type guard and both selected and rejected i32
+    # plans. Use one fixed seed to keep failures reproducible.
+    rng = random.Random(0x0192026)
+    input_pool = (
+        num(-1048577), num(-1048576), num(-1), num(-0.0),
+        num(0), num(1), num(2), num(3.5),
+        num(1048575), num(1048576), num(1048577),
+        num(2**40), num(2**48),
+        text("0"), text("1"), text("2.5"),
+        text("NaN"), text("Infinity"), text("abc"),
+    )
+    for _ in range(48):
+        count = rng.choice((0, 1, 2, 31, 63, 64, 65, 127, 128, 129, 130, 191))
+        index = rng.choice(input_pool)
+        acc = rng.choice(input_pool)
+        kind = rng.choice((0, 1, 2, 3, 4, 6, 7, 8))
+        cases.append((count, index, acc, kind))
+    # Force the narrow path: nonnegative integer state, flat positive
+    # modulo predicates, and both sides of several if statements.
+    for _ in range(32):
+        count = rng.choice((1, 2, 31, 63, 64, 65, 127, 128, 129, 191))
+        index = rng.choice((0, 1, 2, 3, 5, 6, 7, 31, 63, 127,
+                            1024, 65535, 1048575, 1048576))
+        acc = rng.choice((0, 1, 2, 7, 1024, 1048575))
+        cases.append((count, num(index), num(acc), 8))
     if warp:
         cases.append((80000, num(0), num(0), 0))
     outputs = [f"case_{i}_{suffix}" for i in range(len(cases))
@@ -236,6 +263,8 @@ def main():
             ("eager", "1", {"XYO_JIT_CONDITIONAL_I32": "1"}),
             ("hotspot", "1", {"XYO_JIT_CONDITIONAL_I32": "1"}),
             ("eager", "1", {"XYO_JIT_OPT_LEVEL": "2",
+                            "XYO_JIT_CONDITIONAL_I32": "1"}),
+            ("eager", "1", {"XYO_JIT_OPT_LEVEL": "3",
                             "XYO_JIT_CONDITIONAL_I32": "1"}),
         ]:
             result = run(binary, project, keys, jit, flag, extra)

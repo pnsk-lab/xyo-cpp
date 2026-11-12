@@ -231,9 +231,17 @@ int main() {
         std::fprintf(stderr, "OpticalFlow: %s\n", optical.lastError().c_str());
         return 3;
     }
+    const bool jitterTest =
+        std::getenv("XYO_OPTICAL_SMOKE_JITTER") != nullptr;
+    const bool coverageTest =
+        std::getenv("XYO_OPTICAL_SMOKE_COVERAGE") != nullptr;
+    const bool overrideAffine =
+        coverageTest || std::getenv("XYO_OPTICAL_SMOKE_AFFINE") != nullptr;
+    const bool overrideRigid =
+        overrideAffine || std::getenv("XYO_OPTICAL_SMOKE_RIGID") != nullptr;
     xyo::render::DlssVkMotionConverter converter;
     if (!converter.create(physical, device, optical.packedBuffer(), W, H, 4,
-                          optical.costBuffer())) {
+                          optical.costBuffer(), overrideRigid)) {
         std::fprintf(stderr, "Converter: %s\n", converter.lastError().c_str());
         return 3;
     }
@@ -305,7 +313,49 @@ int main() {
     const bool clipCosts =
         std::getenv("XYO_OPTICAL_SMOKE_COST_CLIP") != nullptr;
     const bool costSupported = optical.costAvailable();
-    converter.record(cmds[2], clipCosts ? 8 : 0);
+    xyo::render::DlssRigidMotionRect overrideRect{
+        220, 160, 260, 200, -11.0f, -3.0f};
+    if (overrideAffine) {
+        // Current quad is a 28x28 square rotated +45 degrees around
+        // center (240,180); previous frame is unrotated.
+        constexpr float cos45 = 0.70710678118f;
+        constexpr float halfSide = 28.0f;
+        overrideRect.affine = 1;
+        overrideRect.previousX[0] = cos45;
+        overrideRect.previousX[1] = cos45;
+        overrideRect.previousX[2] =
+            240.0f - cos45*(240.0f+180.0f);
+        overrideRect.previousX[3] = 3.0f/halfSide;
+        overrideRect.previousY[0] = -cos45;
+        overrideRect.previousY[1] = cos45;
+        overrideRect.previousY[2] =
+            180.0f + cos45*240.0f - cos45*180.0f;
+        overrideRect.previousY[3] = 3.0f/halfSide;
+        overrideRect.currentU[0] = cos45/halfSide;
+        overrideRect.currentU[1] = cos45/halfSide;
+        overrideRect.currentU[2] =
+            0.5f - cos45*(240.0f+180.0f)/halfSide;
+        overrideRect.currentV[0] = -cos45/halfSide;
+        overrideRect.currentV[1] = cos45/halfSide;
+        overrideRect.currentV[2] =
+            0.5f + cos45*(240.0f-180.0f)/halfSide;
+        if (coverageTest) {
+            overrideRect.reserved = 1.0f;
+            // Only the central 30%-wide UV area is fully opaque.
+            // At the quad center the geometry vector is expected;
+            // off the central patch it must stay Optical Flow.
+            for (unsigned y=45; y<83; ++y)
+                for (unsigned x=45; x<83; ++x) {
+                    const unsigned index=y*128+x;
+                    overrideRect.opaqueBits[index>>5] |= 1u<<(index&31);
+                }
+        }
+    }
+    converter.record(cmds[2], clipCosts ? 8 : 0,
+        overrideRigid ? std::span<const xyo::render::DlssRigidMotionRect>(
+            &overrideRect, 1) : std::span<const xyo::render::DlssRigidMotionRect>{},
+        jitterTest ? 0.25f : 0.0f,
+        jitterTest ? -0.125f : 0.0f);
     imageBarrier(cmds[2], converter.image(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
@@ -345,6 +395,16 @@ int main() {
     const size_t center = (size_t(H / 2) * W + W / 2) * 2;
     const float vx = float(comps[center]);
     const float vy = float(comps[center+1]);
+    const float outsideVx = float(comps[(size_t(20) * W + 20) * 2]);
+    const float outsideVy = float(comps[(size_t(20) * W + 20) * 2 + 1]);
+    // Pixel (248,180) lies inside the rotated diamond. (222,162) is
+    // in the enclosing AABB but outside the polygon, so MUST remain OF.
+    const size_t inside = (size_t(180) * W + 248) * 2;
+    const size_t aabbOnly = (size_t(162) * W + 222) * 2;
+    const float affineVx = float(comps[inside]);
+    const float affineVy = float(comps[inside+1]);
+    const float cornerVx = float(comps[aabbOnly]);
+    const float cornerVy = float(comps[aabbOnly+1]);
     std::printf("GPU semaphore optical queue %u -> compute queue %u\n",
                 opticalFamily, computeFamily);
     std::printf("Converted 480x360 RG16F DLSS motion: (%.3f, %.3f)\n", vx, vy);
@@ -363,9 +423,28 @@ int main() {
     vkDestroyInstance(instance, nullptr);
     const bool clippedCut = clipCosts && cut && costSupported;
     const bool pass = costPass &&
+        (jitterTest ? (std::abs(vx + dx + 0.25f) < 0.3f &&
+                       std::abs(vy - 0.125f) < 0.12f) :
+        (coverageTest ?
+          (std::abs(vx-0.20710678f) < 0.1f &&
+           std::abs(vy+0.5f) < 0.1f &&
+           std::abs(affineVx + dx) < 0.3f &&
+           std::abs(affineVy) < 0.3f &&
+           std::abs(cornerVx + dx) < 0.3f) :
+        (overrideAffine ?
+          (std::abs(affineVx - (0.70710678118f * (248.5f - 240.0f +
+                      180.5f - 180.0f) - (248.5f - 240.0f))) < 0.1f &&
+           std::abs(affineVy - (0.70710678118f * (180.5f - 180.0f -
+                      (248.5f - 240.0f)) - (180.5f - 180.0f))) < 0.1f &&
+           std::abs(cornerVx + dx) < 0.3f &&
+           std::abs(cornerVy) < 0.3f) :
+        (overrideRigid ? (std::abs(vx + 11.0f) < 0.05f &&
+                          std::abs(vy + 3.0f) < 0.05f &&
+                          std::abs(outsideVx + dx) < 0.3f &&
+                          std::abs(outsideVy) < 0.3f) :
         (clippedCut ? (std::abs(vx) < 0.1f && std::abs(vy) < 0.1f) :
         (cut || std::abs(dx) != 6 ||
-        (std::abs(vx + dx) < 0.25f && std::abs(vy) < 0.25f)));
+        (std::abs(vx + dx) < 0.25f && std::abs(vy) < 0.25f)))))));
     std::puts(pass ? "PASS: GPU optical flow cross-queue semaphores"
                    : "FAIL: optical flow conversion or queue sync");
     return pass ? 0 : 4;

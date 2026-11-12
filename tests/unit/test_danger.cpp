@@ -133,7 +133,11 @@ double counter(Runtime& rt) {
 /// WORK_TIME ループ（1 ティック内で何度も再開する）を介さず
 /// **スレッドごとの予算**そのものを観測できる。
 /// warpTimeMs = 0 → 予算は必ず使い切られる（時間に依存しない）。
-double onePass(bool danger, bool warp, JitMode mode) {
+/// LAYQ の quantum は負荷で変わる（既定で最大 16384）ため、プリエンプションの
+/// 判定は「最初の 1 パスで止まるか」で行う — 4 パスでは 20000 反復が終わり切る
+/// quantum があり得る（4*16384 > 20000）。反復回数の上限ではなく、予算切れで
+/// 譲るという不変条件だけを主張する。
+double onePass(bool danger, bool warp, JitMode mode, int passes = 4) {
     setJitMode(mode);
     Runtime rt;
     const Sb3LoadResult lr = loadSb3(rt, projectJson(warp), nullptr);
@@ -143,7 +147,7 @@ double onePass(bool danger, bool warp, JitMode mode) {
     rt.dangerMode = danger;
     rt.greenFlag();
     rt.sequencer->timer.start();
-    for (int pass = 0; pass < 4; ++pass) {
+    for (int pass = 0; pass < passes; ++pass) {
         for (Thread* t : rt.threads) {
             if (t->status != STATUS_DONE && !t->stack.empty())
                 rt.sequencer->stepThread(*t);
@@ -682,8 +686,9 @@ int test_danger_main() {
         testTransientRhsAfterYield(mode, false);
         testTransientRhsAfterYield(mode, true);
         testWarpYieldReload(mode);
-        // 予算あり: 数パスでは終わらない（予算切れで yield して譲る）。
-        const double limited = onePass(false, true, mode);
+        // 予算あり: 最初のパスで終わらない（予算切れで yield して譲る）。
+        // LAYQ quantum に依存しないよう 1 パスだけ進めて判定する。
+        const double limited = onePass(false, true, mode, 1);
         if (!(limited > 0 && limited < kIterations))
             std::printf("  %s: limited counter after 4 passes = %g\n",
                         modeName(mode), limited);

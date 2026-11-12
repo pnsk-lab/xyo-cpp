@@ -617,6 +617,7 @@ extern int test_list_string_intern_main();
 extern int test_gl_chunk_plan_main();
 extern int test_scratch_compat_main();
 extern int test_list_limit_main();
+extern int test_layq_main();
 extern int test_sstr_cons_main();
 extern int test_gc_pool_main();
 extern int test_opt_flags_main();
@@ -669,6 +670,7 @@ int main() {
     int glChunkPlanFail = test_gl_chunk_plan_main();
     int scratchCompatFail = test_scratch_compat_main();
     int listLimitFail = test_list_limit_main();
+    int layqFail = test_layq_main();
     int sstrConsFail = test_sstr_cons_main();
     int gcPoolFail = test_gc_pool_main();
     int optFlagsFail = test_opt_flags_main();
@@ -678,7 +680,7 @@ int main() {
             equalityLiteralFail + colorFastFail + motionNumericFail + slotHoistFail +
             listCodegenBoundsFail + nanCodegenFail + literalContextFail + numericPromotionFail + typeProfileFail + dangerFail + listStringInternFail +
             glChunkPlanFail + scratchCompatFail + listLimitFail + listReadMemoFail + sstrConsFail + gcPoolFail +
-            optFlagsFail)
+            optFlagsFail + layqFail)
                ? 1
                : 0;
 }

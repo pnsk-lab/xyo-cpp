@@ -86,8 +86,13 @@ Value evaluate(const E& e, Value x, Value y) {
         if (e->literal == "abs") result = std::fabs(n);
         else if (e->literal == "floor") result = std::floor(n);
         else if (e->literal == "ceiling") result = std::ceil(n);
-        else if (e->literal == "sin")
-            result = jsRoundRef(std::sin((kPi * n) / 180.0) * 1e10) / 1e10;
+        else if (e->literal == "sin") {
+            // Scratch's toFixed(10) converts sin(-0) to positive zero.
+            // The runtime must preserve this even though std::sin(-0) is -0.
+            result = n == 0.0
+                ? 0.0
+                : jsRoundRef(std::sin((kPi * n) / 180.0) * 1e10) / 1e10;
+        }
         else if (e->literal == "cos")
             result = jsRoundRef(std::cos((kPi * n) / 180.0) * 1e10) / 1e10;
         else if (e->literal == "asin") result = v8math::asin(n) * 180.0 / kPi;
@@ -331,6 +336,11 @@ std::vector<Input> inputs() {
     out.push_back({Value::boolean(false), Value::boolean(true)});
     out.push_back({Value::boolean(true), Value::boolean(false)});
     out.push_back({Value::undefined(), Value::undefined()});
+    // Integer IEEE classification must reject all NaN payloads, not just the
+    // canonical positive Value::nan(). Keep both signs and signaling payloads.
+    out.push_back({Value{0xfff8000000001234ull}, Value{0xfff0000000000001ull}});
+    out.push_back({Value{0x7ff0000000000001ull}, Value{0xfff8000000000001ull}});
+    out.push_back({Value::color(0x12, 0x34, 0x56), Value::color(0xff, 0, 0xff)});
     return out;
 }
 using Bits = std::vector<std::vector<uint64_t>>;

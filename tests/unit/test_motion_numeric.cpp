@@ -162,7 +162,18 @@ int test_motion_numeric_main() {
         if (test.x == 230 && test.y == 0 && test.direction == 37)
             check(target->direction == -37.00000000000003);
 #endif
-        check(std::abs(target->x) <= 220 && std::abs(target->y) <= 170);
+        // Bounce fencing uses a pixel-centre hull inset, not a full 40x20
+        // bounding box. The reflected direction determines the inset and
+        // may legitimately leave the centre beyond (220, 170) by <= 0.71px.
+        const double angle = target->rotationStyle == "all around"
+            ? (target->direction - 90.0) * 3.14159265358979323846 / 180.0
+            : 0.0;
+        const double pixelInset = target->visible
+            ? std::abs(target->size / 200.0) *
+                (std::abs(std::cos(angle)) + std::abs(std::sin(angle)))
+            : 0.0;
+        check(std::abs(target->x) <= 220.0 + pixelInset + 1e-9 &&
+              std::abs(target->y) <= 170.0 + pixelInset + 1e-9);
     }
     rt.renderer=nullptr;
     std::printf("numeric motion: %d checks, %d failures\n",checks,failures);
