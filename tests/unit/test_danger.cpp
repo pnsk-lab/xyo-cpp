@@ -133,7 +133,7 @@ double counter(Runtime& rt) {
 /// WORK_TIME ループ（1 ティック内で何度も再開する）を介さず
 /// **スレッドごとの予算**そのものを観測できる。
 /// warpTimeMs = 0 → 予算は必ず使い切られる（時間に依存しない）。
-double onePass(bool danger, bool warp, JitMode mode) {
+double onePass(bool danger, bool warp, JitMode mode, int passes = 4) {
     setJitMode(mode);
     Runtime rt;
     const Sb3LoadResult lr = loadSb3(rt, projectJson(warp), nullptr);
@@ -143,7 +143,7 @@ double onePass(bool danger, bool warp, JitMode mode) {
     rt.dangerMode = danger;
     rt.greenFlag();
     rt.sequencer->timer.start();
-    for (int pass = 0; pass < 4; ++pass) {
+    for (int pass = 0; pass < passes; ++pass) {
         for (Thread* t : rt.threads) {
             if (t->status != STATUS_DONE && !t->stack.empty())
                 rt.sequencer->stepThread(*t);
@@ -682,10 +682,14 @@ int test_danger_main() {
         testTransientRhsAfterYield(mode, false);
         testTransientRhsAfterYield(mode, true);
         testWarpYieldReload(mode);
-        // 予算あり: 数パスでは終わらない（予算切れで yield して譲る）。
-        const double limited = onePass(false, true, mode);
+        // With LAYQ a single scheduler slice may execute up to 16384
+        // iterations before the 0ms deadline poll. Four slices can
+        // therefore finish this 20000-iteration test even when each
+        // deadline checkpoint correctly yields. Check the *first* slice
+        // instead: it must stop at a checkpoint before completion.
+        const double limited = onePass(false, true, mode, 1);
         if (!(limited > 0 && limited < kIterations))
-            std::printf("  %s: limited counter after 4 passes = %g\n",
+            std::printf("  %s: limited counter after 1 pass = %g\n",
                         modeName(mode), limited);
         check(limited > 0 && limited < kIterations,
               "warp loop is preempted by the time budget");
