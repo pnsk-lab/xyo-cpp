@@ -273,6 +273,30 @@ public:
     /// このフラグを前提に warp ループの yield 点を落としたコードを吐く。
     bool dangerMode = dangerModeFromEnv();
 
+    // --- LAYQ v2 (push model, src/jit/layq.hpp) ---
+    /// Scheduler-published recommended warp-poll quantum (power of two).
+    /// Written by the scheduler thread once per pass, and only when the
+    /// computed value changes (release store). JIT poll/entry blocks read
+    /// it with a relaxed load. The scheduler derives it from its own
+    /// just-computed active-thread count, so the JIT performs no contention
+    /// math, no shifts, and no extra atomics of its own: the per-poll cost
+    /// is one (usually L1-shared) load plus a clamp to the loop body class.
+    /// Heuristic input only: staleness (<= 1 pass + 1 quantum) costs
+    /// efficiency, never correctness — every poll still runs the full
+    /// deadline/stop/GC check suite. Initialized to the pure-class maximum
+    /// (solo is the common case; the scheduler corrects it downward within
+    /// one pass if loaded, and JIT clamps every use to the loop's body-class
+    /// cap, so a stale-high initial can only widen the first chunk).
+    alignas(64) std::atomic<uint32_t> yieldQuantumHint{16384};
+    /// Monotonic stop generation. Bumped by stopThread (stopAll routes
+    /// through it). JIT warp polls snapshot this into the thread's
+    /// JitCtx and hand off on change, bounding stop latency at one
+    /// quantum regardless of the deadline cadence. Single logical writer
+    /// path (stop paths are rare); relaxed on both sides — a stale read
+    /// only delays a stop by one more poll, and the handoff itself
+    /// synchronizes with the scheduler.
+    std::atomic<uint64_t> stopEpoch{0};
+
     // --- 外部インターフェース ---
     RendererAPI* renderer = nullptr;
     /// Scratch.pen 共有レイヤ skin id（createPenSkin の遅延結果）

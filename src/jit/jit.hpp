@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "../aot/aot.hpp"
+#include "layq.hpp"
 #include "../core/value.hpp"
 #include "../engine/deps.hpp"
 #include "../gpu/gpu_isa.hpp"
@@ -218,6 +219,42 @@ struct JitCtx {
     // This is NOT an arbitrary LLVM SSA/effect-PC deoptimizer.
     int32_t nestedOsrDeoptReady = 0;
     double nestedOsrDeoptRemaining = 0.0;
+    // OSR-011: the MOST RECENT scheduler yield's source phase.
+    // 1: completed selected outer-loop body; 2: completed one inner
+    // loop body while the enclosing outer body is not yet complete.
+    // Zero/invalid means no proven executable continuation.
+    int32_t nestedOsrDeoptPhase = 0;
+    double nestedOsrDeoptInnerRemaining = 0.0;
+    // OSR-013 phase 3: selected outer -> middle -> leaf source loop.
+    // A deep native yield has completed one LEAF body, but neither
+    // enclosing iteration body has reached its source latch.
+    double nestedOsrDeoptDeepRemaining = 0.0;
+    // OSR-014 phase 4: four lexical counted repeats, last body
+    // completed; all enclosing counted-loop bodies are unfinished.
+    double nestedOsrDeoptFourthRemaining = 0.0;
+    // LAYQ (src/jit/layq.hpp): per-thread warp-poll quantum, always a
+    // power of two (keeps the mask form `q - (n & (q-1))`). Initialized
+    // to 64 at attach; the adaptive policy widens it when idle.
+    // ABI: appended, older JitCtx offsets unchanged.
+    uint64_t yieldQuantum = 64;
+    // LAYQ: last Runtime::stopEpoch observed at a warp poll. A mismatch
+    // hands off (spill + xyo_yield), bounding stop latency at one
+    // quantum regardless of the deadline cadence.
+    uint64_t observedStopEpoch = 0;
+    // LAYQ v2: scheduler-published recommended quantum + stop generation.
+    // Pointer indirection follows the sampledWarpClockUs precedent (avoids
+    // offsetof into Runtime, which is not standard-layout): wired at
+    // attach, read with relaxed atomic loads in JIT poll/entry blocks.
+    // Defaults point at never-written fallbacks (floor quantum, no stop)
+    // so hand-rolled test contexts without attach stay safe.
+    std::atomic<uint32_t>* quantumHintPtr = &layqFallbackQuantum;
+    std::atomic<uint64_t>* stopEpochPtr = &layqFallbackStopEpoch;
+    // LAYQ diagnostic counters (XYO_YIELD_QSTATS=1 dumps them at release):
+    // polls executed, polls that handed off, sum of quanta in force.
+    // Own-thread only (written by generated poll blocks, read at release).
+    uint64_t layqPolls = 0;
+    uint64_t layqTaken = 0;
+    uint64_t layqQSum = 0;
 };
 
 /// Publish an entire execution slice with one atomic RMW, including when a

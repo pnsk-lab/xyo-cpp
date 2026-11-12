@@ -3,6 +3,7 @@
 // yield = fiber switch — C++ スタックが保持されるため、ヘルパ内部で
 // 中断してもローカル状態は維持される（executeInCompatibilityLayer 相当）。
 #include "jit.hpp"
+#include "layq.hpp"
 #include "rtprof.hpp"
 #include "procedure_frame_state.hpp"
 
@@ -177,11 +178,43 @@ void xyo_loop_yield(JitCtx* c);
 // An empty warp repeat has no observable body work. Preserve the exact
 // (++yieldCheckN & 63) sampling phase while jumping directly to each check.
 // Only called for nonnegative integral iteration counts <= 2^40.
+// LAYQ: the quantum is re-derived per chunk from the scheduler-published
+// hint (v2 push model) clamped to the pure cap — an empty body performs no
+// calls and no allocation, so the pure cap is sound here (mirrors the
+// body-class rule without needing the scope). Fixed mode uses the pinned
+// entry quantum; off mode keeps 64. The phase math is quantum-agnostic
+// (polls at least every q iterations). The stop-epoch check per chunk
+// preserves the v2 <=1-quantum stop bound (xyo_loop_yield alone cannot
+// observe stops); on mismatch we hand off, sync the epoch, and continue
+// without skipping or duplicating iterations.
 void xyo_empty_repeat_warp(JitCtx* c, double repetitions) {
     uint64_t left = static_cast<uint64_t>(repetitions);
     uint64_t counter = c->yieldCheckN;
+    const LayqMode mode = layqMode();
+    // The helper is a standalone scheduler (own chunk loop): apply the LAYQ
+    // policy directly instead of inheriting a stale ctx quantum. An empty
+    // body performs no calls and no allocation, so the pure cap is sound
+    // (mirrors the body-class rule without needing the scope).
+    const uint64_t pureCap =
+        mode == LayqMode::Off ? 64 : layqConfig().qmaxPure;
+    uint64_t observed = c->observedStopEpoch;
     while (left) {
-        const uint64_t untilCheck = 64 - (counter & 63);
+        uint64_t q = 64;
+        if (mode == LayqMode::Fixed) {
+            const uint64_t pinned = layqConfig().qfixed;
+            q = pinned < pureCap ? pinned : pureCap;
+            if (q < layqConfig().qmin) q = layqConfig().qmin;
+        } else if (mode == LayqMode::Adaptive) {
+            const uint64_t hint = c->quantumHintPtr->load(
+                std::memory_order_relaxed);
+            q = hint < pureCap ? hint : pureCap;
+        }
+        // Belt-and-braces: quantum is always a power of two by
+        // construction (entry/adaptation preserve it); fall back to 64
+        // rather than breaking the phase math if it ever is not.
+        if (q < 1 || (q & (q - 1)) != 0) q = 64;
+        const uint64_t qmask = q - 1;
+        const uint64_t untilCheck = q - (counter & qmask);
         if (left < untilCheck) {
             counter += left;
             break;
@@ -189,6 +222,15 @@ void xyo_empty_repeat_warp(JitCtx* c, double repetitions) {
         counter += untilCheck;
         left -= untilCheck;
         c->yieldCheckN = counter;
+        if (mode != LayqMode::Off) {
+            const uint64_t epoch = c->stopEpochPtr->load(
+                std::memory_order_relaxed);
+            if (epoch != observed) {
+                xyo_yield(c);
+                observed = epoch;
+                c->observedStopEpoch = epoch;
+            }
+        }
         xyo_loop_yield(c);
     }
     c->yieldCheckN = counter;

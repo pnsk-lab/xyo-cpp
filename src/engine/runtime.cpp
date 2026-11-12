@@ -165,6 +165,10 @@ Thread* Runtime::pushThread(const std::string& id, Target* target,
 
 void Runtime::stopThread(Thread* thread) {
     thread->isKilled = true;
+    // LAYQ: wake warp-loop polls. stopAll routes through here, so one bump
+    // covers every stop path. Relaxed: readers only need eventual
+    // visibility (a stale read delays that thread's handoff by one poll).
+    stopEpoch.fetch_add(1, std::memory_order_relaxed);
     sequencer->retireThread(*thread);
 }
 

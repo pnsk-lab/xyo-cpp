@@ -465,10 +465,29 @@ void emitConditionalRepeatChunk(const ConditionalRepeatPlan& plan,
             plan.integer32State ? i32t : i64t));
     }
     b.CreateCondBr(valid, fast, slow);
+#if defined(__linux__)
+    // MATH-019 diagnostic only: an explicit opt-in emits one marker
+    // per guarded chunk to stderr, without touching runtime state.
+    // Normal JIT IR and cost are unchanged when the flag is absent.
+    const bool traceI32Guard = plan.integer32State && [] {
+        const char* flag = std::getenv("XYO_JIT_CONDITIONAL_I32_TRACE");
+        return flag && std::strcmp(flag, "1") == 0;
+    }();
+    const auto emitGuardMarker = [&](const char* message, size_t length) {
+        callN("write", i64t, {
+            ci32(2), b.CreateGlobalString(message), ci64(length)
+        });
+    };
+#endif
     b.SetInsertPoint(fast);
+#if defined(__linux__)
+    if (traceI32Guard) {
+        constexpr char kFast[] = "[math019-i32] fast\n";
+        emitGuardMarker(kFast, sizeof(kFast) - 1);
+    }
+#endif
     llvm::Value* ticks = b.CreateLoad(i64t, curYieldCnt);
-    llvm::Value* untilPoll = b.CreateSub(
-        ci64(64), b.CreateAnd(ticks, ci64(63)));
+    llvm::Value* untilPoll = yieldToPoll(ticks);
     llvm::Value* available = b.CreateZExt(remaining32, i64t);
     llvm::Value* chunk = b.CreateSelect(
         b.CreateICmpULT(available, untilPoll), available, untilPoll);

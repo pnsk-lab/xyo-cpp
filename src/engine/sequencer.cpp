@@ -11,6 +11,7 @@
 #include "../core/gc.hpp"
 #include "../core/sstr.hpp"
 #include "../jit/jit.hpp"
+#include "../jit/layq.hpp"
 #include "../ir/scratch_pipeline.hpp"
 #include "../ir/scratch_source_digest.hpp"
 #include "numeric_thread.hpp"
@@ -295,6 +296,17 @@ JitCtx* acquireJitCtx() {
 }
 void releaseJitCtx(JitCtx* c) {
     if (!c) return;
+    // LAYQ diagnostics: per-thread poll/handoff/quantum summary. Only
+    // threads that actually polled print, so scheduler-churn workloads
+    // (millions of short threads) stay quiet.
+    if (layqStatsEnabled() && (c->layqPolls != 0 || c->layqTaken != 0)) {
+        std::fprintf(stderr,
+                     "[layq] polls=%llu taken=%llu avgQ=%.1f\n",
+                     (unsigned long long)c->layqPolls,
+                     (unsigned long long)c->layqTaken,
+                     c->layqPolls ? (double)c->layqQSum / (double)c->layqPolls
+                                  : 0.0);
+    }
     // Covers normal entry return, stopped/killed threads, fiber-chain
     // completion and a context retired without a final yield.
     flushJitBlockCount(c);
@@ -484,6 +496,38 @@ std::vector<Thread*> Sequencer::stepThreads() {
                 }
             }
             runtime.threads.resize(nextActive);
+        }
+        // LAYQ v2 push: publish the recommended pure-class quantum derived
+        // from this pass's still-runnable count, but only when it changes —
+        // steady state performs zero stores, so JIT readers keep a shared
+        // L1 line. Only adaptive JIT reads the hint (fixed pins its own
+        // constant; off needs nothing), so publish only in adaptive mode.
+        // Release store; relaxed JIT loads (see layq.hpp contract). Danger
+        // pins the hint to the pure cap: polls can never fire for time
+        // budgets there, so contention-driven shrinking would only add
+        // overhead.
+        if (layqMode() == LayqMode::Adaptive) {
+            const LayqConfig layqCfg = layqConfig();
+            const uint64_t competitors =
+                layqCompetitors((uint64_t)numActiveThreads);
+            uint64_t target = layqTarget(competitors, layqCfg.qmaxPure,
+                                         layqCfg.qmin);
+            if (runtime.dangerMode) target = layqCfg.qmaxPure;
+            const auto qt = target > 0xFFFFFFFFu
+                ? 0xFFFFFFFFu
+                : static_cast<uint32_t>(target);
+            static const bool layqTrace = std::getenv("XYO_YIELD_QTRACE") !=
+                nullptr;
+            if (layqTrace)
+                std::fprintf(stderr,
+                             "[layq-pub] active=%zu competitors=%llu "
+                             "target=%llu\n",
+                             numActiveThreads,
+                             (unsigned long long)competitors,
+                             (unsigned long long)target);
+            if (runtime.yieldQuantumHint.load(std::memory_order_relaxed) !=
+                qt)
+                runtime.yieldQuantumHint.store(qt, std::memory_order_release);
         }
         // A lone, read-only sound-polling forever has nothing to observe
         // until another Scratch script can change a condition. No other
@@ -1422,6 +1466,15 @@ void Sequencer::jitStepThread(Thread& thread) {
         c->blockCounter = runtime.blockCountEnabled
             ? &runtime.executedBlocks : nullptr;
         c->sequencer = this;
+        // LAYQ: fresh quantum; stop snapshot so a pooled context reused
+        // after a stop does not spuriously hand off on its first poll.
+        // Pointer wiring follows the sampled-clock precedent (same block
+        // below wires sampledWarpClockUs et al.).
+        c->yieldQuantum = 64;
+        c->observedStopEpoch =
+            runtime.stopEpoch.load(std::memory_order_relaxed);
+        c->quantumHintPtr = &runtime.yieldQuantumHint;
+        c->stopEpochPtr = &runtime.stopEpoch;
         c->compatEc = &thread.compatibilityStackFrame;
         if (thread.osrActive)
             c->osrRepeatRemaining = thread.osrRemaining;

@@ -72,11 +72,17 @@ Target* findBench(Runtime& rt) {
 }
 
 Block* oneTimeSumAssignment(Blocks& blocks) {
-    for (auto& [id, node] : blocks.allBlocks()) {
+    // Read-only scan (Blocks::allBlocks() is const by design; mutating the
+    // graph requires StructuralEdit, whose destructor would bump the
+    // revision and reset caches — exactly what this silent-edit test must
+    // avoid). Re-resolve through the legacy mutable getBlock(), which
+    // performs a plain find with no revision or cache effects, matching
+    // the direct non-resetCache editor edit modeled below.
+    for (const auto& [id, node] : blocks.allBlocks()) {
         if (node.opcode != "data_setvariableto") continue;
         const auto field = node.fields.find("VARIABLE");
         if (field != node.fields.end() && field->second.id == "v_sum")
-            return &node;
+            return blocks.getBlock(id);
     }
     return nullptr;
 }

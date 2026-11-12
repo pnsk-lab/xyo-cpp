@@ -259,8 +259,7 @@ void emitNumericUntilChunk(const NumericUntilPlan& plan,
     b.CreateCondBr(valid, fast, slow);
     b.SetInsertPoint(fast);
     llvm::Value* ticks = b.CreateLoad(i64t, curYieldCnt);
-    llvm::Value* toPoll = b.CreateSub(
-        ci64(64), b.CreateAnd(ticks, ci64(63)));
+    llvm::Value* toPoll = yieldToPoll(ticks);
 
     BasicBlock* preheader = b.GetInsertBlock();
     BasicBlock* nativeHead = newBB("until.num.head");

@@ -3,6 +3,7 @@
 // 値は i64 の NaN ボックス bit パターンとして受け渡しする。
 // 入力・スタック双方、未 lowering のものは compat 層へ落とす。
 #include "jit.hpp"
+#include "layq.hpp"
 #include "llvm_compat.hpp"
 #include "aot_emit.hpp"
 #include "parfor.hpp"
@@ -865,14 +866,184 @@ struct Codegen {
     static constexpr uint64_t kBitsOne = 0x3FF0000000000000ULL;
     static constexpr uint32_t kYieldCheckNOff =
         uint32_t(offsetof(JitCtx, yieldCheckN));
+    // LAYQ offsets (appended JitCtx fields; older offsets unchanged).
+    static constexpr uint32_t kYieldQuantumOff =
+        uint32_t(offsetof(JitCtx, yieldQuantum));
+    static constexpr uint32_t kObservedStopEpochOff =
+        uint32_t(offsetof(JitCtx, observedStopEpoch));
+    static constexpr uint32_t kQuantumHintPtrOff =
+        uint32_t(offsetof(JitCtx, quantumHintPtr));
+    static constexpr uint32_t kStopEpochPtrOff =
+        uint32_t(offsetof(JitCtx, stopEpochPtr));
+    static constexpr uint32_t kLayqPollsOff =
+        uint32_t(offsetof(JitCtx, layqPolls));
+    static constexpr uint32_t kLayqTakenOff =
+        uint32_t(offsetof(JitCtx, layqTaken));
+    static constexpr uint32_t kLayqQSumOff =
+        uint32_t(offsetof(JitCtx, layqQSum));
+
+    // ---- LAYQ v2: push-model adaptive yield quantum (src/jit/layq.hpp) ----
+    // Off (XYO_YIELD_QMODE=off): every helper below folds to constants and
+    // the emitted IR is instruction-identical to the pre-LAYQ form
+    // (verified by IR diff in tests). Adaptive (default): per-loop
+    // power-of-two quantum from the scheduler-published hint (+ body-class
+    // clamp), stop-epoch handoff, and stats. Fixed: pinned constant.
+    static bool layqOff() { return layqMode() == LayqMode::Off; }
+    static bool layqFixed() { return layqMode() == LayqMode::Fixed; }
+    /// Current loop's quantum as IR. Off: constant 64. Fixed: the
+    /// pinned body-class constant (folds everywhere — no loop-carried
+    /// live values, unlike adaptive). Adaptive: the per-loop alloca.
+    llvm::Value* yieldQuantumNow() {
+        if (layqOff()) return ci64(64);
+        if (layqFixed()) return ci64(curYieldQPinned);
+        if (curYieldQuantum) return b.CreateLoad(i64t, curYieldQuantum);
+        return b.CreateLoad(
+            i64t, b.CreateConstGEP1_32(i8t, ctxArg, kYieldQuantumOff));
+    }
+    /// toPoll = q - (ticks & (q-1)). Constant-folds to today's
+    /// `64-(ticks&63)` when LAYQ is off.
+    llvm::Value* yieldToPoll(llvm::Value* ticks) {
+        llvm::Value* q = yieldQuantumNow();
+        return b.CreateSub(q, b.CreateAnd(ticks, b.CreateSub(q, ci64(1))));
+    }
+    /// Body-class cap for the loop being emitted (C++-side immediate).
+    /// Also refreshes the fixed-mode pinned quantum.
+    void layqApplyBodyClass(bool bodyMayAllocate) {
+        LayqConfig cfg = layqConfig();
+        curYieldQMaxVal = bodyMayAllocate ? cfg.qmaxCall : cfg.qmaxPure;
+        if (curYieldQMaxVal < cfg.qmin) curYieldQMaxVal = cfg.qmin;
+        uint64_t pinned =
+            cfg.qfixed < curYieldQMaxVal ? cfg.qfixed : curYieldQMaxVal;
+        if (pinned < cfg.qmin) pinned = cfg.qmin;
+        curYieldQPinned = pinned;
+    }
+    /// v2 push model: load the scheduler-published quantum hint (relaxed;
+    /// usually an L1-shared line since the scheduler stores only on change)
+    /// and clamp it to the loop's body-class cap. No competitor math, no
+    /// shifts, no extra atomics in generated code.
+    llvm::Value* layqHintCapped() {
+        // Load the slot as an integer, not a pointer. The RT-001 GC-root
+        // census chain-traces pointer-typed JitCtx loads through a closed
+        // allowlist (varSlotData + sampledWarpClockUs); this slot holds the
+        // address of a Runtime-embedded u32 atomic that can never reference
+        // GC memory (integer payload only), so integer load + inttoptr keeps
+        // the census output identical with exact semantics preserved (same
+        // address, same atomicity).
+        auto* hintAddr = b.CreateLoad(
+            i64t, b.CreateConstGEP1_32(i8t, ctxArg, kQuantumHintPtrOff));
+        auto* hintPtr = b.CreateIntToPtr(hintAddr, ptrt);
+        auto* hint = b.CreateLoad(i32t, hintPtr);
+        hint->setAtomic(llvm::AtomicOrdering::Monotonic);
+        llvm::Value* h64 = b.CreateZExt(hint, i64t);
+        return b.CreateSelect(b.CreateICmpULT(h64, ci64(curYieldQMaxVal)),
+                              h64, ci64(curYieldQMaxVal));
+    }
+    /// Loop-entry quantum. Fixed: store the pinned body-class constant to
+    /// the ctx field (for the runtime empty-repeat fallback); no allocas,
+    /// so everything folds. Adaptive: re-sync from the ctx field clamped
+    /// to the body cap (mirrors the yieldCheckN discipline) — emitting a
+    /// store here would clobber the adapted quantum every chunk, since this
+    /// position ends up inside the chunk dispatch for chunked loops. The
+    /// first poll then snaps to the published hint.
+    /// Preheader position only.
+    void emitLayqEntryInit() {
+        if (layqOff()) return;
+        if (layqFixed()) {
+            b.CreateStore(
+                ci64(curYieldQPinned),
+                b.CreateConstGEP1_32(i8t, ctxArg, kYieldQuantumOff));
+            return;
+        }
+        if (!curYieldQuantum || !curYieldQMask) return;
+        // Re-sync (not store): this position ends up inside the chunk
+        // dispatch for chunked loops, so emitting a store here would
+        // clobber the adapted quantum every chunk.
+        llvm::Value* qin = b.CreateLoad(
+            i64t, b.CreateConstGEP1_32(i8t, ctxArg, kYieldQuantumOff));
+        llvm::Value* qcur = b.CreateSelect(
+            b.CreateICmpULT(qin, ci64(curYieldQMaxVal)), qin,
+            ci64(curYieldQMaxVal));
+        b.CreateStore(qcur, curYieldQuantum);
+        b.CreateStore(b.CreateSub(qcur, ci64(1)), curYieldQMask);
+    }
+    /// Recompute the body-class cap after the lowering plan is chosen
+    /// (e.g. a generic repeat scope that selects a pure numeric-SSA fast
+    /// path). Preheader position only: re-initializes the quantum so the
+    /// first chunk already uses the right bound.
+    void retargetLoopQuantum(bool bodyMayAllocate) {
+        if (layqOff() || yieldStack.empty()) return;
+        // Fixed mode has no allocas (pinned const folds); adaptive needs
+        // the scope's quantum allocas live to re-seed them.
+        if (!layqFixed() && !curYieldQuantum) return;
+        layqApplyBodyClass(bodyMayAllocate);
+        yieldStack.back().qmaxVal = curYieldQMaxVal;
+        emitLayqEntryInit();
+    }
+    /// Once-per-quantum update at the top of a warp poll. Returns the
+    /// stop-epoch-change signal (i1); updates the loop quantum (alloca +
+    /// ctx) from the scheduler hint (or the fixed pin); records stats when
+    /// XYO_YIELD_QSTATS=1. Stashes the loaded epoch in layqPollEpoch for
+    /// the handoff block to sync back to observedStopEpoch.
+    llvm::Value* emitLayqPollAdaptation() {
+        LayqConfig cfg = layqConfig();
+        llvm::Value* qnew = nullptr;
+        if (layqFixed()) {
+            uint64_t pinned =
+                cfg.qfixed < curYieldQMaxVal ? cfg.qfixed : curYieldQMaxVal;
+            if (pinned < cfg.qmin) pinned = cfg.qmin;
+            qnew = ci64(pinned);
+        } else {
+            // v2 push model: the scheduler precomputes the pure-class
+            // target and publishes it (on change only); the JIT only
+            // clamps it to this loop's body-class cap. No competitor math,
+            // no shifts, no extra atomics here — danger is pinned
+            // scheduler-side, so generated code needs no danger branch.
+            qnew = layqHintCapped();
+        }
+        if (curYieldQuantum) {
+            b.CreateStore(qnew, curYieldQuantum);
+            b.CreateStore(b.CreateSub(qnew, ci64(1)), curYieldQMask);
+        }
+        b.CreateStore(
+            qnew, b.CreateConstGEP1_32(i8t, ctxArg, kYieldQuantumOff));
+        if (layqStatsEnabled()) {
+            auto* p = b.CreateLoad(i64t, b.CreateConstGEP1_32(
+                                             i8t, ctxArg, kLayqPollsOff));
+            b.CreateStore(b.CreateAdd(p, ci64(1)),
+                          b.CreateConstGEP1_32(i8t, ctxArg, kLayqPollsOff));
+            auto* qs = b.CreateLoad(i64t, b.CreateConstGEP1_32(
+                                              i8t, ctxArg, kLayqQSumOff));
+            b.CreateStore(b.CreateAdd(qs, qnew),
+                          b.CreateConstGEP1_32(i8t, ctxArg, kLayqQSumOff));
+        }
+        // Stop-epoch check: a stop (stopAll/stopThread — greenFlag routes
+        // through stopThread too) bumps Runtime::stopEpoch. A mismatch
+        // hands off, bounding stop latency at one quantum regardless of
+        // the deadline cadence. Relaxed: a stale read only delays that
+        // thread's handoff by one more poll; the handoff synchronizes.
+        // Integer load + inttoptr (not a pointer-typed JitCtx load): see
+        // layqHintCapped for why — the slot addresses a Runtime-embedded
+        // u64 atomic with integer payload, never GC memory.
+        auto* epochAddr = b.CreateLoad(
+            i64t, b.CreateConstGEP1_32(i8t, ctxArg, kStopEpochPtrOff));
+        auto* epochPtr = b.CreateIntToPtr(epochAddr, ptrt);
+        auto* epoch = b.CreateLoad(i64t, epochPtr);
+        epoch->setAtomic(llvm::AtomicOrdering::Monotonic);
+        layqPollEpoch = epoch;
+        llvm::Value* obs = b.CreateLoad(
+            i64t, b.CreateConstGEP1_32(i8t, ctxArg, kObservedStopEpochOff));
+        return b.CreateICmpNE(epoch, obs);
+    }
 
     /// ループ末尾の yield 点。non-warp は直接 xyo_yield(_fast)。
     /// warp は 500ms stuck 窓の時計読みを 64 回に 1 回へ間引く
     /// （判定遅延 << 500ms）。xyo_loop_yield 内で isWarp/isStuck を
     /// 再確認するので意味論は不変。
-    void beginLoopYieldScope(const Block* sourceLoop) {
+    void beginLoopYieldScope(const Block* sourceLoop,
+                             bool bodyMayAllocate = true) {
         yieldStack.push_back({curYieldCnt, curYieldWarp, curYieldSourceLoop,
                               curYieldRemainingF64, curYieldRemainingI32});
+        YieldScope& top = yieldStack.back();
         curYieldSourceLoop = sourceLoop;
         curYieldRemainingF64 = nullptr;
         curYieldRemainingI32 = nullptr;
@@ -882,12 +1053,36 @@ struct Codegen {
                          b.CreateConstGEP1_32(i8t, ctxArg, kYieldCheckNOff)),
             curYieldCnt);
         curYieldWarp = loadIsWarp();
+        // LAYQ state (adaptive only allocas; fixed uses the C++-side
+        // pinned constant, off leaves everything null so every quantum
+        // site folds to constant 64).
+        curYieldQuantum = nullptr;
+        curYieldQMask = nullptr;
+        curYieldQMaxVal = 64;
+        curYieldQPinned = 64;
+        layqPollEpoch = nullptr;
+        if (!layqOff()) {
+            layqApplyBodyClass(bodyMayAllocate);
+            top.qmaxVal = curYieldQMaxVal;
+            // Save the outer quantum for the nested-scope restore on exit.
+            top.savedCtxQuantum = b.CreateLoad(
+                i64t, b.CreateConstGEP1_32(i8t, ctxArg, kYieldQuantumOff));
+            if (!layqFixed()) {
+                top.quantum = curYieldQuantum = entryAlloca(i64t, 1, "qnt");
+                top.qmask = curYieldQMask = entryAlloca(i64t, 1, "qmask");
+            }
+            emitLayqEntryInit();
+        }
     }
     /// storeBack: ループが通常脱出するなら ctx へ書き戻す（global 位相を保つ）。
     void endLoopYieldScope(bool storeBack) {
         if (storeBack && curYieldCnt)
             b.CreateStore(b.CreateLoad(i64t, curYieldCnt),
                           b.CreateConstGEP1_32(i8t, ctxArg, kYieldCheckNOff));
+        if (!layqOff() && !yieldStack.empty() &&
+            yieldStack.back().savedCtxQuantum)
+            b.CreateStore(yieldStack.back().savedCtxQuantum,
+                          b.CreateConstGEP1_32(i8t, ctxArg, kYieldQuantumOff));
         YieldScope s = yieldStack.back();
         yieldStack.pop_back();
         curYieldCnt = s.cnt;
@@ -895,6 +1090,10 @@ struct Codegen {
         curYieldSourceLoop = s.sourceLoop;
         curYieldRemainingF64 = s.remainingF64;
         curYieldRemainingI32 = s.remainingI32;
+        curYieldQuantum = s.quantum;
+        curYieldQMask = s.qmask;
+        curYieldQMaxVal = s.qmaxVal;
+        layqPollEpoch = nullptr;
     }
     // Only active while lowering a proven self-append-only warp repeat.
     // The log remains GC-rooted by the immutable prefix snapshot in var.
@@ -1004,14 +1203,31 @@ struct Codegen {
     // actually exceeded (or the sampled-clock fallback is needed).
     void emitWarpDeadlineCheck(BasicBlock* chkBB, BasicBlock* done) {
         b.SetInsertPoint(chkBB);
+        // LAYQ: once-per-quantum adaptation + stop-epoch check. Off mode
+        // emits nothing here, keeping both paths below identical to before.
+        llvm::Value* layqStopDue = nullptr;
+        if (!layqOff()) layqStopDue = emitLayqPollAdaptation();
         if (!sharedWarpClock && promoted.empty() &&
             promotedLists.empty() && !activeTransient) {
+            // Fast path preserves the existing direct-helper shape. When a
+            // stop landed (layqStopDue), skip xyo_loop_yield — it would not
+            // necessarily yield for a stop — and take the full spill +
+            // scheduler handoff once instead (no double yield).
+            BasicBlock* handoff = nullptr;
+            BasicBlock* simpleDone = done;
+            if (layqStopDue) {
+                handoff = newBB("yield.handoff");
+                simpleDone = newBB("yield.simple.done");
+                b.CreateCondBr(layqStopDue, handoff, simpleDone);
+                b.SetInsertPoint(simpleDone);
+            }
             transientBeforeHandoff();
             emitPortableLoopCheckpoint();
             emitNestedOsrYieldCheckpoint();
             call1("xyo_loop_yield", voidt, ctxArg);
             transientAfterHandoff();
             b.CreateBr(done);
+            if (handoff) layqEmitHandoff(handoff, done);
         } else {
             llvm::Value* shouldYield;
             if (sharedWarpClock) {
@@ -1051,21 +1267,60 @@ struct Codegen {
                 shouldYield = b.CreateICmpNE(
                     call1("xyo_warp_yield_due", i32t, ctxArg), ci32(0));
             }
+            // RT-001 opt-in soft memory budget: even with the shared
+            // warp clock (which can bypass xyo_warp_yield_due entirely),
+            // request an ordinary source checkpoint and scheduler yield
+            // after the observed GC heap exceeds the configured budget.
+            // The actual GC is NOT run here: the scheduler must first
+            // certify a source-level continuation and RETIRE this Fiber.
+            if (std::getenv("XYO_RT_GC_SOFT_BUDGET_MB") &&
+                std::getenv("XYO_RT_REQUIRE_GENERATED_SSA_ROOTS")) {
+                auto* overBudget = b.CreateICmpNE(
+                    call1("xyo_rt_gc_soft_budget_due", i32t, ctxArg),
+                    ci32(0));
+                shouldYield = b.CreateOr(shouldYield, overBudget);
+            }
             // Neither a sampled clock read nor the fallback synchronous
             // check changes Scratch variables. Spill only on actual yield.
+            // LAYQ: a stop-epoch change also forces the handoff (bounds
+            // stop latency at one quantum regardless of deadline cadence).
+            if (!layqOff()) shouldYield = b.CreateOr(shouldYield, layqStopDue);
             BasicBlock* handoff = newBB("yield.handoff");
             hotBr(shouldYield, handoff, done, 1, 100000);
-            b.SetInsertPoint(handoff);
-            transientBeforeHandoff();
-            spillPromoted();
-            emitPortableLoopCheckpoint();
-            emitNestedOsrYieldCheckpoint();
-            call1("xyo_yield", voidt, ctxArg);
-            reloadPromoted();
-            transientAfterHandoff();
-            b.CreateBr(done);
+            layqEmitHandoff(handoff, done);
         }
         b.SetInsertPoint(done);
+        layqPollEpoch = nullptr;
+    }
+
+    /// Shared full spill + scheduler handoff. With LAYQ on, syncs the
+    /// observed stop epoch back (a stop-driven handoff does not repeat
+    /// every poll) and counts the handoff when XYO_YIELD_QSTATS=1.
+    void layqEmitHandoff(BasicBlock* handoff, BasicBlock* done) {
+        b.SetInsertPoint(handoff);
+        transientBeforeHandoff();
+        spillPromoted();
+        emitPortableLoopCheckpoint();
+        emitNestedOsrYieldCheckpoint();
+        call1("xyo_yield", voidt, ctxArg);
+        reloadPromoted();
+        transientAfterHandoff();
+        if (!layqOff()) {
+            if (layqPollEpoch) {
+                b.CreateStore(layqPollEpoch, b.CreateConstGEP1_32(
+                                                 i8t, ctxArg,
+                                                 kObservedStopEpochOff));
+            }
+            if (layqStatsEnabled()) {
+                auto* t = b.CreateLoad(
+                    i64t,
+                    b.CreateConstGEP1_32(i8t, ctxArg, kLayqTakenOff));
+                b.CreateStore(b.CreateAdd(t, ci64(1)),
+                              b.CreateConstGEP1_32(i8t, ctxArg,
+                                                   kLayqTakenOff));
+            }
+        }
+        b.CreateBr(done);
     }
 
     void emitLoopYield() {
@@ -1101,8 +1356,19 @@ struct Codegen {
         transientAfterHandoff();
         b.CreateBr(done);
         b.SetInsertPoint(warpBB);
-        llvm::Value* due =
-            b.CreateICmpEQ(b.CreateAnd(n, ci64(63)), ci64(0));
+        // LAYQ: off (default) keeps the exact 64-iteration gate; fixed uses
+        // a constant mask (folds — no extra live values); adaptive uses the
+        // per-loop mask (mem2reg-promoted register, same per-iteration op
+        // count: and + compare).
+        llvm::Value* due = nullptr;
+        if (layqOff()) {
+            due = b.CreateICmpEQ(b.CreateAnd(n, ci64(63)), ci64(0));
+        } else {
+            llvm::Value* mask = curYieldQMask
+                ? b.CreateLoad(i64t, curYieldQMask)
+                : b.CreateSub(yieldQuantumNow(), ci64(1));
+            due = b.CreateICmpEQ(b.CreateAnd(n, mask), ci64(0));
+        }
         hotBr(due, chkBB, done, 1, 63);
         emitWarpDeadlineCheck(chkBB, done);
     }
@@ -1157,8 +1423,7 @@ struct Codegen {
         b.CreateCondBr(b.CreateICmpEQ(remaining, ci64(0)), done, body);
         b.SetInsertPoint(body);
         llvm::Value* ticks = b.CreateLoad(i64t, tickPtr);
-        llvm::Value* toPoll = b.CreateSub(
-            ci64(64), b.CreateAnd(ticks, ci64(63)));
+        llvm::Value* toPoll = yieldToPoll(ticks);
         b.CreateCondBr(b.CreateICmpULT(remaining, toPoll), partial, poll);
         b.SetInsertPoint(partial);
         b.CreateStore(b.CreateAdd(ticks, remaining), tickPtr);
@@ -1506,6 +1771,13 @@ struct Codegen {
         const Block* sourceLoop;
         llvm::AllocaInst* remainingF64;
         llvm::AllocaInst* remainingI32;
+        // LAYQ (adaptive/fixed modes only): per-loop poll quantum state.
+        // quantum/qmask are mem2reg-promoted (register in the hot loop);
+        // qmaxVal is the C++-side body-class cap immediate.
+        llvm::AllocaInst* quantum = nullptr;
+        llvm::AllocaInst* qmask = nullptr;
+        llvm::Value* savedCtxQuantum = nullptr;
+        uint64_t qmaxVal = 64;
     };
     std::vector<YieldScope> yieldStack;
     llvm::AllocaInst* curYieldCnt = nullptr;
@@ -1514,6 +1786,20 @@ struct Codegen {
     const Block* curYieldSourceLoop = nullptr;
     llvm::AllocaInst* curYieldRemainingF64 = nullptr;
     llvm::AllocaInst* curYieldRemainingI32 = nullptr;
+    // LAYQ: current loop's quantum state. Null allocas when LAYQ is off
+    // (or no scope is open) — all quantum sites then fold to constant 64
+    // and the emitted IR is identical to the pre-LAYQ form. In fixed mode
+    // the allocas also stay null: the pinned quantum is a C++-side
+    // constant (curYieldQPinned) that folds everywhere, so fixed mode
+    // carries zero extra loop-carried live values (unlike adaptive, whose
+    // dynamic quantum must ride in registers).
+    llvm::AllocaInst* curYieldQuantum = nullptr;
+    llvm::AllocaInst* curYieldQMask = nullptr;
+    uint64_t curYieldQMaxVal = 64;
+    uint64_t curYieldQPinned = 64;
+    // Epoch value loaded by the current poll (handover block syncs it to
+    // observedStopEpoch after a stop-driven handoff). Null outside polls.
+    llvm::Value* layqPollEpoch = nullptr;
     bool promotingLoop = false;   // このループが write-back を持つ（最外）
     // Resume-epoch guard: compare the actual boxed value after a yield,
     // reusing its numeric shadow when unchanged. A GC collection invalidates
@@ -7119,7 +7405,9 @@ struct Codegen {
         BasicBlock* finish = newBB("induction.finish");
         b.CreateCondBr(b.CreateICmpNE(loadIsWarp(), ci32(0)), prepare, fallback);
         b.SetInsertPoint(prepare);
-        beginLoopYieldScope(sourceLoop);
+        // LAYQ: warp induction is a call-free numeric recurrence by plan
+        // construction; open the scope at the pure body cap directly.
+        beginLoopYieldScope(sourceLoop, false);
         llvm::Value* real = realVarValuePtr(plan.index);
         llvm::Value* boundPtr = plan.boundVariable
             ? realVarValuePtr(plan.boundVariable) : nullptr;
@@ -7163,8 +7451,7 @@ struct Codegen {
         b.CreateCondBr(go, update, finish);
         b.SetInsertPoint(update);
         llvm::Value* ticks = b.CreateLoad(i64t, curYieldCnt);
-        llvm::Value* toPoll = b.CreateSub(
-            ci64(64), b.CreateAnd(ticks, ci64(63)));
+        llvm::Value* toPoll = yieldToPoll(ticks);
         llvm::Value* chunk = b.CreateSelect(
             b.CreateICmpULT(remaining, toPoll), remaining, toPoll);
 
@@ -7511,8 +7798,7 @@ struct Codegen {
         b.CreateCondBr(valid, fast, slow);
         b.SetInsertPoint(fast);
         llvm::Value* ticks = b.CreateLoad(i64t, curYieldCnt);
-        llvm::Value* toPoll = b.CreateSub(
-            ci64(64), b.CreateAnd(ticks, ci64(63)));
+        llvm::Value* toPoll = yieldToPoll(ticks);
         llvm::Value* remaining = b.CreateZExt(remaining32, i64t);
         llvm::Value* chunk = b.CreateSelect(
             b.CreateICmpULT(remaining, toPoll), remaining, toPoll);
@@ -7661,8 +7947,7 @@ struct Codegen {
         b.CreateCondBr(valid, fast, slow);
         b.SetInsertPoint(fast);
         llvm::Value* ticks = b.CreateLoad(i64t, curYieldCnt);
-        llvm::Value* untilPoll = b.CreateSub(
-            ci64(64), b.CreateAnd(ticks, ci64(63)));
+        llvm::Value* untilPoll = yieldToPoll(ticks);
         llvm::Value* left = b.CreateZExt(
             b.CreateSub(ci32(tripCount), zeroIndex), i64t);
         llvm::Value* chunk = b.CreateSelect(
@@ -8098,6 +8383,13 @@ struct Codegen {
             }
             b.CreateCondBr(go, bodyBB, merge);
             b.SetInsertPoint(bodyBB);
+            // LAYQ: numeric-SSA fast loops are call-free by plan
+            // construction (arithmetic region graph / affine induction), so
+            // they may use the pure body cap. List-copy plans may grow the
+            // list (allocation) and stay may-allocate. Verified per kernel
+            // via XYO_JIT_DUMP2 fast-loop call audits.
+            if ((conditionalRepeat || repeatAffine) && !repeatCopies)
+                retargetLoopQuantum(false);
             if (conditionalRepeat && intIv)
                 emitConditionalRepeatChunk(*conditionalRepeat,
                     b.CreateLoad(i32t, intIv), intIv, head);
@@ -8220,10 +8512,15 @@ struct Codegen {
             b.SetInsertPoint(bodyBB);
             // MATH-004: guarded side-effect-free until loops; the slow
             // successor retains the entire original Scratch body.
+            // LAYQ: numeric/affine until fast loops are call-free by plan
+            // construction (see the repeat-case note); retarget to pure.
             if (op == "control_repeat_until") {
-                if (auto affine = affineUntilPlan(blk))
+                const auto affinePlan = affineUntilPlan(blk);
+                const auto numericPlan = numericUntilPlan(blk);
+                if (affinePlan || numericPlan) retargetLoopQuantum(false);
+                if (auto affine = affinePlan)
                     emitAffineUntilChunk(*affine, head);
-                if (auto numeric = numericUntilPlan(blk))
+                if (auto numeric = numericPlan)
                     emitNumericUntilChunk(*numeric, head);
             }
             {
@@ -8332,6 +8629,9 @@ struct Codegen {
                 : b.CreateFCmpOLT(i, bound);
             b.CreateCondBr(go, bodyBB, merge);
             b.SetInsertPoint(bodyBB);
+            // LAYQ: the foreach-sum fast loop is a call-free numeric
+            // reduction by plan construction; retarget to pure.
+            if (ssaSum && intTripCount && iv32) retargetLoopQuantum(false);
             if (ssaSum && intTripCount && iv32)
                 emitForEachSumChunk(*ssaSum, integralIndex, *intTripCount,
                                     iv32, head);

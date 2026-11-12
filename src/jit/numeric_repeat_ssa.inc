@@ -437,8 +437,7 @@ void emitNumericRepeatChunk(const NumericRepeatPlan& plan,
     b.CreateCondBr(valid, fast, slow);
     b.SetInsertPoint(fast);
     llvm::Value* ticks = b.CreateLoad(i64t, curYieldCnt);
-    llvm::Value* untilPoll =
-        b.CreateSub(ci64(64), b.CreateAnd(ticks, ci64(63)));
+    llvm::Value* untilPoll = yieldToPoll(ticks);
     llvm::Value* available = b.CreateZExt(remaining32, i64t);
     llvm::Value* chunk = b.CreateSelect(
         b.CreateICmpULT(available, untilPoll), available, untilPoll);
