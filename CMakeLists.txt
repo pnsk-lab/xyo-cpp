@@ -441,6 +441,9 @@ if(XYO_JIT)
   unset(_xyo_saved_try_type)
   if(XYO_LLVM_HAS_GET_OR_INSERT)
     target_compile_definitions(xyo PUBLIC XYO_LLVM_GET_OR_INSERT=1)
+    # テスト用ターゲットは xyo をリンクしないものがあり、PUBLIC の定義が
+    # 伝播しない。ヘッダ側の #if が全 TU で正しく選ばれるよう全体にも付ける。
+    add_compile_definitions(XYO_LLVM_GET_OR_INSERT=1)
   endif()
   if(XYO_LLVM_LINK_DIRS)
     target_link_directories(xyo PUBLIC ${XYO_LLVM_LINK_DIRS})

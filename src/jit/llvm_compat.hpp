@@ -14,6 +14,9 @@
 #include <llvm/Analysis/CaptureTracking.h>
 #include <llvm/IR/Function.h>
 #include <llvm/Support/CodeGen.h>
+
+#include <type_traits>
+#include <utility>
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/Module.h>
 #include <llvm/TargetParser/Triple.h>
@@ -44,7 +47,8 @@ inline void withContext(llvm::orc::ThreadSafeContext& tsc, Fn&& fn) {
 
 /// intrinsic の宣言を取得する（無ければモジュールへ追加）。
 /// LLVM 23 で getDeclaration から getOrInsertDeclaration に改名された。
-/// CMake が XYO_LLVM_GET_OR_INSERT を定義した場合だけ新しい名前を使う。
+/// CMake が XYO_LLVM_GET_OR_INSERT を定義した場合だけ新しい名前を使う
+/// （定義は全ターゲットへ伝播させる — テスト用 TU でも壊れないように）。
 inline llvm::Function* intrinsicDeclaration(
         llvm::Module* m, llvm::Intrinsic::ID id,
         llvm::ArrayRef<llvm::Type*> overloads = {}) {
