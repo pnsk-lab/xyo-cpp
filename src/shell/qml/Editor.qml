@@ -266,16 +266,113 @@ Item {
                     }
                 }
 
-                // Costumes / Sounds タブ（v1: プレースホルダ）
+                // Costumes / Sounds タブ: 左にアセットセレクタ
                 Rectangle {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     visible: editor.tab !== 0
                     color: cPanel
-                    Text {
-                        anchors.centerIn: parent
-                        text: editor.tab === 1 ? "Costumes" : "Sounds"
-                        color: cFgDim; font.pixelSize: 13
+                    Column {
+                        anchors.fill: parent
+                        anchors.margins: 10
+                        spacing: 8
+                        Text {
+                            text: editor.tab === 1 ? "Costumes" : "Sounds"
+                            color: cFgDim
+                            font.pixelSize: 11; font.bold: true
+                        }
+                        // アセットタイル一覧
+                        Flickable {
+                            width: parent.width
+                            height: parent.height - 54 - newBtn.height
+                            contentHeight: assetCol.height
+                            clip: true
+                            Column {
+                                id: assetCol
+                                spacing: 8
+                                Repeater {
+                                    model: {
+                                        var n = editor.layoutRev
+                                        return editor.tab === 1
+                                                ? editor.costumeItems()
+                                                : editor.soundItems()
+                                    }
+                                    delegate: Rectangle {
+                                        required property var modelData
+                                        width: 200; height: 72
+                                        radius: 6
+                                        color: (editor.tab === 1
+                                                ? modelData.current
+                                                : editor.soundSel() === modelData.index)
+                                               ? "#E4DEFF" : "white"
+                                        border.color: (editor.tab === 1
+                                                       ? modelData.current
+                                                       : editor.soundSel() === modelData.index)
+                                                      ? "#855CD6" : "#D9D9D9"
+                                        border.width: (editor.tab === 1
+                                                       ? modelData.current
+                                                       : editor.soundSel() === modelData.index)
+                                                      ? 2 : 1
+                                        Image {
+                                            visible: editor.tab === 1
+                                            x: 8; y: 8; width: 56; height: 56
+                                            source: "image://xyocostume/" +
+                                                    editor.selTarget + "_" +
+                                                    modelData.index + "/" +
+                                                    editor.layoutRev
+                                            fillMode: Image.PreserveAspectFit
+                                        }
+                                        Text {
+                                            visible: editor.tab === 2
+                                            x: 8; y: 24; text: "🔊"
+                                            font.pixelSize: 24
+                                        }
+                                        Text {
+                                            x: 72; y: 20
+                                            width: 124
+                                            text: modelData.name
+                                            color: cFg
+                                            font.pixelSize: 12
+                                            elide: Text.ElideRight
+                                        }
+                                        Text {
+                                            visible: editor.tab === 2
+                                            x: 72; y: 38
+                                            text: Number(modelData.secs).toFixed(2) + " s"
+                                            color: cFgDim; font.pixelSize: 10
+                                        }
+                                        MouseArea {
+                                            anchors.fill: parent
+                                            onClicked: {
+                                                if (editor.tab === 1)
+                                                    editor.selectCostume(modelData.index)
+                                                else
+                                                    editor.selectSound(modelData.index)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // + ボタン（新規アセット）
+                        Rectangle {
+                            id: newBtn
+                            width: 44; height: 44; radius: 22
+                            color: "#4C97FF"
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            Text {
+                                anchors.centerIn: parent
+                                text: "+"; color: "white"
+                                font.pixelSize: 24; font.bold: true
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: {
+                                    if (editor.tab === 1) editor.addCostume()
+                                    else editor.addSound()
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -457,6 +554,126 @@ Item {
                             editor.fieldEditCommit(fieldInput.text)
                         m.accepted = true
                     }
+                }
+
+                // ---- Costumes / Sounds 詳細エリア ----
+                Rectangle {
+                    id: assetDetail
+                    anchors.fill: parent
+                    visible: editor.tab !== 0
+                    color: cWsBg
+                    z: 5
+                    // プレビュー描画は C++ 側の image provider を利用。
+                    // costume タブのみ画像、sound は再生ボタン。
+                    // layoutRev を参照してモデル変更時に再評価させる
+                    property int rev: editor.layoutRev
+                    property var items: {
+                        var n = rev
+                        return editor.tab === 1 ? editor.costumeItems()
+                                : editor.soundItems()
+                    }
+                    property int sel: editor.tab === 1 ? editor.costumeSel()
+                                      : editor.soundSel()
+                    property var cur: (sel >= 0 && sel < items.length)
+                                      ? items[sel] : null
+                    Column {
+                        anchors.centerIn: parent
+                        spacing: 14
+                        // プレビュー（コスチューム画像 or 再生ボタン）
+                        Rectangle {
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            width: 320; height: 240; radius: 8
+                            color: "white"; border.color: cBorder
+                            Image {
+                                visible: editor.tab === 1
+                                anchors.fill: parent
+                                anchors.margins: 10
+                                source: assetDetail.cur
+                                        ? "image://xyocostume/" +
+                                          editor.selTarget + "_" +
+                                          assetDetail.cur.index + "/" +
+                                          editor.layoutRev
+                                        : ""
+                                fillMode: Image.PreserveAspectFit
+                            }
+                            Rectangle {
+                                visible: editor.tab === 2
+                                anchors.centerIn: parent
+                                width: 64; height: 64; radius: 32
+                                color: playMa.containsMouse ? "#3D8534" : cGreen
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: "▶"; color: "white"
+                                    font.pixelSize: 26
+                                }
+                                MouseArea {
+                                    id: playMa; anchors.fill: parent
+                                    hoverEnabled: true
+                                    onClicked: editor.playSound(
+                                        assetDetail.sel)
+                                }
+                            }
+                        }
+                        // 名前 + 操作ボタン
+                        Row {
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            spacing: 8
+                            TextField {
+                                id: assetName
+                                width: 220
+                                text: assetDetail.cur ? assetDetail.cur.name : ""
+                                font.pixelSize: 13
+                                selectByMouse: true
+                                onAccepted: {
+                                    if (!assetDetail.cur) return
+                                    if (editor.tab === 1)
+                                        editor.renameCostume(assetDetail.sel, text)
+                                    else
+                                        editor.renameSound(assetDetail.sel, text)
+                                }
+                            }
+                            Rectangle {
+                                width: 84; height: 30; radius: 15
+                                color: dupMa.containsMouse ? "#EDF1F5" : "white"
+                                border.color: cBorder
+                                Text { anchors.centerIn: parent
+                                       text: "Duplicate"
+                                       font.pixelSize: 11; color: cFg }
+                                MouseArea {
+                                    id: dupMa; anchors.fill: parent
+                                    hoverEnabled: true
+                                    onClicked: {
+                                        if (!assetDetail.cur) return
+                                        if (editor.tab === 1)
+                                            editor.duplicateCostume(assetDetail.sel)
+                                        else
+                                            editor.duplicateSound(assetDetail.sel)
+                                    }
+                                }
+                            }
+                            Rectangle {
+                                width: 70; height: 30; radius: 15
+                                color: delMa.containsMouse ? "#FFF0EB" : "white"
+                                border.color: "#FF8C1A"
+                                Text { anchors.centerIn: parent
+                                       text: "Delete"
+                                       font.pixelSize: 11; color: "#FF8C1A" }
+                                MouseArea {
+                                    id: delMa; anchors.fill: parent
+                                    hoverEnabled: true
+                                    onClicked: {
+                                        if (!assetDetail.cur) return
+                                        if (editor.tab === 1)
+                                            editor.deleteCostume(assetDetail.sel)
+                                        else
+                                            editor.deleteSound(assetDetail.sel)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // キー入力を ws のキーハンドラから遮断
+                    MouseArea { anchors.fill: parent }
                 }
             }
 

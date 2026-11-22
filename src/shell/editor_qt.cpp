@@ -372,6 +372,7 @@ struct EdCore {
 
     // ---- ブロック操作（editor.cpp から移植）----
     std::string selBlock;
+    int soundSel_ = -1;          // Sounds タブの選択行
     int blkCounter = 0;
     std::string newBlockId() {
         char buf[64];
@@ -1676,6 +1677,212 @@ public:
     Q_INVOKABLE void duplicateSelected() {
         if (!ed.selBlock.empty()) { ed.duplicateBlock(ed.selBlock); bumpLayout(); }
     }
+    // ---- Costumes / Sounds タブ ----
+    Q_INVOKABLE QVariantList costumeItems() const {
+        QVariantList out;
+        const Target* t = ed.rt && ed.selTarget >= 0 &&
+                                  ed.selTarget < (int)ed.rt->targets.size()
+                              ? ed.rt->targets[ed.selTarget]
+                              : nullptr;
+        if (!t || !t->sprite) return out;
+        for (size_t i = 0; i < t->sprite->costumes.size(); ++i) {
+            const Costume& c = t->sprite->costumes[i];
+            QVariantMap m;
+            m["name"] = QString::fromStdString(utf16ToUtf8(c.name));
+            m["index"] = (int)i;
+            m["current"] = (int)i == t->currentCostume;
+            out.push_back(m);
+        }
+        return out;
+    }
+    Q_INVOKABLE QVariantList soundItems() const {
+        QVariantList out;
+        const Target* t = ed.rt && ed.selTarget >= 0 &&
+                                  ed.selTarget < (int)ed.rt->targets.size()
+                              ? ed.rt->targets[ed.selTarget]
+                              : nullptr;
+        if (!t || !t->sprite) return out;
+        for (size_t i = 0; i < t->sprite->sounds.size(); ++i) {
+            const Sound& s = t->sprite->sounds[i];
+            QVariantMap m;
+            m["name"] = QString::fromStdString(utf16ToUtf8(s.name));
+            m["index"] = (int)i;
+            m["secs"] = s.rate > 0 ? s.sampleCount / s.rate : 0.0;
+            out.push_back(m);
+        }
+        return out;
+    }
+    Q_INVOKABLE void selectCostume(int i) {
+        Target* t = ed.selected();
+        if (!t || !t->sprite) return;
+        t->setCostume(double(std::clamp(i, 0,
+            (int)t->sprite->costumes.size() - 1)));
+        refreshCostumeThumbs();
+        Q_EMIT uiChanged();
+    }
+    Q_INVOKABLE void addCostume() {
+        Target* t = ed.selected();
+        if (!t || !t->sprite) return;
+        ed.pushUndo();
+        int n = (int)t->sprite->costumes.size() + 1;
+        Costume c;
+        c.name = utf8ToU16("costume" + std::to_string(n));
+        c.dataFormat = "svg";
+        static const char* cols[] = {"#855CD6", "#0FBD8C", "#FF8C1A",
+                                     "#4C97FF", "#CF63CF", "#FF6680"};
+        static int hue = 0;
+        std::string svg =
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"80\" "
+            "height=\"60\" viewBox=\"0 0 80 60\">"
+            "<ellipse cx=\"40\" cy=\"32\" rx=\"34\" ry=\"26\" fill=\"";
+        svg += cols[hue++ % 6];
+        svg += "\"/>"
+               "<circle cx=\"30\" cy=\"24\" r=\"7\" fill=\"#fff\"/>"
+               "<circle cx=\"50\" cy=\"24\" r=\"7\" fill=\"#fff\"/>"
+               "<circle cx=\"31\" cy=\"25\" r=\"3\" fill=\"#000\"/>"
+               "<circle cx=\"51\" cy=\"25\" r=\"3\" fill=\"#000\"/>"
+               "</svg>";
+        c.data.assign(svg.begin(), svg.end());
+        c.assetId = "gen" + std::to_string(SDL_GetTicks());
+        c.rotationCenterX = 40;
+        c.rotationCenterY = 30;
+        t->sprite->costumes.push_back(c);
+        t->setCostume((double)t->sprite->costumes.size() - 1);
+        refreshCostumeThumbs();
+        bumpLayout();
+    }
+    Q_INVOKABLE void duplicateCostume(int i) {
+        Target* t = ed.selected();
+        if (!t || !t->sprite ||
+            i < 0 || i >= (int)t->sprite->costumes.size()) return;
+        ed.pushUndo();
+        Costume c = t->sprite->costumes[i];
+        std::string bn = utf16ToUtf8(c.name);
+        while (!bn.empty() && std::isdigit((unsigned char)bn.back()))
+            bn.pop_back();
+        auto exists = [&](const std::string& nm) {
+            for (auto& cc : t->sprite->costumes)
+                if (utf16ToUtf8(cc.name) == nm) return true;
+            return false;
+        };
+        int n = 2;
+        while (exists(bn + std::to_string(n))) ++n;
+        c.name = utf8ToU16(bn + std::to_string(n));
+        c.assetId.clear();  // 保存時に再採番
+        t->sprite->costumes.push_back(c);
+        refreshCostumeThumbs();
+        bumpLayout();
+    }
+    Q_INVOKABLE void deleteCostume(int i) {
+        Target* t = ed.selected();
+        if (!t || !t->sprite || t->sprite->costumes.size() <= 1) return;
+        if (i < 0 || i >= (int)t->sprite->costumes.size()) return;
+        ed.pushUndo();
+        t->sprite->costumes.erase(t->sprite->costumes.begin() + i);
+        if (t->currentCostume >= (int)t->sprite->costumes.size())
+            t->setCostume((double)t->sprite->costumes.size() - 1);
+        refreshCostumeThumbs();
+        bumpLayout();
+    }
+    Q_INVOKABLE void renameCostume(int i, const QString& nm) {
+        Target* t = ed.selected();
+        if (!t || !t->sprite ||
+            i < 0 || i >= (int)t->sprite->costumes.size()) return;
+        ed.pushUndo();
+        t->sprite->costumes[i].name = utf8ToU16(nm.toStdString());
+        bumpLayout();
+    }
+    Q_INVOKABLE void selectSound(int i) { ed.soundSel_ = i; Q_EMIT uiChanged(); }
+    Q_INVOKABLE void playSound(int i) {
+        Target* t = ed.selected();
+        if (!t || !t->sprite || !t->sprite->soundBank) return;
+        if (i < 0 || i >= (int)t->sprite->sounds.size()) return;
+        t->sprite->soundBank->playSound(t, t->sprite->sounds[i].soundId);
+    }
+    Q_INVOKABLE void addSound() {
+        Target* t = ed.selected();
+        if (!t || !t->sprite) return;
+        ed.pushUndo();
+        int n = (int)t->sprite->sounds.size() + 1;
+        Sound s2;
+        s2.name = utf8ToU16("pop" + std::to_string(n));
+        s2.dataFormat = "wav";
+        const int RATE = 22050, N = RATE * 12 / 100;
+        std::vector<uint8_t> wav(44 + N * 2);
+        auto w32 = [&](size_t o, uint32_t v) { std::memcpy(&wav[o], &v, 4); };
+        auto w16 = [&](size_t o, uint16_t v) { std::memcpy(&wav[o], &v, 2); };
+        std::memcpy(&wav[0], "RIFF", 4);
+        w32(4, 36 + N * 2);
+        std::memcpy(&wav[8], "WAVEfmt ", 8);
+        w32(16, 16);
+        w16(20, 1); w16(22, 1); w32(24, RATE);
+        w32(28, RATE * 2); w16(32, 2); w16(34, 16);
+        std::memcpy(&wav[36], "data", 4);
+        w32(40, N * 2);
+        for (int i = 0; i < N; ++i) {
+            double env = 1.0 - (double)i / N;
+            int16_t v = (int16_t)(std::sin(i * 440.0 * 6.2831853 / RATE) *
+                                  30000 * env);
+            std::memcpy(&wav[44 + i * 2], &v, 2);
+        }
+        s2.data = std::move(wav);
+        s2.assetId = "gen" + std::to_string(SDL_GetTicks());
+        s2.soundId = (int)t->sprite->sounds.size();
+        t->sprite->sounds.push_back(std::move(s2));
+        ed.soundSel_ = (int)t->sprite->sounds.size() - 1;
+        bumpLayout();
+    }
+    Q_INVOKABLE void duplicateSound(int i) {
+        Target* t = ed.selected();
+        if (!t || !t->sprite ||
+            i < 0 || i >= (int)t->sprite->sounds.size()) return;
+        ed.pushUndo();
+        Sound s2 = t->sprite->sounds[i];
+        std::string bn = utf16ToUtf8(s2.name);
+        while (!bn.empty() && std::isdigit((unsigned char)bn.back()))
+            bn.pop_back();
+        auto exists = [&](const std::string& nm) {
+            for (auto& ss : t->sprite->sounds)
+                if (utf16ToUtf8(ss.name) == nm) return true;
+            return false;
+        };
+        int n = 2;
+        while (exists(bn + std::to_string(n))) ++n;
+        s2.name = utf8ToU16(bn + std::to_string(n));
+        s2.assetId.clear();
+        t->sprite->sounds.push_back(s2);
+        ed.soundSel_ = (int)t->sprite->sounds.size() - 1;
+        bumpLayout();
+    }
+    Q_INVOKABLE void deleteSound(int i) {
+        Target* t = ed.selected();
+        if (!t || !t->sprite ||
+            i < 0 || i >= (int)t->sprite->sounds.size()) return;
+        ed.pushUndo();
+        t->sprite->sounds.erase(t->sprite->sounds.begin() + i);
+        if (ed.soundSel_ >= (int)t->sprite->sounds.size())
+            ed.soundSel_ = (int)t->sprite->sounds.size() - 1;
+        bumpLayout();
+    }
+    Q_INVOKABLE void renameSound(int i, const QString& nm) {
+        Target* t = ed.selected();
+        if (!t || !t->sprite ||
+            i < 0 || i >= (int)t->sprite->sounds.size()) return;
+        ed.pushUndo();
+        t->sprite->sounds[i].name = utf8ToU16(nm.toStdString());
+        bumpLayout();
+    }
+    Q_INVOKABLE int costumeSel() const {
+        const Target* t = ed.rt && ed.selTarget >= 0 &&
+                                  ed.selTarget < (int)ed.rt->targets.size()
+                              ? ed.rt->targets[ed.selTarget]
+                              : nullptr;
+        return t ? t->currentCostume : 0;
+    }
+    Q_INVOKABLE int soundSel() const { return ed.soundSel_; }
+    /// コスチュームタブ用サムネイルを作り直す（target 単位）。
+    void refreshCostumeThumbs();  // provider へのアクセスのため main 側で実装
+
     Q_INVOKABLE void cleanupBlocks() {
         Target* t = ed.selected();
         if (!t || !t->blocks) return;
@@ -2259,17 +2466,25 @@ private:
 // ---------------------------------------------------------------------------
 class CostumeImageProvider : public QQuickImageProvider {
 public:
-    /// GUI スレッドで事前生成したサムネイル（index → QImage）。
+    /// GUI スレッドで事前生成したサムネイル。
+    /// キー: "ti" = スプライトタイル用の現行コスチューム、
+    ///       "ti_ci" = コスチュームタブ用の個別コスチューム。
     /// requestImage は別スレッドから呼ばれ得るので decode はしない。
-    std::map<int, QImage> thumbs;
+    std::map<std::string, QImage> thumbs;
     CostumeImageProvider()
         : QQuickImageProvider(QQuickImageProvider::Image) {}
     QImage requestImage(const QString& id, QSize*, const QSize&) override {
-        int ti = id.section('/', 0, 0).toInt();
-        auto it = thumbs.find(ti);
+        auto it = thumbs.find(id.section('/', 0, 0).toStdString());
         return it == thumbs.end() ? QImage() : it->second;
     }
 };
+
+/// 選択ターゲットの全コスチューム + タイル用現行コスチュームを再生成
+/// するコールバック（editorMainQt で provider へ束縛）。
+static std::function<void()> g_thumbRefresh;
+void EditorController::refreshCostumeThumbs() {
+    if (g_thumbRefresh) g_thumbRefresh();
+}
 
 class StageItem : public QQuickPaintedItem {
     Q_OBJECT
@@ -2393,18 +2608,29 @@ int xyo::editorMainQt(const char* path, bool danger) {
     qmlRegisterType<StageItem>("Xyo.Editor", 1, 0, "StageItem");
 
     auto* imgProvider = new CostumeImageProvider();
-    // スプライトタイルのサムネイルを GUI スレッドで事前生成
-    for (size_t i = 0; i < rtOwn->targets.size(); ++i) {
-        Target* t = rtOwn->targets[i];
-        const Costume* c = t->getCurrentCostume();
-        std::vector<uint8_t> px;
-        int w = 0, h = 0;
-        if (!c || !ctrl.ren.costumePixels(c, px, &w, &h)) continue;
-        QImage img(w, h, QImage::Format_RGBA8888);
-        std::memcpy(img.bits(), px.data(), size_t(w) * h * 4);
-        imgProvider->thumbs[(int)i] =
-            img.convertToFormat(QImage::Format_ARGB32_Premultiplied);
-    }
+    // サムネイルを GUI スレッドで事前生成
+    auto rebuildThumbs = [&]() {
+        for (size_t i = 0; i < rtOwn->targets.size(); ++i) {
+            Target* t = rtOwn->targets[i];
+            if (!t->sprite) continue;
+            for (size_t ci = 0; ci < t->sprite->costumes.size(); ++ci) {
+                const Costume* c = &t->sprite->costumes[ci];
+                std::vector<uint8_t> px;
+                int w = 0, h = 0;
+                if (!ctrl.ren.costumePixels(c, px, &w, &h)) continue;
+                QImage img(w, h, QImage::Format_RGBA8888);
+                std::memcpy(img.bits(), px.data(), size_t(w) * h * 4);
+                img = img.convertToFormat(
+                    QImage::Format_ARGB32_Premultiplied);
+                if ((int)ci == t->currentCostume)
+                    imgProvider->thumbs[std::to_string(i)] = img;  // タイル用
+                imgProvider->thumbs[std::to_string(i) + "_" +
+                                    std::to_string(ci)] = img;      // タブ用
+            }
+        }
+    };
+    rebuildThumbs();
+    g_thumbRefresh = rebuildThumbs;
     QQuickView view;
     view.engine()->addImageProvider(QStringLiteral("xyocostume"),
                                     imgProvider);
@@ -2459,6 +2685,35 @@ int xyo::editorMainQt(const char* path, bool danger) {
             else if (a == "dup") ctrl.duplicateSelected();
             else if (a == "del") ctrl.deleteSelected();
             else if (a == "cleanup") ctrl.cleanupBlocks();
+            else if (a.startsWith("tab:")) ctrl.setTab(a.mid(4).toInt());
+            else if (a == "addcostume") ctrl.addCostume();
+            else if (a == "addsound") ctrl.addSound();
+            else if (a.startsWith("key:")) {
+                // key:<letter|space|up|down|left|right|return> — down+up
+                const QString k = a.mid(4);
+                int sdl = 0;
+                if (k.size() == 1 && k[0] >= 'a' && k[0] <= 'z')
+                    sdl = k[0].unicode();
+                else if (k == "space") sdl = SDLK_SPACE;
+                else if (k == "up") sdl = SDLK_UP;
+                else if (k == "down") sdl = SDLK_DOWN;
+                else if (k == "left") sdl = SDLK_LEFT;
+                else if (k == "right") sdl = SDLK_RIGHT;
+                else if (k == "return") sdl = SDLK_RETURN;
+                else if (k.size() == 1) sdl = k[0].unicode();
+                if (sdl) {
+                    ctrl.stageKey(sdl, true);
+                    ctrl.stageKey(sdl, false);
+                }
+            }
+            else if (a.startsWith("sclick:")) {
+                // sclick:x:y — ステージ表示座標でクリック
+                QStringList p = a.mid(7).split(':');
+                if (p.size() == 2) {
+                    ctrl.stageMouseDown(p[0].toDouble(), p[1].toDouble());
+                    ctrl.stageMouseUp(p[0].toDouble(), p[1].toDouble());
+                }
+            }
             else if (a.startsWith("target:"))
                 ctrl.setSelTarget(a.mid(7).toInt());
             else if (a.startsWith("cat:"))
