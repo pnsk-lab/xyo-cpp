@@ -26,15 +26,27 @@ jobs:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
-      - run: bun install --frozen-lockfile
+      - uses: actions/checkout@v5
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install site dependencies
         working-directory: site
-      - run: bun run build
+        run: bun install --frozen-lockfile
+
+      - name: Build site
         working-directory: site
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
+        run: bun run build
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
         with:
           path: site/dist
-      - id: deploy
+
+      - name: Deploy to GitHub Pages
+        id: deploy
         uses: actions/deploy-pages@v4

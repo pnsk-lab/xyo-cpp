@@ -1,4 +1,4 @@
-name: release
+name: Release
 
 on:
   push:
@@ -13,18 +13,21 @@ env:
 
 jobs:
   linux:
-    name: Linux / JIT + SDL2 + librsvg
+    name: Linux / JIT + SDL2 + librsvg + Qt
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
 
-      - uses: ./.github/actions/linux-deps
+      # Qt Quick ランチャー用の Qt6 は共有ライブラリでリンクする（LGPL）。
+      # ユーザー側では Qt6 ランタイムパッケージが必要。
+      - name: Install dependencies
+        uses: ./.github/actions/linux-deps
         with:
           llvm: ${{ env.LLVM_STATIC }}
-          extra: libzstd-dev libxml2-dev libncurses-dev libsdl2-dev librsvg2-dev libgl-dev glslc
+          extra: libzstd-dev libxml2-dev libncurses-dev libsdl2-dev librsvg2-dev libgl-dev glslc qt6-base-dev qt6-declarative-dev
 
-      - name: Configure + build（Release / LLVM は静的リンク）
+      - name: Configure and build (Release / static LLVM / dynamic Qt)
         run: |
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DXYO_BUILD_TESTS=OFF \
@@ -35,8 +38,10 @@ jobs:
           cmake --build build -j"$(nproc)"
           echo "--- libLLVM に依存していないこと ---"
           readelf -d build/xyo | grep -c "libLLVM" | grep -q "^0$"
+          echo "--- Qt が動的リンクであること（LGPL） ---"
+          ldd build/xyo | grep libQt6Core
 
-      - name: Smoke（run / AOT / play）
+      - name: Smoke (run / play / gui)
         run: |
           bash tools/ci/smoke.sh run build/xyo
           bash tools/ci/smoke.sh play build/xyo
@@ -45,7 +50,7 @@ jobs:
       # The host runner can execute native AVX instructions, masking a bug
       # in portable AOT artifacts. Emulate baseline x86-64 (without SSE4.1
       # or AVX) so a native-tuned AOT regression fails before publishing.
-      - name: AOT portability smoke（baseline x86-64）
+      - name: AOT portability smoke (baseline x86-64)
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq qemu-user
@@ -53,17 +58,18 @@ jobs:
           build/xyo aot examples/play_demo.sb3 --obj build/aot-portability/play.o
           qemu-x86_64 -cpu qemu64 build/xyo run examples/play_demo.sb3 --aot build/aot-portability/play.o --frames 30
 
-      - name: パッケージ
+      - name: Package
         run: |
           mkdir -p dist/pkg
           cp build/xyo dist/pkg/
-          cp LICENSE dist/pkg/
+          cp LICENSE THIRD-PARTY-NOTICES.txt dist/pkg/
           cp RUNNING.md dist/pkg/RUNNING.txt
           tar -C dist/pkg -czf dist/xyo-linux-x86_64.tar.gz \
-            xyo LICENSE RUNNING.txt
+            xyo LICENSE THIRD-PARTY-NOTICES.txt RUNNING.txt
           ls -lh dist
 
-      - uses: actions/upload-artifact@v5
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
         with:
           name: linux-dist
           path: dist/xyo-linux-x86_64.tar.gz
@@ -76,12 +82,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: ./.github/actions/linux-deps
+      - name: Install dependencies
+        uses: ./.github/actions/linux-deps
         with:
           llvm: ${{ env.LLVM_STATIC }}
           extra: libzstd-dev libxml2-dev libncurses-dev
 
-      - name: Configure + build（-static / SDL2 なし）
+      - name: Configure and build (static / no SDL2)
         run: |
           cmake -B build-static -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DXYO_LLVM_MODE=llvm-config \
@@ -91,27 +98,31 @@ jobs:
           cmake --build build-static -j"$(nproc)"
           test "$(readelf -d build-static/xyo | grep -c NEEDED)" = "0"
 
-      - name: Smoke（run / AOT）
+      - name: Smoke (run / AOT)
         run: bash tools/ci/smoke.sh run build-static/xyo
 
-      - name: パッケージ
+      - name: Package
         run: |
           mkdir -p dist/pkg
           cp build-static/xyo dist/pkg/
-          cp LICENSE dist/pkg/
+          cp LICENSE THIRD-PARTY-NOTICES.txt dist/pkg/
           cp RUNNING.md dist/pkg/RUNNING.txt
           tar -C dist/pkg -czf dist/xyo-linux-x86_64-static.tar.gz \
-            xyo LICENSE RUNNING.txt
+            xyo LICENSE THIRD-PARTY-NOTICES.txt RUNNING.txt
           ls -lh dist
 
-      - uses: actions/upload-artifact@v5
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
         with:
           name: linux-static-dist
           path: dist/xyo-linux-x86_64-static.tar.gz
           if-no-files-found: error
 
+  # Qt Quick ランチャーは LGPL のため Qt6*.dll との動的リンクが必須。
+  # xyo.exe は Qt・SDL2 等の DLL と同梱し、依存ゼロが欲しい向けに
+  # Qt なしの完全静的 xyo-headless.exe も同梱する。
   windows:
-    name: Windows / JIT + SDL2（完全静的）
+    name: Windows / JIT + SDL2 + Qt（DLL 同梱）
     runs-on: windows-latest
     timeout-minutes: 60
     defaults:
@@ -120,7 +131,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: msys2/setup-msys2@v2
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
           update: false
@@ -135,40 +147,76 @@ jobs:
             mingw-w64-x86_64-ncurses
             mingw-w64-x86_64-libxml2
             mingw-w64-x86_64-SDL2
+            mingw-w64-x86_64-qt6-base
+            mingw-w64-x86_64-qt6-declarative
 
-      - name: Configure + build（JIT / SDL2・LLVM・libstdc++ 静的）
+      - name: Configure and build (JIT / static LLVM / dynamic Qt + SDL2)
         run: |
           cmake -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DXYO_JIT=ON -DXYO_LLVM_MODE=llvm-config \
-            -DXYO_STATIC=ON -DXYO_STATIC_LLVM=ON \
+            -DXYO_STATIC_LLVM=ON \
             -DXYO_SDL2=ON -DXYO_REQUIRE_SDL2=ON -DXYO_FULL_BUILD=ON \
             -DXYO_BUILD_TESTS=OFF
           cmake --build build-win -j"$(nproc)"
-          strip -s build-win/xyo.exe
           ls -la build-win/xyo.exe
-          echo "--- 依存 DLL ---"
+          echo "--- 依存 DLL（Qt は LGPL のため動的リンク必須） ---"
           objdump -p build-win/xyo.exe | grep -i "DLL Name" || true
-          if objdump -p build-win/xyo.exe | grep -qi "DLL Name: SDL2.dll"; then
-            echo "SDL2.dll に依存しています（静的リンクになっていない）"
-            exit 1
-          fi
+          objdump -p build-win/xyo.exe | grep -i "DLL Name" | grep -qi qt6 \
+            || { echo "Qt6 DLL にリンクされていません"; exit 1; }
 
-      - name: Smoke（run / AOT / play）
+      - name: Smoke (run / play / gui)
         run: |
           bash tools/ci/smoke.sh run build-win/xyo.exe --jit-log
           bash tools/ci/smoke.sh play build-win/xyo.exe
           bash tools/ci/smoke.sh gui build-win/xyo.exe
 
-      - name: パッケージ
+      # 完全静的ビルドは Qt を入れられない（LGPL）ためヘッドレス版として別名同梱。
+      - name: Configure and build headless (fully static / no Qt)
+        run: |
+          cmake -B build-win-static -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DXYO_JIT=ON -DXYO_LLVM_MODE=llvm-config \
+            -DXYO_STATIC=ON -DXYO_STATIC_LLVM=ON \
+            -DXYO_SDL2=ON -DXYO_REQUIRE_SDL2=ON -DXYO_FULL_BUILD=ON \
+            -DXYO_BUILD_TESTS=OFF
+          cmake --build build-win-static -j"$(nproc)"
+          strip -s build-win-static/xyo.exe
+          for dll in SDL2.dll Qt6Core.dll Qt6Quick.dll Qt6Qml.dll; do
+            if objdump -p build-win-static/xyo.exe | grep -qi "DLL Name: $dll"; then
+              echo "$dll に依存しています（静的リンクになっていない）"
+              exit 1
+            fi
+          done
+
+      - name: Smoke headless (run)
+        run: bash tools/ci/smoke.sh run build-win-static/xyo.exe
+
+      - name: Package (xyo.exe + Qt/MSYS2 DLLs + headless)
         run: |
           mkdir -p dist/pkg
           cp build-win/xyo.exe dist/pkg/
-          cp LICENSE dist/pkg/
+          cp build-win-static/xyo.exe dist/pkg/xyo-headless.exe
+          cp LICENSE THIRD-PARTY-NOTICES.txt dist/pkg/
           cp RUNNING.md dist/pkg/RUNNING.txt
-          (cd dist/pkg && zip -q "../xyo-windows-x86_64.zip" xyo.exe LICENSE RUNNING.txt)
+          # windeployqt が Qt6*.dll・QML モジュール・プラグインを集める。
+          # 残り（SDL2 等の MSYS2 DLL）は ldd で拾って同じフォルダへ。
+          deploy="$(command -v windeployqt6 || command -v windeployqt || true)"
+          test -n "$deploy" || { echo "windeployqt が見つかりません" >&2; exit 1; }
+          "$deploy" --release --compiler-runtime \
+            --qmldir src/shell/qml dist/pkg/xyo.exe
+          ldd dist/pkg/xyo.exe | awk '/=> \/mingw64\// {print $3}' \
+            | while read -r dll; do cp -n "$dll" dist/pkg/; done
+          # 同梱漏れが無いことを確認 — /mingw64 側へ解決される依存が
+          # 残っていたらコピー漏れなので失敗にする。
+          if ldd dist/pkg/xyo.exe | grep -q '/mingw64/'; then
+            echo "同梱漏れの依存 DLL があります:" >&2
+            ldd dist/pkg/xyo.exe | grep '/mingw64/' >&2
+            exit 1
+          fi
+          (cd dist/pkg && zip -qr "../xyo-windows-x86_64.zip" .)
           ls -lh dist
 
-      - uses: actions/upload-artifact@v5
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
         with:
           name: windows-dist
           path: dist/xyo-windows-x86_64.zip
@@ -189,9 +237,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Dependencies
+      - name: Install dependencies
         run: brew install llvm ninja sdl2 pkgconf
 
+      # 配布 tarball は自己完結させるため Qt を使わない（-DXYO_QT=OFF で
+      # ランチャーはスタブ）。動的リンクの brew Qt に依存させると
+      # 未インストール環境で xyo 自体が起動しなくなるため。
       - name: Build
         run: |
           cmake -S . -B build-macos -G Ninja -DCMAKE_BUILD_TYPE=Release \
@@ -200,7 +251,7 @@ jobs:
             -DCMAKE_PREFIX_PATH="$(brew --prefix)" \
             -DXYO_BUILD_TESTS=OFF -DXYO_JIT=ON -DXYO_SDL2=ON \
             -DXYO_REQUIRE_SDL2=ON -DXYO_RSVG=OFF -DXYO_FULL_BUILD=ON \
-            -DXYO_BINARYEN_C_API=OFF
+            -DXYO_BINARYEN_C_API=OFF -DXYO_QT=OFF
           cmake --build build-macos --parallel 2
 
       - name: Smoke
@@ -211,14 +262,15 @@ jobs:
       - name: Package
         run: |
           mkdir -p dist/pkg
-          cp build-macos/xyo LICENSE RUNNING.md dist/pkg/
+          cp build-macos/xyo LICENSE THIRD-PARTY-NOTICES.txt RUNNING.md dist/pkg/
           mkdir -p dist/pkg/docs
           cp docs/macos.md dist/pkg/docs/
           mv dist/pkg/RUNNING.md dist/pkg/RUNNING.txt
           tar -C dist/pkg -czf dist/xyo-macos-${{ matrix.arch }}.tar.gz \
-            xyo LICENSE RUNNING.txt docs/macos.md
+            xyo LICENSE THIRD-PARTY-NOTICES.txt RUNNING.txt docs/macos.md
 
-      - uses: actions/upload-artifact@v5
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
         with:
           name: macos-${{ matrix.arch }}-dist
           path: dist/xyo-macos-${{ matrix.arch }}.tar.gz
@@ -230,19 +282,20 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/download-artifact@v5
+      - name: Download all dist artifacts
+        uses: actions/download-artifact@v5
         with:
           path: dist
           merge-multiple: true
 
-      - name: チェックサム
+      - name: Checksums
         run: |
           cd dist
           sha256sum xyo-* > SHA256SUMS.txt
           cat SHA256SUMS.txt
           ls -lh
 
-      - name: Release
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           name: xyo-cpp ${{ github.ref_name }}

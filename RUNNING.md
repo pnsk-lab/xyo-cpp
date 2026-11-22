@@ -77,12 +77,16 @@ Linux 版は 2 種類あります。どちらも **LLVM は静的リンク**な�
 | `librsvg-2.so.2` / `libcairo.so.2` / `libglib-2.0.so.0` / `libgobject-2.0.so.0` | `librsvg2-2` |
 | `libGL.so.1`（GPU ペン層） | `libgl1` |
 | `libz.so.1` / `libzstd.so.1` / `libtinfo.so.6`（LLVM 静的ライブラリが参照） | `zlib1g` / `libzstd1` / `libtinfo6` |
+| `libQt6Core.so.6` / `libQt6Gui.so.6` / `libQt6Qml.so.6` / `libQt6Quick.so.6`（ランチャー GUI のみ） | `libqt6qml6` / `libqt6quick6`（`apt install qt6-declarative-dev` の実行時側） |
 
 `ldd` で実際に必要なのは上記のみです（`libxml2` は不要）。
+Qt は LGPL-3.0 のため **動的リンク（.so）のみ**で使っています
+（`THIRD-PARTY-NOTICES.txt` 参照）。Qt が無い環境では `run` / `play`
+など他のコマンドは動きますが、`xyo gui`（ランチャー）だけは使えません。
 
 ```sh
 ./xyo play <project.sb3>             # ウィンドウで再生
-./xyo                                # （引数なし）ランチャー GUI
+./xyo                                # （引数なし）ランチャー GUI（Qt6 必須）
 ```
 
 ## macOS (Apple Silicon arm64 / Intel x86-64)
@@ -93,23 +97,29 @@ Homebrew を用いた LLVM ORC JIT + SDL2 のネイティブビルドに対応�
 
 ## Windows x86-64（xyo-windows-x86_64.zip）
 
-同梱: `xyo.exe`（**JIT + SDL2 レンダラ + ランチャー GUI**、LLVM・libstdc++・SDL2 は
-静的リンクなので **DLL の同梱は不要**です）
+同梱:
+
+- `xyo.exe`（**JIT + SDL2 レンダラ + Qt Quick ランチャー GUI**）
+- `Qt6*.dll` / `SDL2.dll` / QML モジュールなど必要な DLL 一式
+- `xyo-headless.exe`（**Qt なし完全静的ビルド**。DLL ゼロでどこでも動き、
+  `run` / `test` / `aot` / `minify` などヘッドレス系はすべて使えます）
+- `THIRD-PARTY-NOTICES.txt`（Qt = LGPL-3.0 の告知。Qt は動的リンクなので
+  同梱 DLL を別バージョンに差し替えられます）
 
 ```sh
 xyo.exe play <project.sb3>             # ウィンドウで再生
 xyo.exe                                # （引数なし）ランチャー GUI
-xyo.exe run <project.sb3> --frames N   # ヘッドレス実行（LLVM JIT）
-xyo.exe test <fixture.sb3|dir>         # フィクスチャ検証
-xyo.exe aot <project.sb3> -o <app.exe> # 単体実行ファイルを書き出し
-xyo.exe minify <project.sb3>           # sb3 を小さくする
+xyo-headless.exe run <project.sb3> --frames N   # ヘッドレス実行（LLVM JIT）
+xyo-headless.exe test <fixture.sb3|dir>         # フィクスチャ検証
+xyo-headless.exe aot <project.sb3> -o <app.exe> # 単体実行ファイルを書き出し
+xyo-headless.exe minify <project.sb3>           # sb3 を小さくする
 ```
 
 - **LLVM JIT が動きます**（MSYS2 の mingw-w64 LLVM でビルド。LLVM は静的リンクなので
   `LLVM-*.dll` は不要）。ホットなスクリプトはネイティブコードにコンパイルされます。
 - **AOT 書き出しも Windows で動作**します（COFF オブジェクトを exe 末尾へ追記）。
-- **ウィンドウ表示（`play` / `gui`）も動きます**。SDL2 は静的リンク（`SDL2.dll` 不要）で、
-  モニタ・バブルの文字用フォント（Liberation Sans）も exe に埋め込まれています。
+- **ウィンドウ表示（`play` / `gui`）も動きます**。モニタ・バブルの文字用
+  フォント（Liberation Sans）は exe に埋め込まれています。
 - **SVG コスチュームは nanosvg でラスタ化**します（Windows には librsvg が無いため）。
   `<text>` / `<tspan>` の文字だけは描画されません（ビットマップコスチュームは完全対応）。
   GPU ペン層（OpenGL FBO/シェーダ）も Windows では無効で、CPU ラスタで描画します。

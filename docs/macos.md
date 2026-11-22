@@ -30,6 +30,23 @@ ctest --test-dir build-macos --output-on-failure
 ./build-macos/xyo run examples/play_demo.sb3 --aot play.o --frames 30
 ```
 
+## Qt Quick ランチャー（`xyo gui`、任意）
+
+`xyo gui` の Qt Quick ランチャーを有効にするには Qt6 を入れる。
+Qt は LGPL-3.0 なので**動的リンク（dylib / framework）必須**
+（Homebrew の `qt` は共有ライブラリなので問題ない）:
+
+```sh
+brew install qt
+cmake -S . -B build-macos -G Ninja \
+  -DQt6_DIR="$(brew --prefix qt)/lib/cmake/Qt6" \
+  ...（上記と同じオプション）
+```
+
+公式リリースの tarball は自己完結させるため `-DXYO_QT=OFF` で
+ビルドしてあり、`xyo gui` はスタブになっている（他コマンドは動く）。
+ランチャー付きが必要なら上記の手順で自前ビルドする。
+
 CPU 別のコンパイルが必要（ユニバーサルバイナリは作らない）。
 `XYO_JIT_BACKEND=none` と `XYO_JIT=OFF` のビルドも可能。
 GUI が不要なら `-DXYO_SDL2=OFF` を指定する。

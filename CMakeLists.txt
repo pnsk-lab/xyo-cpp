@@ -77,6 +77,7 @@ unset(_xyo_asm_default)
 option(XYO_STATIC_LLVM "Link LLVM statically (static archives required)" OFF)
 set(XYO_LLVM_MODE "auto" CACHE STRING "LLVM の検出方法: auto | config | llvm-config")
 option(XYO_STATIC "Link the executable fully static (-static)" OFF)
+option(XYO_QT "Enable the Qt Quick launcher when a dynamically-linked Qt6 is found" ON)
 # Opt-in Linux system allocator for the native CLI. The Scratch runtime
 # creates many short-lived JSON/Block structures during SB3 loading.
 # Keep OFF by default: the resulting executable depends on libjemalloc.so.
@@ -701,15 +702,24 @@ endif()
 if(XYO_BUILD_SHELL)
   # Qt Quick ランチャー: Qt6 が見つかれば gui_qt.cpp（QML UI）を使う。
   # 無ければ `xyo gui` は「Qt6 未導入」のスタブを返す。
+  # Qt は LGPL なので動的リンク（.dll/.so/.dylib）必須: XYO_STATIC の
+  # 完全静的ビルドでは探さず、共有ライブラリの Qt だけを使う。
   set(XYO_QT_GUI OFF)
-  if(NOT EMSCRIPTEN)
+  if(XYO_QT AND NOT EMSCRIPTEN AND NOT XYO_STATIC)
     find_package(Qt6 QUIET COMPONENTS Quick Qml Gui)
     if(Qt6_FOUND)
-      set(XYO_QT_GUI ON)
-      message(STATUS "Qt6 Quick found (${Qt6_VERSION}): Qt Quick launcher enabled")
+      get_target_property(_xyo_qt_type Qt6::Core TYPE)
+      if(_xyo_qt_type STREQUAL "SHARED_LIBRARY")
+        set(XYO_QT_GUI ON)
+        message(STATUS "Qt6 Quick found (${Qt6_VERSION}): Qt Quick launcher enabled")
+      else()
+        message(STATUS "Qt6 found but ${_xyo_qt_type} (LGPL requires dynamic linking): 'xyo gui' launcher disabled")
+      endif()
     else()
       message(STATUS "Qt6 Quick not found: 'xyo gui' launcher disabled")
     endif()
+  elseif(XYO_STATIC)
+    message(STATUS "XYO_STATIC: Qt Quick launcher disabled (LGPL requires dynamic linking)")
   endif()
   # editor.cpp が本体（SDL2 が無いビルドでは editor.cpp 内の #else スタブ）。
   add_executable(xyo-cli src/shell/main.cpp src/shell/gui_qt.cpp

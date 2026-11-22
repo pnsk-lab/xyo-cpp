@@ -1,0 +1,29 @@
+Third-party notices
+===================
+
+xyo-cpp bundles or dynamically links the following third-party components.
+
+Qt 6 (Qt Quick, Qt Qml, Qt Gui, Qt Core)
+----------------------------------------
+The `xyo gui` launcher uses Qt 6, which is licensed under the GNU Lesser
+General Public License version 3 (LGPL-3.0) or the GNU General Public
+License version 3 (GPL-3.0), at your option, as published by The Qt
+Company.
+
+  https://www.qt.io/licensing/
+  https://doc.qt.io/qt-6/lgpl.html
+  https://code.qt.io/cgit/
+
+xyo links Qt as *shared libraries* (Qt6*.dll on Windows, libQt6*.so on
+Linux, Qt6*.framework on macOS). The Qt libraries are not statically
+linked into the xyo executable, so you may replace them with a compatible
+version of Qt at any time (for example via your package manager, Homebrew,
+or the official Qt installer). The corresponding Qt source code is
+available from https://code.qt.io/ and from the same distribution channels
+that provided the libraries.
+
+Other bundled dependencies
+--------------------------
+See the sources in third_party/ and the CMake configuration for the full
+list of embedded libraries (Dear ImGui, stb, nanosvg, fdlibm-derived math
+routines, and others); each carries its own license header.

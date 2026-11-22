@@ -85,12 +85,12 @@ play)
     ls -l "$work/shot.ppm"
     ;;
 gui)
-    echo "--- gui（SDL dummy ドライバ） ---"
-    export SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy
+    echo "--- gui（SDL dummy + Qt offscreen） ---"
+    export SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy QT_QPA_PLATFORM=offscreen
     # ウィンドウ生成とランチャー描画を検証し、1 フレームで終了する。
-    # Qt6 を入れていないビルド（Windows / macOS の CI）ではスタブが
+    # Qt6 を入れていないビルドではスタブが
     # 「built without Qt6 Quick support」と言って 1 で終わるので、それを
-    # スキップとして扱う（ランチャー自体は Linux のフルビルドで検証する）。
+    # スキップとして扱う。
     gui_log="$(mktemp)"
     set +e
     XYO_GUI_ACTIONS=quit "$bin" gui examples >"$gui_log" 2>&1

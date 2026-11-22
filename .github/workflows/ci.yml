@@ -37,20 +37,26 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install dependencies
-        run: brew install llvm ninja sdl2 pkgconf
+        run: brew install llvm ninja sdl2 pkgconf qt
 
       - name: Configure
         run: |
           LLVM_CONFIG="$(brew --prefix llvm)/bin/llvm-config"
+          # Qt6 is keg-only on Homebrew; point CMake at its config package
+          # directly. Qt must stay dynamically linked for LGPL compliance.
           cmake -S . -B build-macos -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DXYO_LLVM_MODE=llvm-config -DLLVM_CONFIG="$LLVM_CONFIG" \
             -DCMAKE_PREFIX_PATH="$(brew --prefix)" \
+            -DQt6_DIR="$(brew --prefix qt)/lib/cmake/Qt6" \
             -DXYO_JIT=ON -DXYO_SDL2=ON -DXYO_REQUIRE_SDL2=ON \
             -DXYO_RSVG=OFF -DXYO_FULL_BUILD=ON \
             -DXYO_BINARYEN_C_API=OFF
 
       - name: Build (limit parallelism on M1 runner)
-        run: cmake --build build-macos --parallel 2
+        run: |
+          cmake --build build-macos --parallel 2
+          # Qt は LGPL のため動的リンク必須（framework dylib への参照を確認）
+          otool -L build-macos/xyo | grep Qt6Core
 
       - name: Unit and interpreter/JIT parity
         run: |
@@ -83,7 +89,7 @@ jobs:
         with:
           llvm: ${{ env.LLVM_LATEST }}
           llvm_apt: "true"
-          extra: libsdl2-dev librsvg2-dev libgl-dev glslc
+          extra: libsdl2-dev librsvg2-dev libgl-dev glslc qt6-base-dev qt6-declarative-dev
 
       - name: Configure
         run: |
@@ -98,6 +104,11 @@ jobs:
 
       - name: Build
         run: cmake --build build -j"$(nproc)"
+
+      # Qt は LGPL のため動的リンク必須。検出落ちや静的 Qt 解決を
+      # 黙って通さないよう libQt6Core の DT_NEEDED を確認する。
+      - name: Verify dynamic Qt link (LGPL)
+        run: ldd build/xyo | grep libQt6Core
 
       # Long-running nested warp/OSR and native deopt use a separate Linux job.
       # Keep this job below its 45-minute timeout without dropping coverage.
@@ -325,13 +336,15 @@ jobs:
             mingw-w64-x86_64-ncurses
             mingw-w64-x86_64-libxml2
             mingw-w64-x86_64-SDL2
+            mingw-w64-x86_64-qt6-base
+            mingw-w64-x86_64-qt6-declarative
 
       - name: Verify toolchain
         run: |
           llvm-config --version
           ls /mingw64/lib/libLLVM*.a | head -3
 
-      - name: Build (JIT + SDL2, dynamic)
+      - name: Build (JIT + SDL2 + Qt, dynamic)
         run: |
           cmake -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DXYO_JIT=ON -DXYO_LLVM_MODE=config \
@@ -339,6 +352,9 @@ jobs:
             -DXYO_BUILD_TESTS=OFF
           cmake --build build-win -j"$(nproc)"
           ls -l build-win/xyo.exe
+          echo "--- 依存 DLL（Qt は LGPL のため動的リンク必須） ---"
+          objdump -p build-win/xyo.exe | grep -i "DLL Name" | grep -i qt6 \
+            || { echo "Qt6 DLL にリンクされていません"; exit 1; }
 
       - name: Smoke (run / play / gui)
         run: |
@@ -346,7 +362,9 @@ jobs:
           bash tools/ci/smoke.sh play build-win/xyo.exe
           bash tools/ci/smoke.sh gui build-win/xyo.exe
 
-      - name: Build (JIT + SDL2, fully static)
+      # -static では LGPL の Qt を入れられないため、Qt は CMake 側で
+      # 自動的に無効化される（ランチャーはスタブ）。
+      - name: Build (JIT + SDL2, fully static — no Qt)
         run: |
           cmake -B build-win-static -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DXYO_JIT=ON -DXYO_LLVM_MODE=llvm-config \
@@ -357,10 +375,12 @@ jobs:
           ls -l build-win-static/xyo.exe
           echo "--- 依存 DLL ---"
           objdump -p build-win-static/xyo.exe | grep -i "DLL Name" || true
-          if objdump -p build-win-static/xyo.exe | grep -qi "DLL Name: SDL2.dll"; then
-            echo "SDL2.dll に依存しています（静的リンクになっていない）"
-            exit 1
-          fi
+          for dll in SDL2.dll Qt6Core.dll Qt6Quick.dll Qt6Qml.dll; do
+            if objdump -p build-win-static/xyo.exe | grep -qi "DLL Name: $dll"; then
+              echo "$dll に依存しています（静的リンクになっていない）"
+              exit 1
+            fi
+          done
 
       - name: Smoke (fully static — run / play / gui)
         run: |
@@ -397,12 +417,12 @@ jobs:
           name: xyo-linux-full
           path: .bench/bin
 
-      - name: Install runtime dependencies (LLVM + renderer)
+      - name: Install runtime dependencies (LLVM + renderer + Qt runtime)
         uses: ./.github/actions/linux-deps
         with:
           llvm: ${{ env.LLVM_LATEST }}
           llvm_apt: "true"
-          extra: libsdl2-2.0-0 librsvg2-2 libgl1 xvfb fonts-liberation
+          extra: libsdl2-2.0-0 librsvg2-2 libgl1 xvfb fonts-liberation libqt6core6 libqt6gui6 libqt6qml6 libqt6quick6
 
       - name: Verify built xyo
         run: |
