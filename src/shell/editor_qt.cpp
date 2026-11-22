@@ -620,6 +620,165 @@ struct EdCore {
         wsDirty_ = true;
     }
 
+    // ---- Make a Variable / List ----
+    void addVariable(bool list) {
+        Target* t = selected();
+        if (!t) return;
+        pushUndo();
+        int n = 1;
+        for (auto& [vid, v] : t->variables)
+            if ((v.type == Variable::kListType) == list) n++;
+        std::string name = list ? "my list" : "my variable";
+        if (n > 1) name += std::to_string(n);
+        Variable v = Variable::create("xyo_var_" + std::to_string(++blkCounter),
+                                      utf8ToU16(name),
+                                      list ? Variable::kListType
+                                           : Variable::kScalarType,
+                                      false);
+        t->variables.emplace(v.id, std::move(v));
+        flyDirty_ = true;
+    }
+
+    // ---- モニタ表示切替（変数行チェックボックス）----
+    void toggleMonitor(const std::string& varId, const std::string& name) {
+        if (!rt) return;
+        Target* t = selected();
+        MonitorRecord& rec = rt->monitorState.getOrCreate(varId);
+        if (rec.id.empty()) {
+            rec.id = varId;
+            rec.opcode = "data_variable";
+            rec.params["VARIABLE"] = utf8ToU16(name);
+            rec.targetId = t ? t->id : "";
+        }
+        rec.visible = !rec.visible;
+        rt->monitorState.dirty = true;
+        if (rt->monitorBlocks) {
+            Blocks::StructuralEdit sourceEdit(*rt->monitorBlocks);
+            if (Block* b = sourceEdit.getBlock(varId))
+                b->isMonitored = rec.visible;
+        }
+    }
+
+    // ---- Make a Block ダイアログ（簡易版: QML 側で parts 編集）----
+    struct MakeBlockDlg {
+        enum PartKind { Text = 0, StrInput = 1, BoolInput = 2 };
+        struct Part { PartKind kind; std::string text; };
+        bool open = false;
+        std::vector<Part> parts;
+        bool warp = false;
+        void reset() {
+            open = true; warp = false;
+            parts.clear();
+            parts.push_back({Text, "block name"});
+        }
+        std::string proccode() const {
+            std::string pc;
+            for (const Part& p : parts) {
+                if (p.kind == Text) {
+                    if (!pc.empty()) pc += " ";
+                    pc += p.text;
+                } else {
+                    pc += (p.kind == BoolInput ? " %b" : " %s");
+                }
+            }
+            return pc;
+        }
+    };
+    MakeBlockDlg mb_;
+
+    /// Make a Block — proccode/mutation 付きで定義（prototype + hat）を生成。
+    void makeProcedure() {
+        Target* t = selected();
+        if (!t || !t->blocks) return;
+        Blocks* blocks = t->blocks;
+        pushUndo();
+        Blocks::StructuralEdit sourceEdit(*blocks);
+        std::string proccode = mb_.proccode();
+        if (proccode.empty()) proccode = "my block";
+        {
+            std::string base = proccode;
+            bool dup = true;
+            int n = 1;
+            while (dup) {
+                dup = false;
+                for (auto& [bid, pb] : blocks->allBlocks())
+                    if (pb.opcode == "procedures_prototype" && pb.mutation &&
+                        pb.mutation->attr("proccode") == proccode) {
+                        proccode = base + std::to_string(++n);
+                        dup = true;
+                        break;
+                    }
+            }
+        }
+        std::string ids = "[", names = "[", dflts = "[";
+        struct ArgShadow { std::string id; bool isBool; std::string name; };
+        std::vector<ArgShadow> argShadows;
+        int ai = 0;
+        for (const auto& p : mb_.parts) {
+            if (p.kind == MakeBlockDlg::Text) continue;
+            if (ai) ids += ",", names += ",", dflts += ",";
+            std::string aid = "arg" + std::to_string(ai);
+            ids += "\"" + aid + "\"";
+            names += "\"" + p.text + "\"";
+            bool isBool = p.kind == MakeBlockDlg::BoolInput;
+            dflts += isBool ? "false" : "\"\"";
+            argShadows.push_back({aid, isBool, p.text});
+            ai++;
+        }
+        ids += "]"; names += "]"; dflts += "]";
+
+        Block proto;
+        proto.id = newBlockId();
+        proto.opcode = "procedures_prototype";
+        proto.shadow = true;
+        Mutation m;
+        m.tagName = "mutation";
+        m.attrs["proccode"] = proccode;
+        m.attrs["argumentids"] = ids;
+        m.attrs["argumentnames"] = names;
+        m.attrs["argumentdefaults"] = dflts;
+        m.attrs["warp"] = mb_.warp ? "true" : "false";
+        m.parsed = false;
+        proto.mutation = m;
+        std::string protoId = proto.id;
+
+        Block def;
+        def.id = newBlockId();
+        def.opcode = "procedures_definition";
+        def.topLevel = true;
+        // ワークスペース表示中央上あたり（論理座標）
+        def.x = (-panX) / wsScale() + 40;
+        def.y = (-panY) / wsScale() + 40;
+        BlockInput in;
+        in.block = protoId;
+        in.shadow = protoId;
+        def.inputs.set("custom_block", in);
+        proto.parent = def.id;
+        for (const auto& as : argShadows) {
+            Block arg;
+            arg.id = newBlockId();
+            arg.opcode = as.isBool ? "argument_reporter_boolean"
+                                   : "argument_reporter_string_number";
+            arg.shadow = true;
+            arg.parent = proto.id;
+            arg.fields["VALUE"] =
+                BlockField{Value::string(SStr::fromUtf8(as.name))};
+            BlockInput ai2;
+            ai2.block = arg.id;
+            ai2.shadow = arg.id;
+            proto.inputs.set(as.id, ai2);
+            blocks->createBlock(arg);
+        }
+        blocks->createBlock(def);
+        blocks->createBlock(proto);
+        if (Block* dp = sourceEdit.getBlock(def.id)) {
+            dp->topLevel = true;
+            blocks->addScript(def.id);
+        }
+        wsDirty_ = true;
+        flyDirty_ = true;
+    }
+
     // ---- フライアウト ----
     struct FlyItem {
         enum Kind { BlockT, Header, Button, VarRow, ListRow, Divider } kind = BlockT;
@@ -709,7 +868,15 @@ struct EdCore {
                 for (auto& [vid, v] : t->variables) {
                     if (v.type == Variable::kListType) continue;
                     FlyItem fi;
+                    // ドラッグ用テンプレ（data_variable に VAR を束縛）
+                    std::map<std::string, BlockField> init;
+                    BlockField f{Value::string(
+                        SStr::fromUtf8(utf16ToUtf8(v.name)))};
+                    f.id = vid;
+                    init["VAR"] = f;
+                    makeFlyItem(&tmp, "data_variable", init, fi);
                     fi.kind = FlyItem::VarRow;
+                    fi.list = false;
                     fi.varId = vid;
                     fi.text = utf16ToUtf8(v.name);
                     fi.y = y; fi.h = 34;
@@ -751,7 +918,14 @@ struct EdCore {
                 for (auto& [vid, v] : t->variables) {
                     if (v.type != Variable::kListType) continue;
                     FlyItem fi;
+                    std::map<std::string, BlockField> init;
+                    BlockField f{Value::string(
+                        SStr::fromUtf8(utf16ToUtf8(v.name)))};
+                    f.id = vid;
+                    init["LIST"] = f;
+                    makeFlyItem(&tmp, "data_listcontents", init, fi);
                     fi.kind = FlyItem::ListRow;
+                    fi.list = true;
                     fi.varId = vid;
                     fi.text = utf16ToUtf8(v.name);
                     fi.y = y; fi.h = 34;
@@ -1883,6 +2057,45 @@ public:
     /// コスチュームタブ用サムネイルを作り直す（target 単位）。
     void refreshCostumeThumbs();  // provider へのアクセスのため main 側で実装
 
+    // ---- Make a Block ダイアログ ----
+    Q_INVOKABLE bool mbOpen() const { return ed.mb_.open; }
+    Q_INVOKABLE QVariantList mbParts() const {
+        QVariantList out;
+        for (const auto& p : ed.mb_.parts) {
+            QVariantMap m;
+            m["kind"] = (int)p.kind;      // 0=text 1=str 2=bool
+            m["text"] = QString::fromStdString(p.text);
+            out.push_back(m);
+        }
+        return out;
+    }
+    Q_INVOKABLE bool mbWarp() const { return ed.mb_.warp; }
+    Q_INVOKABLE void mbSetWarp(bool v) { ed.mb_.warp = v; bumpLayout(); }
+    Q_INVOKABLE void mbAddPart(int kind) {
+        if (!ed.mb_.open || kind < 0 || kind > 2) return;
+        QString dflt = kind == 0 ? "label text"
+                       : kind == 1 ? "string or number" : "boolean";
+        ed.mb_.parts.push_back(
+            {(EdCore::MakeBlockDlg::PartKind)kind,
+             dflt.toStdString()});
+        bumpLayout();
+    }
+    Q_INVOKABLE void mbRemovePart(int i) {
+        if (!ed.mb_.open || i < 0 || i >= (int)ed.mb_.parts.size()) return;
+        ed.mb_.parts.erase(ed.mb_.parts.begin() + i);
+        bumpLayout();
+    }
+    Q_INVOKABLE void mbSetPartText(int i, const QString& tx) {
+        if (!ed.mb_.open || i < 0 || i >= (int)ed.mb_.parts.size()) return;
+        ed.mb_.parts[i].text = tx.toStdString();
+    }
+    Q_INVOKABLE void mbOk() {
+        ed.mb_.open = false;
+        ed.makeProcedure();
+        bumpLayout();
+    }
+    Q_INVOKABLE void mbCancel() { ed.mb_.open = false; Q_EMIT uiChanged(); }
+
     Q_INVOKABLE void cleanupBlocks() {
         Target* t = ed.selected();
         if (!t || !t->blocks) return;
@@ -2067,6 +2280,37 @@ public:
     // ---- フライアウト入力 ----
     Q_INVOKABLE void flyMousePress(double x, double y, double viewW) {
         if (EdCore::FlyItem* fi = ed.flyItemAt(float(x), float(y), float(viewW))) {
+            if (fi->kind == EdCore::FlyItem::Button) {
+                if (fi->makeBlock) {
+                    ed.mb_.reset();
+                    bumpLayout();
+                } else {
+                    ed.addVariable(fi->list);
+                    bumpLayout();
+                }
+                return;
+            }
+            if (fi->kind == EdCore::FlyItem::VarRow ||
+                fi->kind == EdCore::FlyItem::ListRow) {
+                // チェックボックス部（左 14px、行頭）ならモニタ切替
+                float sy = fi->y * bl::kWsZoom - ed.flyScroll;
+                if (x >= 14 && x < 28 && y >= sy + 10 && y < sy + 24) {
+                    ed.toggleMonitor(fi->varId, fi->text);
+                    bumpLayout();
+                    return;
+                }
+                // 変数記者としてドラッグ（lb は rebuildFlyout で計測済み）
+                ed.drag = EdCore::Drag{};
+                ed.drag.pending = true;
+                ed.drag.fromFlyout = true;
+                ed.drag.flyItem = fi;
+                ed.drag.opcode = fi->opcode;
+                ed.drag.initFields = fi->initFields;
+                ed.drag.shape = edit::Shape::Reporter;
+                ed.drag.tmpl = fi->lb;
+                ed.drag.tmplSt = fi->st;
+                return;
+            }
             if (fi->kind == EdCore::FlyItem::BlockT) {
                 ed.drag.pending = true;
                 ed.drag.fromFlyout = true;
@@ -2688,6 +2932,46 @@ int xyo::editorMainQt(const char* path, bool danger) {
             else if (a.startsWith("tab:")) ctrl.setTab(a.mid(4).toInt());
             else if (a == "addcostume") ctrl.addCostume();
             else if (a == "addsound") ctrl.addSound();
+            else if (a.startsWith("flypress:")) {
+                // flypress:<index> — フライアウト項目の中心を押す
+                EdCore& e = ctrl.ed;
+                e.flyDirty_ = true;
+                e.rebuildFlyout();
+                int idx = a.mid(9).toInt();
+                if (std::getenv("XYO_EDIT_DEBUG")) {
+                    std::fprintf(stderr, "[edqt] flypress items=%zu cat=%s selTarget=%d\n",
+                                 e.flyItems_.size(), e.flyCat_.c_str(),
+                                 e.selTarget);
+                    for (size_t i = 0; i < e.flyItems_.size(); ++i)
+                        std::fprintf(stderr, "  [%zu] kind=%d y=%.0f h=%.0f %s\n",
+                                     i, (int)e.flyItems_[i].kind,
+                                     e.flyItems_[i].y, e.flyItems_[i].h,
+                                     e.flyItems_[i].text.c_str());
+                }
+                if (idx >= 0 && idx < (int)e.flyItems_.size()) {
+                    const EdCore::FlyItem& fi = e.flyItems_[idx];
+                    float sy = fi.y * bl::kWsZoom - e.flyScroll + fi.h * 0.5f;
+                    ctrl.flyMousePress(60, sy, 190);
+                    ctrl.flyMouseRelease();
+                }
+            }
+            else if (a.startsWith("flycheck:")) {
+                // flycheck:<index> — 変数行のチェックボックス（モニタ切替）
+                EdCore& e = ctrl.ed;
+                e.flyDirty_ = true;
+                e.rebuildFlyout();
+                int idx = a.mid(9).toInt();
+                if (idx >= 0 && idx < (int)e.flyItems_.size()) {
+                    const EdCore::FlyItem& fi = e.flyItems_[idx];
+                    float sy = fi.y * bl::kWsZoom - e.flyScroll;
+                    ctrl.flyMousePress(20, sy + 17, 190);
+                }
+            }
+            else if (a.startsWith("mbadd:"))
+                ctrl.mbAddPart(a.mid(6).toInt());
+            else if (a == "mbwarp") ctrl.mbSetWarp(!ctrl.mbWarp());
+            else if (a == "mbok") ctrl.mbOk();
+            else if (a == "mbcancel") ctrl.mbCancel();
             else if (a.startsWith("key:")) {
                 // key:<letter|space|up|down|left|right|return> — down+up
                 const QString k = a.mid(4);
@@ -2744,8 +3028,11 @@ int xyo::editorMainQt(const char* path, bool danger) {
                         std::fprintf(stderr,
                                      "[edqt] flydrag items=%zu idx=%d\n",
                                      e.flyItems_.size(), idx);
+                    auto k = e.flyItems_[idx].kind;
                     if (idx >= 0 && idx < (int)e.flyItems_.size() &&
-                        e.flyItems_[idx].kind == EdCore::FlyItem::BlockT) {
+                        (k == EdCore::FlyItem::BlockT ||
+                         k == EdCore::FlyItem::VarRow ||
+                         k == EdCore::FlyItem::ListRow)) {
                         EdCore::FlyItem* fi = &e.flyItems_[idx];
                         e.drag.pending = true;
                         e.drag.fromFlyout = true;

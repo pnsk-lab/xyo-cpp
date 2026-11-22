@@ -512,7 +512,7 @@ Item {
                                 width: Math.max(120, itemText.implicitWidth + 34)
                                 height: 26
                                 radius: 4
-                                color: itemMa.containsMouse ? "rgba(0,0,0,0.2)"
+                                color: itemMa.containsMouse ? "#33000000"
                                         : "transparent"
                                 Row {
                                     anchors.fill: parent
@@ -897,6 +897,196 @@ Item {
                         if (modelData.act === "save") editor.save()
                         else if (modelData.act === "undo") editor.undo()
                         else if (modelData.act === "redo") editor.redo()
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Make a Block ダイアログ（custom-procedures 準拠）----
+    Rectangle {
+        id: makeBlockOverlay
+        anchors.fill: parent
+        property int rev: editor.layoutRev   // mbOpen/mbWarp 再評価フック
+        visible: { var n = rev; return editor.mbOpen() }
+        color: "#E6253E8C"                // $ui-modal-overlay 青90%
+        z: 20
+        MouseArea { anchors.fill: parent }   // モーダル: 裏を遮断
+        Rectangle {
+            width: 700; height: 340
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.top: parent.top
+            anchors.topMargin: 50
+            color: "transparent"
+            border.color: "#59FFFFFF"
+            border.width: 4; radius: 8
+            Row {
+                anchors.fill: parent
+                anchors.margins: 12
+                spacing: 16
+                // 左ピンク列: プレビューピル
+                Rectangle {
+                    width: 240; height: 300
+                    color: "#ECA0D2"
+                    radius: 4
+                    Rectangle {
+                        anchors.centerIn: parent
+                        width: prevTxt.implicitWidth + 36; height: 44
+                        radius: 22; color: "#FF6680"
+                        Text {
+                            id: prevTxt
+                            anchors.centerIn: parent
+                            text: {
+                                var s = ""
+                                var ps = editor.mbParts()
+                                for (var i = 0; i < ps.length; i++) {
+                                    if (ps[i].kind === 0)
+                                        s += (s ? " " : "") + ps[i].text
+                                    else
+                                        s += (ps[i].kind === 2 ? " ◇" : " ○")
+                                }
+                                return s || "block name"
+                            }
+                            color: "white"; font.pixelSize: 14; font.bold: true
+                        }
+                    }
+                }
+                // 右列: パーツ編集 + ボタン
+                Column {
+                    width: 700 - 24 - 240 - 16
+                    height: 300
+                    spacing: 10
+                    Text {
+                        text: "Make a Block"
+                        color: "white"; font.pixelSize: 16; font.bold: true
+                    }
+                    // parts 一覧
+                    Flickable {
+                        width: parent.width; height: 128
+                        contentHeight: partCol.height
+                        clip: true
+                        Column {
+                            id: partCol
+                            width: parent.width - 8
+                            spacing: 6
+                            Repeater {
+                                model: {
+                                    var n = editor.layoutRev  // 再評価フック
+                                    return editor.mbOpen() ? editor.mbParts() : []
+                                }
+                                delegate: Row {
+                                    required property var modelData
+                                    required property int index
+                                    spacing: 6
+                                    Rectangle {
+                                        width: 250; height: 30; radius: 15
+                                        color: "white"; border.color: cBorder
+                                        TextInput {
+                                            anchors.fill: parent
+                                            anchors.leftMargin: 12
+                                            anchors.rightMargin: 12
+                                            verticalAlignment: Text.AlignVCenter
+                                            font.pixelSize: 12; color: cFg
+                                            selectByMouse: true; clip: true
+                                            text: modelData.text
+                                            onEditingFinished:
+                                                editor.mbSetPartText(index, text)
+                                        }
+                                    }
+                                    Text {
+                                        text: modelData.kind === 0 ? "label"
+                                              : modelData.kind === 1 ? "input"
+                                              : "bool"
+                                        color: "white"; font.pixelSize: 11
+                                        anchors.verticalCenter: parent.verticalCenter
+                                    }
+                                    Rectangle {
+                                        width: 30; height: 30; radius: 15
+                                        color: "transparent"
+                                        Text { anchors.centerIn: parent
+                                               text: "✕"; color: "white"
+                                               font.pixelSize: 13 }
+                                        MouseArea {
+                                            anchors.fill: parent
+                                            onClicked: editor.mbRemovePart(index)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Add input / label
+                    Row {
+                        spacing: 8
+                        Repeater {
+                            model: [
+                                { t: "Add input string or number", k: 1, c: "#4C97FF" },
+                                { t: "Add input boolean", k: 2, c: "#9966FF" },
+                                { t: "Add label text", k: 0, c: "#CF63CF" }
+                            ]
+                            delegate: Rectangle {
+                                required property var modelData
+                                width: addTxt.implicitWidth + 20; height: 34
+                                radius: 17; color: modelData.c
+                                Text {
+                                    id: addTxt; anchors.centerIn: parent
+                                    text: modelData.t
+                                    color: "white"; font.pixelSize: 12
+                                }
+                                MouseArea {
+                                    anchors.fill: parent
+                                    onClicked: editor.mbAddPart(modelData.k)
+                                }
+                            }
+                        }
+                    }
+                    // warp
+                    Row {
+                        spacing: 8
+                        Rectangle {
+                            width: 16; height: 16; radius: 2
+                            property bool w: { var n = makeBlockOverlay.rev
+                                               return editor.mbWarp() }
+                            color: w ? "#4C97FF" : "white"
+                            border.color: w ? "#4C97FF" : cBorder
+                            anchors.verticalCenter: parent.verticalCenter
+                            Text {
+                                anchors.centerIn: parent
+                                text: parent.w ? "✓" : ""
+                                color: "white"; font.pixelSize: 11
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: editor.mbSetWarp(!editor.mbWarp())
+                            }
+                        }
+                        Text {
+                            text: "Run without screen refresh"
+                            color: "white"; font.pixelSize: 12
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
+                    }
+                    // Cancel / OK
+                    Row {
+                        spacing: 10
+                        anchors.right: parent.right
+                        Rectangle {
+                            width: 80; height: 36; radius: 4
+                            color: "transparent"; border.color: "white"
+                            Text { anchors.centerIn: parent; text: "Cancel"
+                                   color: "white"; font.pixelSize: 13 }
+                            MouseArea { anchors.fill: parent
+                                        onClicked: editor.mbCancel() }
+                        }
+                        Rectangle {
+                            width: 80; height: 36; radius: 4
+                            color: "#FF8C1A"
+                            Text { anchors.centerIn: parent; text: "OK"
+                                   color: "white"; font.pixelSize: 13
+                                   font.bold: true }
+                            MouseArea { anchors.fill: parent
+                                        onClicked: editor.mbOk() }
+                        }
                     }
                 }
             }
