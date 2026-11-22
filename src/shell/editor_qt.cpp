@@ -619,6 +619,216 @@ struct EdCore {
         if (!nid.empty()) selBlock = nid;
         wsDirty_ = true;
     }
+    void deleteAllBlocks() {
+        Target* t = selected();
+        Blocks* blocks = t ? t->blocks : nullptr;
+        if (!blocks) return;
+        pushUndo();
+        Blocks::StructuralEdit sourceEdit(*blocks);
+        // deleteBlock() mutates getScripts(); never iterate that vector
+        // while deleting its entries (invalidated references/iterators).
+        const auto scripts = blocks->getScripts();
+        for (const auto& sid : scripts) blocks->deleteBlock(sid);
+        selBlock.clear();
+        wsDirty_ = true;
+    }
+    /// チェーン内の非 shadow ブロック数（ctx の "Delete N Blocks" 用）
+    int chainCount(const std::string& id) const {
+        Target* t = const_cast<EdCore*>(this)->selected();
+        Blocks* blocks = t ? t->blocks : nullptr;
+        if (!blocks || id.empty()) return 0;
+        int n = 0;
+        for (Block* cur = blocks->getBlock(id); cur;
+             cur = cur->next.empty() ? nullptr : blocks->getBlock(cur->next))
+            if (!cur->shadow) ++n;
+        return n;
+    }
+    int allBlockCount() const {
+        Target* t = const_cast<EdCore*>(this)->selected();
+        Blocks* blocks = t ? t->blocks : nullptr;
+        if (!blocks) return 0;
+        int n = 0;
+        for (auto& [id, b] : blocks->allBlocks())
+            if (!b.shadow) ++n;
+        return n;
+    }
+
+    // ---- コメント編集 ----
+    struct CmtEdit {
+        bool active = false;
+        std::string blockId;
+    } cmt_;
+    void startEditingComment(const std::string& id) {
+        Target* t = selected();
+        if (!t || !t->blocks || id.empty()) return;
+        if (!t->blocks->getBlock(id)) return;
+        cmt_.active = true;
+        cmt_.blockId = id;
+    }
+    QString commentText() const {
+        Target* t = const_cast<EdCore*>(this)->selected();
+        if (!t || !t->blocks) return QString();
+        const Block* b = t->blocks->getBlock(cmt_.blockId);
+        return b ? QString::fromStdString(b->comment) : QString();
+    }
+    void commitComment(const QString& text) {
+        Target* t = selected();
+        if (t && t->blocks) {
+            if (Block* b = t->blocks->getBlock(cmt_.blockId)) {
+                pushUndo();
+                b->comment = text.toStdString();
+                t->blocks->resetCache();
+                wsDirty_ = true;
+            }
+        }
+        cmt_.active = false;
+        cmt_.blockId.clear();
+    }
+    void removeComment(const std::string& id) {
+        Target* t = selected();
+        if (!t || !t->blocks) return;
+        if (Block* b = t->blocks->getBlock(id)) {
+            pushUndo();
+            b->comment.clear();
+            t->blocks->resetCache();
+            wsDirty_ = true;
+        }
+    }
+
+    // ---- バックパック ----
+    struct BpItem { std::string json, label; };
+    std::vector<BpItem> backpack;
+    bool backpackReadOnly = false;
+    bool bpOpen = false;
+    std::string backpackPath() const {
+        if (const char* p = std::getenv("XYO_BACKPACK")) return p;
+        const char* h = std::getenv("HOME");
+        return h ? (std::string(h) + "/.xyo-backpack.json") : std::string();
+    }
+    void backpackSave() {
+        if (backpackReadOnly) return;
+        std::string p = backpackPath();
+        if (p.empty()) return;
+        JsonArray arr;
+        for (auto& it : backpack) {
+            JsonObject o;
+            o["label"] = JsonValue(it.label);
+            o["json"] = JsonValue(it.json);
+            arr.push_back(JsonValue(std::move(o)));
+        }
+        std::string s = jsonStringify(JsonValue(std::move(arr)));
+        FILE* f = fopenUtf8(p.c_str(), "wb");
+        if (!f) return;
+        std::fwrite(s.data(), 1, s.size(), f);
+        std::fclose(f);
+    }
+    void backpackLoad() {
+        std::string p = backpackPath();
+        if (p.empty()) return;
+        FILE* f = fopenUtf8(p.c_str(), "rb");
+        if (!f) return;
+        std::string s;
+        char buf[4096];
+        size_t n;
+        while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) s.append(buf, n);
+        std::fclose(f);
+        JsonValue v = jsonParse(s);
+        if (!v.isArray()) return;
+        for (const auto& e : v.asArray()) {
+            BpItem it;
+            it.label = e.get("label").asString();
+            it.json = e.get("json").asString();
+            if (!it.json.empty()) backpack.push_back(std::move(it));
+        }
+    }
+    void backpackAdd(const std::string& id) {
+        Target* t = selected();
+        if (!t || !t->blocks || id.empty()) return;
+        Block* b = t->blocks->getBlock(id);
+        if (!b) return;
+        BpItem it;
+        it.json = jsonStringify(saveBlocksFragment(*t->blocks, id));
+        const edit::BlockDef* d = edit::findBlock(b->opcode);
+        it.label = d ? bl::shortBlockLabel(d) : b->opcode;
+        backpack.push_back(std::move(it));
+        backpackSave();
+    }
+    /// バックパック項目を ws 中央へ貼り付ける
+    void backpackPaste(int i, float viewW, float viewH) {
+        Target* t = selected();
+        if (!t || !t->blocks) return;
+        if (i < 0 || i >= (int)backpack.size()) return;
+        JsonValue frag = jsonParse(backpack[i].json);
+        if (!frag.isObject()) return;
+        pushUndo();
+        Blocks::StructuralEdit sourceEdit(*t->blocks);
+        std::string head;
+        loadBlocksFragment(*t->blocks, frag, &head);
+        if (head.empty()) return;
+        if (Block* h = sourceEdit.getBlock(head)) {
+            h->topLevel = true;
+            h->parent.clear();
+            h->x = (viewW / 2 - panX) / wsScale();
+            h->y = (viewH / 2 - panY) / wsScale();
+            t->blocks->addScript(head);
+        }
+        selBlock = head;
+        wsDirty_ = true;
+    }
+
+    // ---- 右クリックコンテキストメニュー ----
+    struct CtxItem { QString label; QString act; bool enabled = true; };
+    std::vector<CtxItem> ctx_;
+    std::string ctxBlockId_;
+    /// ws 上の右クリック（x,y は ws ビュー座標）。メニュー内容を構築する。
+    /// 戻り値: メニューを開くなら true。
+    bool buildWsContext(float x, float y) {
+        ctx_.clear();
+        ctxBlockId_.clear();
+        float s = wsScale();
+        bl::LBlock* lb = wsBlockAtLogical((x - panX) / s, (y - panY) / s);
+        if (lb) {
+            // scratch-blocks BlockSvg.showContextMenu_ 準拠:
+            // Duplicate / Add|Remove Comment / Delete N Blocks / Copy to Backpack
+            ctxBlockId_ = lb->id;
+            selBlock = lb->id;
+            bool hasCmt = lb->block && !lb->block->comment.empty();
+            int n = chainCount(lb->id);
+            ctx_.push_back({"Duplicate", "dup"});
+            ctx_.push_back({hasCmt ? "Remove Comment" : "Add Comment",
+                            hasCmt ? "rmcomment" : "addcomment"});
+            ctx_.push_back({n <= 1 ? "Delete Block"
+                                   : QString("Delete %1 Blocks").arg(n),
+                            "del"});
+            ctx_.push_back({"Copy to Backpack", "backpack"});
+        } else {
+            // WorkspaceSvg.showContextMenu_ 準拠:
+            // Undo / Redo / Clean up Blocks / Paste / Delete N Blocks
+            Target* t = selected();
+            Blocks* blocks = t ? t->blocks : nullptr;
+            ctx_.push_back({"Undo", "undo", !undoStack.empty()});
+            ctx_.push_back({"Redo", "redo", !redoStack.empty()});
+            ctx_.push_back({"Clean up Blocks", "cleanup",
+                            blocks && !blocks->getScripts().empty()});
+            if (!backpack.empty())
+                ctx_.push_back({"Paste", "paste"});
+            int total = allBlockCount();
+            ctx_.push_back({total <= 1 ? "Delete Block"
+                                       : QString("Delete %1 Blocks").arg(total),
+                            "delall", total > 0});
+        }
+        return true;
+    }
+    QVariantList ctxItems() const {
+        QVariantList l;
+        for (auto& c : ctx_) {
+            QVariantMap m;
+            m["label"] = c.label;
+            m["enabled"] = c.enabled;
+            l.push_back(m);
+        }
+        return l;
+    }
 
     // ---- Make a Variable / List ----
     void addVariable(bool list) {
@@ -2120,6 +2330,68 @@ public:
         bumpLayout();
     }
     Q_INVOKABLE void deleteSprite(int i) { ed.deleteSprite(i); bumpLayout(); }
+
+    // ---- 右クリックコンテキストメニュー ----
+    /// ws 上で右クリック: メニュー項目を構築（QML が ctxItems() で表示）。
+    Q_INVOKABLE void openWsContextMenu(double x, double y) {
+        ed.buildWsContext(float(x), float(y));
+        bumpLayout();
+    }
+    /// メニュー項目 {label, enabled} 一覧
+    Q_INVOKABLE QVariantList ctxItems() const { return ed.ctxItems(); }
+    /// メニュー項目実行（index は ctxItems のもの）。
+    /// px/py は paste 位置計算用の ws ビューサイズ。
+    Q_INVOKABLE void runCtxItem(int i, double viewW, double viewH) {
+        if (i < 0 || i >= (int)ed.ctx_.size()) return;
+        const EdCore::CtxItem& it = ed.ctx_[i];
+        if (!it.enabled) return;
+        const QString& a = it.act;
+        const std::string bid = ed.ctxBlockId_;
+        if (a == "dup") ed.duplicateBlock(bid);
+        else if (a == "del") ed.deleteBlockChain(bid);
+        else if (a == "delall") ed.deleteAllBlocks();
+        else if (a == "cleanup") cleanupBlocks();
+        else if (a == "undo") undo();
+        else if (a == "redo") redo();
+        else if (a == "backpack") { ed.backpackAdd(bid); ed.bpOpen = true; }
+        else if (a == "paste")
+            ed.backpackPaste(0, float(viewW), float(viewH));
+        else if (a == "addcomment") { ed.startEditingComment(bid); }
+        else if (a == "rmcomment") { ed.removeComment(bid); }
+        bumpLayout();
+    }
+
+    // ---- コメント編集 ----
+    Q_INVOKABLE bool commentActive() const { return ed.cmt_.active; }
+    Q_INVOKABLE QString commentText() const { return ed.commentText(); }
+    Q_INVOKABLE void commentCommit(const QString& text) {
+        ed.commitComment(text);
+        bumpLayout();
+    }
+    Q_INVOKABLE void commentCancel() {
+        ed.cmt_.active = false;
+        ed.cmt_.blockId.clear();
+        bumpLayout();
+    }
+
+    // ---- バックパック ----
+    Q_INVOKABLE QVariantList backpackItems() const {
+        QVariantList l;
+        for (auto& it : ed.backpack) {
+            QVariantMap m;
+            m["label"] = QString::fromStdString(it.label);
+            l.push_back(m);
+        }
+        return l;
+    }
+    Q_INVOKABLE bool backpackOpen() const { return ed.bpOpen; }
+    Q_INVOKABLE void toggleBackpack() { ed.bpOpen = !ed.bpOpen; bumpLayout(); }
+    Q_INVOKABLE void backpackPasteAt(int i, double viewW, double viewH) {
+        ed.backpackPaste(i, float(viewW), float(viewH));
+        bumpLayout();
+    }
+    Q_INVOKABLE int backpackCount() const { return (int)ed.backpack.size(); }
+
     Q_INVOKABLE void greenFlag() {
         if (rt) rt->greenFlag();
     }
@@ -2792,6 +3064,7 @@ int xyo::editorMainQt(const char* path, bool danger) {
     ctrl.ed.rt = rtOwn.get();
     ctrl.ed.path = path;
     ctrl.ed.buildCategories();
+    ctrl.ed.backpackLoad();
     for (size_t i = 0; i < rtOwn->targets.size(); ++i)
         if (!rtOwn->targets[i]->isStage) { ctrl.ed.selTarget = (int)i; break; }
     if (const char* tg = std::getenv("XYO_EDIT_TARGET"))
@@ -2972,6 +3245,25 @@ int xyo::editorMainQt(const char* path, bool danger) {
             else if (a == "mbwarp") ctrl.mbSetWarp(!ctrl.mbWarp());
             else if (a == "mbok") ctrl.mbOk();
             else if (a == "mbcancel") ctrl.mbCancel();
+            else if (a.startsWith("rclick:")) {
+                QStringList p = a.mid(7).split(':');
+                if (p.size() == 2) {
+                    ctrl.openWsContextMenu(p[0].toDouble(), p[1].toDouble());
+                    if (std::getenv("XYO_EDIT_DEBUG"))
+                        for (const auto& m : ctrl.ed.ctx_)
+                            std::fprintf(stderr, "[edqt] ctx: %s (%s)%s\n",
+                                         m.label.toStdString().c_str(),
+                                         m.act.toStdString().c_str(),
+                                         m.enabled ? "" : " disabled");
+                }
+            }
+            else if (a.startsWith("ctx:"))
+                ctrl.runCtxItem(a.mid(4).toInt(), 700, 500);
+            else if (a.startsWith("cmt:"))
+                ctrl.commentCommit(QString::fromStdString(a.mid(4).toStdString()));
+            else if (a == "cmtcancel") ctrl.commentCancel();
+            else if (a.startsWith("bppaste:"))
+                ctrl.backpackPasteAt(a.mid(8).toInt(), 700, 500);
             else if (a.startsWith("key:")) {
                 // key:<letter|space|up|down|left|right|return> — down+up
                 const QString k = a.mid(4);

@@ -394,6 +394,7 @@ Item {
                     acceptedButtons: Qt.LeftButton | Qt.RightButton
                     onPressed: function(m) {
                         if (m.button === Qt.RightButton) {
+                            editor.openWsContextMenu(m.x, m.y)
                             ctxMenu.popup(m.x, m.y)
                             return
                         }
@@ -443,15 +444,23 @@ Item {
                         }
                     }
                 }
-                // コンテキストメニュー
+                // コンテキストメニュー（scratch-blocks showContextMenu_ 準拠:
+                // C++ 側で項目を構築し ctxItems() で受け取る）
                 Menu {
                     id: ctxMenu
-                    MenuItem { text: "Delete block"; onTriggered: editor.deleteSelected() }
-                    MenuItem { text: "Duplicate"; onTriggered: editor.duplicateSelected() }
-                    MenuSeparator {}
-                    MenuItem { text: "Clean up Blocks"; onTriggered: editor.cleanupBlocks() }
-                    MenuItem { text: "Undo"; enabled: editor.canUndo; onTriggered: editor.undo() }
-                    MenuItem { text: "Redo"; enabled: editor.canRedo; onTriggered: editor.redo() }
+                    Repeater {
+                        model: {
+                            var n = editor.layoutRev
+                            return editor.ctxItems()
+                        }
+                        delegate: MenuItem {
+                            required property var modelData
+                            text: modelData.label
+                            enabled: modelData.enabled
+                            onTriggered: editor.runCtxItem(
+                                index, wsCanvas.width, wsCanvas.height)
+                        }
+                    }
                 }
 
                 // ---- インラインフィールド編集 ----
@@ -553,6 +562,56 @@ Item {
                         if (editor.fieldEditActive)
                             editor.fieldEditCommit(fieldInput.text)
                         m.accepted = true
+                    }
+                }
+
+                // ---- コメント編集（scratchComment 準拠の黄色吹き出し）----
+                Rectangle {
+                    id: cmtBox
+                    property int rev: editor.layoutRev
+                    visible: {
+                        var n = rev
+                        return editor.commentActive()
+                    }
+                    anchors.centerIn: parent
+                    width: 300
+                    height: cmtInput.implicitHeight + 60
+                    color: "#FEF49C"
+                    border.color: "#BCA903"
+                    border.width: 1
+                    radius: 4
+                    z: 11
+                    TextInput {
+                        id: cmtInput
+                        anchors.fill: parent
+                        anchors.margins: 8
+                        anchors.bottomMargin: 32
+                        wrapMode: TextInput.Wrap
+                        font.pixelSize: 12
+                        color: "#000000"
+                        clip: true
+                        onAccepted: editor.commentCommit(text)
+                        Keys.onEscapePressed: editor.commentCancel()
+                    }
+                    Rectangle {
+                        anchors.right: parent.right
+                        anchors.bottom: parent.bottom
+                        anchors.margins: 6
+                        width: 44; height: 22; radius: 4
+                        color: "#4C97FF"
+                        Text { anchors.centerIn: parent; text: "OK"
+                               color: "white"; font.pixelSize: 11 }
+                        MouseArea {
+                            anchors.fill: parent
+                            onClicked: editor.commentCommit(cmtInput.text)
+                        }
+                    }
+                    onVisibleChanged: {
+                        if (visible) {
+                            cmtInput.text = editor.commentText()
+                            cmtInput.forceActiveFocus()
+                            cmtInput.selectAll()
+                        }
                     }
                 }
 
@@ -858,6 +917,90 @@ Item {
                                     z: -1
                                     onClicked: editor.selTarget = index
                                 }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- バックパックバー ----
+        Rectangle {
+            id: bpBar
+            Layout.fillWidth: true
+            property int rev: editor.layoutRev
+            property bool open: {
+                var n = rev
+                return editor.backpackOpen()
+            }
+            Layout.preferredHeight: open ? 130 : 30
+            color: cPanel
+            border.color: cBorder
+            border.width: 1
+            // ヘッダー（クリックで開閉）
+            Rectangle {
+                anchors.top: parent.top
+                width: parent.width; height: 30
+                color: "transparent"
+                Text {
+                    anchors.centerIn: parent
+                    text: "Backpack"
+                    color: cFg; font.pixelSize: 13; font.bold: true
+                }
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: editor.toggleBackpack()
+                }
+            }
+            // 項目一覧
+            Flickable {
+                visible: bpBar.open
+                anchors.top: parent.top
+                anchors.topMargin: 34
+                anchors.bottom: parent.bottom
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.margins: 6
+                contentWidth: bpRow.width
+                clip: true
+                Row {
+                    id: bpRow
+                    spacing: 8
+                    Text {
+                        property int rev: bpBar.rev
+                        visible: { var n = rev; return editor.backpackCount() === 0 }
+                        text: "Backpack is empty"
+                        color: cFgDim; font.pixelSize: 13
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
+                    Repeater {
+                        model: {
+                            var n = bpBar.rev
+                            return editor.backpackItems()
+                        }
+                        delegate: Rectangle {
+                            required property var modelData
+                            required property int index
+                            width: 96; height: 84
+                            radius: 4
+                            color: bpItemMa.containsMouse ? "#EDF1F5" : "#F9F9F9"
+                            border.color: cBorder
+                            Text {
+                                anchors.centerIn: parent
+                                width: 88
+                                text: modelData.label
+                                color: cFg; font.pixelSize: 10
+                                horizontalAlignment: Text.AlignHCenter
+                                elide: Text.ElideRight
+                                maximumLineCount: 3
+                                wrapMode: Text.WordWrap
+                            }
+                            MouseArea {
+                                id: bpItemMa
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                onClicked: editor.backpackPasteAt(
+                                    index, wsCanvas.width, wsCanvas.height)
                             }
                         }
                     }
