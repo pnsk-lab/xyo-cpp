@@ -1865,7 +1865,7 @@ if(XYO_JIT AND XYO_JIT_BACKEND STREQUAL "llvm" AND NOT EMSCRIPTEN)
   target_include_directories(xyo-ir001-postopt-write-audit-smoke
     PRIVATE ${LLVM_INCLUDE_DIRS})
   target_link_libraries(xyo-ir001-postopt-write-audit-smoke
-    PRIVATE ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS})
+    PRIVATE xyo ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS})
   target_compile_options(xyo-ir001-postopt-write-audit-smoke
     PRIVATE -fno-exceptions -fno-rtti)
   add_test(NAME xyo-ir001-postopt-write-audit-smoke
@@ -2037,7 +2037,7 @@ if(XYO_JIT AND XYO_JIT_BACKEND STREQUAL "llvm" AND NOT EMSCRIPTEN)
   target_include_directories(xyo-rt001-pointer-region-smoke
     PRIVATE ${LLVM_INCLUDE_DIRS})
   target_link_libraries(xyo-rt001-pointer-region-smoke
-    PRIVATE ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS})
+    PRIVATE xyo ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS})
   target_compile_options(xyo-rt001-pointer-region-smoke
     PRIVATE -fno-exceptions -fno-rtti)
   add_test(NAME xyo-rt001-pointer-region-smoke
@@ -2051,7 +2051,7 @@ if(XYO_JIT AND XYO_JIT_BACKEND STREQUAL "llvm" AND NOT EMSCRIPTEN)
   target_include_directories(xyo-rt001-postopt-async-roots-smoke
     PRIVATE ${LLVM_INCLUDE_DIRS})
   target_link_libraries(xyo-rt001-postopt-async-roots-smoke
-    PRIVATE ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS})
+    PRIVATE xyo ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS})
   target_compile_options(xyo-rt001-postopt-async-roots-smoke
     PRIVATE -fno-exceptions -fno-rtti)
   add_test(NAME xyo-rt001-postopt-async-roots-smoke
@@ -2099,7 +2099,7 @@ if(XYO_JIT AND XYO_JIT_BACKEND STREQUAL "llvm" AND NOT EMSCRIPTEN)
   target_include_directories(xyo-rt001-postopt-ssa-audit-smoke
     PRIVATE ${LLVM_INCLUDE_DIRS})
   target_link_libraries(xyo-rt001-postopt-ssa-audit-smoke
-    PRIVATE ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS})
+    PRIVATE xyo ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS})
   target_compile_options(xyo-rt001-postopt-ssa-audit-smoke
     PRIVATE -fno-exceptions -fno-rtti)
   add_test(NAME xyo-rt001-postopt-ssa-audit-smoke
@@ -2111,7 +2111,7 @@ if(XYO_JIT AND XYO_JIT_BACKEND STREQUAL "llvm" AND NOT EMSCRIPTEN)
   target_include_directories(xyo-rt001-yield-edge-stackmap-smoke
     PRIVATE ${LLVM_INCLUDE_DIRS})
   target_link_libraries(xyo-rt001-yield-edge-stackmap-smoke
-    PRIVATE ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS})
+    PRIVATE xyo ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS})
   target_compile_options(xyo-rt001-yield-edge-stackmap-smoke
     PRIVATE -fno-exceptions -fno-rtti)
   add_test(NAME xyo-rt001-yield-edge-stackmap-smoke
@@ -2123,7 +2123,7 @@ if(XYO_JIT AND XYO_JIT_BACKEND STREQUAL "llvm" AND NOT EMSCRIPTEN)
   target_include_directories(xyo-rt001-yield-ssa-stackmap-smoke
     PRIVATE ${LLVM_INCLUDE_DIRS})
   target_link_libraries(xyo-rt001-yield-ssa-stackmap-smoke
-    PRIVATE ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS})
+    PRIVATE xyo ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS})
   target_compile_options(xyo-rt001-yield-ssa-stackmap-smoke
     PRIVATE -fno-exceptions -fno-rtti -UNDEBUG)
   add_test(NAME xyo-rt001-yield-ssa-stackmap-smoke
@@ -2849,7 +2849,7 @@ if(XYO_JIT AND XYO_JIT_BACKEND STREQUAL "llvm" AND NOT EMSCRIPTEN)
   add_executable(xyo-llvm-helper-attributes-smoke
     platform/llvm_helper_attributes_smoke.cpp)
   target_include_directories(xyo-llvm-helper-attributes-smoke PRIVATE ${LLVM_INCLUDE_DIRS})
-  target_link_libraries(xyo-llvm-helper-attributes-smoke PRIVATE ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS})
+  target_link_libraries(xyo-llvm-helper-attributes-smoke PRIVATE xyo ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS})
   target_compile_options(xyo-llvm-helper-attributes-smoke PRIVATE -fno-exceptions -fno-rtti)
   add_test(NAME xyo-llvm-helper-attributes-on COMMAND xyo-llvm-helper-attributes-smoke)
   add_test(NAME xyo-llvm-helper-attributes-off COMMAND xyo-llvm-helper-attributes-smoke off)
