@@ -125,7 +125,7 @@ struct Lowerer {
     llvm::Type* i32() { return b.getInt32Ty(); }
     llvm::Type* i64() { return b.getInt64Ty(); }
     llvm::Type* f64() { return b.getDoubleTy(); }
-    llvm::Type* ptr() { return llvm::PointerType::getUnqual(lc); }
+    llvm::PointerType* ptr() { return llvm::PointerType::getUnqual(lc); }
 
     llvm::Type* ty(Type t) {
         switch (t.kind) {
@@ -3368,8 +3368,7 @@ void Lowerer::emitOp(Op& op) {
         llvm::AllocaInst* outSlot = nullptr;
         args.push_back(ctx);
         if (reporterCallee) {
-            outSlot = new llvm::AllocaInst(i64(), 0, "call.out",
-                                           fn->getEntryBlock().begin());
+            outSlot = entryAlloca(i64(), "call.out");
             b.CreateStore(llvm::ConstantInt::get(i64(), val::kUndefined),
                           outSlot);
             args.push_back(outSlot);
