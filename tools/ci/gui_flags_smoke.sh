@@ -8,6 +8,14 @@ mkdir -p build
 work="$(mktemp -d "$PWD/build/gui-flags-smoke.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 
+# Qt6 の無いビルド（Windows / macOS の CI）ではランチャーがスタブなので、
+# フラグ永続化の検証はスキップする（Linux のフルビルドで検証する）。
+probe="$(XYO_GUI_ACTIONS=quit SDL_VIDEODRIVER=dummy "$bin" gui examples 2>&1 || true)"
+if printf '%s' "$probe" | grep -q "built without Qt6"; then
+    echo "gui-flags-smoke: SKIP (このビルドは Qt6 無し)"
+    exit 0
+fi
+
 export XDG_STATE_HOME="$work/state"
 export SDL_VIDEODRIVER=dummy
 export SDL_AUDIODRIVER=dummy
