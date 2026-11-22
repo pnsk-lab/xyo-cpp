@@ -1,1194 +1,1269 @@
-// xyo-cpp: Qt Quick ランチャー（`xyo` / `xyo gui`）
-// C++ 側は src/shell/gui_qt.cpp の LauncherController（context 名 `launcher`）
-// と `entryModel`（フィルタ+ソート済みプロキシ）を使う。
 import QtQuick
+import QtQuick.Controls.Basic
+import QtQuick.Layouts
 
 Item {
     id: root
     width: 1120
     height: 760
 
-    // ---- palette（旧 SDL ランチャーと同じ色）
+    // 落ち着いたデスクトップ・ツール調のカラーパレット（xyo / Scratch 系の紫をアクセントに）
     QtObject {
-        id: theme
-        readonly property color bg: "#F4F6FB"
-        readonly property color panel: "#FFFFFF"
-        readonly property color fg: "#575E75"
-        readonly property color strong: "#2B3247"
-        readonly property color dim: "#8691A7"
-        readonly property color muted: "#A8B1C2"
-        readonly property color border: "#1A000000"
-        readonly property color field: "#F1F4F9"
-        readonly property color accent: "#3A78D8"
-        readonly property color accentHot: "#2964BF"
-        readonly property color folder: "#F2C46D"
-        readonly property color folderDark: "#E0AE4F"
-        readonly property color folderLight: "#F8D996"
-        readonly property color green: "#3FB26B"
-        readonly property color warn: "#E05B52"
-        readonly property color sidebar: "#EDF0F6"
-        readonly property color sidebarHover: "#DBE2F3"
-        readonly property color sidebarText: "#2E3850"
-        readonly property color sidebarMuted: "#7A859D"
-        readonly property color selectBg: "#DAE6FF"
-        readonly property color rowHover: "#F1F4FC"
-        readonly property color hairline: "#E3E7F0"
+        id: pal
+        readonly property color windowBg:     "#F3F4F6"
+        readonly property color surface:      "#FFFFFF"
+        readonly property color surfaceAlt:   "#F8F9FB"
+        readonly property color sidebarBg:    "#ECEEF2"
+        readonly property color sidebarHover: "#E1E4EB"
+        readonly property color sidebarSel:   "#E3DCF8"
+        readonly property color border:       "#D5D9E2"
+        readonly property color borderLight:  "#E6E9EF"
+        readonly property color textPrimary:  "#1C2029"
+        readonly property color textSecond:   "#5B6374"
+        readonly property color textMuted:    "#8B93A4"
+        readonly property color accent:       "#7C4DFF"
+        readonly property color accentHover:  "#6B3EE8"
+        readonly property color accentSoft:   "#EFEAFF"
+        readonly property color accentBorder: "#C5B3F9"
+        readonly property color rowSelBg:     "#E9E3FC"
+        readonly property color rowHoverBg:   "#F2F4F8"
+        readonly property color folderMain:   "#E8B857"
+        readonly property color folderTab:    "#D19E3B"
+        readonly property color ok:           "#2E9E5B"
+        readonly property color danger:       "#D64545"
     }
 
-    readonly property int sideW: width < 880 ? 186 : 218
-    readonly property int footerH: 96
-    readonly property int gridX: sideW + 24
-    // preview pane (list mode only)
-    readonly property int previewW: listMode && (width - gridX) >= 720
-        ? Math.max(230, Math.min(290, Math.floor((width - gridX) / 3))) : 0
     readonly property bool listMode: launcher.listView
-    // grid mode metrics
-    readonly property int gap: 16
-    readonly property int gridAvail: Math.max(180, width - gridX - 24)
-    readonly property int gridCols: Math.max(1, Math.min(5,
-        Math.floor((gridAvail + gap) / (192 + gap))))
-    readonly property int cardW: Math.floor(
-        (gridAvail - (gridCols - 1) * gap) / gridCols)
-    readonly property int cardH: Math.round(cardW * 0.75) - 12 + 54
-    readonly property string fontUi: ""
+    readonly property int gridCols: Math.max(1, Math.floor((contentPane.width - 28 + 12) / (176 + 12)))
 
-    // =========================================================
-    // navigation rail
-    // =========================================================
-    Rectangle {
-        id: rail
-        x: 0; y: 0; width: root.sideW; height: root.height
-        color: theme.sidebar
-
-        Rectangle {
-            x: 20; y: 19; width: 40; height: 40; radius: 12
-            color: theme.accent
-            Text {
-                anchors.centerIn: parent
-                text: "X"; color: "white"
-                font.pixelSize: 20; font.bold: true
+    // 軽量ベクターアイコン（Canvas で 1.5px ストロークの線画アイコンを描画）
+    component LineIcon: Canvas {
+        property string kind: ""
+        property color strokeColor: pal.textSecond
+        property real strokeWidth: 1.5
+        width: 16; height: 16
+        onKindChanged: requestPaint()
+        onStrokeColorChanged: requestPaint()
+        onPaint: {
+            var ctx = getContext("2d")
+            ctx.reset()
+            ctx.strokeStyle = strokeColor
+            ctx.fillStyle = strokeColor
+            ctx.lineWidth = strokeWidth
+            ctx.lineCap = "round"
+            ctx.lineJoin = "round"
+            var w = width, h = height
+            ctx.beginPath()
+            if (kind === "back") {
+                ctx.moveTo(w * 0.62, h * 0.22); ctx.lineTo(w * 0.32, h * 0.50); ctx.lineTo(w * 0.62, h * 0.78)
+            } else if (kind === "forward") {
+                ctx.moveTo(w * 0.38, h * 0.22); ctx.lineTo(w * 0.68, h * 0.50); ctx.lineTo(w * 0.38, h * 0.78)
+            } else if (kind === "up") {
+                ctx.moveTo(w * 0.50, h * 0.78); ctx.lineTo(w * 0.50, h * 0.24)
+                ctx.moveTo(w * 0.24, h * 0.46); ctx.lineTo(w * 0.50, h * 0.22); ctx.lineTo(w * 0.76, h * 0.46)
+            } else if (kind === "reload") {
+                ctx.arc(w * 0.5, h * 0.5, w * 0.31, -0.4, Math.PI * 1.45)
+                ctx.moveTo(w * 0.74, h * 0.22); ctx.lineTo(w * 0.80, h * 0.40); ctx.lineTo(w * 0.62, h * 0.40)
+            } else if (kind === "search") {
+                ctx.arc(w * 0.44, h * 0.44, w * 0.26, 0, Math.PI * 2)
+                ctx.moveTo(w * 0.64, h * 0.64); ctx.lineTo(w * 0.84, h * 0.84)
+            } else if (kind === "list") {
+                ctx.moveTo(w * 0.20, h * 0.30); ctx.lineTo(w * 0.82, h * 0.30)
+                ctx.moveTo(w * 0.20, h * 0.50); ctx.lineTo(w * 0.82, h * 0.50)
+                ctx.moveTo(w * 0.20, h * 0.70); ctx.lineTo(w * 0.82, h * 0.70)
+            } else if (kind === "grid") {
+                ctx.rect(w * 0.18, h * 0.18, w * 0.25, h * 0.25)
+                ctx.rect(w * 0.57, h * 0.18, w * 0.25, h * 0.25)
+                ctx.rect(w * 0.18, h * 0.57, w * 0.25, h * 0.25)
+                ctx.rect(w * 0.57, h * 0.57, w * 0.25, h * 0.25)
+            } else if (kind === "settings") {
+                ctx.arc(w * 0.5, h * 0.5, w * 0.17, 0, Math.PI * 2)
+                for (var i = 0; i < 6; ++i) {
+                    var a = i * Math.PI / 3
+                    ctx.moveTo(w * 0.5 + Math.cos(a) * w * 0.25, h * 0.5 + Math.sin(a) * h * 0.25)
+                    ctx.lineTo(w * 0.5 + Math.cos(a) * w * 0.38, h * 0.5 + Math.sin(a) * h * 0.38)
+                }
+            } else if (kind === "home") {
+                ctx.moveTo(w * 0.18, h * 0.48); ctx.lineTo(w * 0.50, h * 0.20); ctx.lineTo(w * 0.82, h * 0.48)
+                ctx.moveTo(w * 0.28, h * 0.42); ctx.lineTo(w * 0.28, h * 0.80); ctx.lineTo(w * 0.72, h * 0.80); ctx.lineTo(w * 0.72, h * 0.42)
+            } else if (kind === "folder") {
+                ctx.moveTo(w * 0.16, h * 0.26); ctx.lineTo(w * 0.42, h * 0.26); ctx.lineTo(w * 0.50, h * 0.34)
+                ctx.lineTo(w * 0.84, h * 0.34); ctx.lineTo(w * 0.84, h * 0.76); ctx.lineTo(w * 0.16, h * 0.76); ctx.closePath()
+            } else if (kind === "download") {
+                ctx.moveTo(w * 0.50, h * 0.20); ctx.lineTo(w * 0.50, h * 0.64)
+                ctx.moveTo(w * 0.30, h * 0.46); ctx.lineTo(w * 0.50, h * 0.66); ctx.lineTo(w * 0.70, h * 0.46)
+                ctx.moveTo(w * 0.22, h * 0.80); ctx.lineTo(w * 0.78, h * 0.80)
+            } else if (kind === "star") {
+                ctx.moveTo(w * 0.50, h * 0.16); ctx.lineTo(w * 0.60, h * 0.38); ctx.lineTo(w * 0.84, h * 0.41)
+                ctx.lineTo(w * 0.66, h * 0.58); ctx.lineTo(w * 0.71, h * 0.82); ctx.lineTo(w * 0.50, h * 0.70)
+                ctx.lineTo(w * 0.29, h * 0.82); ctx.lineTo(w * 0.34, h * 0.58); ctx.lineTo(w * 0.16, h * 0.41)
+                ctx.lineTo(w * 0.40, h * 0.38); ctx.closePath()
+            } else if (kind === "play") {
+                ctx.moveTo(w * 0.30, h * 0.22); ctx.lineTo(w * 0.78, h * 0.50); ctx.lineTo(w * 0.30, h * 0.78); ctx.closePath()
+                ctx.stroke(); ctx.fill(); return
+            } else if (kind === "edit") {
+                ctx.moveTo(w * 0.22, h * 0.78); ctx.lineTo(w * 0.28, h * 0.58); ctx.lineTo(w * 0.68, h * 0.18)
+                ctx.lineTo(w * 0.82, h * 0.32); ctx.lineTo(w * 0.42, h * 0.72); ctx.closePath()
+            } else if (kind === "bolt") {
+                ctx.moveTo(w * 0.56, h * 0.16); ctx.lineTo(w * 0.26, h * 0.54); ctx.lineTo(w * 0.50, h * 0.54)
+                ctx.lineTo(w * 0.44, h * 0.84); ctx.lineTo(w * 0.74, h * 0.46); ctx.lineTo(w * 0.50, h * 0.46); ctx.closePath()
+            } else if (kind === "export") {
+                ctx.moveTo(w * 0.22, h * 0.62); ctx.lineTo(w * 0.22, h * 0.80); ctx.lineTo(w * 0.78, h * 0.80); ctx.lineTo(w * 0.78, h * 0.62)
+                ctx.moveTo(w * 0.50, h * 0.62); ctx.lineTo(w * 0.50, h * 0.18)
+                ctx.moveTo(w * 0.32, h * 0.36); ctx.lineTo(w * 0.50, h * 0.18); ctx.lineTo(w * 0.68, h * 0.36)
+            } else if (kind === "close") {
+                ctx.moveTo(w * 0.26, h * 0.26); ctx.lineTo(w * 0.74, h * 0.74)
+                ctx.moveTo(w * 0.74, h * 0.26); ctx.lineTo(w * 0.26, h * 0.74)
             }
+            ctx.stroke()
         }
-        Text {
-            x: 72; y: 18; text: "xyo"; color: theme.sidebarText
-            font.pixelSize: 23; font.bold: true
-        }
-        Text {
-            x: 73; y: 47; text: "PROJECT STUDIO"; color: theme.sidebarMuted
-            font.pixelSize: 10
+    }
+
+    // フォルダアイコン（シンプルで視認性の高い2トーン）
+    component FolderIcon: Item {
+        width: 24; height: 20
+        Rectangle {
+            x: 1; y: 1; width: parent.width * 0.44; height: parent.height * 0.35
+            radius: 2; color: pal.folderTab
         }
         Rectangle {
-            x: 20; y: 78; width: root.sideW - 40; height: 1
-            color: "#D5DBE7"
-        }
-        Text {
-            x: 22; y: 95; text: "よく使う項目"; color: theme.sidebarMuted
-            font.pixelSize: 12; font.bold: true
-        }
-
-        component NavItem: Item {
-            property string glyph: ""
-            property string label: ""
-            property string target: ""
-            property bool selected: launcher.dirPath === target
-            width: parent.width - 24; height: 38
-            visible: target !== ""
+            x: 1; y: parent.height * 0.22; width: parent.width - 2; height: parent.height * 0.72
+            radius: 3; color: pal.folderMain
             Rectangle {
-                anchors.fill: parent; radius: 10; visible: parent.selected || ma.containsMouse
-                color: parent.selected ? "#D3E3FA" : theme.sidebarHover
+                anchors.top: parent.top; anchors.left: parent.left; anchors.right: parent.right
+                height: 2; color: "#F4CE7C"
             }
-            Rectangle {
-                x: 9; y: 8; width: 22; height: 22; radius: 6
-                color: parent.selected ? "#BBD5F6" : "#DEE4F1"
-                Text {
-                    anchors.centerIn: parent
-                    text: parent.parent.glyph; color: theme.accent
-                    font.pixelSize: 14; font.bold: true
-                }
-            }
-            Text {
-                x: 41; y: 10; width: parent.width - 51
-                text: parent.label; color: parent.selected ? theme.strong : theme.sidebarText
-                font.pixelSize: 13; font.bold: parent.selected
-                elide: Text.ElideRight
-            }
-            MouseArea {
-                id: ma; anchors.fill: parent; hoverEnabled: true
-                onClicked: launcher.openDir(parent.target)
-            }
-        }
-        Column {
-            x: 12; y: 120; spacing: 5
-            NavItem { glyph: "H"; label: "ホーム"; target: launcher.homeDir }
-            NavItem { glyph: "D"; label: "デスクトップ"; target: launcher.desktopDir }
-            NavItem { glyph: "F"; label: "書類"; target: launcher.documentsDir }
-            NavItem { glyph: "↓"; label: "ダウンロード"; target: launcher.downloadsDir }
-            NavItem { glyph: "S"; label: "サンプル"; target: launcher.examplesDir }
-        }
-
-        Rectangle {
-            x: 20; y: 345; width: root.sideW - 40; height: 1
-            color: "#D5DBE7"
-        }
-        Text {
-            x: 22; y: 357; text: "最近開いたプロジェクト"; color: theme.sidebarMuted
-            font.pixelSize: 12; font.bold: true
-        }
-        Repeater {
-            model: launcher.recentList
-            delegate: Item {
-                x: 12; y: 384 + index * 44
-                width: root.sideW - 24; height: 40
-                visible: y + height < root.height - root.footerH - 60
-                Rectangle {
-                    anchors.fill: parent; radius: 10
-                    color: rma.containsMouse ? theme.sidebarHover : "transparent"
-                }
-                Rectangle {
-                    x: 9; y: 8; width: 24; height: 24; radius: 7
-                    color: "#D9D5F6"
-                    Text {
-                        anchors.centerIn: parent; text: "P"
-                        color: theme.accent; font.pixelSize: 12; font.bold: true
-                    }
-                }
-                Text {
-                    x: 42; y: 3; width: parent.width - 50
-                    text: modelData.stem; color: theme.sidebarText
-                    font.pixelSize: 12; font.bold: true
-                    elide: Text.ElideRight
-                }
-                Text {
-                    x: 42; y: 22; width: parent.width - 50
-                    text: modelData.parent; color: theme.sidebarMuted
-                    font.pixelSize: 10; elide: Text.ElideRight
-                }
-                MouseArea {
-                    id: rma; anchors.fill: parent; hoverEnabled: true
-                    onClicked: launcher.openRecent(modelData.path)
-                    onDoubleClicked: {
-                        launcher.openRecent(modelData.path)
-                        launcher.activate()
-                    }
-                }
-            }
-        }
-        Text {
-            x: 22; y: 392; visible: launcher.recentList.length === 0
-            text: "実行するとここに表示"; color: theme.sidebarMuted
-            font.pixelSize: 12; width: root.sideW - 34; elide: Text.ElideRight
-        }
-        Text {
-            x: 22; y: root.height - root.footerH - 49
-            text: "ファイルをドロップして開く"; color: theme.sidebarMuted
-            font.pixelSize: 11
-        }
-        Text {
-            x: 22; y: root.height - root.footerH - 29
-            text: "Ctrl / Cmd + L でパス入力"; color: theme.sidebarMuted
-            font.pixelSize: 11
         }
     }
 
-    // =========================================================
-    // workspace header
-    // =========================================================
-    Rectangle {
-        x: root.sideW; y: 0; width: root.width - root.sideW; height: 75
-        color: theme.panel
-        Rectangle {
-            anchors.bottom: parent.bottom; width: parent.width; height: 1
-            color: "#E1E7F1"
-        }
-        Text {
-            x: 24; y: 17; width: Math.max(80, parent.width - 24 - 375)
-            text: launcher.dirName; color: theme.strong
-            font.pixelSize: 20; font.bold: true; elide: Text.ElideRight
-        }
-        Text {
-            x: 24; y: 49
-            text: "xyo  /  Scratch プロジェクト"; color: theme.dim
-            font.pixelSize: 12
-        }
-    }
-
-    // search field
-    Rectangle {
-        id: searchBox
-        width: Math.min(326, Math.floor((root.width - root.sideW) / 2))
-        height: 40
-        x: root.width - 24 - width; y: 18
-        radius: 12
-        color: searchInput.activeFocus ? "#F1EFFF" : theme.field
-        border.width: 1
-        border.color: searchInput.activeFocus ? theme.accent
-            : (searchMa.containsMouse ? "#C9B8F0" : "#DEE4EE")
-
-        Canvas {
-            id: magIcon
-            x: 12; y: 14; width: 14; height: 14
-            onPaint: {
-                var ctx = getContext("2d")
-                ctx.strokeStyle = "#8691A7"
-                ctx.lineWidth = 2
-                ctx.beginPath()
-                ctx.arc(5, 5, 4, 0, Math.PI * 2)
-                ctx.stroke()
-                ctx.beginPath()
-                ctx.moveTo(8, 9); ctx.lineTo(13, 14)
-                ctx.stroke()
-            }
-        }
-        TextInput {
-            id: searchInput
-            x: 36; y: 0; width: parent.width - 70; height: parent.height
-            verticalAlignment: TextInput.AlignVCenter
-            font.pixelSize: 14; color: theme.fg
-            clip: true
-            selectByMouse: true
-            onTextChanged: launcher.filter = text
-            Keys.onEscapePressed: {
-                text = ""
-                focus = false
-            }
-            Keys.onReturnPressed: { focus = false; launcher.activate() }
-            Keys.onEnterPressed: { focus = false; launcher.activate() }
-            Keys.onDownPressed: launcher.moveSelectionRows(1, root.gridCols)
-            Keys.onUpPressed: launcher.moveSelectionRows(-1, root.gridCols)
-            Text {
-                anchors.verticalCenter: parent.verticalCenter
-                visible: !parent.text && !parent.activeFocus
-                text: "プロジェクトを検索   /"; color: theme.muted
-                font.pixelSize: 13
-            }
-        }
-        Connections {
-            target: launcher
-            function onFilterChanged() {
-                if (searchInput.text !== launcher.filter)
-                    searchInput.text = launcher.filter
-            }
-        }
-        Rectangle {
-            id: searchClear
-            width: 24; height: 23; radius: 9
-            x: parent.width - 33; y: 9
-            visible: searchInput.text.length > 0
-            color: clearMa.containsMouse ? "#E4E9F2" : "transparent"
-            Text {
-                anchors.centerIn: parent; text: "x"
-                color: theme.dim; font.pixelSize: 15
-            }
-            MouseArea {
-                id: clearMa; anchors.fill: parent; hoverEnabled: true
-                onClicked: searchInput.text = ""
-            }
-        }
-        MouseArea {
-            id: searchMa; anchors.fill: parent; hoverEnabled: true
-            propagateComposedEvents: true
-            onClicked: { searchInput.forceActiveFocus(); mouse.accepted = false }
-        }
-    }
-
-    // =========================================================
-    // toolbar: nav buttons + breadcrumbs/path field
-    // =========================================================
-    component PillButton: Rectangle {
-        property string label: ""
+    // ツールボタン（フラットで押しやすいデスクトップ風）
+    component ToolBtn: Rectangle {
+        property string iconKind: ""
+        property string textLabel: ""
+        property bool active: false
         property bool enabled: true
-        property bool accent: false
-        property bool hovered: ma.containsMouse
-        implicitWidth: 36; implicitHeight: 36
-        radius: height / 2
-        color: !enabled ? "#F4F5F8"
-             : accent ? (hovered ? theme.accentHot : theme.accent)
-             : (hovered ? "#F0EEFF" : theme.panel)
-        border.width: (!accent || !enabled) ? 1 : 0
-        border.color: hovered && enabled ? "#C9B8F0" : "#DFE4EF"
-        Text {
+        property color fgColor: active ? pal.accent : (enabled ? pal.textPrimary : pal.textMuted)
+        implicitWidth: textLabel !== "" ? Math.max(30, lbl.implicitWidth + (iconKind !== "" ? 32 : 18)) : 30
+        implicitHeight: 28
+        radius: 5
+        color: !enabled ? "transparent"
+             : active ? pal.accentSoft
+             : (tma.containsMouse ? "#E5E8EE" : "transparent")
+        border.width: active ? 1 : 0
+        border.color: pal.accentBorder
+
+        Row {
             anchors.centerIn: parent
-            text: parent.label
-            color: !parent.enabled ? theme.muted
-                 : parent.accent ? "white" : theme.fg
-            font.pixelSize: 14; font.bold: parent.accent && parent.enabled
+            spacing: 5
+            LineIcon {
+                visible: iconKind !== ""
+                kind: parent.parent.iconKind
+                strokeColor: parent.parent.fgColor
+                anchors.verticalCenter: parent.verticalCenter
+            }
+            Text {
+                id: lbl
+                visible: textLabel !== ""
+                text: textLabel
+                color: parent.parent.fgColor
+                font.pixelSize: 12
+                font.weight: active ? Font.DemiBold : Font.Normal
+                anchors.verticalCenter: parent.verticalCenter
+            }
         }
         MouseArea {
-            id: ma; anchors.fill: parent; hoverEnabled: true
-            enabled: parent.enabled
+            id: tma; anchors.fill: parent; hoverEnabled: true; enabled: parent.enabled
             onClicked: parent.clicked()
         }
         signal clicked()
     }
 
-    PillButton {
-        id: bBack; x: root.gridX; y: 86; label: "<"
-        enabled: launcher.canGoBack
-        onClicked: launcher.goBack()
-    }
-    PillButton {
-        id: bForward; x: root.gridX + 42; y: 86; label: ">"
-        enabled: launcher.canGoForward
-        onClicked: launcher.goForward()
-    }
-    PillButton {
-        id: bUp; x: root.gridX + 84; y: 86; label: "^"
-        enabled: launcher.canGoUp
-        onClicked: launcher.goUp()
-    }
+    // アクションボタン（右インスペクタの実行/編集/AOT等）
+    component ActionBtn: Rectangle {
+        property string iconKind: ""
+        property string label: ""
+        property bool primary: false
+        property bool enabled: true
+        implicitHeight: primary ? 38 : 32
+        radius: 6
+        color: !enabled ? "#ECEEF2"
+             : primary ? (ama.containsMouse ? pal.accentHover : pal.accent)
+             : (ama.containsMouse ? "#F3F4F8" : pal.surface)
+        border.width: primary && enabled ? 0 : 1
+        border.color: !enabled ? pal.borderLight : (ama.containsMouse ? "#BFC5D2" : pal.border)
 
-    Rectangle {
-        id: pathBox
-        x: root.gridX + 132; y: 86
-        width: Math.max(60, root.width - root.gridX - 156)
-        height: 36; radius: 10
-        color: pathInput.visible ? "#F0EDFF" : theme.panel
-        border.width: 1
-        border.color: pathInput.visible ? theme.accent
-            : (pathMa.containsMouse ? "#C9B8F0" : "#DFE5EE")
-        Text {
-            x: 12; anchors.verticalCenter: parent.verticalCenter
-            text: "/"; color: theme.accent; font.pixelSize: 14; font.bold: true
-        }
-        // breadcrumb mode
-        Item {
-            anchors.left: parent.left; anchors.leftMargin: 30
-            anchors.right: parent.right; anchors.rightMargin: 64
-            anchors.verticalCenter: parent.verticalCenter
-            height: 24; clip: true
-            visible: !pathInput.visible
-            Row {
-                anchors.right: parent.right; height: parent.height
-                spacing: 4
-                Repeater {
-                    model: launcher.crumbs
-                    delegate: Row {
-                        spacing: 4; height: parent.height
-                        Text {
-                            text: index + 1 < launcher.crumbs.length ? "›" : ""
-                            color: theme.muted; font.pixelSize: 12
-                            anchors.verticalCenter: parent.verticalCenter
-                            visible: index > 0
-                        }
-                        Text {
-                            text: modelData.label
-                            color: index === launcher.crumbs.length - 1
-                                   ? theme.strong : theme.dim
-                            font.pixelSize: 12
-                            font.bold: index === launcher.crumbs.length - 1
-                            anchors.verticalCenter: parent.verticalCenter
-                            MouseArea {
-                                anchors.fill: parent
-                                onClicked: launcher.openDir(modelData.path)
-                            }
-                        }
-                    }
-                }
+        RowLayout {
+            anchors.fill: parent
+            anchors.leftMargin: 12; anchors.rightMargin: 12
+            spacing: 8
+            LineIcon {
+                visible: iconKind !== ""
+                kind: parent.parent.iconKind
+                strokeColor: !parent.parent.enabled ? pal.textMuted
+                           : (parent.parent.primary ? "#FFFFFF" : pal.textSecond)
             }
-        }
-        // edit mode
-        TextInput {
-            id: pathInput
-            visible: false
-            anchors.left: parent.left; anchors.leftMargin: 30
-            anchors.right: parent.right; anchors.rightMargin: 64
-            anchors.verticalCenter: parent.verticalCenter
-            font.pixelSize: 12; color: theme.fg; clip: true
-            selectByMouse: true
-            function open() {
-                text = launcher.dirPath
-                visible = true
-                forceActiveFocus()
-                selectAll()
+            Text {
+                Layout.fillWidth: true
+                text: parent.parent.label
+                color: !parent.parent.enabled ? pal.textMuted
+                     : (parent.parent.primary ? "#FFFFFF" : pal.textPrimary)
+                font.pixelSize: parent.parent.primary ? 13 : 12
+                font.weight: parent.parent.primary ? Font.DemiBold : Font.Medium
+                elide: Text.ElideRight
             }
-            function close() { visible = false; focus = false }
-            Keys.onReturnPressed: { launcher.openDir(text); close() }
-            Keys.onEnterPressed: { launcher.openDir(text); close() }
-            Keys.onEscapePressed: close()
-            onActiveFocusChanged: if (!activeFocus && visible) close()
-        }
-        Text {
-            anchors.right: parent.right; anchors.rightMargin: 14
-            anchors.verticalCenter: parent.verticalCenter
-            text: "⌘ L"; color: theme.muted; font.pixelSize: 11
         }
         MouseArea {
-            id: pathMa; anchors.fill: parent; hoverEnabled: true
-            propagateComposedEvents: true
-            onClicked: { pathInput.open(); mouse.accepted = false }
+            id: ama; anchors.fill: parent; hoverEnabled: true; enabled: parent.enabled
+            onClicked: parent.clicked()
         }
+        signal clicked()
     }
 
-    // =========================================================
-    // section heading + view buttons
-    // =========================================================
-    Text {
-        x: root.gridX; y: 144
-        text: launcher.filter === "" ? "このフォルダ" : "検索結果"
-        color: theme.strong; font.pixelSize: 18; font.bold: true
-    }
-    Text {
-        x: root.gridX + 148; y: 151
-        visible: root.width >= 900
-        text: entryModel.rowCount() + " 項目"
-        color: theme.dim; font.pixelSize: 12
-    }
-    PillButton {
-        id: bIcons
-        implicitWidth: 76; implicitHeight: 32
-        x: bList.x - 6 - width; y: 140
-        label: "アイコン"; accent: !root.listMode
-        onClicked: launcher.listView = false
-    }
-    PillButton {
-        id: bList
-        implicitWidth: 64; implicitHeight: 32
-        x: bSort.x - 10 - width; y: 140
-        label: "リスト"; accent: root.listMode
-        onClicked: launcher.listView = true
-    }
-    PillButton {
-        id: bSort
-        implicitWidth: 108; implicitHeight: 32
-        x: bSettings.x - 8 - width; y: 140
-        label: launcher.sortRecent ? "更新日順" : "名前順"
-        onClicked: launcher.sortRecent = !launcher.sortRecent
-    }
-    PillButton {
-        id: bSettings
-        implicitWidth: 96; implicitHeight: 32
-        x: root.width - 24 - width; y: 140
-        label: "実行設定"; accent: settingsPanel.visible
-        onClicked: settingsPanel.visible = !settingsPanel.visible
-    }
-    Connections {
-        target: launcher
-        function onToggleSettingsRequested() {
-            settingsPanel.visible = !settingsPanel.visible
-        }
-    }
-
-    // =========================================================
-    // content area
-    // =========================================================
-    readonly property int contentTop: listMode ? 209 : 185
-    readonly property int contentH: Math.max(80,
-        height - contentTop - footerH - 12)
-
-    // ----- Finder-style list
-    Item {
-        visible: root.listMode
-        x: root.gridX; y: root.contentTop - 29
-        width: root.width - root.gridX - 24 - (root.previewW ? root.previewW + 13 : 0)
-        height: root.height - root.footerH - 10 - y
-        Rectangle {
-            anchors.fill: parent; color: theme.panel
-        }
-        Rectangle {
-            x: 0; y: 28; width: parent.width; height: 1
-            color: "#E5E9F2"
-        }
-        Text { x: 15; y: 7; text: "名前"; color: theme.dim; font.pixelSize: 12 }
-        Text {
-            x: parent.width - 180; y: 7; text: "変更日"
-            color: theme.dim; font.pixelSize: 12
-            visible: parent.width >= 420
-        }
-        Text {
-            x: parent.width - 77; y: 7; text: "サイズ"
-            color: theme.dim; font.pixelSize: 12
-            visible: parent.width >= 420
-        }
-        Text {
-            x: parent.width - 102; y: 7; text: "種類"
-            color: theme.dim; font.pixelSize: 12
-            visible: parent.width < 420
-        }
-
-        ListView {
-            id: fileList
-            anchors.fill: parent; anchors.topMargin: 29
-            clip: true
-            model: entryModel
-            boundsBehavior: Flickable.StopAtBounds
-            delegate: Item {
-                width: fileList.width; height: 40
-                readonly property bool sel:
-                    model.path === launcher.selectedPath
-                Rectangle {
-                    x: 4; y: 2; width: parent.width - 8; height: parent.height - 4
-                    color: sel ? theme.selectBg
-                         : rowMa.containsMouse ? theme.rowHover
-                         : (index % 2 ? "#FAFBFE" : "transparent")
-                }
-                // icon
-                Item {
-                    x: 12; y: 8; width: 30; height: 26
-                    FolderGlyph {
-                        anchors.centerIn: parent; scale: 0.55
-                        visible: model.isDir
-                    }
-                    Image {
-                        id: listThumbImg
-                        anchors.fill: parent
-                        visible: !model.isDir && model.thumbUrl !== ""
-                        source: visible ? model.thumbUrl : ""
-                        fillMode: Image.PreserveAspectFit
-                        asynchronous: true
-                    }
-                    Rectangle {
-                        visible: !model.isDir &&
-                                 (model.thumbUrl === "" || listThumbImg.status !== Image.Ready)
-                        x: 1; y: 0; width: 27; height: 25; radius: 4
-                        color: "#D7D1F2"
-                        Text {
-                            anchors.centerIn: parent; text: "S"
-                            color: theme.accent; font.pixelSize: 12
-                            font.bold: true
-                        }
-                    }
-                }
-                Text {
-                    x: 53; y: 10; width: Math.max(16,
-                        parent.width - (parent.width >= 420 ? 242 : 168))
-                    text: model.displayName
-                    color: sel ? theme.strong : theme.fg
-                    font.pixelSize: 13; font.bold: sel
-                    elide: Text.ElideRight
-                }
-                Text {
-                    x: parent.width - 180; y: 12; width: 95
-                    text: model.dateText; color: theme.dim
-                    font.pixelSize: 11; elide: Text.ElideRight
-                    visible: parent.width >= 420
-                }
-                Text {
-                    x: parent.width - 77; y: 12; width: 69
-                    text: model.sizeText; color: theme.dim
-                    font.pixelSize: 11; elide: Text.ElideRight
-                    visible: parent.width >= 420
-                }
-                Text {
-                    x: parent.width - 102; y: 12; width: 89
-                    text: model.isDir ? "フォルダ" : "Scratch"
-                    color: theme.dim; font.pixelSize: 11
-                    elide: Text.ElideRight
-                    visible: parent.width < 420
-                }
-                Rectangle {
-                    x: 0; y: parent.height - 1; width: parent.width; height: 1
-                    color: "#F0F2F7"
-                }
-                MouseArea {
-                    id: rowMa; anchors.fill: parent; hoverEnabled: true
-                    onClicked: launcher.selectAt(index)
-                    onDoubleClicked: launcher.activateAt(index)
-                }
-            }
-            Rectangle {
-                // thin custom scrollbar
-                anchors.right: parent.right; anchors.rightMargin: 3
-                y: fileList.visibleArea.yPosition * fileList.height
-                width: 4; radius: 2
-                height: Math.max(30,
-                    fileList.visibleArea.heightRatio * fileList.height)
-                color: "#A8B1C2"
-                visible: fileList.visibleArea.heightRatio < 1
-            }
-        }
-        Text {
-            anchors.centerIn: parent
-            visible: entryModel.rowCount() === 0
-            text: launcher.filter === ""
-                  ? "このフォルダにプロジェクトがありません"
-                  : "一致するプロジェクトがありません"
-            color: theme.dim; font.pixelSize: 15
-        }
-    }
-
-    // ----- preview pane (list mode)
     Rectangle {
-        id: previewPane
-        visible: root.listMode && root.previewW > 0
-        x: root.gridX + (root.width - root.gridX - 24 - root.previewW) + 13
-        y: root.contentTop - 28
-        width: Math.max(40, root.previewW)
-        height: root.height - root.footerH - 11 - y
-        color: theme.panel
-        Rectangle {
-            x: 0; y: 0; width: 1; height: parent.height
-            color: "#E3E7F0"
-        }
-        Text {
-            x: 18; y: 14; text: "プレビュー"; color: theme.strong
-            font.pixelSize: 14; font.bold: true
-        }
-        Text {
-            x: 18; y: 66; width: parent.width - 36
-            visible: !launcher.hasSelection
-            text: "ファイルを選択してください"
-            color: theme.dim; font.pixelSize: 12
-            wrapMode: Text.Wrap
-        }
-        Item {
-            visible: launcher.hasSelection
-            anchors.fill: parent
-            Rectangle {
-                id: pvBox
-                width: Math.max(24, Math.min(parent.width - 36, 236))
-                height: Math.min(width * 3 / 4, 180)
-                x: (parent.width - width) / 2; y: 55
-                radius: 10; color: theme.field; clip: true
-                FolderGlyph {
-                    anchors.centerIn: parent; scale: 1.6
-                    visible: launcher.selectedIsDir
-                }
-                Image {
-                    anchors.fill: parent
-                    visible: !launcher.selectedIsDir &&
-                             launcher.selectedThumb !== ""
-                    source: visible ? launcher.selectedThumb : ""
-                    fillMode: Image.PreserveAspectCrop
-                    asynchronous: true
-                }
-                Text {
-                    anchors.centerIn: parent
-                    visible: !launcher.selectedIsDir &&
-                             pvImg.status !== Image.Ready
-                    text: "読み込み中..."
-                    color: theme.dim; font.pixelSize: 12
-                }
-                Image {
-                    id: pvImg; visible: false
-                    source: launcher.selectedThumb
-                    asynchronous: true
-                }
-            }
-            Text {
-                x: 18; y: pvBox.y + pvBox.height + 22
-                width: parent.width - 36
-                text: launcher.selectedName; color: theme.strong
-                font.pixelSize: 16; font.bold: true; elide: Text.ElideRight
-            }
-            Text {
-                x: 18; y: pvBox.y + pvBox.height + 51
-                width: parent.width - 36
-                text: launcher.selectedKind; color: theme.dim
-                font.pixelSize: 12; elide: Text.ElideRight
-            }
-            Rectangle {
-                x: 18; y: pvBox.y + pvBox.height + 80
-                width: parent.width - 36; height: 1
-                color: "#E4E8F0"
-            }
-            Text {
-                x: 18; y: pvBox.y + pvBox.height + 96
-                text: "情報"; color: theme.strong
-                font.pixelSize: 12; font.bold: true
-            }
-            Text {
-                x: 18; y: pvBox.y + pvBox.height + 122
-                width: parent.width - 36
-                text: "種類  " + launcher.selectedKind
-                color: theme.dim; font.pixelSize: 12; elide: Text.ElideRight
-            }
-            Text {
-                x: 18; y: pvBox.y + pvBox.height + 145
-                width: parent.width - 36
-                text: launcher.selectedMeta
-                color: theme.dim; font.pixelSize: 12; elide: Text.ElideRight
-            }
-        }
+        anchors.fill: parent
+        color: pal.windowBg
     }
 
-    // ----- icon grid
-    Item {
-        visible: !root.listMode
-        x: root.gridX; y: root.contentTop
-        width: root.width - root.gridX - 24
-        height: root.contentH
-        GridView {
-            id: fileGrid
-            anchors.fill: parent
-            clip: true
-            model: entryModel
-            cellWidth: root.cardW + root.gap
-            cellHeight: root.cardH + root.gap
-            boundsBehavior: Flickable.StopAtBounds
-            delegate: Item {
-                width: fileGrid.cellWidth - root.gap
-                height: fileGrid.cellHeight - root.gap
-                readonly property bool sel:
-                    model.path === launcher.selectedPath
-                readonly property bool hot: cardMa.containsMouse
-                Rectangle {
-                    x: 2; y: 5; width: parent.width; height: parent.height
-                    radius: 16
-                    color: hot ? "#33575E75" : "#15575E75"
-                }
-                Rectangle {
-                    anchors.fill: parent; radius: 16; color: theme.panel
-                    border.width: sel ? 2 : 1
-                    border.color: sel ? theme.accent
-                        : (hot ? "#C9B8F0" : "#E2E7F0")
-                    Item {
-                        x: 8; y: 8
-                        width: parent.width - 16
-                        height: Math.round(root.cardW * 0.75) - 12
-                        clip: true
-                        FolderGlyph {
-                            anchors.centerIn: parent; scale: 1.4
-                            visible: model.isDir
+    ColumnLayout {
+        anchors.fill: parent
+        spacing: 0
+
+        // =====================================================
+        // トップツールバー（ナビゲーション + パス + 検索 + 表示切替）
+        // =====================================================
+        Rectangle {
+            Layout.fillWidth: true
+            Layout.preferredHeight: 48
+            color: pal.surface
+
+            RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: 12
+                anchors.rightMargin: 12
+                spacing: 8
+
+                // アプリ識別（控えめで機能的なブランド表記）
+                RowLayout {
+                    spacing: 7
+                    Rectangle {
+                        width: 24; height: 24; radius: 6; color: pal.accent
+                        Text {
+                            anchors.centerIn: parent
+                            text: "x"; color: "#FFFFFF"
+                            font.pixelSize: 15; font.bold: true
                         }
-                        Rectangle {
-                            visible: !model.isDir &&
-                                     gridThumbImg.status !== Image.Ready
-                            anchors.fill: parent; radius: 8
-                            color: "#F2F5FA"
-                            Rectangle {
-                                width: 36; height: 28; radius: 5
-                                anchors.centerIn: parent
-                                color: "#DDE3EE"
-                                Canvas {
-                                    anchors.centerIn: parent
-                                    width: 16; height: 14
-                                    onPaint: {
-                                        var ctx = getContext("2d")
-                                        ctx.fillStyle = "#B4BED0"
-                                        ctx.beginPath()
-                                        ctx.moveTo(3, 0); ctx.lineTo(3, 14)
-                                        ctx.lineTo(16, 7)
-                                        ctx.closePath(); ctx.fill()
+                    }
+                    Text {
+                        text: "xyo"
+                        color: pal.textPrimary
+                        font.pixelSize: 15; font.bold: true
+                    }
+                }
+
+                Rectangle { width: 1; height: 20; color: pal.borderLight }
+
+                // 履歴・親フォルダ・再読込
+                RowLayout {
+                    spacing: 2
+                    ToolBtn { iconKind: "back"; enabled: launcher.canGoBack; onClicked: launcher.goBack() }
+                    ToolBtn { iconKind: "forward"; enabled: launcher.canGoForward; onClicked: launcher.goForward() }
+                    ToolBtn { iconKind: "up"; enabled: launcher.canGoUp; onClicked: launcher.goUp() }
+                    ToolBtn { iconKind: "reload"; onClicked: launcher.reload() }
+                }
+
+                // パスバー（通常はクリックできるパンくず、クリックまたは Ctrl+L で直接入力）
+                Rectangle {
+                    id: addressBar
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 30
+                    radius: 5
+                    color: pathEdit.visible ? pal.surface : pal.surfaceAlt
+                    border.width: 1
+                    border.color: pathEdit.visible ? pal.accent
+                                : (addrMa.containsMouse ? "#BFC5D2" : pal.border)
+
+                    Row {
+                        visible: !pathEdit.visible
+                        anchors.left: parent.left; anchors.leftMargin: 8
+                        anchors.right: parent.right; anchors.rightMargin: 8
+                        anchors.verticalCenter: parent.verticalCenter
+                        clip: true
+                        spacing: 2
+                        Repeater {
+                            model: launcher.crumbs
+                            delegate: Row {
+                                spacing: 2
+                                height: 24
+                                Text {
+                                    visible: index > 0
+                                    text: "/"
+                                    color: pal.textMuted
+                                    font.pixelSize: 12
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+                                Rectangle {
+                                    height: 22
+                                    width: crumbTxt.implicitWidth + 10
+                                    radius: 4
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    color: cma.containsMouse ? "#E5E8EE" : "transparent"
+                                    Text {
+                                        id: crumbTxt
+                                        anchors.centerIn: parent
+                                        text: modelData.label
+                                        color: index === launcher.crumbs.length - 1 ? pal.textPrimary : pal.textSecond
+                                        font.pixelSize: 12
+                                        font.weight: index === launcher.crumbs.length - 1 ? Font.DemiBold : Font.Normal
+                                    }
+                                    MouseArea {
+                                        id: cma; anchors.fill: parent; hoverEnabled: true
+                                        onClicked: launcher.openDir(modelData.path)
                                     }
                                 }
                             }
                         }
-                        Image {
-                            id: gridThumbImg
+                    }
+
+                    TextInput {
+                        id: pathEdit
+                        visible: false
+                        anchors.fill: parent
+                        anchors.leftMargin: 10; anchors.rightMargin: 10
+                        verticalAlignment: TextInput.AlignVCenter
+                        font.pixelSize: 12
+                        color: pal.textPrimary
+                        selectByMouse: true
+                        clip: true
+                        function open() {
+                            text = launcher.dirPath
+                            visible = true
+                            forceActiveFocus()
+                            selectAll()
+                        }
+                        function close() { visible = false; focus = false }
+                        Keys.onReturnPressed: { launcher.openDir(text); close() }
+                        Keys.onEnterPressed: { launcher.openDir(text); close() }
+                        Keys.onEscapePressed: close()
+                        onActiveFocusChanged: if (!activeFocus && visible) close()
+                    }
+
+                    MouseArea {
+                        id: addrMa
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        propagateComposedEvents: true
+                        z: -1
+                        onClicked: pathEdit.open()
+                    }
+                }
+
+                // 検索フィールド
+                Rectangle {
+                    Layout.preferredWidth: Math.min(220, Math.max(140, root.width * 0.2))
+                    Layout.preferredHeight: 30
+                    radius: 5
+                    color: searchInput.activeFocus ? pal.surface : pal.surfaceAlt
+                    border.width: 1
+                    border.color: searchInput.activeFocus ? pal.accent : pal.border
+
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: 8; anchors.rightMargin: 6
+                        spacing: 6
+                        LineIcon { kind: "search"; width: 14; height: 14; strokeColor: pal.textMuted }
+                        TextInput {
+                            id: searchInput
+                            Layout.fillWidth: true
+                            font.pixelSize: 12
+                            color: pal.textPrimary
+                            selectByMouse: true
+                            clip: true
+                            onTextChanged: launcher.filter = text
+                            Keys.onEscapePressed: { text = ""; focus = false }
+                            Keys.onReturnPressed: { focus = false; launcher.activate() }
+                            Keys.onEnterPressed: { focus = false; launcher.activate() }
+                            Keys.onDownPressed: launcher.moveSelectionRows(1, root.listMode ? 1 : root.gridCols)
+                            Keys.onUpPressed: launcher.moveSelectionRows(-1, root.listMode ? 1 : root.gridCols)
+                            Text {
+                                anchors.verticalCenter: parent.verticalCenter
+                                visible: !parent.text && !parent.activeFocus
+                                text: "検索 (/)"
+                                color: pal.textMuted
+                                font.pixelSize: 12
+                            }
+                        }
+                        ToolBtn {
+                            visible: searchInput.text.length > 0
+                            iconKind: "close"
+                            implicitWidth: 20; implicitHeight: 20
+                            onClicked: searchInput.text = ""
+                        }
+                    }
+                    Connections {
+                        target: launcher
+                        function onFilterChanged() {
+                            if (searchInput.text !== launcher.filter)
+                                searchInput.text = launcher.filter
+                        }
+                    }
+                }
+
+                // リスト / アイコン切替セグメント
+                Rectangle {
+                    Layout.preferredHeight: 28
+                    Layout.preferredWidth: 62
+                    radius: 5
+                    color: pal.surfaceAlt
+                    border.width: 1; border.color: pal.border
+                    RowLayout {
+                        anchors.fill: parent; anchors.margins: 2; spacing: 2
+                        Rectangle {
+                            Layout.fillWidth: true; Layout.fillHeight: true; radius: 3
+                            color: root.listMode ? pal.surface : "transparent"
+                            border.width: root.listMode ? 1 : 0; border.color: pal.borderLight
+                            LineIcon {
+                                anchors.centerIn: parent; width: 14; height: 14; kind: "list"
+                                strokeColor: root.listMode ? pal.accent : pal.textSecond
+                            }
+                            MouseArea { anchors.fill: parent; onClicked: launcher.listView = true }
+                        }
+                        Rectangle {
+                            Layout.fillWidth: true; Layout.fillHeight: true; radius: 3
+                            color: !root.listMode ? pal.surface : "transparent"
+                            border.width: !root.listMode ? 1 : 0; border.color: pal.borderLight
+                            LineIcon {
+                                anchors.centerIn: parent; width: 14; height: 14; kind: "grid"
+                                strokeColor: !root.listMode ? pal.accent : pal.textSecond
+                            }
+                            MouseArea { anchors.fill: parent; onClicked: launcher.listView = false }
+                        }
+                    }
+                }
+
+                ToolBtn {
+                    textLabel: launcher.sortRecent ? "更新日順" : "名前順"
+                    onClicked: launcher.sortRecent = !launcher.sortRecent
+                }
+                ToolBtn {
+                    iconKind: "settings"
+                    textLabel: "設定"
+                    active: settingsDialog.visible
+                    onClicked: settingsDialog.visible = !settingsDialog.visible
+                }
+            }
+
+            Rectangle {
+                anchors.bottom: parent.bottom; width: parent.width; height: 1
+                color: pal.border
+            }
+        }
+
+        // =====================================================
+        // メイン 3 ペイン（左: 場所と履歴 | 中央: 一覧 | 右: プレビューと操作）
+        // =====================================================
+        RowLayout {
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            spacing: 0
+
+            // -------------------------------------------------
+            // 左サイドバー
+            // -------------------------------------------------
+            Rectangle {
+                Layout.preferredWidth: root.width < 880 ? 176 : 204
+                Layout.fillHeight: true
+                color: pal.sidebarBg
+
+                ColumnLayout {
+                    anchors.fill: parent
+                    anchors.margins: 10
+                    spacing: 4
+
+                    Text {
+                        text: "場所"
+                        color: pal.textMuted
+                        font.pixelSize: 11; font.weight: Font.DemiBold
+                        Layout.leftMargin: 6; Layout.topMargin: 4; Layout.bottomMargin: 2
+                    }
+
+                    component SidebarItem: Rectangle {
+                        property string iconKind: "folder"
+                        property string label: ""
+                        property string target: ""
+                        property bool current: target !== "" && launcher.dirPath === target
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 30
+                        visible: target !== ""
+                        radius: 5
+                        color: current ? pal.sidebarSel : (sma.containsMouse ? pal.sidebarHover : "transparent")
+
+                        RowLayout {
                             anchors.fill: parent
-                            visible: !model.isDir && model.thumbUrl !== ""
-                            source: visible ? model.thumbUrl : ""
-                            fillMode: Image.PreserveAspectCrop
+                            anchors.leftMargin: 8; anchors.rightMargin: 8
+                            spacing: 8
+                            LineIcon {
+                                kind: parent.parent.iconKind
+                                width: 15; height: 15
+                                strokeColor: parent.parent.current ? pal.accent : pal.textSecond
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                text: parent.parent.label
+                                color: parent.parent.current ? pal.textPrimary : pal.textSecond
+                                font.pixelSize: 12
+                                font.weight: parent.parent.current ? Font.DemiBold : Font.Normal
+                                elide: Text.ElideRight
+                            }
+                        }
+                        MouseArea {
+                            id: sma; anchors.fill: parent; hoverEnabled: true
+                            onClicked: launcher.openDir(parent.target)
+                        }
+                    }
+
+                    SidebarItem { iconKind: "home";     label: "ホーム";       target: launcher.homeDir }
+                    SidebarItem { iconKind: "folder";   label: "デスクトップ"; target: launcher.desktopDir }
+                    SidebarItem { iconKind: "folder";   label: "書類";         target: launcher.documentsDir }
+                    SidebarItem { iconKind: "download"; label: "ダウンロード"; target: launcher.downloadsDir }
+                    SidebarItem { iconKind: "star";     label: "サンプル";     target: launcher.examplesDir }
+
+                    Rectangle {
+                        Layout.fillWidth: true; Layout.preferredHeight: 1
+                        Layout.topMargin: 8; Layout.bottomMargin: 6
+                        color: pal.border
+                    }
+
+                    Text {
+                        text: "最近開いた項目"
+                        color: pal.textMuted
+                        font.pixelSize: 11; font.weight: Font.DemiBold
+                        Layout.leftMargin: 6; Layout.bottomMargin: 2
+                    }
+
+                    ListView {
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        clip: true
+                        spacing: 2
+                        model: launcher.recentList
+                        boundsBehavior: Flickable.StopAtBounds
+                        delegate: Rectangle {
+                            width: ListView.view.width
+                            height: 40
+                            radius: 5
+                            color: rma.containsMouse ? pal.sidebarHover : "transparent"
+                            ColumnLayout {
+                                anchors.fill: parent
+                                anchors.leftMargin: 8; anchors.rightMargin: 8
+                                anchors.topMargin: 5; anchors.bottomMargin: 5
+                                spacing: 1
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: modelData.stem
+                                    color: pal.textPrimary
+                                    font.pixelSize: 12; font.weight: Font.Medium
+                                    elide: Text.ElideRight
+                                }
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: modelData.parent
+                                    color: pal.textMuted
+                                    font.pixelSize: 10
+                                    elide: Text.ElideRight
+                                }
+                            }
+                            MouseArea {
+                                id: rma; anchors.fill: parent; hoverEnabled: true
+                                onClicked: launcher.openRecent(modelData.path)
+                                onDoubleClicked: {
+                                    launcher.openRecent(modelData.path)
+                                    launcher.activate()
+                                }
+                            }
+                        }
+                        Text {
+                            anchors.top: parent.top; anchors.left: parent.left; anchors.leftMargin: 8
+                            visible: launcher.recentList.length === 0
+                            text: "履歴はありません"
+                            color: pal.textMuted
+                            font.pixelSize: 11
+                        }
+                    }
+                }
+
+                Rectangle {
+                    anchors.right: parent.right; width: 1; height: parent.height
+                    color: pal.border
+                }
+            }
+
+            // -------------------------------------------------
+            // 中央: プロジェクト一覧（リスト / グリッド）
+            // -------------------------------------------------
+            Rectangle {
+                id: contentPane
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                color: pal.surface
+
+                // リスト表示
+                ColumnLayout {
+                    anchors.fill: parent
+                    spacing: 0
+                    visible: root.listMode
+
+                    // カラムヘッダ
+                    Rectangle {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 28
+                        color: pal.surfaceAlt
+                        RowLayout {
+                            anchors.fill: parent
+                            anchors.leftMargin: 14; anchors.rightMargin: 16
+                            spacing: 8
+                            Text {
+                                Layout.fillWidth: true
+                                text: "名前 (" + entryModel.rowCount() + ")"
+                                color: pal.textSecond; font.pixelSize: 11; font.weight: Font.DemiBold
+                            }
+                            Text {
+                                Layout.preferredWidth: 88
+                                visible: contentPane.width >= 420
+                                text: "更新日"
+                                color: pal.textSecond; font.pixelSize: 11; font.weight: Font.DemiBold
+                            }
+                            Text {
+                                Layout.preferredWidth: 68
+                                visible: contentPane.width >= 420
+                                horizontalAlignment: Text.AlignRight
+                                text: "サイズ"
+                                color: pal.textSecond; font.pixelSize: 11; font.weight: Font.DemiBold
+                            }
+                            Text {
+                                Layout.preferredWidth: 54
+                                visible: contentPane.width >= 500
+                                horizontalAlignment: Text.AlignRight
+                                text: "種類"
+                                color: pal.textSecond; font.pixelSize: 11; font.weight: Font.DemiBold
+                            }
+                        }
+                        Rectangle {
+                            anchors.bottom: parent.bottom; width: parent.width; height: 1
+                            color: pal.border
+                        }
+                    }
+
+                    ListView {
+                        id: fileList
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        clip: true
+                        model: entryModel
+                        boundsBehavior: Flickable.StopAtBounds
+                        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+                        delegate: Rectangle {
+                            width: fileList.width
+                            height: 36
+                            readonly property bool sel: model.path === launcher.selectedPath
+                            color: sel ? pal.rowSelBg
+                                 : (lma.containsMouse ? pal.rowHoverBg : (index % 2 === 1 ? "#FAFBFD" : pal.surface))
+
+                            RowLayout {
+                                anchors.fill: parent
+                                anchors.leftMargin: 12; anchors.rightMargin: 16
+                                spacing: 10
+
+                                // アイコン or ミニサムネイル
+                                Item {
+                                    Layout.preferredWidth: 26
+                                    Layout.preferredHeight: 20
+                                    FolderIcon {
+                                        anchors.centerIn: parent
+                                        visible: model.isDir
+                                        width: 20; height: 16
+                                    }
+                                    Rectangle {
+                                        anchors.fill: parent; radius: 3
+                                        visible: !model.isDir
+                                        color: "#EDEEF3"
+                                        border.width: 1; border.color: pal.borderLight
+                                        clip: true
+                                        Image {
+                                            id: listThumbImg
+                                            anchors.fill: parent
+                                            visible: model.thumbUrl !== ""
+                                            source: visible ? model.thumbUrl : ""
+                                            fillMode: Image.PreserveAspectCrop
+                                            asynchronous: true
+                                        }
+                                        Text {
+                                            anchors.centerIn: parent
+                                            visible: model.thumbUrl === "" || listThumbImg.status !== Image.Ready
+                                            text: model.ext.replace(".", "")
+                                            color: pal.textMuted; font.pixelSize: 8; font.bold: true
+                                        }
+                                    }
+                                }
+
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: model.displayName
+                                    color: pal.textPrimary
+                                    font.pixelSize: 13
+                                    font.weight: sel ? Font.DemiBold : Font.Normal
+                                    elide: Text.ElideRight
+                                }
+                                Text {
+                                    Layout.preferredWidth: 88
+                                    visible: contentPane.width >= 420
+                                    text: model.dateText
+                                    color: pal.textSecond; font.pixelSize: 11
+                                    elide: Text.ElideRight
+                                }
+                                Text {
+                                    Layout.preferredWidth: 68
+                                    visible: contentPane.width >= 420
+                                    horizontalAlignment: Text.AlignRight
+                                    text: model.sizeText
+                                    color: pal.textSecond; font.pixelSize: 11
+                                }
+                                Text {
+                                    Layout.preferredWidth: 54
+                                    visible: contentPane.width >= 500
+                                    horizontalAlignment: Text.AlignRight
+                                    text: model.isDir ? "フォルダ" : model.ext.toUpperCase().replace(".", "")
+                                    color: pal.textMuted; font.pixelSize: 11
+                                }
+                            }
+
+                            Rectangle {
+                                anchors.bottom: parent.bottom; width: parent.width; height: 1
+                                color: pal.borderLight
+                            }
+                            MouseArea {
+                                id: lma; anchors.fill: parent; hoverEnabled: true
+                                onClicked: launcher.selectAt(index)
+                                onDoubleClicked: launcher.activateAt(index)
+                            }
+                        }
+                    }
+                }
+
+                // グリッド表示
+                GridView {
+                    id: fileGrid
+                    visible: !root.listMode
+                    anchors.fill: parent
+                    anchors.margins: 14
+                    clip: true
+                    model: entryModel
+                    cellWidth: Math.floor((width) / root.gridCols)
+                    cellHeight: Math.round((cellWidth - 12) * 0.72) + 52
+                    boundsBehavior: Flickable.StopAtBounds
+                    ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+                    delegate: Item {
+                        width: fileGrid.cellWidth
+                        height: fileGrid.cellHeight
+                        readonly property bool sel: model.path === launcher.selectedPath
+
+                        Rectangle {
+                            anchors.fill: parent
+                            anchors.margins: 6
+                            radius: 7
+                            color: sel ? pal.accentSoft : (gma.containsMouse ? pal.surfaceAlt : pal.surface)
+                            border.width: sel ? 2 : 1
+                            border.color: sel ? pal.accent : (gma.containsMouse ? "#BFC5D2" : pal.borderLight)
+
+                            ColumnLayout {
+                                anchors.fill: parent
+                                anchors.margins: 7
+                                spacing: 6
+
+                                Rectangle {
+                                    Layout.fillWidth: true
+                                    Layout.fillHeight: true
+                                    radius: 4
+                                    color: model.isDir ? "transparent" : "#EEF0F5"
+                                    clip: true
+
+                                    FolderIcon {
+                                        anchors.centerIn: parent
+                                        visible: model.isDir
+                                        width: 58; height: 46
+                                    }
+                                    Image {
+                                        id: gridThumbImg
+                                        anchors.fill: parent
+                                        visible: !model.isDir && model.thumbUrl !== ""
+                                        source: visible ? model.thumbUrl : ""
+                                        fillMode: Image.PreserveAspectCrop
+                                        asynchronous: true
+                                    }
+                                    Text {
+                                        anchors.centerIn: parent
+                                        visible: !model.isDir && (model.thumbUrl === "" || gridThumbImg.status !== Image.Ready)
+                                        text: model.ext.toUpperCase().replace(".", "")
+                                        color: pal.textMuted; font.pixelSize: 13; font.bold: true
+                                    }
+                                }
+
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 1
+                                    Text {
+                                        Layout.fillWidth: true
+                                        text: model.displayName
+                                        color: pal.textPrimary
+                                        font.pixelSize: 12; font.weight: Font.DemiBold
+                                        elide: Text.ElideRight
+                                    }
+                                    Text {
+                                        Layout.fillWidth: true
+                                        text: model.isDir ? "フォルダ" : (model.sizeText + (model.dateText !== "—" ? " · " + model.dateText : ""))
+                                        color: pal.textMuted
+                                        font.pixelSize: 10
+                                        elide: Text.ElideRight
+                                    }
+                                }
+                            }
+                            MouseArea {
+                                id: gma; anchors.fill: parent; hoverEnabled: true
+                                onClicked: launcher.selectAt(index)
+                                onDoubleClicked: launcher.activateAt(index)
+                            }
+                        }
+                    }
+                }
+
+                // 空状態表示
+                Column {
+                    anchors.centerIn: parent
+                    spacing: 6
+                    visible: entryModel.rowCount() === 0
+                    Text {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        text: launcher.filter === "" ? "プロジェクトが見つかりません" : "検索条件に一致する項目がありません"
+                        color: pal.textSecond; font.pixelSize: 14; font.weight: Font.Medium
+                    }
+                    Text {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        visible: launcher.filter === ""
+                        text: ".sb3 / .sb2 ファイルを置くか、ウィンドウにドロップしてください"
+                        color: pal.textMuted; font.pixelSize: 12
+                    }
+                }
+            }
+
+            // -------------------------------------------------
+            // 右インスペクタ（プレビュー + 実行/編集/AOT 操作）
+            // -------------------------------------------------
+            Rectangle {
+                Layout.preferredWidth: 268
+                Layout.fillHeight: true
+                color: pal.surfaceAlt
+
+                Rectangle {
+                    anchors.left: parent.left; width: 1; height: parent.height
+                    color: pal.border
+                }
+
+                ColumnLayout {
+                    anchors.fill: parent
+                    anchors.margins: 16
+                    spacing: 12
+
+                    // プレビュー枠（4:3）
+                    Rectangle {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: Math.round(width * 0.75)
+                        radius: 6
+                        color: pal.surface
+                        border.width: 1; border.color: pal.border
+                        clip: true
+
+                        Text {
+                            anchors.centerIn: parent
+                            visible: !launcher.hasSelection
+                            text: "未選択"
+                            color: pal.textMuted; font.pixelSize: 12
+                        }
+                        FolderIcon {
+                            anchors.centerIn: parent
+                            visible: launcher.hasSelection && launcher.selectedIsDir
+                            width: 64; height: 50
+                        }
+                        Image {
+                            id: pvImg
+                            anchors.fill: parent
+                            visible: launcher.hasSelection && !launcher.selectedIsDir && launcher.selectedThumb !== ""
+                            source: visible ? launcher.selectedThumb : ""
+                            fillMode: Image.PreserveAspectFit
                             asynchronous: true
                         }
+                        Text {
+                            anchors.centerIn: parent
+                            visible: launcher.hasSelection && !launcher.selectedIsDir && pvImg.status !== Image.Ready
+                            text: "読込中..."
+                            color: pal.textMuted; font.pixelSize: 11
+                        }
                     }
-                    Text {
-                        x: 12; y: Math.round(root.cardW * 0.75) - 12 + 14
-                        width: parent.width - 24
-                        text: model.isDir ? model.displayName : model.displayName
-                        color: theme.strong; font.pixelSize: 14; font.bold: true
-                        elide: Text.ElideRight
+
+                    // 選択アイテム情報
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 3
+                        Text {
+                            Layout.fillWidth: true
+                            text: launcher.hasSelection ? launcher.selectedName : "ファイルを選択"
+                            color: pal.textPrimary
+                            font.pixelSize: 15; font.bold: true
+                            elide: Text.ElideRight
+                        }
+                        Text {
+                            Layout.fillWidth: true
+                            visible: launcher.hasSelection
+                            text: launcher.selectedKind
+                            color: pal.accent; font.pixelSize: 11; font.weight: Font.DemiBold
+                        }
+                        Text {
+                            Layout.fillWidth: true
+                            visible: launcher.hasSelection
+                            text: launcher.selectedIsDir ? "開いてフォルダ内を表示" : launcher.selectedMeta
+                            color: pal.textSecond; font.pixelSize: 12
+                            elide: Text.ElideRight
+                        }
                     }
-                    Text {
-                        x: 12; y: Math.round(root.cardW * 0.75) - 12 + 32
-                        width: parent.width - 24
-                        text: model.isDir
-                              ? "フォルダ"
-                              : model.ext + "  /  " + model.sizeText +
-                                (model.dateText === "—" ? "" : "  ·  " + model.dateText)
-                        color: theme.dim; font.pixelSize: 11
-                        elide: Text.ElideRight
+
+                    Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: pal.borderLight }
+
+                    // 操作ボタン群
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 8
+
+                        ActionBtn {
+                            Layout.fillWidth: true
+                            primary: true
+                            iconKind: launcher.selectedIsDir ? "folder" : "play"
+                            label: launcher.selectedIsDir ? "フォルダを開く" : "実行する"
+                            enabled: launcher.hasSelection && (launcher.selectedIsDir || launcher.playAvailable)
+                            onClicked: launcher.activate()
+                        }
+                        ActionBtn {
+                            Layout.fillWidth: true
+                            iconKind: "edit"
+                            label: "エディタで編集 (E)"
+                            enabled: launcher.projectSelected
+                            onClicked: launcher.openEditor()
+                        }
+                        ActionBtn {
+                            Layout.fillWidth: true
+                            iconKind: "bolt"
+                            label: "AOT コンパイル実行"
+                            enabled: launcher.projectSelected && launcher.jitAvailable
+                            onClicked: launcher.runAotProject()
+                        }
+                        ActionBtn {
+                            Layout.fillWidth: true
+                            iconKind: "export"
+                            label: "単体実行ファイルを書き出し (A)"
+                            enabled: launcher.projectSelected && launcher.jitAvailable
+                            onClicked: launcher.exportAot()
+                        }
                     }
-                }
-                MouseArea {
-                    id: cardMa; anchors.fill: parent; hoverEnabled: true
-                    onClicked: launcher.selectAt(index)
-                    onDoubleClicked: launcher.activateAt(index)
-                }
-            }
-            Rectangle {
-                anchors.right: parent.right; anchors.rightMargin: 0
-                y: fileGrid.visibleArea.yPosition * fileGrid.height
-                width: 4; radius: 2
-                height: Math.max(30,
-                    fileGrid.visibleArea.heightRatio * fileGrid.height)
-                color: "#A8B1C2"
-                visible: fileGrid.visibleArea.heightRatio < 1
-            }
-        }
-        Text {
-            anchors.centerIn: parent
-            visible: entryModel.rowCount() === 0
-            text: launcher.filter === ""
-                  ? "このフォルダにプロジェクトがありません"
-                  : "一致するプロジェクトがありません"
-            color: theme.dim; font.pixelSize: 15
-        }
-        Text {
-            anchors.centerIn: parent; anchors.verticalCenterOffset: 24
-            visible: entryModel.rowCount() === 0 && launcher.filter === ""
-            text: ".sb3 / .sb2 をこのフォルダに置いてください"
-            color: theme.muted; font.pixelSize: 12
-        }
-    }
 
-    // ----- selected project inspector (grid mode, fits under short folders)
-    // Like the SDL launcher, it uses the space below the last card row and
-    // hides when the folder has enough rows to fill the view.
-    Rectangle {
-        id: detailPanel
-        readonly property int rowsH: Math.min(
-            fileGrid.count * (root.cardH + root.gap),
-            root.contentH)
-        readonly property int availableH:
-            root.contentH - rowsH - 12 - 18
-        visible: !root.listMode && launcher.hasSelection && availableH >= 184
-        x: root.gridX
-        y: root.contentTop + rowsH + 12
-        width: root.width - root.gridX - 24
-        height: availableH
-        radius: 18; color: theme.panel
-        border.width: 1; border.color: "#E2E7F1"
-        Rectangle {
-            id: detailPreview
-            width: Math.min(250, (parent.height - 28) * 4 / 3)
-            height: width * 3 / 4
-            x: 16; y: (parent.height - height) / 2
-            radius: 11; color: theme.field; clip: true
-            FolderGlyph {
-                anchors.centerIn: parent; scale: 1.8
-                visible: launcher.selectedIsDir
-            }
-            Image {
-                id: detailThumbImg
-                anchors.fill: parent
-                visible: !launcher.selectedIsDir &&
-                         launcher.selectedThumb !== ""
-                source: visible ? launcher.selectedThumb : ""
-                fillMode: Image.PreserveAspectCrop
-                asynchronous: true
-            }
-            Text {
-                anchors.centerIn: parent
-                visible: !launcher.selectedIsDir &&
-                         detailThumbImg.status !== Image.Ready
-                text: "プレビューを読み込み中"
-                color: theme.dim; font.pixelSize: 12
-            }
-        }
-        Text {
-            x: detailPreview.x + detailPreview.width + 25; y: 21
-            text: launcher.selectedIsDir ? "FOLDER" : "PROJECT PREVIEW"
-            color: theme.accent; font.pixelSize: 11; font.bold: true
-        }
-        Text {
-            x: detailPreview.x + detailPreview.width + 25; y: 48
-            width: Math.max(32, parent.width - x - 20)
-            text: launcher.selectedName; color: theme.strong
-            font.pixelSize: 19; font.bold: true; elide: Text.ElideRight
-        }
-        Text {
-            x: detailPreview.x + detailPreview.width + 25; y: 83
-            width: Math.max(32, parent.width - x - 20)
-            text: launcher.selectedIsDir ? "フォルダを開いて内容を表示"
-                                         : launcher.selectedMeta
-            color: theme.dim; font.pixelSize: 13; elide: Text.ElideRight
-        }
-        Row {
-            x: detailPreview.x + detailPreview.width + 25
-            y: parent.height - 37; spacing: 8
-            Rectangle {
-                width: 8; height: 8; radius: 4; color: theme.green
-                anchors.verticalCenter: parent.verticalCenter
-            }
-            Text {
-                text: launcher.selectedIsDir ? "Enter  フォルダを開く"
-                                             : "Enter  実行   ·   E  編集"
-                color: theme.fg; font.pixelSize: 12
-                anchors.verticalCenter: parent.verticalCenter
-            }
-        }
-    }
+                    Item { Layout.fillHeight: true }
 
-    // =========================================================
-    // folder glyph (shared)
-    // =========================================================
-    component FolderGlyph: Item {
-        width: 72; height: 56
-        Rectangle {
-            x: 0; y: 10; width: 72; height: 46; radius: 9
-            color: theme.folder
-        }
-        Rectangle {
-            x: 0; y: 0; width: 30; height: 18; radius: 7
-            color: theme.folderDark
-        }
-        Rectangle {
-            x: 0; y: 8; width: 72; height: 20; radius: 8
-            color: theme.folderDark
-        }
-        Rectangle {
-            x: 2; y: 12; width: 68; height: 42; radius: 8
-            color: theme.folderLight
-        }
-        Rectangle {
-            x: 2; y: 12; width: 68; height: 8
-            color: theme.folder
-        }
-    }
+                    // 現在の実行設定サマリ
+                    Rectangle {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: optCol.implicitHeight + 16
+                        radius: 6
+                        color: pal.surface
+                        border.width: 1; border.color: pal.borderLight
 
-    // =========================================================
-    // footer: status + action bar
-    // =========================================================
-    Rectangle {
-        x: root.sideW; y: root.height - root.footerH
-        width: root.width - root.sideW; height: root.footerH
-        color: theme.panel
-        Rectangle {
-            x: 0; y: 0; width: parent.width; height: 1
-            color: "#E1E6F0"
-        }
-        // status line
-        Item {
-            x: root.gridX - root.sideW; y: 14
-            width: parent.width - (root.gridX - root.sideW) - 14
-            height: 18
-            Rectangle {
-                width: 8; height: 8; radius: 4
-                x: 5; y: 5
-                color: launcher.statusIsError ? theme.warn : theme.green
-                visible: launcher.statusText !== ""
-            }
-            Text {
-                x: 17; y: 0; width: parent.width - 21
-                text: launcher.statusText !== ""
-                      ? launcher.statusText
-                      : (launcher.hasSelection
-                         ? launcher.selectedName + "  /  " + launcher.selectedMeta
-                         : "プロジェクトを選んでください")
-                color: launcher.statusText !== ""
-                       ? (launcher.statusIsError ? theme.warn : theme.fg)
-                       : (launcher.hasSelection ? theme.strong : theme.dim)
-                font.pixelSize: 13; elide: Text.ElideRight
-            }
-        }
-        // AOT progress bar
-        Rectangle {
-            x: root.gridX - root.sideW + 17; y: 41
-            width: Math.max(0, parent.width - x - 21)
-            height: 5; radius: 2; color: theme.field
-            visible: launcher.aotProgress >= 0
-            Rectangle {
-                width: parent.width * Math.max(0, Math.min(1, launcher.aotProgress))
-                height: parent.height; radius: 2; color: theme.accent
-            }
-        }
-        // buttons
-        PillButton {
-            id: bQuit
-            implicitWidth: 70; implicitHeight: 36
-            x: root.width - 20 - width; y: root.height - 49
-            label: "終了"
-            onClicked: launcher.quitApp()
-        }
-        PillButton {
-            id: bRun
-            implicitWidth: 118; implicitHeight: 36
-            x: bQuit.x - 8 - width; y: root.height - 49
-            label: launcher.projectSelected ? "実行  ▶" : "フォルダを開く"
-            accent: true
-            enabled: launcher.hasSelection && launcher.playAvailable
-            onClicked: launcher.activate()
-        }
-        PillButton {
-            id: bEdit
-            implicitWidth: 76; implicitHeight: 36
-            x: bRun.x - 8 - width; y: root.height - 49
-            label: "編集"
-            enabled: launcher.projectSelected
-            onClicked: launcher.openEditor()
-        }
-        PillButton {
-            id: bAotRun
-            implicitWidth: 88; implicitHeight: 36
-            x: bEdit.x - 8 - width; y: root.height - 49
-            label: "AOT 実行"
-            enabled: launcher.projectSelected && launcher.jitAvailable
-            onClicked: launcher.runAotProject()
-        }
-        PillButton {
-            id: bExport
-            implicitWidth: 112; implicitHeight: 36
-            x: bAotRun.x - 8 - width; y: root.height - 49
-            label: "AOT 書き出し"
-            enabled: launcher.projectSelected && launcher.jitAvailable
-            onClicked: launcher.exportAot()
-        }
-    }
-
-    // =========================================================
-    // settings sheet
-    // =========================================================
-    Item {
-        id: settingsPanel
-        visible: false
-        anchors.fill: parent
-        Rectangle {
-            anchors.fill: parent; color: "#A216243B"
-            MouseArea {
-                anchors.fill: parent
-                onClicked: settingsPanel.visible = false
-            }
-        }
-        Rectangle {
-            id: sheet
-            width: Math.min(676, parent.width - 42)
-            height: Math.min(505, parent.height - 32)
-            anchors.centerIn: parent
-            radius: 18; color: theme.panel
-            border.width: 1; border.color: "#D9E0EC"
-            MouseArea { anchors.fill: parent }   // swallow clicks
-            Text {
-                x: 24; y: 18; text: "実行設定"; color: theme.strong
-                font.pixelSize: 21; font.bold: true
-            }
-            Text {
-                x: 24; y: 48
-                text: "選んだプロジェクトを実行するときに使用するフラグ"
-                color: theme.dim; font.pixelSize: 12
-            }
-            PillButton {
-                x: parent.width - 49; y: 16
-                implicitWidth: 32; implicitHeight: 32
-                label: "×"
-                onClicked: settingsPanel.visible = false
-            }
-            // choice rows
-            component ChoiceRow: Item {
-                property string label: ""
-                property var labels: []
-                property int active: 0
-                property bool enabled: true
-                signal picked(int index)
-                width: sheet.width - 52; height: 35
-                Text {
-                    x: 0; y: 9; width: 130
-                    text: parent.label; color: theme.fg
-                    font.pixelSize: 13; font.bold: true
-                }
-                Row {
-                    x: 139; y: 0; spacing: 6
-                    width: parent.width - 165; height: 35
-                    Repeater {
-                        model: parent.parent.labels.length
-                        delegate: PillButton {
-                            required property int index
-                            required property var modelData
-                            implicitWidth: Math.floor(
-                                (parent.width - 6 * (parent.parent.labels.length - 1)) /
-                                parent.parent.labels.length)
-                            implicitHeight: 35
-                            label: parent.parent.labels[index]
-                            accent: index === parent.parent.active
-                            enabled: parent.parent.enabled
-                            onClicked: parent.parent.picked(index)
+                        ColumnLayout {
+                            id: optCol
+                            anchors.fill: parent; anchors.margins: 8
+                            spacing: 4
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: "実行プロファイル"
+                                    color: pal.textMuted; font.pixelSize: 11; font.weight: Font.DemiBold
+                                }
+                                Text {
+                                    text: "変更..."
+                                    color: pal.accent; font.pixelSize: 11; font.weight: Font.DemiBold
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        onClicked: settingsDialog.visible = true
+                                    }
+                                }
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                text: launcher.optScale + "× · "
+                                    + (launcher.optFps === -1 ? "FPS自動" : launcher.optFps + "fps") + " · "
+                                    + (launcher.jitAvailable ? (launcher.optJit === 0 ? "HotSpot" : launcher.optJit === 1 ? "Eager" : "JIT OFF") : "Interp")
+                                    + (launcher.optTurbo ? " · Turbo" : "")
+                                    + (launcher.optDanger ? " · 危険" : "")
+                                color: launcher.optDanger ? pal.danger : pal.textSecond
+                                font.pixelSize: 11
+                                elide: Text.ElideRight
+                            }
                         }
                     }
                 }
             }
-            Column {
-                x: 26; y: 83; spacing: 26; width: sheet.width - 52
-                ChoiceRow {
-                    label: "画面倍率"; labels: ["1×", "2×", "3×", "4×"]
-                    active: launcher.optScale - 1
-                    onPicked: function(i) { launcher.optScale = i + 1 }
+        }
+
+        // =====================================================
+        // 最下部ステータスバー
+        // =====================================================
+        Rectangle {
+            Layout.fillWidth: true
+            Layout.preferredHeight: 28
+            color: pal.surface
+
+            Rectangle {
+                anchors.top: parent.top; width: parent.width; height: 1
+                color: pal.border
+            }
+
+            RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: 12; anchors.rightMargin: 12
+                spacing: 10
+
+                Rectangle {
+                    width: 7; height: 7; radius: 4
+                    visible: launcher.statusText !== ""
+                    color: launcher.statusIsError ? pal.danger : pal.ok
                 }
-                ChoiceRow {
-                    label: "フレームレート"; labels: ["自動", "30", "60", "120"]
-                    active: launcher.optFps === -1 ? 0
-                          : launcher.optFps === 30 ? 1
-                          : launcher.optFps === 60 ? 2 : 3
-                    onPicked: function(i) {
-                        launcher.optFps = [-1, 30, 60, 120][i]
+                Text {
+                    Layout.fillWidth: true
+                    text: launcher.statusText !== ""
+                          ? launcher.statusText
+                          : (launcher.dirPath + "  —  " + entryModel.rowCount() + " 項目")
+                    color: launcher.statusIsError ? pal.danger : pal.textSecond
+                    font.pixelSize: 11
+                    elide: Text.ElideRight
+                }
+
+                // AOT 進捗バー
+                Rectangle {
+                    visible: launcher.aotProgress >= 0
+                    Layout.preferredWidth: 160
+                    Layout.preferredHeight: 6
+                    radius: 3
+                    color: pal.sidebarBg
+                    Rectangle {
+                        width: parent.width * Math.max(0, Math.min(1, launcher.aotProgress))
+                        height: parent.height; radius: 3; color: pal.accent
                     }
                 }
-                ChoiceRow {
-                    label: "JIT 実行方式"; labels: ["HotSpot", "Eager", "OFF"]
-                    active: launcher.jitAvailable ? launcher.optJit : 2
-                    enabled: launcher.jitAvailable
-                    onPicked: function(i) { launcher.optJit = i }
+
+                Text {
+                    text: "終了 (Esc)"
+                    color: qma.containsMouse ? pal.textPrimary : pal.textMuted
+                    font.pixelSize: 11
+                    MouseArea {
+                        id: qma; anchors.fill: parent; hoverEnabled: true
+                        onClicked: launcher.quitApp()
+                    }
                 }
-                ChoiceRow {
-                    label: "遅延 JIT"; labels: ["自動", "ON", "OFF"]
-                    active: launcher.jitAvailable ? launcher.optLazy : 2
-                    enabled: launcher.jitAvailable && launcher.optJit !== 2
-                    onPicked: function(i) { launcher.optLazy = i }
-                }
-                ChoiceRow {
-                    label: "GPU 描画 (実験的)"; labels: ["通常", "Ray", "Path"]
-                    active: launcher.optGpu + 1
-                    onPicked: function(i) { launcher.optGpu = i - 1 }
-                }
-            }
-            PillButton {
-                x: 26; y: 394; implicitWidth: 185; implicitHeight: 36
-                label: launcher.optTurbo ? "✓ Turbo 強制 ON" : "Turbo 自動"
-                accent: launcher.optTurbo
-                onClicked: launcher.optTurbo = !launcher.optTurbo
-            }
-            PillButton {
-                x: 220; y: 394; implicitWidth: 226; implicitHeight: 36
-                label: launcher.optDanger ? "✓ 危険モード有効" : "危険モード無効"
-                accent: launcher.optDanger
-                onClicked: launcher.optDanger = !launcher.optDanger
-            }
-            Text {
-                x: 26; y: 446; width: sheet.width - 52
-                text: launcher.optDanger
-                      ? "注意: スクリプトの実行時間制限が解除されます"
-                      : "設定は保存されます。危険モードだけは毎回無効に戻ります。"
-                color: launcher.optDanger ? theme.warn : theme.dim
-                font.pixelSize: 12; wrapMode: Text.Wrap
             }
         }
     }
 
     // =========================================================
-    // busy overlay (AOT compile 中など)
+    // 実行設定モーダル（コンパクトで明快なフォーム）
     // =========================================================
+    Item {
+        id: settingsDialog
+        visible: false
+        anchors.fill: parent
+
+        Rectangle {
+            anchors.fill: parent; color: "#8010141C"
+            MouseArea { anchors.fill: parent; onClicked: settingsDialog.visible = false }
+        }
+
+        Rectangle {
+            width: Math.min(540, parent.width - 40)
+            height: settingsCol.implicitHeight + 36
+            anchors.centerIn: parent
+            radius: 8
+            color: pal.surface
+            border.width: 1; border.color: pal.border
+            MouseArea { anchors.fill: parent } // クリック透過防止
+
+            ColumnLayout {
+                id: settingsCol
+                anchors.fill: parent; anchors.margins: 18
+                spacing: 14
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    Text {
+                        Layout.fillWidth: true
+                        text: "実行設定"
+                        color: pal.textPrimary; font.pixelSize: 16; font.bold: true
+                    }
+                    ToolBtn {
+                        iconKind: "close"
+                        onClicked: settingsDialog.visible = false
+                    }
+                }
+
+                Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: pal.borderLight }
+
+                component SegRow: RowLayout {
+                    property string title: ""
+                    property var items: []
+                    property int current: 0
+                    property bool enabled: true
+                    signal chosen(int idx)
+                    Layout.fillWidth: true
+                    spacing: 12
+
+                    Text {
+                        Layout.preferredWidth: 130
+                        text: parent.title
+                        color: pal.textSecond; font.pixelSize: 12; font.weight: Font.Medium
+                    }
+                    Rectangle {
+                        Layout.fillWidth: true; Layout.preferredHeight: 30
+                        radius: 5; color: pal.surfaceAlt
+                        border.width: 1; border.color: pal.border
+                        RowLayout {
+                            anchors.fill: parent; anchors.margins: 2; spacing: 2
+                            Repeater {
+                                model: items.length
+                                delegate: Rectangle {
+                                    required property int index
+                                    Layout.fillWidth: true; Layout.fillHeight: true; radius: 3
+                                    readonly property bool sel: index === current
+                                    color: sel ? (enabled ? pal.accent : pal.textMuted) : "transparent"
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: items[index]
+                                        color: sel ? "#FFFFFF" : (enabled ? pal.textPrimary : pal.textMuted)
+                                        font.pixelSize: 12; font.weight: sel ? Font.DemiBold : Font.Normal
+                                    }
+                                    MouseArea {
+                                        anchors.fill: parent; enabled: parent.parent.parent.parent.enabled
+                                        onClicked: chosen(index)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                SegRow {
+                    title: "画面倍率"; items: ["1×", "2×", "3×", "4×"]
+                    current: launcher.optScale - 1
+                    onChosen: function(i) { launcher.optScale = i + 1 }
+                }
+                SegRow {
+                    title: "フレームレート"; items: ["自動", "30", "60", "120"]
+                    current: launcher.optFps === -1 ? 0 : launcher.optFps === 30 ? 1 : launcher.optFps === 60 ? 2 : 3
+                    onChosen: function(i) { launcher.optFps = [-1, 30, 60, 120][i] }
+                }
+                SegRow {
+                    title: "JIT 実行方式"; items: ["HotSpot", "Eager", "OFF"]
+                    current: launcher.jitAvailable ? launcher.optJit : 2
+                    enabled: launcher.jitAvailable
+                    onChosen: function(i) { launcher.optJit = i }
+                }
+                SegRow {
+                    title: "遅延 JIT"; items: ["自動", "ON", "OFF"]
+                    current: launcher.jitAvailable ? launcher.optLazy : 2
+                    enabled: launcher.jitAvailable && launcher.optJit !== 2
+                    onChosen: function(i) { launcher.optLazy = i }
+                }
+                SegRow {
+                    title: "GPU 描画 (実験的)"; items: ["通常", "Ray", "Path"]
+                    current: launcher.optGpu + 1
+                    onChosen: function(i) { launcher.optGpu = i - 1 }
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true; spacing: 10; Layout.topMargin: 4
+                    ActionBtn {
+                        Layout.fillWidth: true
+                        label: launcher.optTurbo ? "✓ Turbo モード強制 ON" : "Turbo モード: 自動"
+                        primary: launcher.optTurbo
+                        onClicked: launcher.optTurbo = !launcher.optTurbo
+                    }
+                    ActionBtn {
+                        Layout.fillWidth: true
+                        label: launcher.optDanger ? "✓ 危険モード (時間制限なし)" : "危険モード: 無効"
+                        primary: launcher.optDanger
+                        onClicked: launcher.optDanger = !launcher.optDanger
+                    }
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    text: launcher.optDanger
+                          ? "警告: スクリプトの実行時間制限が解除されます（起動ごとに無効へ戻ります）。"
+                          : "設定は自動的に保存されます（危険モードのみ安全のため毎回無効に戻ります）。"
+                    color: launcher.optDanger ? pal.danger : pal.textMuted
+                    font.pixelSize: 11; wrapMode: Text.Wrap
+                }
+            }
+        }
+    }
+
+    Connections {
+        target: launcher
+        function onToggleSettingsRequested() {
+            settingsDialog.visible = !settingsDialog.visible
+        }
+    }
+
+    // ビジーオーバーレイ
     Rectangle {
         anchors.fill: parent
         visible: launcher.busy
-        color: "#3316243B"
+        color: "#4010141C"
         MouseArea { anchors.fill: parent; enabled: parent.visible }
     }
 
-    // =========================================================
-    // drag & drop
-    // =========================================================
+    // D&D
     DropArea {
         anchors.fill: parent
         onDropped: function(drop) {
             if (drop.hasUrls && drop.urls.length > 0) {
-                const p = decodeURIComponent(
-                    String(drop.urls[0]).replace(/^file:\/\//, ""))
+                const p = decodeURIComponent(String(drop.urls[0]).replace(/^file:\/\//, ""))
                 launcher.openDir(p)
             }
         }
     }
 
-    // =========================================================
-    // keyboard
-    // =========================================================
+    // キーボードショートカット
     focus: true
     Keys.onPressed: function(ev) {
-        if (settingsPanel.visible) {
-            if (ev.key === Qt.Key_Escape ||
-                ev.key === Qt.Key_Return || ev.key === Qt.Key_Enter) {
-                settingsPanel.visible = false
+        if (settingsDialog.visible) {
+            if (ev.key === Qt.Key_Escape || ev.key === Qt.Key_Return || ev.key === Qt.Key_Enter) {
+                settingsDialog.visible = false
                 ev.accepted = true
             }
             return
         }
-        if (searchInput.activeFocus || pathInput.visible) return
+        if (searchInput.activeFocus || pathEdit.visible) return
         const ctrl = ev.modifiers & (Qt.ControlModifier | Qt.MetaModifier)
         const alt = ev.modifiers & Qt.AltModifier
-        if (ctrl && ev.key === Qt.Key_Comma) {
-            settingsPanel.visible = !settingsPanel.visible
-        } else if (ev.key === Qt.Key_F4) {
-            settingsPanel.visible = !settingsPanel.visible
+        if ((ctrl && ev.key === Qt.Key_Comma) || ev.key === Qt.Key_F4) {
+            settingsDialog.visible = !settingsDialog.visible
         } else if (ctrl && (ev.key === Qt.Key_L || ev.key === Qt.Key_O)) {
-            pathInput.open()
+            pathEdit.open()
         } else if (ctrl && ev.key === Qt.Key_F) {
             searchInput.forceActiveFocus()
         } else if (ctrl && ev.key === Qt.Key_1) {
@@ -1218,11 +1293,9 @@ Item {
             if (root.listMode && launcher.selectedIsDir) launcher.activate()
             else if (!root.listMode) launcher.moveSelection(1)
         } else if (ev.key === Qt.Key_PageUp) {
-            launcher.moveSelectionRows(-Math.max(1,
-                Math.floor(root.contentH / 40)), 1)
+            launcher.moveSelectionRows(-10, 1)
         } else if (ev.key === Qt.Key_PageDown) {
-            launcher.moveSelectionRows(Math.max(1,
-                Math.floor(root.contentH / 40)), 1)
+            launcher.moveSelectionRows(10, 1)
         } else if (ev.key === Qt.Key_Home) {
             launcher.selectHome()
         } else if (ev.key === Qt.Key_End) {
@@ -1244,7 +1317,6 @@ Item {
         ev.accepted = true
     }
 
-    // selection follow + scripted scroll
     Connections {
         target: launcher
         function onRevealSelection() {
