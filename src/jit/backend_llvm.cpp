@@ -1855,11 +1855,11 @@ static void configureExperimentalCodegen(Builder& builder, const char* engine) {
         return;
     }
     if (level) {
-        llvm::CodeGenOptLevel opt = llvm::CodeGenOptLevel::Default;
+        auto opt = llvmc::codeGenOptDefault();
         if (std::strcmp(level, "less") == 0)
-            opt = llvm::CodeGenOptLevel::Less;
+            opt = llvmc::codeGenOptLess();
         else if (std::strcmp(level, "none") == 0)
-            opt = llvm::CodeGenOptLevel::None;
+            opt = llvmc::codeGenOptNone();
         host->setCodeGenOptLevel(opt);
     }
     if (useLarge)

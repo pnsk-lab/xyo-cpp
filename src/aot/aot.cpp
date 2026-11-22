@@ -372,7 +372,7 @@ bool compileProject(Runtime& rt, uint64_t projectHash, BuildResult& out,
     llvm::raw_svector_ostream os(buf);
     llvm::legacy::PassManager pm;
     if (tm->addPassesToEmitFile(pm, os, nullptr,
-                                llvm::CodeGenFileType::ObjectFile)) {
+                                llvmc::codeGenFileTypeObject())) {
         if (why) *why = "object emission unsupported";
         return false;
     }

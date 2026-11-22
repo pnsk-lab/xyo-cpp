@@ -13,6 +13,7 @@
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
 #include <llvm/Analysis/CaptureTracking.h>
 #include <llvm/IR/Function.h>
+#include <llvm/Support/CodeGen.h>
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/Module.h>
 #include <llvm/TargetParser/Triple.h>
@@ -59,6 +60,40 @@ inline llvm::Function* intrinsicDeclaration(
 /// 明示的に 3 引数で呼ぶ（19 以降も既定値と同値なので結果は同じ）。
 inline bool pointerMayBeCaptured(const llvm::Value* v, bool returnCaptures) {
     return llvm::PointerMayBeCaptured(v, returnCaptures, /*StoreCaptures=*/false);
+}
+
+/// オブジェクトファイル出力の種類。LLVM 17 までは素の enum
+/// (`CGFT_ObjectFile`)、18 以降は `CodeGenFileType::ObjectFile`。
+inline auto codeGenFileTypeObject() {
+#if LLVM_VERSION_MAJOR <= 17
+    return llvm::CGFT_ObjectFile;
+#else
+    return llvm::CodeGenFileType::ObjectFile;
+#endif
+}
+
+/// 最適化レベル。LLVM 17 までは `CodeGenOpt::Level`、18 以降は
+/// `CodeGenOptLevel`（enum class）。
+inline auto codeGenOptNone() {
+#if LLVM_VERSION_MAJOR <= 17
+    return llvm::CodeGenOpt::None;
+#else
+    return llvm::CodeGenOptLevel::None;
+#endif
+}
+inline auto codeGenOptLess() {
+#if LLVM_VERSION_MAJOR <= 17
+    return llvm::CodeGenOpt::Less;
+#else
+    return llvm::CodeGenOptLevel::Less;
+#endif
+}
+inline auto codeGenOptDefault() {
+#if LLVM_VERSION_MAJOR <= 17
+    return llvm::CodeGenOpt::Default;
+#else
+    return llvm::CodeGenOptLevel::Default;
+#endif
 }
 
 } // namespace xyo::llvmc
