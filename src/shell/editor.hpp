@@ -1,22 +1,21 @@
 // xyo-cpp: ビルトインエディタ。
 // scratch-gui のレイアウトを再現する単一ウィンドウ構成。
-// Qt ありの環境では Qt Quick 版（editor_qt.cpp）が既定。
+// 実装は Qt Quick 版（editor_qt.cpp + qml/Editor.qml）。
 #pragma once
+#include <cstdio>
 
 namespace xyo {
 
 /// エディタを起動する。path がプロジェクトファイル。終了コードを返す。
 /// danger はスレッドごとの実行時間予算を外す危険モード（`--danger`）。
-/// エントリは環境により Qt Quick 版（editor_qt.cpp）を優先する。
-int editorMain(const char* path, bool danger = false);
-
+/// Qt6 Quick 必須（XYO_HAVE_QT 未定義ビルドは stub が 1 を返す）。
 #ifdef XYO_HAVE_QT
-/// Qt Quick 版エディタ（Editor.qml）。Qt6 Quick 必須。
 int editorMainQt(const char* path, bool danger = false);
 #else
-/// Qt 無しビルドでは SDL 版へフォールバック。
-inline int editorMainQt(const char* path, bool danger = false) {
-    return editorMain(path, danger);
+inline int editorMainQt(const char* path, bool = false) {
+    std::fprintf(stderr,
+                 "editor: %s (this build has no Qt6 Quick)\n", path);
+    return 1;
 }
 #endif
 

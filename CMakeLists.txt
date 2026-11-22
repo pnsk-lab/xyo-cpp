@@ -721,12 +721,12 @@ if(XYO_BUILD_SHELL)
   elseif(XYO_STATIC)
     message(STATUS "XYO_STATIC: Qt Quick launcher disabled (LGPL requires dynamic linking)")
   endif()
-  # editor.cpp が本体（SDL2 が無いビルドでは editor.cpp 内の #else スタブ）。
+  # エディタは Qt Quick 版（editor_qt.cpp + qml/Editor.qml）。
+  # 旧 ImGui 版 editor.cpp は削除済み（履歴は git を参照）。
   add_executable(xyo-cli src/shell/main.cpp src/shell/gui_qt.cpp
                  src/shell/launcher_core.cpp
                  src/shell/launcher.qrc
                  src/shell/wasm_command.cpp
-                 src/shell/editor.cpp
                  src/shell/editor_qt.cpp
                  src/blockly/shape.cpp src/blockly/layout.cpp
                  src/blockly/geom.cpp
