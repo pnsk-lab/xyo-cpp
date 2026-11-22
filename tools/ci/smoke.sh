@@ -88,7 +88,25 @@ gui)
     echo "--- gui（SDL dummy ドライバ） ---"
     export SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy
     # ウィンドウ生成とランチャー描画を検証し、1 フレームで終了する。
-    XYO_GUI_ACTIONS=quit "$bin" gui examples
+    # Qt6 を入れていないビルド（Windows / macOS の CI）ではスタブが
+    # 「built without Qt6 Quick support」と言って 1 で終わるので、それを
+    # スキップとして扱う（ランチャー自体は Linux のフルビルドで検証する）。
+    gui_log="$(mktemp)"
+    set +e
+    XYO_GUI_ACTIONS=quit "$bin" gui examples >"$gui_log" 2>&1
+    gui_rc=$?
+    set -e
+    cat "$gui_log"
+    if [ "$gui_rc" -ne 0 ]; then
+        if grep -q "built without Qt6" "$gui_log"; then
+            echo "smoke(gui): SKIP (このビルドは Qt6 無し)"
+            rm -f "$gui_log"
+            exit 0
+        fi
+        rm -f "$gui_log"
+        exit "$gui_rc"
+    fi
+    rm -f "$gui_log"
     ;;
 *)
     usage
