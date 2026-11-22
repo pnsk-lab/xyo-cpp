@@ -147,13 +147,18 @@ Item {
         implicitHeight: 28
         radius: 5
         color: !enabled ? "transparent"
-             : active ? pal.accentSoft
-             : (tma.containsMouse ? "#E5E8EE" : "transparent")
+             : active ? pal.accentSoft : "transparent"
         border.width: active ? 1 : 0
         border.color: pal.accentBorder
         scale: tma.pressed && enabled ? 0.96 : 1.0
 
-        Behavior on color { ColorAnimation { duration: 110 } }
+        Rectangle {
+            anchors.fill: parent
+            radius: parent.radius
+            color: "#E5E8EE"
+            opacity: (parent.enabled && !parent.active && tma.containsMouse) ? 1.0 : 0.0
+            Behavior on opacity { NumberAnimation { duration: 110; easing.type: Easing.OutCubic } }
+        }
         Behavior on scale { NumberAnimation { duration: 90; easing.type: Easing.OutCubic } }
 
         Row {
@@ -430,7 +435,8 @@ Item {
                         anchors.fill: parent; anchors.margins: 2; spacing: 2
                         Rectangle {
                             Layout.fillWidth: true; Layout.fillHeight: true; radius: 3
-                            color: root.listMode ? pal.surface : "transparent"
+                            // コンテナ背景と同じ不透明色を未選択色にして透明補間を避ける
+                            color: root.listMode ? pal.surface : pal.surfaceAlt
                             border.width: root.listMode ? 1 : 0; border.color: pal.borderLight
                             Behavior on color { ColorAnimation { duration: 120 } }
                             LineIcon {
@@ -441,7 +447,7 @@ Item {
                         }
                         Rectangle {
                             Layout.fillWidth: true; Layout.fillHeight: true; radius: 3
-                            color: !root.listMode ? pal.surface : "transparent"
+                            color: !root.listMode ? pal.surface : pal.surfaceAlt
                             border.width: !root.listMode ? 1 : 0; border.color: pal.borderLight
                             Behavior on color { ColorAnimation { duration: 120 } }
                             LineIcon {
@@ -508,8 +514,14 @@ Item {
                         Layout.preferredHeight: 30
                         visible: target !== ""
                         radius: 5
-                        color: current ? pal.sidebarSel : (sma.containsMouse ? pal.sidebarHover : "transparent")
-                        Behavior on color { ColorAnimation { duration: 110 } }
+                        color: current ? pal.sidebarSel : "transparent"
+                        Rectangle {
+                            anchors.fill: parent
+                            radius: parent.radius
+                            color: pal.sidebarHover
+                            opacity: (!parent.current && sma.containsMouse) ? 1.0 : 0.0
+                            Behavior on opacity { NumberAnimation { duration: 110; easing.type: Easing.OutCubic } }
+                        }
 
                         RowLayout {
                             anchors.fill: parent
@@ -554,50 +566,63 @@ Item {
                         Layout.leftMargin: 6; Layout.bottomMargin: 2
                     }
 
-                    ListView {
+                    // 履歴リスト + 空表示のオーバーレイ
+                    Item {
                         Layout.fillWidth: true
                         Layout.fillHeight: true
-                        clip: true
-                        spacing: 2
-                        model: launcher.recentList
-                        boundsBehavior: Flickable.StopAtBounds
-                        delegate: Rectangle {
-                            width: ListView.view.width
-                            height: 40
-                            radius: 5
-                            color: rma.containsMouse ? pal.sidebarHover : "transparent"
-                            Behavior on color { ColorAnimation { duration: 110 } }
-                            ColumnLayout {
-                                anchors.fill: parent
-                                anchors.leftMargin: 8; anchors.rightMargin: 8
-                                anchors.topMargin: 5; anchors.bottomMargin: 5
-                                spacing: 1
-                                Text {
-                                    Layout.fillWidth: true
-                                    text: modelData.stem
-                                    color: pal.textPrimary
-                                    font.pixelSize: 12; font.weight: Font.Medium
-                                    elide: Text.ElideRight
+
+                        ListView {
+                            anchors.fill: parent
+                            clip: true
+                            spacing: 2
+                            model: launcher.recentList
+                            boundsBehavior: Flickable.StopAtBounds
+                            delegate: Rectangle {
+                                width: ListView.view.width
+                                height: 40
+                                radius: 5
+                                color: "transparent"
+                                // 透明↔不透明の色補間は半透明の黒を通って暗く点滅するため、
+                                // 不透明色のハイライトを opacity でフェードさせる
+                                Rectangle {
+                                    anchors.fill: parent
+                                    radius: parent.radius
+                                    color: pal.sidebarHover
+                                    opacity: rma.containsMouse ? 1.0 : 0.0
+                                    Behavior on opacity { NumberAnimation { duration: 110; easing.type: Easing.OutCubic } }
                                 }
-                                Text {
-                                    Layout.fillWidth: true
-                                    text: modelData.parent
-                                    color: pal.textMuted
-                                    font.pixelSize: 10
-                                    elide: Text.ElideRight
+                                ColumnLayout {
+                                    anchors.fill: parent
+                                    anchors.leftMargin: 8; anchors.rightMargin: 8
+                                    anchors.topMargin: 5; anchors.bottomMargin: 5
+                                    spacing: 1
+                                    Text {
+                                        Layout.fillWidth: true
+                                        text: modelData.stem
+                                        color: pal.textPrimary
+                                        font.pixelSize: 12; font.weight: Font.Medium
+                                        elide: Text.ElideRight
+                                    }
+                                    Text {
+                                        Layout.fillWidth: true
+                                        text: modelData.parent
+                                        color: pal.textMuted
+                                        font.pixelSize: 10
+                                        elide: Text.ElideRight
+                                    }
                                 }
-                            }
-                            MouseArea {
-                                id: rma; anchors.fill: parent; hoverEnabled: true
-                                onClicked: launcher.openRecent(modelData.path)
-                                onDoubleClicked: {
-                                    launcher.openRecent(modelData.path)
-                                    launcher.activate()
+                                MouseArea {
+                                    id: rma; anchors.fill: parent; hoverEnabled: true
+                                    onClicked: launcher.openRecent(modelData.path)
+                                    // 1 回目のクリックで既に openRecent 済みなので activate のみ
+                                    onDoubleClicked: launcher.activate()
                                 }
                             }
                         }
+
                         Text {
-                            anchors.top: parent.top; anchors.left: parent.left; anchors.leftMargin: 8
+                            anchors.left: parent.left; anchors.leftMargin: 8
+                            anchors.top: parent.top; anchors.topMargin: 4
                             visible: launcher.recentList.length === 0
                             text: "履歴はありません"
                             color: pal.textMuted
@@ -1198,15 +1223,23 @@ Item {
                                 delegate: Rectangle {
                                     required property int index
                                     Layout.fillWidth: true; Layout.fillHeight: true; radius: 3
+                                    // delegate → RowLayout → セグメント枠 → SegRow
+                                    readonly property bool segEnabled: parent.parent.parent.enabled
                                     readonly property bool sel: index === current
-                                    color: sel ? (enabled ? pal.accent : pal.textMuted) : "transparent"
-                                    Behavior on color { ColorAnimation { duration: 120 } }
+                                    color: "transparent"
+                                    Rectangle {
+                                        anchors.fill: parent
+                                        radius: parent.radius
+                                        color: parent.segEnabled ? pal.accent : pal.textMuted
+                                        opacity: parent.sel ? 1.0 : 0.0
+                                        Behavior on opacity { NumberAnimation { duration: 120; easing.type: Easing.OutCubic } }
+                                    }
                                     Text {
                                         anchors.centerIn: parent
                                         text: items[index]
-                                        color: sel ? "#FFFFFF" : (enabled ? pal.textPrimary : pal.textMuted)
+                                        color: parent.sel ? "#FFFFFF" : (parent.segEnabled ? pal.textPrimary : pal.textMuted)
                                         Behavior on color { ColorAnimation { duration: 120 } }
-                                        font.pixelSize: 12; font.weight: sel ? Font.DemiBold : Font.Normal
+                                        font.pixelSize: 12; font.weight: parent.sel ? Font.DemiBold : Font.Normal
                                     }
                                     MouseArea {
                                         anchors.fill: parent; enabled: parent.parent.parent.parent.enabled
