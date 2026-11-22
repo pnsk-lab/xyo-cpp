@@ -708,7 +708,7 @@ int test_danger_main() {
         // LAYQ quantum に依存しないよう 1 パスだけ進めて判定する。
         const double limited = onePass(false, true, mode, 1);
         if (!(limited > 0 && limited < kIterations))
-            std::printf("  %s: limited counter after 4 passes = %g\n",
+            std::printf("  %s: limited counter after 1 pass = %g\n",
                         modeName(mode), limited);
         check(limited > 0 && limited < kIterations,
               "warp loop is preempted by the time budget");

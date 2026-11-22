@@ -700,6 +700,18 @@ if(TARGET xyo-cli AND SDL2_FOUND AND NOT EMSCRIPTEN)
                PASS_REGULAR_EXPRESSION "EDIT-TEST: all checks passed")
 endif()
 
+# v1.2.2: same millisecond wall-clock reporter, boxed vs direct-f64 JIT path.
+# Check time-invariant arithmetic in the Interpreter, Eager and HotSpot
+# tiers without mocking the system clock.
+if(TARGET xyo-cli AND XYO_JIT AND Python3_Interpreter_FOUND AND NOT EMSCRIPTEN)
+  add_test(NAME xyo-days-f64-parity
+    COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_days_f64.py"
+      "$<TARGET_FILE:xyo-cli>"
+      "${CMAKE_BINARY_DIR}/days-f64-differential")
+  set_tests_properties(xyo-days-f64-parity PROPERTIES TIMEOUT 240)
+endif()
+
 # Portable running-state snapshots, including SDL audio and pen pixels.
 # The regression harness uses the Linux SDL offscreen driver; do not add it
 # to headless or non-Linux targets.
@@ -868,6 +880,15 @@ if(TARGET xyo-cli)
               "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_lazy_integration.py"
               "$<TARGET_FILE:xyo-cli>")
     set_tests_properties(xyo-jit-lazy-integration PROPERTIES TIMEOUT 180)
+
+    # BUG-001: address-taken internal par-for functions must be fully
+    # materialized before the C++ callback invokes their native pointer.
+    add_test(NAME xyo-jit-lazy-parfor-callback
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/differential/jit_lazy_parfor_callback.py"
+              --native "$<TARGET_FILE:xyo-cli>"
+              --out "${CMAKE_CURRENT_BINARY_DIR}/jit-lazy-parfor-fixtures")
+    set_tests_properties(xyo-jit-lazy-parfor-callback PROPERTIES TIMEOUT 120)
 
     # Preserve Scratch semantics with dynamic limits, fractional bounds, or
     # index mutation when optional static induction analysis is enabled.
