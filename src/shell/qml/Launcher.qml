@@ -151,6 +151,10 @@ Item {
              : (tma.containsMouse ? "#E5E8EE" : "transparent")
         border.width: active ? 1 : 0
         border.color: pal.accentBorder
+        scale: tma.pressed && enabled ? 0.96 : 1.0
+
+        Behavior on color { ColorAnimation { duration: 110 } }
+        Behavior on scale { NumberAnimation { duration: 90; easing.type: Easing.OutCubic } }
 
         Row {
             anchors.centerIn: parent
@@ -191,6 +195,11 @@ Item {
              : (ama.containsMouse ? "#F3F4F8" : pal.surface)
         border.width: primary && enabled ? 0 : 1
         border.color: !enabled ? pal.borderLight : (ama.containsMouse ? "#BFC5D2" : pal.border)
+        scale: ama.pressed && enabled ? 0.985 : 1.0
+
+        Behavior on color { ColorAnimation { duration: 120 } }
+        Behavior on border.color { ColorAnimation { duration: 120 } }
+        Behavior on scale { NumberAnimation { duration: 90; easing.type: Easing.OutCubic } }
 
         RowLayout {
             anchors.fill: parent
@@ -281,6 +290,7 @@ Item {
                     border.width: 1
                     border.color: pathEdit.visible ? pal.accent
                                 : (addrMa.containsMouse ? "#BFC5D2" : pal.border)
+                    Behavior on border.color { ColorAnimation { duration: 120 } }
 
                     Row {
                         visible: !pathEdit.visible
@@ -365,6 +375,7 @@ Item {
                     color: searchInput.activeFocus ? pal.surface : pal.surfaceAlt
                     border.width: 1
                     border.color: searchInput.activeFocus ? pal.accent : pal.border
+                    Behavior on border.color { ColorAnimation { duration: 120 } }
 
                     RowLayout {
                         anchors.fill: parent
@@ -421,6 +432,7 @@ Item {
                             Layout.fillWidth: true; Layout.fillHeight: true; radius: 3
                             color: root.listMode ? pal.surface : "transparent"
                             border.width: root.listMode ? 1 : 0; border.color: pal.borderLight
+                            Behavior on color { ColorAnimation { duration: 120 } }
                             LineIcon {
                                 anchors.centerIn: parent; width: 14; height: 14; kind: "list"
                                 strokeColor: root.listMode ? pal.accent : pal.textSecond
@@ -431,6 +443,7 @@ Item {
                             Layout.fillWidth: true; Layout.fillHeight: true; radius: 3
                             color: !root.listMode ? pal.surface : "transparent"
                             border.width: !root.listMode ? 1 : 0; border.color: pal.borderLight
+                            Behavior on color { ColorAnimation { duration: 120 } }
                             LineIcon {
                                 anchors.centerIn: parent; width: 14; height: 14; kind: "grid"
                                 strokeColor: !root.listMode ? pal.accent : pal.textSecond
@@ -447,8 +460,8 @@ Item {
                 ToolBtn {
                     iconKind: "settings"
                     textLabel: "設定"
-                    active: settingsDialog.visible
-                    onClicked: settingsDialog.visible = !settingsDialog.visible
+                    active: settingsDialog.open
+                    onClicked: settingsDialog.open = !settingsDialog.open
                 }
             }
 
@@ -496,6 +509,7 @@ Item {
                         visible: target !== ""
                         radius: 5
                         color: current ? pal.sidebarSel : (sma.containsMouse ? pal.sidebarHover : "transparent")
+                        Behavior on color { ColorAnimation { duration: 110 } }
 
                         RowLayout {
                             anchors.fill: parent
@@ -552,6 +566,7 @@ Item {
                             height: 40
                             radius: 5
                             color: rma.containsMouse ? pal.sidebarHover : "transparent"
+                            Behavior on color { ColorAnimation { duration: 110 } }
                             ColumnLayout {
                                 anchors.fill: parent
                                 anchors.leftMargin: 8; anchors.rightMargin: 8
@@ -610,7 +625,10 @@ Item {
                 ColumnLayout {
                     anchors.fill: parent
                     spacing: 0
-                    visible: root.listMode
+                    opacity: root.listMode ? 1.0 : 0.0
+                    visible: opacity > 0
+                    enabled: root.listMode
+                    Behavior on opacity { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
 
                     // カラムヘッダ
                     Rectangle {
@@ -668,6 +686,17 @@ Item {
                             readonly property bool sel: model.path === launcher.selectedPath
                             color: sel ? pal.rowSelBg
                                  : (lma.containsMouse ? pal.rowHoverBg : (index % 2 === 1 ? "#FAFBFD" : pal.surface))
+                            Behavior on color { ColorAnimation { duration: 100 } }
+
+                            Rectangle {
+                                width: 3
+                                height: sel ? 20 : 0
+                                radius: 1.5
+                                x: 3
+                                anchors.verticalCenter: parent.verticalCenter
+                                color: pal.accent
+                                Behavior on height { NumberAnimation { duration: 130; easing.type: Easing.OutCubic } }
+                            }
 
                             RowLayout {
                                 anchors.fill: parent
@@ -753,7 +782,10 @@ Item {
                 // グリッド表示
                 GridView {
                     id: fileGrid
-                    visible: !root.listMode
+                    opacity: !root.listMode ? 1.0 : 0.0
+                    visible: opacity > 0
+                    enabled: !root.listMode
+                    Behavior on opacity { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
                     anchors.fill: parent
                     anchors.margins: 14
                     clip: true
@@ -775,6 +807,10 @@ Item {
                             color: sel ? pal.accentSoft : (gma.containsMouse ? pal.surfaceAlt : pal.surface)
                             border.width: sel ? 2 : 1
                             border.color: sel ? pal.accent : (gma.containsMouse ? "#BFC5D2" : pal.borderLight)
+                            scale: gma.pressed ? 0.98 : 1.0
+                            Behavior on color { ColorAnimation { duration: 110 } }
+                            Behavior on border.color { ColorAnimation { duration: 110 } }
+                            Behavior on scale { NumberAnimation { duration: 90; easing.type: Easing.OutCubic } }
 
                             ColumnLayout {
                                 anchors.fill: parent
@@ -800,6 +836,8 @@ Item {
                                         source: visible ? model.thumbUrl : ""
                                         fillMode: Image.PreserveAspectCrop
                                         asynchronous: true
+                                        opacity: status === Image.Ready ? 1.0 : 0.0
+                                        Behavior on opacity { NumberAnimation { duration: 160; easing.type: Easing.OutQuad } }
                                     }
                                     Text {
                                         anchors.centerIn: parent
@@ -901,6 +939,8 @@ Item {
                             source: visible ? launcher.selectedThumb : ""
                             fillMode: Image.PreserveAspectFit
                             asynchronous: true
+                            opacity: status === Image.Ready ? 1.0 : 0.0
+                            Behavior on opacity { NumberAnimation { duration: 180; easing.type: Easing.OutQuad } }
                         }
                         Text {
                             anchors.centerIn: parent
@@ -1000,7 +1040,7 @@ Item {
                                     color: pal.accent; font.pixelSize: 11; font.weight: Font.DemiBold
                                     MouseArea {
                                         anchors.fill: parent
-                                        onClicked: settingsDialog.visible = true
+                                        onClicked: settingsDialog.open = true
                                     }
                                 }
                             }
@@ -1064,6 +1104,7 @@ Item {
                     Rectangle {
                         width: parent.width * Math.max(0, Math.min(1, launcher.aotProgress))
                         height: parent.height; radius: 3; color: pal.accent
+                        Behavior on width { NumberAnimation { duration: 120; easing.type: Easing.OutCubic } }
                     }
                 }
 
@@ -1085,21 +1126,31 @@ Item {
     // =========================================================
     Item {
         id: settingsDialog
-        visible: false
+        property bool open: false
+        visible: open || backdrop.opacity > 0.01
         anchors.fill: parent
 
         Rectangle {
-            anchors.fill: parent; color: "#8010141C"
-            MouseArea { anchors.fill: parent; onClicked: settingsDialog.visible = false }
+            id: backdrop
+            anchors.fill: parent
+            color: "#8010141C"
+            opacity: settingsDialog.open ? 1.0 : 0.0
+            Behavior on opacity { NumberAnimation { duration: 150; easing.type: Easing.OutQuad } }
+            MouseArea { anchors.fill: parent; onClicked: settingsDialog.open = false }
         }
 
         Rectangle {
+            id: dialogCard
             width: Math.min(540, parent.width - 40)
             height: settingsCol.implicitHeight + 36
             anchors.centerIn: parent
             radius: 8
             color: pal.surface
             border.width: 1; border.color: pal.border
+            opacity: settingsDialog.open ? 1.0 : 0.0
+            scale: settingsDialog.open ? 1.0 : 0.96
+            Behavior on opacity { NumberAnimation { duration: 160; easing.type: Easing.OutCubic } }
+            Behavior on scale { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
             MouseArea { anchors.fill: parent } // クリック透過防止
 
             ColumnLayout {
@@ -1116,7 +1167,7 @@ Item {
                     }
                     ToolBtn {
                         iconKind: "close"
-                        onClicked: settingsDialog.visible = false
+                        onClicked: settingsDialog.open = false
                     }
                 }
 
@@ -1149,10 +1200,12 @@ Item {
                                     Layout.fillWidth: true; Layout.fillHeight: true; radius: 3
                                     readonly property bool sel: index === current
                                     color: sel ? (enabled ? pal.accent : pal.textMuted) : "transparent"
+                                    Behavior on color { ColorAnimation { duration: 120 } }
                                     Text {
                                         anchors.centerIn: parent
                                         text: items[index]
                                         color: sel ? "#FFFFFF" : (enabled ? pal.textPrimary : pal.textMuted)
+                                        Behavior on color { ColorAnimation { duration: 120 } }
                                         font.pixelSize: 12; font.weight: sel ? Font.DemiBold : Font.Normal
                                     }
                                     MouseArea {
@@ -1224,7 +1277,7 @@ Item {
     Connections {
         target: launcher
         function onToggleSettingsRequested() {
-            settingsDialog.visible = !settingsDialog.visible
+            settingsDialog.open = !settingsDialog.open
         }
     }
 
@@ -1250,9 +1303,9 @@ Item {
     // キーボードショートカット
     focus: true
     Keys.onPressed: function(ev) {
-        if (settingsDialog.visible) {
+        if (settingsDialog.open) {
             if (ev.key === Qt.Key_Escape || ev.key === Qt.Key_Return || ev.key === Qt.Key_Enter) {
-                settingsDialog.visible = false
+                settingsDialog.open = false
                 ev.accepted = true
             }
             return
@@ -1261,7 +1314,7 @@ Item {
         const ctrl = ev.modifiers & (Qt.ControlModifier | Qt.MetaModifier)
         const alt = ev.modifiers & Qt.AltModifier
         if ((ctrl && ev.key === Qt.Key_Comma) || ev.key === Qt.Key_F4) {
-            settingsDialog.visible = !settingsDialog.visible
+            settingsDialog.open = !settingsDialog.open
         } else if (ctrl && (ev.key === Qt.Key_L || ev.key === Qt.Key_O)) {
             pathEdit.open()
         } else if (ctrl && ev.key === Qt.Key_F) {
