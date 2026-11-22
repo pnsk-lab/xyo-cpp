@@ -696,8 +696,22 @@ endif()
 
 # --- シェル ---
 if(XYO_BUILD_SHELL)
+  # Qt Quick ランチャー: Qt6 が見つかれば gui_qt.cpp（QML UI）を使う。
+  # 無ければ `xyo gui` は「Qt6 未導入」のスタブを返す。
+  set(XYO_QT_GUI OFF)
+  if(NOT EMSCRIPTEN)
+    find_package(Qt6 QUIET COMPONENTS Quick Qml Gui)
+    if(Qt6_FOUND)
+      set(XYO_QT_GUI ON)
+      message(STATUS "Qt6 Quick found (${Qt6_VERSION}): Qt Quick launcher enabled")
+    else()
+      message(STATUS "Qt6 Quick not found: 'xyo gui' launcher disabled")
+    endif()
+  endif()
   # editor.cpp が本体（SDL2 が無いビルドでは editor.cpp 内の #else スタブ）。
-  add_executable(xyo-cli src/shell/main.cpp src/shell/gui.cpp
+  add_executable(xyo-cli src/shell/main.cpp src/shell/gui_qt.cpp
+                 src/shell/launcher_core.cpp
+                 src/shell/launcher.qrc
                  src/shell/wasm_command.cpp
                  src/shell/editor.cpp
                  src/blockly/shape.cpp src/blockly/layout.cpp
@@ -705,6 +719,12 @@ if(XYO_BUILD_SHELL)
                  src/blockly/label.cpp src/blockly/ops.cpp
                  src/blockly/dynamic_catalog.cpp)
   target_link_libraries(xyo-cli PRIVATE xyo)
+  if(XYO_QT_GUI)
+    # gui_qt.cpp 内の Q_OBJECT クラスと qml/Launcher.qml リソース用。
+    set_target_properties(xyo-cli PROPERTIES AUTOMOC ON AUTORCC ON)
+    target_compile_definitions(xyo-cli PRIVATE XYO_HAVE_QT=1)
+    target_link_libraries(xyo-cli PRIVATE Qt6::Quick Qt6::Qml Qt6::Gui)
+  endif()
   if(XYO_LINK_JEMALLOC)
     # Keep the allocator in DT_NEEDED even when the executable has no direct
     # unresolved malloc symbol (the core library may hide libc references).

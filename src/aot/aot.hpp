@@ -44,6 +44,9 @@ struct BuildResult {
     std::string meta;   // ロード用メタデータ（JSON）
     int scripts = 0;
     int slots = 0;
+    /// `slots` は Qt moc のキーワードと衝突するため、moc 対象の
+    /// コード（Qt ランチャー）からはこちらを使う。
+    int slotCount() const { return slots; }
 };
 
 /// プロジェクト全体を AOT コンパイルする。GPU 並列ループは

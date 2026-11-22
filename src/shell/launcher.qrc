@@ -1,0 +1,5 @@
+<RCC>
+    <qresource prefix="/xyo">
+        <file>qml/Launcher.qml</file>
+    </qresource>
+</RCC>
