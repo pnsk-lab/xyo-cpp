@@ -2,6 +2,7 @@
 // switched-resume coroutine.  No C++ helper that can suspend is permitted.
 // This file is intentionally separate from the generic Scratch code emitter.
 #pragma once
+#include "llvm_compat.hpp"
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
@@ -256,15 +257,15 @@ inline bool lower(llvm::Module& mod, const std::string& entryName) {
     Type* i64 = Type::getInt64Ty(lc);
     Type* voidt = Type::getVoidTy(lc);
     llvm::Value* none = ConstantTokenNone::get(lc);
-    auto* idFn = Intrinsic::getOrInsertDeclaration(&mod, Intrinsic::coro_id);
-    auto* beginFn = Intrinsic::getOrInsertDeclaration(&mod, Intrinsic::coro_begin);
-    auto* sizeFn = Intrinsic::getOrInsertDeclaration(&mod, Intrinsic::coro_size, {i64});
-    auto* suspendFn = Intrinsic::getOrInsertDeclaration(&mod, Intrinsic::coro_suspend);
-    auto* freeFn = Intrinsic::getOrInsertDeclaration(&mod, Intrinsic::coro_free);
-    auto* endFn = Intrinsic::getOrInsertDeclaration(&mod, Intrinsic::coro_end);
-    auto* resumeFn = Intrinsic::getOrInsertDeclaration(&mod, Intrinsic::coro_resume);
-    auto* doneFn = Intrinsic::getOrInsertDeclaration(&mod, Intrinsic::coro_done);
-    auto* destroyFn = Intrinsic::getOrInsertDeclaration(&mod, Intrinsic::coro_destroy);
+    auto* idFn = llvmc::intrinsicDeclaration(&mod, Intrinsic::coro_id);
+    auto* beginFn = llvmc::intrinsicDeclaration(&mod, Intrinsic::coro_begin);
+    auto* sizeFn = llvmc::intrinsicDeclaration(&mod, Intrinsic::coro_size, {i64});
+    auto* suspendFn = llvmc::intrinsicDeclaration(&mod, Intrinsic::coro_suspend);
+    auto* freeFn = llvmc::intrinsicDeclaration(&mod, Intrinsic::coro_free);
+    auto* endFn = llvmc::intrinsicDeclaration(&mod, Intrinsic::coro_end);
+    auto* resumeFn = llvmc::intrinsicDeclaration(&mod, Intrinsic::coro_resume);
+    auto* doneFn = llvmc::intrinsicDeclaration(&mod, Intrinsic::coro_done);
+    auto* destroyFn = llvmc::intrinsicDeclaration(&mod, Intrinsic::coro_destroy);
     FunctionCallee alloc = mod.getOrInsertFunction(
         "malloc", FunctionType::get(ptr, {i64}, false));
     FunctionCallee dealloc = mod.getOrInsertFunction(
@@ -403,15 +404,15 @@ inline bool lowerOne(llvm::Module& mod, llvm::Function* fn, bool isEntry,
     Type* i64 = Type::getInt64Ty(lc);
     Type* voidt = Type::getVoidTy(lc);
     llvm::Value* none = ConstantTokenNone::get(lc);
-    auto* idFn = Intrinsic::getOrInsertDeclaration(&mod, Intrinsic::coro_id);
-    auto* beginFn = Intrinsic::getOrInsertDeclaration(&mod, Intrinsic::coro_begin);
-    auto* sizeFn = Intrinsic::getOrInsertDeclaration(&mod, Intrinsic::coro_size, {i64});
-    auto* suspendFn = Intrinsic::getOrInsertDeclaration(&mod, Intrinsic::coro_suspend);
-    auto* freeFn = Intrinsic::getOrInsertDeclaration(&mod, Intrinsic::coro_free);
-    auto* endFn = Intrinsic::getOrInsertDeclaration(&mod, Intrinsic::coro_end);
-    auto* resumeFn = Intrinsic::getOrInsertDeclaration(&mod, Intrinsic::coro_resume);
-    auto* doneFn = Intrinsic::getOrInsertDeclaration(&mod, Intrinsic::coro_done);
-    auto* destroyFn = Intrinsic::getOrInsertDeclaration(&mod, Intrinsic::coro_destroy);
+    auto* idFn = llvmc::intrinsicDeclaration(&mod, Intrinsic::coro_id);
+    auto* beginFn = llvmc::intrinsicDeclaration(&mod, Intrinsic::coro_begin);
+    auto* sizeFn = llvmc::intrinsicDeclaration(&mod, Intrinsic::coro_size, {i64});
+    auto* suspendFn = llvmc::intrinsicDeclaration(&mod, Intrinsic::coro_suspend);
+    auto* freeFn = llvmc::intrinsicDeclaration(&mod, Intrinsic::coro_free);
+    auto* endFn = llvmc::intrinsicDeclaration(&mod, Intrinsic::coro_end);
+    auto* resumeFn = llvmc::intrinsicDeclaration(&mod, Intrinsic::coro_resume);
+    auto* doneFn = llvmc::intrinsicDeclaration(&mod, Intrinsic::coro_done);
+    auto* destroyFn = llvmc::intrinsicDeclaration(&mod, Intrinsic::coro_destroy);
     FunctionCallee alloc = mod.getOrInsertFunction(
         "malloc", FunctionType::get(ptr, {i64}, false));
     FunctionCallee dealloc = mod.getOrInsertFunction(

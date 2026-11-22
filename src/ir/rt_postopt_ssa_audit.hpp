@@ -3,6 +3,7 @@
 // Post-lowering register allocation / stack maps are still unproved.
 #pragma once
 
+#include "../jit/llvm_compat.hpp"
 #include "llvm_ssa_liveness.hpp"
 #include "../jit/rt_ssa_extra_capture.hpp"
 
@@ -292,7 +293,7 @@ emitExperimentalAsyncStackmaps(
     const auto sites = auditPostoptAsyncRoots(module);
     std::vector<ExperimentalAsyncStackmapSite> records;
     std::unordered_set<uint64_t> emittedIds;
-    auto* stackmap = llvm::Intrinsic::getOrInsertDeclaration(
+    auto* stackmap = llvmc::intrinsicDeclaration(
         &module, llvm::Intrinsic::experimental_stackmap);
     for (const auto& site : sites) {
         ExperimentalAsyncStackmapSite record;
@@ -566,7 +567,7 @@ emitExperimentalPostoptStackmaps(llvm::Module& module) {
     const auto sites = auditPostoptSsaCaptures(module);
     std::vector<ExperimentalStackmapSite> reports;
     std::unordered_set<uint64_t> emittedIds;
-    auto* intrinsic = llvm::Intrinsic::getOrInsertDeclaration(
+    auto* intrinsic = llvmc::intrinsicDeclaration(
         &module, llvm::Intrinsic::experimental_stackmap);
     for (const auto& site : sites) {
         ExperimentalStackmapSite record;

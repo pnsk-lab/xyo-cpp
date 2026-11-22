@@ -4,6 +4,7 @@
 // or permission for native garbage collection.
 #pragma once
 
+#include "../jit/llvm_compat.hpp"
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/InstrTypes.h>
 #include <llvm/IR/Intrinsics.h>
@@ -98,7 +99,7 @@ emitExperimentalYieldEdgeStackmaps(llvm::Module& module) {
                 }
 
                 if (!stackmap)
-                    stackmap = llvm::Intrinsic::getOrInsertDeclaration(
+                    stackmap = llvmc::intrinsicDeclaration(
                         &module, llvm::Intrinsic::experimental_stackmap);
                 llvm::IRBuilder<> builder(call);
                 // Exactly one *pointer-location* operand, unrelated

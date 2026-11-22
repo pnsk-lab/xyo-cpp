@@ -8,6 +8,7 @@
 // This header never authorizes native Fiber garbage collection.
 #pragma once
 
+#include "../jit/llvm_compat.hpp"
 #include "../ir/llvm_ssa_liveness.hpp"
 #include "../jit/rt_ssa_extra_capture.hpp"
 #include "../core/value.hpp"
@@ -391,7 +392,7 @@ emitExperimentalYieldSsaSnapshots(
                 }
 
                 if (!stackmap)
-                    stackmap = llvm::Intrinsic::getOrInsertDeclaration(
+                    stackmap = llvmc::intrinsicDeclaration(
                         &module, llvm::Intrinsic::experimental_stackmap);
                 llvm::IRBuilder<> builder(previous);
                 std::vector<llvm::Value*> args{

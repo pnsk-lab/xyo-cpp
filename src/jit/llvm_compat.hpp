@@ -11,6 +11,7 @@
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Config/llvm-config.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
+#include <llvm/Analysis/CaptureTracking.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/Module.h>
@@ -51,6 +52,13 @@ inline llvm::Function* intrinsicDeclaration(
 #else
     return llvm::Intrinsic::getDeclaration(m, id, overloads);
 #endif
+}
+
+/// ポインタが捕捉される可能性があるか。
+/// LLVM 18 の CaptureTracking.h は StoreCaptures を省略できないため、
+/// 明示的に 3 引数で呼ぶ（19 以降も既定値と同値なので結果は同じ）。
+inline bool pointerMayBeCaptured(const llvm::Value* v, bool returnCaptures) {
+    return llvm::PointerMayBeCaptured(v, returnCaptures, /*StoreCaptures=*/false);
 }
 
 } // namespace xyo::llvmc

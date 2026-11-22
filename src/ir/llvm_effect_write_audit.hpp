@@ -5,6 +5,7 @@
 // CFG path. It proves neither inter-procedural effects nor GC/source parity.
 #pragma once
 
+#include "../jit/llvm_compat.hpp"
 #include <llvm/Analysis/CaptureTracking.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/CFG.h>
@@ -108,7 +109,7 @@ inline bool isIr001IsolatedStackStore(const llvm::StoreInst& store) {
     const llvm::Value* base =
         llvm::getUnderlyingObject(store.getPointerOperand());
     const auto* local = llvm::dyn_cast<llvm::AllocaInst>(base);
-    return local && !llvm::PointerMayBeCaptured(local, true);
+    return local && !llvmc::pointerMayBeCaptured(local, true);
 }
 
 // Internal/private functions cannot be replaced by a foreign symbol.
@@ -415,7 +416,7 @@ inline std::vector<llvm::CallBase*> findUnprovenLlvmEffectCheckpoints(
             if (const auto* local =
                     llvm::dyn_cast<llvm::AllocaInst>(&instruction))
                 isolated.emplace(
-                    local, !llvm::PointerMayBeCaptured(local, true));
+                    local, !llvmc::pointerMayBeCaptured(local, true));
 
     std::unordered_map<const llvm::BasicBlock*,
                        LlvmEffectCheckpointState> out;
