@@ -38,6 +38,7 @@
 #undef slots
 
 #include <SDL.h>
+#include <zlib.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -2330,6 +2331,82 @@ public:
         }
         return out;
     }
+    // 波形包絡（scratch-gui wavEnvelope 準拠）: WAV を float に
+    // デコードして ~120 バケットのピークを返す（QVariantList<double>）
+    Q_INVOKABLE QVariantList soundEnvelope(int idx) const {
+        QVariantList out;
+        const Target* t = ed.rt && ed.selTarget >= 0 &&
+                                  ed.selTarget < (int)ed.rt->targets.size()
+                              ? ed.rt->targets[ed.selTarget]
+                              : nullptr;
+        if (!t || !t->sprite || idx < 0 ||
+            idx >= (int)t->sprite->sounds.size())
+            return out;
+        const Sound& s = t->sprite->sounds[size_t(idx)];
+        // WAV だけ簡易デコード（mp3 は sdl_audio の経路に任せる）
+        if (s.data.size() < 44 ||
+            !(s.data[0] == 'R' && s.data[1] == 'I' && s.data[2] == 'F' &&
+              s.data[3] == 'F' && s.data[8] == 'W' && s.data[9] == 'A' &&
+              s.data[10] == 'V' && s.data[11] == 'E'))
+            return out;
+        SDL_RWops* rw =
+            SDL_RWFromConstMem(s.data.data(), (int)s.data.size());
+        if (!rw) return out;
+        SDL_AudioSpec spec;
+        Uint8* buf = nullptr;
+        Uint32 len = 0;
+        if (!SDL_LoadWAV_RW(rw, 1, &spec, &buf, &len) || !buf) return out;
+        int ch = spec.channels > 0 ? spec.channels : 1;
+        size_t frames = 0;
+        std::vector<float> pcm;
+        if (spec.format == AUDIO_S16SYS) {
+            frames = len / 2 / ch;
+            pcm.resize(frames);
+            const int16_t* p = (const int16_t*)buf;
+            for (size_t i = 0; i < frames; ++i) {
+                float acc = 0;
+                for (int c = 0; c < ch; ++c)
+                    acc = std::max(acc, std::fabs(float(p[i * ch + c])
+                                                   / 32768.f));
+                pcm[i] = acc;
+            }
+        } else if (spec.format == AUDIO_U8) {
+            frames = len / ch;
+            pcm.resize(frames);
+            for (size_t i = 0; i < frames; ++i) {
+                float acc = 0;
+                for (int c = 0; c < ch; ++c)
+                    acc = std::max(acc,
+                                   std::fabs(float(buf[i * ch + c] - 128)
+                                             / 128.f));
+                pcm[i] = acc;
+            }
+        } else if (spec.format == AUDIO_F32LSB ||
+                   spec.format == AUDIO_F32SYS) {
+            frames = len / 4 / ch;
+            pcm.resize(frames);
+            const float* p = (const float*)buf;
+            for (size_t i = 0; i < frames; ++i) {
+                float acc = 0;
+                for (int c = 0; c < ch; ++c)
+                    acc = std::max(acc, std::fabs(p[i * ch + c]));
+                pcm[i] = acc;
+            }
+        }
+        SDL_FreeWAV(buf);
+        if (frames == 0) return out;
+        const int kBuckets = 120;
+        for (int b = 0; b < kBuckets; ++b) {
+            size_t i0 = size_t(b) * frames / kBuckets;
+            size_t i1 = size_t(b + 1) * frames / kBuckets;
+            if (i1 <= i0) i1 = i0 + 1;
+            float pk = 0;
+            for (size_t i = i0; i < i1 && i < frames; ++i)
+                pk = std::max(pk, pcm[i]);
+            out.push_back(double(pk));
+        }
+        return out;
+    }
     Q_INVOKABLE void selectCostume(int i) {
         Target* t = ed.selected();
         if (!t || !t->sprite) return;
@@ -2489,6 +2566,196 @@ public:
         ed.pushUndo();
         t->sprite->sounds[i].name = utf8ToU16(nm.toStdString());
         bumpLayout();
+    }
+    // ---- サウンドエフェクト（sound-editor.jsx の 9 ボタン相当）----
+    // faster/slower/louder/softer/mute/fadein/fadeout/reverse/robot
+    static bool decodePcmMono(const std::vector<uint8_t>& data,
+                              std::vector<float>& out, int& rate) {
+        if (data.size() < 44 ||
+            !(data[0] == 'R' && data[1] == 'I' && data[2] == 'F' &&
+              data[3] == 'F' && data[8] == 'W' && data[9] == 'A' &&
+              data[10] == 'V' && data[11] == 'E'))
+            return false;
+        SDL_RWops* rw = SDL_RWFromConstMem(data.data(), (int)data.size());
+        if (!rw) return false;
+        SDL_AudioSpec spec;
+        Uint8* buf = nullptr;
+        Uint32 len = 0;
+        if (!SDL_LoadWAV_RW(rw, 1, &spec, &buf, &len) || !buf) return false;
+        int ch = spec.channels > 0 ? spec.channels : 1;
+        if ((spec.format & 0xFF) == 0x10) {       // 16-bit signed
+            size_t frames = len / 2 / ch;
+            out.resize(frames);
+            const int16_t* p = (const int16_t*)buf;
+            for (size_t i = 0; i < frames; ++i) {
+                float acc = 0;
+                for (int c = 0; c < ch; ++c)
+                    acc += float(p[i * ch + c]) / ch;
+                out[i] = acc / 32768.f;
+            }
+        } else if (spec.format == AUDIO_U8) {
+            size_t frames = len / ch;
+            out.resize(frames);
+            for (size_t i = 0; i < frames; ++i) {
+                float acc = 0;
+                for (int c = 0; c < ch; ++c)
+                    acc += float(buf[i * ch + c] - 128) / ch;
+                out[i] = acc / 128.f;
+            }
+        } else if ((spec.format & 0xFF) == 0x20) { // 32-bit float
+            size_t frames = len / 4 / ch;
+            out.resize(frames);
+            const float* p = (const float*)buf;
+            for (size_t i = 0; i < frames; ++i) {
+                float acc = 0;
+                for (int c = 0; c < ch; ++c) acc += p[i * ch + c];
+                out[i] = acc / ch;
+            }
+        }
+        SDL_FreeWAV(buf);
+        rate = spec.freq;
+        return !out.empty();
+    }
+    static std::vector<uint8_t> encodeWav16(const std::vector<float>& pcm,
+                                            int rate) {
+        const size_t N = pcm.size();
+        std::vector<uint8_t> wav(44 + N * 2);
+        auto w32 = [&](size_t o, uint32_t v) { std::memcpy(&wav[o], &v, 4); };
+        auto w16 = [&](size_t o, uint16_t v) { std::memcpy(&wav[o], &v, 2); };
+        std::memcpy(&wav[0], "RIFF", 4);
+        w32(4, 36 + (uint32_t)N * 2);
+        std::memcpy(&wav[8], "WAVEfmt ", 8);
+        w32(16, 16);
+        w16(20, 1); w16(22, 1); w32(24, (uint32_t)rate);
+        w32(28, (uint32_t)rate * 2); w16(32, 2); w16(34, 16);
+        std::memcpy(&wav[36], "data", 4);
+        w32(40, (uint32_t)N * 2);
+        for (size_t i = 0; i < N; ++i) {
+            float v = std::clamp(pcm[i], -1.f, 1.f);
+            int16_t s = (int16_t)(v * 32767.f);
+            std::memcpy(&wav[44 + i * 2], &s, 2);
+        }
+        return wav;
+    }
+    Q_INVOKABLE void soundEffect(int idx, const QString& fx) {
+        Target* t = ed.selected();
+        if (!t || !t->sprite ||
+            idx < 0 || idx >= (int)t->sprite->sounds.size()) return;
+        Sound& s = t->sprite->sounds[size_t(idx)];
+        std::vector<float> pcm;
+        int rate = 0;
+        if (!decodePcmMono(s.data, pcm, rate)) return;
+        ed.pushUndo();
+        const size_t n = pcm.size();
+        const std::string f = fx.toStdString();
+        if (f == "faster" || f == "slower") {
+            // 1.5x / 0.67x — scratch-paint の speed up/down 相当
+            double g = f == "faster" ? 1.5 : 0.67;
+            size_t nn = size_t(n / g);
+            std::vector<float> o(nn);
+            for (size_t i = 0; i < nn; ++i) {
+                double pos = i * g;
+                size_t j = (size_t)pos;
+                double fr = pos - j;
+                o[i] = j + 1 < n
+                           ? pcm[j] * float(1 - fr) + pcm[j + 1] * float(fr)
+                           : pcm[std::min(j, n - 1)];
+            }
+            pcm = std::move(o);
+        } else if (f == "louder") {
+            for (auto& v : pcm) v = std::clamp(v * 1.25f, -1.f, 1.f);
+        } else if (f == "softer") {
+            for (auto& v : pcm) v *= 0.8f;
+        } else if (f == "mute") {
+            std::fill(pcm.begin(), pcm.end(), 0.f);
+        } else if (f == "fadein") {
+            for (size_t i = 0; i < n; ++i)
+                pcm[i] *= std::min(1.0f, float(i) * 2 / n);
+        } else if (f == "fadeout") {
+            for (size_t i = 0; i < n; ++i)
+                pcm[i] *= std::min(1.0f, float(n - i) * 2 / n);
+        } else if (f == "reverse") {
+            std::reverse(pcm.begin(), pcm.end());
+        } else if (f == "robot") {
+            // 50 Hz 矩形波 AM（scratch-paint の robot effect 相当）
+            for (size_t i = 0; i < n; ++i) {
+                double ph = std::fmod(i * 50.0 / rate, 1.0);
+                pcm[i] *= (ph < 0.5) ? 1.f : 0.15f;
+            }
+        }
+        s.data = encodeWav16(pcm, rate);
+        s.dataFormat = "wav";
+        s.sampleCount = (double)pcm.size();
+        s.rate = rate;
+        s.md5.clear();   // 保存時に assetId 由来の新名を使う
+        s.assetId = "fx" + std::to_string(SDL_GetTicks());
+        bumpLayout();
+    }
+    // ---- Convert to Bitmap（paint-editor のボタン相当）----
+    // costumePixels の RGBA8 を zlib で PNG 化して data へ差し替える。
+    static bool encodePng(const uint8_t* rgba, int w, int h,
+                          std::vector<uint8_t>& out) {
+        if (w <= 0 || h <= 0) return false;
+        std::vector<uint8_t> raw(size_t(h) * (size_t(w) * 4 + 1));
+        for (int y = 0; y < h; ++y) {
+            raw[y * (w * 4 + 1)] = 0;  // filter: none
+            std::memcpy(raw.data() + y * (w * 4 + 1) + 1,
+                        rgba + size_t(y) * w * 4, size_t(w) * 4);
+        }
+        uLongf clen = compressBound((uLong)raw.size());
+        std::vector<uint8_t> cbuf(clen);
+        if (compress2(cbuf.data(), &clen, raw.data(),
+                      (uLong)raw.size(), 6) != Z_OK)
+            return false;
+        cbuf.resize(clen);
+        auto u32 = [&](uint32_t v) {
+            out.push_back(uint8_t(v >> 24)); out.push_back(uint8_t(v >> 16));
+            out.push_back(uint8_t(v >> 8));  out.push_back(uint8_t(v));
+        };
+        auto chunk = [&](const char* tag, const uint8_t* d, size_t n) {
+            u32((uint32_t)n);
+            size_t at = out.size();
+            out.push_back((uint8_t)tag[0]); out.push_back((uint8_t)tag[1]);
+            out.push_back((uint8_t)tag[2]); out.push_back((uint8_t)tag[3]);
+            out.insert(out.end(), d, d + n);
+            uint32_t c = crc32(0, out.data() + at, (uInt)(4 + n));
+            u32(c);
+        };
+        static const uint8_t sig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+        out.insert(out.end(), sig, sig + 8);
+        uint8_t ihdr[13];
+        ihdr[0] = uint8_t(w >> 24); ihdr[1] = uint8_t(w >> 16);
+        ihdr[2] = uint8_t(w >> 8);  ihdr[3] = uint8_t(w);
+        ihdr[4] = uint8_t(h >> 24); ihdr[5] = uint8_t(h >> 16);
+        ihdr[6] = uint8_t(h >> 8);  ihdr[7] = uint8_t(h);
+        ihdr[8] = 8; ihdr[9] = 6;  // 8bit RGBA
+        ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+        chunk("IHDR", ihdr, 13);
+        chunk("IDAT", cbuf.data(), cbuf.size());
+        chunk("IEND", nullptr, 0);
+        return true;
+    }
+    Q_INVOKABLE bool convertCostumeToBitmap(int idx) {
+        Target* t = ed.selected();
+        if (!t || !t->sprite ||
+            idx < 0 || idx >= (int)t->sprite->costumes.size())
+            return false;
+        Costume& c = t->sprite->costumes[size_t(idx)];
+        if (c.dataFormat != "svg") return false;   // 既にビットマップ
+        std::vector<uint8_t> px;
+        int w = 0, h = 0;
+        if (!ren.costumePixels(&c, px, &w, &h)) return false;
+        std::vector<uint8_t> png;
+        if (!encodePng(px.data(), w, h, png)) return false;
+        ed.pushUndo();
+        c.data = std::move(png);
+        c.dataFormat = "png";
+        c.bitmapResolution = 2;
+        c.md5.clear();
+        c.assetId = "png" + std::to_string(SDL_GetTicks());
+        refreshCostumeThumbs();
+        bumpLayout();
+        return true;
     }
     Q_INVOKABLE int costumeSel() const {
         const Target* t = ed.rt && ed.selTarget >= 0 &&
@@ -3560,6 +3827,12 @@ int xyo::editorMainQt(const char* path, bool danger) {
                     ctrl.spriteReorder(p[0].toInt(), p[1].toInt());
             }
             else if (a == "spradd") ctrl.addSprite();
+            else if (a.startsWith("sndfx:"))
+                ctrl.soundEffect(std::max(0, ctrl.ed.soundSel_), a.mid(6));
+            else if (a == "c2bmp") {
+                int ci = ctrl.ed.rt->targets[ctrl.ed.selTarget]->currentCostume;
+                ctrl.convertCostumeToBitmap(ci);
+            }
             else if (a.startsWith("sprrot:"))
                 ctrl.setSpriteRotStyle(a.mid(7));
             else if (a.startsWith("addext:"))

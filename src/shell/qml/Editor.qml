@@ -697,8 +697,13 @@ Item {
                         return editor.tab === 1 ? editor.costumeItems()
                                 : editor.soundItems()
                     }
-                    property int sel: editor.tab === 1 ? editor.costumeSel()
-                                      : editor.soundSel()
+                    // sel が -1（未選択）なら先頭アセットを表示
+                    property int sel: {
+                        var n = rev
+                        var s = editor.tab === 1 ? editor.costumeSel()
+                                                 : editor.soundSel()
+                        return (s < 0 && items.length > 0) ? 0 : s
+                    }
                     property var cur: (sel >= 0 && sel < items.length)
                                       ? items[sel] : null
                     Column {
@@ -721,21 +726,77 @@ Item {
                                         : ""
                                 fillMode: Image.PreserveAspectFit
                             }
+                            // 波形（sound-editor.jsx wavEnvelope 準拠:
+                            // 120 バケット包絡、容器 hsla(300,53%,60%,.15)）
                             Rectangle {
                                 visible: editor.tab === 2
-                                anchors.centerIn: parent
-                                width: 64; height: 64; radius: 32
-                                color: playMa.containsMouse ? "#3D8534" : cGreen
-                                Text {
-                                    anchors.centerIn: parent
-                                    text: "▶"; color: "white"
-                                    font.pixelSize: 26
+                                anchors.fill: parent
+                                anchors.margins: 10
+                                color: "#26E9EEF2"   // hsla(300,53%,60%,.15)
+                                radius: 4
+                                Canvas {
+                                    id: waveCanvas
+                                    anchors.fill: parent
+                                    anchors.margins: 4
+                                    Component.onCompleted: requestPaint()
+                                    onWidthChanged: requestPaint()
+                                    onHeightChanged: requestPaint()
+                                    Connections {
+                                        target: assetDetail
+                                        function onSelChanged() {
+                                            waveCanvas.requestPaint()
+                                        }
+                                        function onCurChanged() {
+                                            waveCanvas.requestPaint()
+                                        }
+                                    }
+                                    onPaint: {
+                                        var ctx = getContext("2d")
+                                        ctx.reset()
+                                        if (editor.tab !== 2 ||
+                                            !assetDetail.cur) return
+                                        var env = editor.soundEnvelope(
+                                            assetDetail.sel)
+                                        var n = env.length
+                                        if (n === 0) {
+                                            ctx.fillStyle = "#8691A7"
+                                            ctx.font = "11px sans-serif"
+                                            ctx.fillText(
+                                                "(no waveform)", 8, 20)
+                                            return
+                                        }
+                                        var w = width, h = height
+                                        var mid = h / 2
+                                        ctx.fillStyle = "#9966FF"
+                                        for (var i = 0; i < n; ++i) {
+                                            var x = i * w / n
+                                            var bw = Math.max(1, w / n - 0.5)
+                                            var bh = Math.max(1,
+                                                              env[i] * h * 0.95)
+                                            ctx.fillRect(x, mid - bh / 2,
+                                                         bw, bh)
+                                        }
+                                    }
                                 }
-                                MouseArea {
-                                    id: playMa; anchors.fill: parent
-                                    hoverEnabled: true
-                                    onClicked: editor.playSound(
-                                        assetDetail.sel)
+                                // 再生ボタン（波形の左下に重ねる）
+                                Rectangle {
+                                    x: 8; y: 8
+                                    width: 40; height: 40; radius: 20
+                                    color: playMa.containsMouse
+                                           ? "#3D8534" : cGreen
+                                    border.color: "white"
+                                    border.width: 3
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: "▶"; color: "white"
+                                        font.pixelSize: 16
+                                    }
+                                    MouseArea {
+                                        id: playMa; anchors.fill: parent
+                                        hoverEnabled: true
+                                        onClicked: editor.playSound(
+                                            assetDetail.sel)
+                                    }
                                 }
                             }
                         }
@@ -793,6 +854,70 @@ Item {
                                         else
                                             editor.deleteSound(assetDetail.sel)
                                     }
+                                }
+                            }
+                        }
+                        // サウンドエフェクト行（sound-editor.jsx row3 相当）
+                        Flow {
+                            visible: editor.tab === 2
+                            width: Math.min(parent.width - 40, 560)
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            spacing: 6
+                            Repeater {
+                                model: [
+                                    { t: "Faster",   f: "faster" },
+                                    { t: "Slower",   f: "slower" },
+                                    { t: "Louder",   f: "louder" },
+                                    { t: "Softer",   f: "softer" },
+                                    { t: "Mute",     f: "mute" },
+                                    { t: "Fade In",  f: "fadein" },
+                                    { t: "Fade Out", f: "fadeout" },
+                                    { t: "Reverse",  f: "reverse" },
+                                    { t: "Robot",    f: "robot" }
+                                ]
+                                delegate: Rectangle {
+                                    required property var modelData
+                                    property bool hov: fxMa.containsMouse
+                                    width: 76; height: 26; radius: 13
+                                    color: hov ? "#EDF1F5" : "white"
+                                    border.color: cBorder
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: modelData.t
+                                        font.pixelSize: 10; color: cFg
+                                    }
+                                    MouseArea {
+                                        id: fxMa; anchors.fill: parent
+                                        hoverEnabled: true
+                                        onClicked: {
+                                            if (!assetDetail.cur) return
+                                            editor.soundEffect(
+                                                assetDetail.sel,
+                                                modelData.f)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Convert to Bitmap（paint-editor のボタン相当）
+                        Rectangle {
+                            visible: editor.tab === 1 && assetDetail.cur
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            width: 150; height: 30; radius: 15
+                            color: ctbMa.containsMouse ? "#EDF1F5" : "white"
+                            border.color: cBorder
+                            Text {
+                                anchors.centerIn: parent
+                                text: "Convert to Bitmap"
+                                font.pixelSize: 11; color: cFg
+                            }
+                            MouseArea {
+                                id: ctbMa; anchors.fill: parent
+                                hoverEnabled: true
+                                onClicked: {
+                                    if (!assetDetail.cur) return
+                                    editor.convertCostumeToBitmap(
+                                        assetDetail.sel)
                                 }
                             }
                         }
