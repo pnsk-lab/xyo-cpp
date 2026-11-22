@@ -191,6 +191,57 @@ Item {
                         ListView {
                             anchors.fill: parent
                             model: editor.categoryNames.length
+                            // Add Extension ボタン（ツールボックス最下部、
+                            // editor.cpp::addExtRect_ 相当）
+                            footer: Item {
+                                width: 60; height: 52
+                                Rectangle {
+                                    width: 28; height: 28; radius: 14
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    y: 4
+                                    color: extMa.containsMouse
+                                           ? "#6A4CA0" : "#855CD6"
+                                    Text { anchors.centerIn: parent; text: "+"
+                                           color: "white"; font.pixelSize: 18
+                                           font.bold: true }
+                                }
+                                Text {
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    y: 34; width: 58
+                                    horizontalAlignment: Text.AlignHCenter
+                                    text: "Add Ext."
+                                    font.pixelSize: 9; color: cFg
+                                }
+                                MouseArea {
+                                    id: extMa; anchors.fill: parent
+                                    hoverEnabled: true
+                                    onClicked: extMenu.popup(
+                                        parent.width, parent.height / 2)
+                                }
+                                Menu {
+                                    id: extMenu
+                                    MenuItem {
+                                        text: "Pen"
+                                        property bool en: {
+                                            var n = editor.layoutRev
+                                            return editor.enabledExtensions()
+                                                   .indexOf("pen") >= 0
+                                        }
+                                        enabled: !en
+                                        onTriggered: editor.addExtension("pen")
+                                    }
+                                    MenuItem {
+                                        text: "Music"
+                                        property bool en: {
+                                            var n = editor.layoutRev
+                                            return editor.enabledExtensions()
+                                                   .indexOf("music") >= 0
+                                        }
+                                        enabled: !en
+                                        onTriggered: editor.addExtension("music")
+                                    }
+                                }
+                            }
                             delegate: Item {
                                 width: 60; height: 46
                                 Rectangle {
@@ -828,30 +879,189 @@ Item {
                     }
                 }
 
-                // スプライト情報パネル
+                // スプライト情報パネル（sprite-info.jsx 準拠:
+                // 名前/x/y + Show トグル + Size + Direction）
                 Rectangle {
+                    id: spInfoPanel
                     Layout.fillWidth: true
-                    Layout.preferredHeight: 56
+                    Layout.preferredHeight: 76
                     color: cPanel
                     Rectangle { anchors.top: parent.top
                                 width: parent.width; height: 1
                                 color: cBorder }
-                    RowLayout {
+                    property bool isStage: editor.selTarget === 0
+                    ColumnLayout {
                         anchors.fill: parent
                         anchors.leftMargin: 12
                         anchors.rightMargin: 12
-                        spacing: 8
-                        Text {
-                            text: editor.spriteInfo.length > 0
-                                  ? editor.spriteInfo[0] : ""
-                            color: cFg; font.pixelSize: 13; font.bold: true
+                        anchors.topMargin: 6
+                        anchors.bottomMargin: 8
+                        spacing: 4
+                        RowLayout {
+                            spacing: 8
+                            Text {
+                                text: "Sprite"
+                                color: cFg; font.pixelSize: 11; font.bold: true
+                            }
+                            Rectangle {
+                                Layout.preferredWidth: 128
+                                Layout.preferredHeight: 28
+                                radius: 14
+                                color: "white"; border.color: cBorder
+                                TextInput {
+                                    id: spNameInput
+                                    anchors.fill: parent
+                                    anchors.leftMargin: 10
+                                    anchors.rightMargin: 10
+                                    verticalAlignment: TextInput.AlignVCenter
+                                    font.pixelSize: 12; color: cFg
+                                    text: editor.spriteInfo.length > 0
+                                          ? editor.spriteInfo[0] : ""
+                                    enabled: !spInfoPanel.isStage
+                                    onAccepted: editor.setSpriteName(text)
+                                    onActiveFocusChanged:
+                                        if (!activeFocus)
+                                            editor.setSpriteName(text)
+                                }
+                            }
+                            Item { Layout.fillWidth: true }
+                            // x / y 入力
+                            RowLayout {
+                                spacing: 4
+                                visible: editor.spriteInfo.length > 2
+                                Text { text: "x"; color: cFg
+                                       font.pixelSize: 11; font.bold: true }
+                                Rectangle {
+                                    Layout.preferredWidth: 52
+                                    Layout.preferredHeight: 28; radius: 14
+                                    color: "white"; border.color: cBorder
+                                    TextInput {
+                                        anchors.fill: parent
+                                        horizontalAlignment: TextInput.AlignHCenter
+                                        verticalAlignment: TextInput.AlignVCenter
+                                        font.pixelSize: 11; color: cFg
+                                        validator: DoubleValidator {}
+                                        text: Math.round(
+                                                  (editor.spriteInfo[1] || 0))
+                                        onAccepted: editor.setSpriteX(
+                                                        parseFloat(text))
+                                        onActiveFocusChanged:
+                                            if (!activeFocus)
+                                                editor.setSpriteX(
+                                                    parseFloat(text))
+                                    }
+                                }
+                                Text { text: "y"; color: cFg
+                                       font.pixelSize: 11; font.bold: true }
+                                Rectangle {
+                                    Layout.preferredWidth: 52
+                                    Layout.preferredHeight: 28; radius: 14
+                                    color: "white"; border.color: cBorder
+                                    TextInput {
+                                        anchors.fill: parent
+                                        horizontalAlignment: TextInput.AlignHCenter
+                                        verticalAlignment: TextInput.AlignVCenter
+                                        font.pixelSize: 11; color: cFg
+                                        validator: DoubleValidator {}
+                                        text: Math.round(
+                                                  (editor.spriteInfo[2] || 0))
+                                        onAccepted: editor.setSpriteY(
+                                                        parseFloat(text))
+                                        onActiveFocusChanged:
+                                            if (!activeFocus)
+                                                editor.setSpriteY(
+                                                    parseFloat(text))
+                                    }
+                                }
+                            }
                         }
-                        Item { Layout.fillWidth: true }
-                        Text {
+                        // 行2: Show トグル + Size + Direction（stage は非表示）
+                        RowLayout {
+                            spacing: 8
                             visible: editor.spriteInfo.length > 2
-                            text: "x: " + Math.round(editor.spriteInfo[1] || 0)
-                                  + "  y: " + Math.round(editor.spriteInfo[2] || 0)
-                            color: cFgDim; font.pixelSize: 11
+                            Text { text: "Show"; color: cFgDim
+                                   font.pixelSize: 11 }
+                            // 連結トグル（toggle-buttons.css 準拠）
+                            Rectangle {
+                                Layout.preferredWidth: 64
+                                Layout.preferredHeight: 28
+                                radius: 4; color: "white"
+                                border.color: cBorder
+                                Row {
+                                    anchors.fill: parent
+                                    Rectangle {   // Show（左）
+                                        width: 32; height: 28; radius: 4
+                                        color: editor.spriteInfo[5]
+                                               ? "#CDDCF7" : "white"
+                                        Text { anchors.centerIn: parent
+                                               text: "👁"; font.pixelSize: 12 }
+                                        MouseArea {
+                                            anchors.fill: parent
+                                            onClicked:
+                                                editor.setSpriteVisible(true)
+                                        }
+                                    }
+                                    Rectangle { width: 1; height: 28
+                                                color: cBorder }
+                                    Rectangle {   // Hide（右）
+                                        width: 31; height: 28; radius: 4
+                                        color: !editor.spriteInfo[5]
+                                               ? "#CDDCF7" : "white"
+                                        Text { anchors.centerIn: parent
+                                               text: "👁"
+                                               color: "#999"
+                                               font.pixelSize: 12 }
+                                        MouseArea {
+                                            anchors.fill: parent
+                                            onClicked:
+                                                editor.setSpriteVisible(false)
+                                        }
+                                    }
+                                }
+                            }
+                            Item { Layout.fillWidth: true }
+                            Text { text: "Size"; color: cFgDim
+                                   font.pixelSize: 11 }
+                            Rectangle {
+                                Layout.preferredWidth: 52
+                                Layout.preferredHeight: 28; radius: 14
+                                color: "white"; border.color: cBorder
+                                TextInput {
+                                    anchors.fill: parent
+                                    horizontalAlignment: TextInput.AlignHCenter
+                                    verticalAlignment: TextInput.AlignVCenter
+                                    font.pixelSize: 11; color: cFg
+                                    validator: DoubleValidator {}
+                                    text: Math.round(editor.spriteInfo[3] || 0)
+                                    onAccepted: editor.setSpriteSize(
+                                                    parseFloat(text))
+                                    onActiveFocusChanged:
+                                        if (!activeFocus)
+                                            editor.setSpriteSize(
+                                                parseFloat(text))
+                                }
+                            }
+                            Text { text: "Direction"; color: cFgDim
+                                   font.pixelSize: 11 }
+                            Rectangle {
+                                Layout.preferredWidth: 52
+                                Layout.preferredHeight: 28; radius: 14
+                                color: "white"; border.color: cBorder
+                                TextInput {
+                                    anchors.fill: parent
+                                    horizontalAlignment: TextInput.AlignHCenter
+                                    verticalAlignment: TextInput.AlignVCenter
+                                    font.pixelSize: 11; color: cFg
+                                    validator: DoubleValidator {}
+                                    text: Math.round(editor.spriteInfo[4] || 0)
+                                    onAccepted: editor.setSpriteDirection(
+                                                    parseFloat(text))
+                                    onActiveFocusChanged:
+                                        if (!activeFocus)
+                                            editor.setSpriteDirection(
+                                                parseFloat(text))
+                                }
+                            }
                         }
                     }
                 }
@@ -1070,6 +1280,34 @@ Item {
                         MenuItem {
                             text: "delete"
                             onTriggered: editor.deleteSprite(sprCtxMenu.tileIndex)
+                        }
+                    }
+                    // Add Sprite ボタン（ActionMenu 44px 青丸 +
+                    // topMenu which 3 準拠の Choose/Paint/Surprise/Upload）
+                    Rectangle {
+                        anchors.right: parent.right
+                        anchors.bottom: parent.bottom
+                        anchors.margins: 8
+                        width: 44; height: 44; radius: 22
+                        color: addSprMa.containsMouse ? "#3E7BD8" : "#4C97FF"
+                        Text { anchors.centerIn: parent; text: "＋"
+                               color: "white"; font.pixelSize: 22 }
+                        MouseArea {
+                            id: addSprMa; anchors.fill: parent
+                            hoverEnabled: true
+                            onClicked: addSprMenu.popup(
+                                -addSprMenu.width + width, -addSprMenu.height)
+                        }
+                        Menu {
+                            id: addSprMenu
+                            MenuItem { text: "Choose a Sprite"
+                                       onTriggered: editor.addSprite() }
+                            MenuItem { text: "Paint"
+                                       onTriggered: editor.addSprite() }
+                            MenuItem { text: "Surprise"
+                                       onTriggered: editor.addSprite() }
+                            MenuItem { text: "Upload"
+                                       onTriggered: editor.addSprite() }
                         }
                     }
                 }

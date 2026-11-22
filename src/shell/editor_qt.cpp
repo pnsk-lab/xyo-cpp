@@ -1999,6 +1999,21 @@ struct EdCore {
         p += "-" + utf16ToUtf8(t->sprite->name) + ".sprite3";
         return saveSprite3File(*rt, *t, p.c_str());
     }
+    /// Add Extension — カテゴリをツールボックスへ恒常追加。
+    /// 既に有効な拡張 id の一覧（QML メニュー制御用）。
+    std::vector<std::string> enabledExtensions() const {
+        std::vector<std::string> l;
+        for (const auto& c : cats_)
+            if (c.id == "pen" || c.id == "music") l.push_back(c.id);
+        return l;
+    }
+    void addExtension(const std::string& id) {
+        for (const auto& c : cats_)
+            if (c.id == id) return;            // 追加済み
+        for (const auto& c : edit::kExtensionCategories)
+            if (c.id == id) cats_.push_back(c);
+        flyDirty_ = true;
+    }
 };
 
 } // namespace
@@ -2101,6 +2116,96 @@ public:
         l << qstr(utf16ToUtf8(t->getName()));
         l << t->x << t->y << t->size << t->direction << t->visible;
         return l;
+    }
+    // ---- スプライト情報パネルの編集 ----
+    Q_INVOKABLE void setSpriteName(const QString& name) {
+        Target* t = ed.selected();
+        if (!t || !t->sprite || t->isStage || name.isEmpty()) return;
+        t->sprite->name = utf8ToU16(name.toStdString());
+        bumpLayout();
+    }
+    Q_INVOKABLE void setSpriteX(double x) {
+        Target* t = ed.selected();
+        if (!t || t->isStage) return;
+        t->setXY(x, t->y);
+        bumpLayout();
+    }
+    Q_INVOKABLE void setSpriteY(double y) {
+        Target* t = ed.selected();
+        if (!t || t->isStage) return;
+        t->setXY(t->x, y);
+        bumpLayout();
+    }
+    Q_INVOKABLE void setSpriteSize(double s) {
+        Target* t = ed.selected();
+        if (!t || t->isStage) return;
+        t->size = std::clamp(s, 1.0, 1000.0);
+        bumpLayout();
+    }
+    Q_INVOKABLE void setSpriteDirection(double d) {
+        Target* t = ed.selected();
+        if (!t || t->isStage) return;
+        t->direction = d;
+        bumpLayout();
+    }
+    Q_INVOKABLE void setSpriteVisible(bool v) {
+        Target* t = ed.selected();
+        if (!t || t->isStage) return;
+        t->visible = v;
+        bumpLayout();
+    }
+    /// 新規スプライト（生成コスチューム付き、editor.cpp::addSprite 準拠）
+    Q_INVOKABLE void addSprite() {
+        if (!ed.rt) return;
+        auto spr = std::make_unique<Sprite>(ed.rt);
+        Sprite* sp = spr.get();
+        ed.rt->ownedSprites.push_back(std::move(spr));
+        int n = 1;
+        for (Target* t : ed.rt->targets)
+            if (!t->isStage) n++;
+        sp->name = utf8ToU16("Sprite" + std::to_string(n));
+        // 生成コスチューム（塗りつぶし円 + 目）
+        {
+            Costume c;
+            c.name = u"costume1";
+            c.dataFormat = "svg";
+            static int hue = 0;
+            static const char* cols[] = {"#855CD6", "#0FBD8C", "#FF8C1A",
+                                          "#4C97FF", "#CF63CF", "#FF6680"};
+            const char* col = cols[hue++ % 6];
+            std::string svg =
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"80\" "
+                "height=\"60\" viewBox=\"0 0 80 60\">"
+                "<ellipse cx=\"40\" cy=\"32\" rx=\"34\" ry=\"26\" fill=\"";
+            svg += col;
+            svg += "\"/>"
+                   "<circle cx=\"30\" cy=\"24\" r=\"7\" fill=\"#fff\"/>"
+                   "<circle cx=\"50\" cy=\"24\" r=\"7\" fill=\"#fff\"/>"
+                   "<circle cx=\"31\" cy=\"25\" r=\"3\" fill=\"#000\"/>"
+                   "<circle cx=\"51\" cy=\"25\" r=\"3\" fill=\"#000\"/>"
+                   "</svg>";
+            c.data.assign(svg.begin(), svg.end());
+            c.assetId = "gen" + std::to_string(SDL_GetTicks());
+            c.bitmapResolution = 1;
+            c.rotationCenterX = 40;
+            c.rotationCenterY = 30;
+            c.skinId = 0;
+            sp->costumes.push_back(c);
+        }
+        Target* nt = sp->createClone();
+        nt->visible = true;
+        nt->size = 100;
+        nt->direction = 90;
+        nt->draggable = true;
+        nt->rotationStyle = "all around";
+        nt->volume = 100;
+        ed.rt->addTarget(nt);
+        ed.selTarget = (int)ed.rt->targets.size() - 1;
+        ed.clearHistory();
+        ed.wsDirty_ = true;
+        ed.flyDirty_ = true;
+        bumpLayout();
+        refreshCostumeThumbs();
     }
     bool canUndo() const { return !ed.undoStack.empty(); }
     bool canRedo() const { return !ed.redoStack.empty(); }
@@ -2456,6 +2561,17 @@ public:
         ed.spriteReorder(ti, ins);
         bumpLayout();
         refreshCostumeThumbs();
+    }
+    // ---- Add Extension ----
+    Q_INVOKABLE QStringList enabledExtensions() const {
+        QStringList l;
+        for (auto& s : const_cast<EdCore&>(ed).enabledExtensions())
+            l << QString::fromStdString(s);
+        return l;
+    }
+    Q_INVOKABLE void addExtension(const QString& id) {
+        ed.addExtension(id.toStdString());
+        bumpLayout();
     }
 
     // ---- 右クリックコンテキストメニュー ----
@@ -3400,6 +3516,15 @@ int xyo::editorMainQt(const char* path, bool danger) {
                 if (p.size() == 2)
                     ctrl.spriteReorder(p[0].toInt(), p[1].toInt());
             }
+            else if (a == "spradd") ctrl.addSprite();
+            else if (a.startsWith("addext:"))
+                ctrl.addExtension(a.mid(7));
+            else if (a.startsWith("sprname:"))
+                ctrl.setSpriteName(a.mid(8));
+            else if (a.startsWith("sprx:"))
+                ctrl.setSpriteX(a.mid(5).toDouble());
+            else if (a.startsWith("spry:"))
+                ctrl.setSpriteY(a.mid(5).toDouble());
             else if (a.startsWith("key:")) {
                 // key:<letter|space|up|down|left|right|return> — down+up
                 const QString k = a.mid(4);
