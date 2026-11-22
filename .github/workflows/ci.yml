@@ -89,7 +89,7 @@ jobs:
         with:
           llvm: ${{ env.LLVM_LATEST }}
           llvm_apt: "true"
-          extra: libsdl2-dev librsvg2-dev libgl-dev glslc qt6-base-dev qt6-declarative-dev
+          extra: libsdl2-dev librsvg2-dev libgl-dev glslc qt6-base-dev qt6-declarative-dev qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-layouts qml6-module-qtqml-workerscript
 
       - name: Configure
         run: |

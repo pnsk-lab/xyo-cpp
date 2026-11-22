@@ -25,7 +25,7 @@ jobs:
         uses: ./.github/actions/linux-deps
         with:
           llvm: ${{ env.LLVM_STATIC }}
-          extra: libzstd-dev libxml2-dev libncurses-dev libsdl2-dev librsvg2-dev libgl-dev glslc qt6-base-dev qt6-declarative-dev
+          extra: libzstd-dev libxml2-dev libncurses-dev libsdl2-dev librsvg2-dev libgl-dev glslc qt6-base-dev qt6-declarative-dev qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-layouts qml6-module-qtqml-workerscript
 
       - name: Configure and build (Release / static LLVM / dynamic Qt)
         run: |
