@@ -83,6 +83,34 @@ python3 -m http.server -d build-wasm-web 8000
 > headless CLI（Node）は execute フィクスチャ **116/116**（assert 339、
 > ネイティブ interp と一致）。Asyncify 有効ビルドも 116/116。
 
+### WASM 拡張（headless / Node）
+
+Emscripten ビルドでも `provider: "wasm"` の拡張を実行できる。ネイティブの
+wasm3 ではなく、ブラウザ / Node の `WebAssembly` API を `EM_JS` から使う
+（`src/extensions/wasm_provider_browser.cpp`）。拡張は xyo とは別の
+`WebAssembly.Memory` を持ち、引数・戻り値は JS 側でコピーする。
+
+```sh
+source "$HOME/.emsdk/emsdk_env.sh"
+emcmake cmake -B build-wasm-ext -G Ninja \
+  -DCMAKE_TOOLCHAIN_FILE=cmake/emscripten.cmake \
+  -DCMAKE_BUILD_TYPE=Release -DXYO_SDL2=OFF -DXYO_BUILD_TESTS=OFF
+cmake --build build-wasm-ext
+
+XYO_EXTENSION_PATH=examples/extensions \
+  node build-wasm-ext/xyo.js run \
+  tests/fixtures/extensions/wasm_demo.sb3 --print-list out --frames 3
+# 42 / 3 / hello from wasm / 6
+
+node tests/wasm/extensions_check.mjs build-wasm-ext/xyo.js
+# PASS
+```
+
+注意: ブラウザの WebAssembly には gas / 命令数上限が無いため、無限ループ
+する拡張は main thread を止める。ネイティブの wasm3 プロバイダだけが
+gas で trap する（`tests/fixtures/extensions/spin`）。ブラウザで信頼できない
+拡張を動かす場合は Worker + タイムアウトなどの別レイヤが必要。
+
 ## 4. 実装メモ（Phase A で入れた差分）
 
 | 箇所 | 内容 |
@@ -180,10 +208,18 @@ wasm なので LLVM を積めず、**wasm エンコーダは自前で書く**。
 source "$HOME/.emsdk/emsdk_env.sh"
 emcmake cmake -B build-wasm-jit -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE=cmake/emscripten.cmake \
-  -DCMAKE_BUILD_TYPE=Release -DXYO_SDL2=OFF -DXYO_WASM_JIT=ON -DXYO_BUILD_TESTS=OFF
+  -DCMAKE_BUILD_TYPE=Release -DXYO_SDL2=OFF \
+  -DXYO_JIT_BACKEND=wasm -DXYO_WASM_JIT=ON -DXYO_BUILD_TESTS=OFF
 cmake --build build-wasm-jit
 node web/xyo-node.mjs build-wasm-jit/xyo.js wasm-selftest
 ```
+
+`XYO_JIT_BACKEND=wasm` は必須。既定の `llvm` のままでは
+`cmake/emscripten.cmake` が `XYO_JIT=OFF` にし、`src/jit/rt.cpp` の
+ヘルパ（`xyo_lt` 等）がリンクされず `xyo.js` のリンクに失敗する。
+`XYO_WASM_JIT=ON` だけではホット JIT のブリッジは有効にならない。
+オプションで `EM_CACHE=<repo>/.emcache` を設定すると、emsdk が
+読み取り専用の環境でもキャッシュをワークスペース内に置ける。
 
 検証結果（実測）:
 
@@ -200,24 +236,30 @@ node web/xyo-node.mjs build-wasm-jit/xyo.js wasm-selftest
    wasm ランタイムの中で wasm を生成し、JS が instantiate して 1000 回の
    ループを実行、変数が期待値になることを確認。
 4. **JIT モードのランタイムは意味論不変**: `xyo-node.mjs ... test
-   refs/scratch-vm/test/fixtures/execute` が **116/116（assert 339）**、
-   ネイティブ interp と一致。
+   refs/scratch-vm/test/fixtures/execute` が 116/116（assert 339）。
+   2026-11-16 再測ではネイティブ/WASM JIT/WASM interp のすべてで
+   115/116（残る 1 件は 4 エンジン共通の `control-stop-all-leaks.sb2`）。
 
-#### 残作業
+#### 完了状況（2026-11-16）
 
-1. **`lowerBlocks`（ブロック木 → `Program`）**: `Blocks` を走査して
-   対応 opcode（`data_variable`/`data_setvariableto`/`data_changevariableby`/
-   `operator_add|subtract|multiply|divide|mod|round|mathop`/`control_repeat`/
-   `control_if`）を `Program` へ落とし、それ以外を含むスクリプトは除外する。
-   変数は `Variable**`（`JitCtx::varSlotData`）経由で `Variable::value` の
-   オフセットを実行時に埋め込む。
-2. **JitEngine への組み込み**: wasm ターゲット用の `CompiledScript` を作り、
-   `jitStepThread` から `xyo_host_invoke` で呼ぶ（`mayYield` でゲート）。
-   インタプリタ / ネイティブ JIT とのフォールバック関係を整理する。
-3. **検証**: 非 yield スクリプト（warp ループ）の wasm 実行結果が
-   インタプリタと一致すること（`XYO_DUMPVARS` で全変数を比較）。
-4. **ブラウザでの通し確認**: `XYO_WASM_BROWSER` + `XYO_WASM_JIT` の組み合わせ
-   （MODULARIZE 形のシェル対応）と、ブラウザでの instantiate 検証。
+以下の当初の残作業は解消済み。詳細と再現手順は
+[Binaryen backend completion](binaryen-backend-completion-2026-11-16.md)。
+
+1. **`lowerBlocks`（ブロック木 → `Program`）**: 実装済み。数値・リスト・
+   制御構文を `Program` へ落とし、非対応 opcode を含むスクリプトは
+   部分モジュールを公開せず `false`（interpreter fallback）にする。
+   変数は `Variable**`（`JitCtx::varSlotData`）経由で解決する。
+2. **JitEngine への組み込み**: 実装済み。wasm ターゲットの
+   `CompiledScript` を HotSpot が選び、`xyo_host_invoke` で実行する。
+   非対応・失敗時は値を書き戻さず Interpreter にフォールバックする。
+3. **検証**: execute フィクスチャ 116 件で WASM (JIT/Interpreter) が
+   ネイティブ同じ結果（115/116、残り 1 件は 4 エンジン共通の
+   `control-stop-all-leaks.sb2`）。共通 CFG 33/33・手続き 55/55・
+   effect fallback 8/8・emitter selection 6/6 が Interpreter/LLVM/
+   Builtin/Binaryen で一致。
+4. **ブラウザでの instantiate**: `XYO_WASM_JIT=1` の MODULARIZE 出力を
+   `Module.xyoOptimizeWasm`（任意）と `Module.wasmMemory` で起動できる。
+   Binaryen JS の同梱は行わず、ホストが関数を差し込む opt-in 方式。
 
 ### 2026-11: WASM HotSpot 統合
 

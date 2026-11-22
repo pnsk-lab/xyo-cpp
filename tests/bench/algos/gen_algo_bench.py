@@ -308,6 +308,14 @@ class Gen:
                 if first2:
                     self.blocks[bid]["inputs"]["SUBSTACK2"] = [2, first2]
             return bid
+        if k == "motion":
+            _, opcode, inputs, fields = s
+            bid = self.new(opcode, parent=parent)
+            for name, e in inputs.items():
+                self.blocks[bid]["inputs"][name] = self.emit_value(e, bid)
+            for name, value in fields.items():
+                self.blocks[bid]["fields"][name] = [value, None]
+            return bid
         if k == "call":
             _, proccode, args = s
             tmpl = self.procs[proccode]

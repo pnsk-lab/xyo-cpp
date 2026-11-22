@@ -1940,10 +1940,12 @@ bool SdlRenderer::colorTouchingColor(uint32_t color, uint32_t target,
     if (!d || !d->target) return false;
     double b[4];
     getDrawableBounds(drawableID, b);
-    int x0 = static_cast<int>(stageX(std::min(b[0], b[1])));
-    int x1 = static_cast<int>(std::ceil(stageX(std::max(b[0], b[1]))));
-    int y0 = static_cast<int>(stageY(std::max(b[2], b[3])));
-    int y1 = static_cast<int>(std::ceil(stageY(std::min(b[2], b[3]))));
+    // Scratch tests colour overlap only within the stage. Offstage skin
+    // pixels must not match, even when the two costumes intersect there.
+    const int x0 = std::clamp(static_cast<int>(stageX(std::min(b[0], b[1]))), 0, stageW_);
+    const int x1 = std::clamp(static_cast<int>(std::ceil(stageX(std::max(b[0], b[1])))), 0, stageW_);
+    const int y0 = std::clamp(static_cast<int>(stageY(std::max(b[2], b[3]))), 0, stageH_);
+    const int y1 = std::clamp(static_cast<int>(std::ceil(stageY(std::min(b[2], b[3])))), 0, stageH_);
     uint8_t c1r = (color >> 16) & 0xFF, c1g = (color >> 8) & 0xFF,
             c1b = color & 0xFF;
     uint8_t c2r = (target >> 16) & 0xFF, c2g = (target >> 8) & 0xFF,

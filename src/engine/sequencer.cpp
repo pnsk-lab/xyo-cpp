@@ -32,6 +32,7 @@
 #endif
 #include "numeric_thread.hpp"
 #include "source_continuation_handoff.hpp"
+#include "mega_preset.hpp"
 #include "../wasm/hot_jit.hpp"
 #include "../wasm/nested_jit.hpp"
 #include "../model/target.hpp"
@@ -42,23 +43,169 @@
 #include "runtime.hpp"
 #include "warp_clock.hpp"
 
+extern "C" int32_t xyo_lt(uint64_t, uint64_t);
+
 namespace xyo {
 
+namespace {
+// Opt-in total timings for the switch(pc) sender. Each clock read
+// requires XYO_JIT_MEGA_JOIN_PROFILE=1; normal builds pay only the
+// predictable flag branch. Totals are diagnostic, not a speed estimate.
+struct MegaJoinProfile {
+    bool enabled = [] {
+        const char* flag = std::getenv("XYO_JIT_MEGA_JOIN_PROFILE");
+        return flag && flag[0] == '1' && flag[1] == '\0';
+    }();
+    uint64_t steps = 0, launches = 0, polls = 0, llvmCalls = 0;
+    uint64_t stepNs = 0, launchNs = 0, pollNs = 0, llvmNs = 0;
+    ~MegaJoinProfile() {
+        if (!enabled) return;
+        std::fprintf(stderr,
+            "[mega-join-prof] steps=%llu launches=%llu polls=%llu "
+            "llvm_calls=%llu step_ns=%llu launch_ns=%llu "
+            "poll_ns=%llu llvm_ns=%llu\n",
+            (unsigned long long)steps,
+            (unsigned long long)launches,
+            (unsigned long long)polls,
+            (unsigned long long)llvmCalls,
+            (unsigned long long)stepNs,
+            (unsigned long long)launchNs,
+            (unsigned long long)pollNs,
+            (unsigned long long)llvmNs);
+    }
+};
+MegaJoinProfile& megaJoinProfile() {
+    static MegaJoinProfile profile;
+    return profile;
+}
+using MegaClock = std::chrono::steady_clock;
+uint64_t megaElapsedNs(MegaClock::time_point started) {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        MegaClock::now() - started).count();
+}
+struct MegaStepProfile {
+    MegaJoinProfile& stats;
+    MegaClock::time_point start;
+    explicit MegaStepProfile(MegaJoinProfile& s)
+        : stats(s), start(s.enabled ? MegaClock::now()
+                                  : MegaClock::time_point{}) {
+        if (stats.enabled) ++stats.steps;
+    }
+    ~MegaStepProfile() {
+        if (stats.enabled) stats.stepNs += megaElapsedNs(start);
+    }
+};
+} // namespace
+
 Sequencer::Sequencer(Runtime& rt) : runtime(rt) {
+    // `XYO_JIT_MEGA=1` must reach every function-local flag cache below,
+    // including the JitEngine built after this Sequencer.
+    applyMegaPreset();
+    // Mega lowering is Eager-only. The environment preset already writes
+    // XYO_JIT_MODE when it can, but an earlier jitMode() query may have
+    // cached the HotSpot default, so select Eager here as well. An
+    // explicit mode (env or --jit) always wins.
+    if (megaPresetRequested() && jitEnabled() && !jitModeExplicit())
+        setJitMode(JitMode::Eager);
 #if defined(__EMSCRIPTEN__) && defined(XYO_WASM_HOTSPOT)
-    // This is a correctness-validated experimental continuation, not a
-    // blanket performance optimization: one tiny WASM invocation per
-    // Scratch body can be slower than the interpreter. Never add the
-    // dispatch cost to ordinary scripts unless explicitly opted in.
+    // Nested numeric loops inside warp procedures are correctness-validated
+    // (5-way parity fuzz plus the 2123-check project) and now enabled by
+    // default for the warp-only subset. Warp loops never yield, so batching
+    // iterations inside one WASM call cannot change Scratch scheduling.
+    //   XYO_NESTED_WASM=0            disable entirely
+    //   XYO_NESTED_WASM=1            enable (and honour WARP_ONLY below)
+    //   XYO_NESTED_WASM_WARP_ONLY=0  with =1: allow statement candidates too
+    // Unset defaults to warp-only: only control_repeat/while/until/for_each
+    // inside an active warp frame are attempted.
     const char* nested = std::getenv("XYO_NESTED_WASM");
-    if (nested && nested[0] == '1') {
+    const auto equalsIgnoreCase = [](const char* value, const char* word) {
+        if (!value) return false;
+        for (; *value && *word; ++value, ++word) {
+            char a = *value, b = *word;
+            if (a >= 'A' && a <= 'Z') a = char(a - 'A' + 'a');
+            if (b >= 'A' && b <= 'Z') b = char(b - 'A' + 'a');
+            if (a != b) return false;
+        }
+        return *value == '\0' && *word == '\0';
+    };
+    const bool nestedExplicitlyOff =
+        nested && (nested[0] == '0' || equalsIgnoreCase(nested, "off") ||
+                   equalsIgnoreCase(nested, "false"));
+    const bool nestedExplicitlyOn =
+        nested && (nested[0] == '1' || equalsIgnoreCase(nested, "on") ||
+                   equalsIgnoreCase(nested, "true"));
+    if (!nestedExplicitlyOff) {
         nestedJit_ = std::make_unique<wasm::NestedJitCache>();
-        const char* warpOnly = std::getenv("XYO_NESTED_WASM_WARP_ONLY");
-        nestedWarpOnly_ = warpOnly && warpOnly[0] == '1';
+        if (nestedExplicitlyOn) {
+            const char* warpOnly = std::getenv("XYO_NESTED_WASM_WARP_ONLY");
+            nestedWarpOnly_ = warpOnly && warpOnly[0] == '1';
+        } else {
+            nestedWarpOnly_ = true;
+        }
     }
 #endif
 }
 Sequencer::~Sequencer() {
+    if (const char* diag = std::getenv("XYO_FIBER_CHAIN_COMPONENT_STATS");
+        diag && diag[0] == '1') {
+        std::fprintf(stderr,
+            "[fiber-component] candidates=%llu chained=%llu threads=%llu\n",
+            (unsigned long long)parStats_.genericComponentCandidates,
+            (unsigned long long)parStats_.genericComponentChained,
+            (unsigned long long)parStats_.genericComponentThreads);
+    }
+    if (const char* stats = std::getenv("XYO_JIT_MEGA_BULK_STATS");
+        stats && stats[0] == '1' && megaScalarBatchCalls_ != 0) {
+        std::fprintf(stderr,
+                     "[mega-bulk] calls=%llu threads=%llu\n",
+                     static_cast<unsigned long long>(
+                         megaScalarBatchCalls_),
+                     static_cast<unsigned long long>(
+                         megaScalarBatchThreads_));
+    }
+    if (const char* stats = std::getenv("XYO_JIT_MEGA_BULK_STATS");
+        stats && stats[0] == '1' && megaRepeatBurstCalls_ != 0) {
+        std::fprintf(stderr,
+                     "[mega-repeat-burst] calls=%llu turns=%llu\n",
+                     static_cast<unsigned long long>(
+                         megaRepeatBurstCalls_),
+                     static_cast<unsigned long long>(
+                         megaRepeatBurstTurns_));
+    }
+    if (const char* stats = std::getenv("XYO_JIT_MEGA_BULK_STATS");
+        stats && stats[0] == '1' && megaMultiBurstCalls_ != 0) {
+        std::fprintf(stderr,
+                     "[mega-multi-burst] calls=%llu turns=%llu\n",
+                     static_cast<unsigned long long>(megaMultiBurstCalls_),
+                     static_cast<unsigned long long>(megaMultiBurstTurns_));
+    }
+    if (const char* profile = std::getenv("XYO_SCHED_CLEANUP_PROFILE");
+        profile && profile[0] == '1') {
+        std::fprintf(stderr,
+            "[sched-cleanup] compact_calls=%llu slots=%llu removed=%llu "
+            "relocated=%llu compact_ns=%llu retire_calls=%llu "
+            "retire_ns=%llu map_hits=%llu map_size_0=%llu "
+            "map_size_1=%llu map_size_2=%llu map_size_3_4=%llu "
+            "map_size_5plus=%llu samples=%llu map_sample_ns=%llu "
+            "release_sample_ns=%llu append_sample_ns=%llu\n",
+            (unsigned long long)cleanupProfile_.compactionCalls,
+            (unsigned long long)cleanupProfile_.scannedSlots,
+            (unsigned long long)cleanupProfile_.removedThreads,
+            (unsigned long long)cleanupProfile_.relocatedThreads,
+            (unsigned long long)cleanupProfile_.compactionNs,
+            (unsigned long long)cleanupProfile_.retirementCalls,
+            (unsigned long long)cleanupProfile_.retirementNs,
+            (unsigned long long)cleanupProfile_.mapEraseHits,
+            (unsigned long long)cleanupProfile_.mapSizeZero,
+            (unsigned long long)cleanupProfile_.mapSizeOne,
+            (unsigned long long)cleanupProfile_.mapSizeTwo,
+            (unsigned long long)cleanupProfile_.mapSizeThreeToFour,
+            (unsigned long long)cleanupProfile_.mapSizeFivePlus,
+            (unsigned long long)cleanupProfile_.sampledRemovals,
+            (unsigned long long)cleanupProfile_.sampledMapNs,
+            (unsigned long long)cleanupProfile_.sampledReleaseNs,
+            (unsigned long long)cleanupProfile_.sampledAppendNs);
+    }
     if (std::getenv("XYO_EVENT_SCHED_STATS")) {
         std::fprintf(stderr,
                      "[event-sched] skipped=%llu woken=%llu\n",
@@ -269,6 +416,32 @@ struct ProfAccum {
     }
 };
 ProfAccum& prof() { static ProfAccum p; return p; }
+// Compiled out of Release. Sample one in 64 native Fiber activations
+// per OS thread to avoid adding a clock read on every Scratch yield.
+// The sample includes all effects until the end of jitStepThread.
+struct NativeResumeBreakdown {
+    const bool enabled = [] {
+        const char* env = std::getenv("XYO_JIT_NATIVE_RESUME_PROFILE");
+        return env && env[0] == '1';
+    }();
+    std::atomic<uint64_t> calls{0}, completed{0}, clockNs{0};
+    std::atomic<uint64_t> fiberNs{0}, postNs{0};
+    ~NativeResumeBreakdown() {
+        if (!enabled) return;
+        std::fprintf(stderr,
+            "[jit-resume] samples=%llu finished=%llu clock_ns=%llu "
+            "fiber_ns=%llu post_ns=%llu\n",
+            (unsigned long long)calls.load(std::memory_order_relaxed),
+            (unsigned long long)completed.load(std::memory_order_relaxed),
+            (unsigned long long)clockNs.load(std::memory_order_relaxed),
+            (unsigned long long)fiberNs.load(std::memory_order_relaxed),
+            (unsigned long long)postNs.load(std::memory_order_relaxed));
+    }
+};
+NativeResumeBreakdown& nativeResumeBreakdown() {
+    static NativeResumeBreakdown state;
+    return state;
+}
 struct ProfScope {
     std::atomic<double>* acc;
     std::chrono::steady_clock::time_point t0;
@@ -312,6 +485,14 @@ JitCtx* acquireJitCtx() {
 }
 void releaseJitCtx(JitCtx* c) {
     if (!c) return;
+    // Drop any coroutine-frame root provider before the frame is freed or
+    // the context is reused.
+    Gc::get().removeRootProvider(c);
+    if (c->coroJoinRefs) {
+        if (c->joinRefs == c->coroJoinRefs) c->joinRefs = nullptr;
+        delete c->coroJoinRefs;
+        c->coroJoinRefs = nullptr;
+    }
     // LAYQ diagnostics: per-thread poll/handoff/quantum summary. Only
     // threads that actually polled print, so scheduler-churn workloads
     // (millions of short threads) stay quiet.
@@ -326,6 +507,7 @@ void releaseJitCtx(JitCtx* c) {
     // Covers normal entry return, stopped/killed threads, fiber-chain
     // completion and a context retired without a final yield.
     flushJitBlockCount(c);
+    xyo_coro_clear_frames(c);
     *c = JitCtx{};
     auto& p = jitCtxPool();
     if (p.size() < kJitCtxPoolCap) p.push_back(c);
@@ -463,27 +645,687 @@ Sequencer::ParFlush Sequencer::dispatchReadyThread(
     return outcome;
 }
 
+// Execute contiguous certified scalar/loop script turns via one LLVM call.
+// Every counted repeat performs at most one iteration per scheduler pass.
+bool Sequencer::tryMegaScalarBatch(size_t start, bool allowParallel,
+                                   size_t& consumed, size_t& active,
+                                   bool& stopped) {
+    consumed = 0;
+    active = 0;
+    stopped = false;
+    static const bool enabled = [] {
+        const char* flag = std::getenv("XYO_JIT_MEGA_SCALAR_BATCH");
+        return flag && flag[0] == '1';
+    }();
+    static const bool waitRegistry = [] {
+        const char* env = std::getenv("XYO_WAIT_WAKE_REGISTRY");
+        return env && env[0] == '1';
+    }();
+    if (!enabled || !stepping || start >= stepping->size() ||
+        runtime.renderer || runtime.blockCountEnabled ||
+        std::getenv("XYO_PROF") || std::getenv("XYO_TOPPROF") ||
+        std::getenv("XYO_TOPTRACE") || waitRegistry ||
+        !parBatch_.empty()) return false;
+    // This is strictly in-order serial execution, even if ordinary
+    // eligible scripts might otherwise join an optional worker batch.
+    // The prior parallel queue must already be empty (checked above).
+    (void)allowParallel;
+
+    Thread* first = (*stepping)[start];
+    if (!first || !first->megaDispatch ||
+        !first->megaDispatch->directScalar ||
+        !first->blockContainer || !first->target) return false;
+    const auto code = first->megaDispatch;
+    const bool multiPc = !code->scalarBatchEntry &&
+                         code->multiPcBatchEntry;
+    if (!code->scalarBatchEntry && !multiPc) return false;
+    const uint64_t revision = code->sourceRevision;
+    if (code->sourceBlocks != first->blockContainer ||
+        first->blockContainer->revision() != revision) return false;
+
+    static const bool singleDispatch = [] {
+        const char* flag = std::getenv("XYO_JIT_MEGA_SINGLE_DISPATCH");
+        return flag && flag[0] == '1' && flag[1] == '\0';
+    }();
+    static const bool singleFastScan = [] {
+        const char* flag = std::getenv("XYO_JIT_MEGA_SINGLE_FAST_SCAN");
+        return flag && flag[0] == '1' && flag[1] == '\0';
+    }();
+    static const bool singlePreprove = [] {
+        const char* flag = std::getenv("XYO_JIT_MEGA_SINGLE_PREPROVE");
+        return flag && flag[0] == '1' && flag[1] == '\0';
+    }();
+    // A fully validated, cached ONE-Thread continuation needs neither the
+    // 8-element batch arrays nor the general per-source operand scanner.
+    // Restrict this to the very last scheduler slot and to one finite
+    // numeric delta. Any ambiguous state falls through to the original
+    // scanner, which owns cache invalidation and all generic fallbacks.
+    if (singleDispatch && singleFastScan && multiPc &&
+        code->multiPcSingleEntry && start == 0 &&
+        stepping->size() == 1 &&
+        first->megaDispatch == code &&
+        first->status == STATUS_RUNNING && !first->stack.empty() &&
+        !first->isKilled && !first->stackClick &&
+        !first->updateMonitor && first->isCompiled &&
+        !first->jitCtx && !first->fiber && !first->interpreterStarted &&
+        !first->osrActive && !first->nestedOsrActive &&
+        first->megaReturnDepth == 0 &&
+        first->megaPc != UINT32_MAX &&
+        !first->megaBroadcastPending && first->megaJoinRefs.empty() &&
+        !first->eventWaitArmed && !first->hasWarpTimer) {
+        const auto* compiled =
+            static_cast<const CompiledScript*>(first->compiled);
+        const uint32_t pc = first->megaPc;
+        const uint32_t slot = pc / 2;
+        // These source-shape conditions are immutable after successful
+        // compilation. When enabled, use the backend's compact pre-proof
+        // rather than rechecking seven metadata containers each turn.
+        // The generic proof is retained for flag-off A/B comparison.
+        bool sourceValid = false;
+        bool isRepeat = false;
+        if (singlePreprove) {
+            // Import source-shape proof from the LLVM backend. No legacy
+            // metadata lookups or condition/operand scans on this path.
+            if (slot < code->singleFastSourceKinds.size()) {
+                const uint8_t kind = code->singleFastSourceKinds[slot];
+                sourceValid = kind != 0;
+                isRepeat = kind == 2;
+            }
+        } else {
+            sourceValid =
+                slot < code->entries &&
+                slot < code->scalarVariableIds.size() &&
+                slot < code->multiPcKinds.size() &&
+                slot < code->multiPcRepetitions.size() &&
+                slot < code->multiPcSecondChanges.size() &&
+                slot < code->multiPcConditionals.size() &&
+                slot < code->multiPcElseBranches.size() &&
+                slot < code->multiPcThenSecondChanges.size() &&
+                slot < code->multiPcElseSecondChanges.size() &&
+                code->scalarVariableIds[slot].size() == 1 &&
+                !code->multiPcSecondChanges[slot] &&
+                !code->multiPcConditionals[slot] &&
+                !code->multiPcElseBranches[slot] &&
+                !code->multiPcThenSecondChanges[slot] &&
+                !code->multiPcElseSecondChanges[slot];
+            if (sourceValid) isRepeat = code->multiPcKinds[slot] == 1;
+        }
+        if (compiled && compiled->entry && !compiled->mainThread &&
+            !compiled->wasm && !compiled->coroResume &&
+            !compiled->aotSourceRevision &&
+            sourceValid && slot < code->entries &&
+            slot < code->multiPcRepetitions.size() &&
+            (((pc & 1u) == 0 && first->megaRemaining == 0) ||
+             ((pc & 1u) != 0 && isRepeat &&
+              first->megaRemaining <= code->multiPcRepetitions[slot]))) {
+            // Check structural generations BEFORE reading saved Variable*.
+            // This includes stage ownership for clone-local bindings.
+            const auto stamp = first->target->variableBindingStamp();
+            if (first->megaScalarBindingsReady &&
+                first->megaBoundTarget == first->target &&
+                first->megaBoundStage == stamp.stage &&
+                first->megaLocalGeneration == stamp.localGeneration &&
+                first->megaStageGeneration == stamp.stageGeneration) {
+                Variable* variable = first->megaScalarBindings[0];
+                if (variable && variable->type == Variable::kScalarType &&
+                    variable->value.isNumber() &&
+                    std::isfinite(variable->value.asNumberUnchecked())) {
+                    MegaDispatchCode::MultiPcItem item{
+                        variable, nullptr, nullptr, nullptr, nullptr,
+                        &first->megaPc, &first->megaRemaining};
+                    code->multiPcSingleEntry(&item);
+                    ++megaScalarBatchCalls_;
+                    ++megaScalarBatchThreads_;
+                    ++megaSingleFastCalls_;
+                    consumed = 1;
+                    activeThread = first;
+                    first->pendingShortBroadcast = false;
+                    first->hasWarpTimer = false;
+                    if (first->megaPc == UINT32_MAX) {
+                        first->megaDispatch.reset();
+                        retireThread(*first);
+                        stopped = true;
+                    } else {
+                        first->status = STATUS_RUNNING;
+                        active = 1;
+                    }
+                    return true;
+                }
+            }
+        }
+    }
+
+    std::array<Thread*, 8> members{};
+    std::array<Variable*, 8> values{};
+    std::array<MegaDispatchCode::MultiPcItem, 8> items{};
+    for (size_t i = 0; i < members.size() &&
+                       start + i < stepping->size(); ++i) {
+        Thread* thread = (*stepping)[start + i];
+        if (!thread || thread->megaDispatch != code ||
+            !thread->target || thread->blockContainer != code->sourceBlocks ||
+            thread->blockContainer->revision() != revision ||
+            thread->status != STATUS_RUNNING ||
+            thread->stack.empty() || thread->isKilled ||
+            thread->stackClick || thread->updateMonitor ||
+            !thread->isCompiled || thread->jitCtx || thread->fiber ||
+            thread->interpreterStarted ||
+            thread->osrActive || thread->nestedOsrActive ||
+            thread->megaReturnDepth != 0 ||
+            thread->megaPc == UINT32_MAX ||
+            thread->megaBroadcastPending ||
+            !thread->megaJoinRefs.empty() || thread->eventWaitArmed ||
+            thread->hasWarpTimer)
+            break;
+        const auto* compiled =
+            static_cast<const CompiledScript*>(thread->compiled);
+        if (!compiled || !compiled->entry ||
+            compiled->mainThread || compiled->wasm ||
+            compiled->coroResume || compiled->aotSourceRevision)
+            break;
+        const uint32_t slot = thread->megaPc / 2;
+        if (slot >= code->entries ||
+            slot >= code->scalarVariableIds.size())
+            break;
+        const auto& ids = code->scalarVariableIds[slot];
+        if (ids.empty() || ids.size() > 5) break;
+        if (!multiPc && ids.size() != 1) break;
+        bool conditional = false;
+        bool hasElse = false;
+        bool thenSecond = false;
+        bool elseSecond = false;
+        if (multiPc) {
+            if (slot >= code->multiPcKinds.size() ||
+                slot >= code->multiPcRepetitions.size() ||
+                slot >= code->multiPcSecondChanges.size() ||
+                slot >= code->multiPcConditionals.size() ||
+                slot >= code->multiPcElseBranches.size() ||
+                slot >= code->multiPcThenSecondChanges.size() ||
+                slot >= code->multiPcElseSecondChanges.size())
+                break;
+            conditional = code->multiPcConditionals[slot];
+            hasElse = code->multiPcElseBranches[slot];
+            thenSecond = code->multiPcThenSecondChanges[slot];
+            elseSecond = code->multiPcElseSecondChanges[slot];
+            if (conditional ?
+                (ids.size() !=
+                     (hasElse ? 3u : 2u) +
+                     uint32_t(thenSecond) + uint32_t(elseSecond) ||
+                 code->multiPcSecondChanges[slot] ||
+                 (elseSecond && !hasElse)) :
+                (hasElse || thenSecond || elseSecond ||
+                 ids.size() !=
+                     (code->multiPcSecondChanges[slot] ? 2u : 1u)))
+                break;
+            const bool resumed = (thread->megaPc & 1u) != 0;
+            if (resumed) {
+                if (code->multiPcKinds[slot] != 1 ||
+                    thread->megaRemaining >
+                        code->multiPcRepetitions[slot]) break;
+            } else if (thread->megaRemaining != 0) break;
+        } else if (thread->megaRemaining != 0 ||
+                   (thread->megaPc & 1u) != 0) break;
+        // The regular Mega continuation already owns a guarded variable
+        // binding cache. Reuse its exact source-index order instead of
+        // performing up to five map lookups EVERY scheduler pass.
+        // Never dereference any previously saved pointer until both
+        // local and Stage structural generations have been compared.
+        const auto stamp = thread->target->variableBindingStamp();
+        const bool sameStamp =
+            thread->megaBoundTarget == thread->target &&
+            thread->megaBoundStage == stamp.stage &&
+            thread->megaLocalGeneration == stamp.localGeneration &&
+            thread->megaStageGeneration == stamp.stageGeneration;
+        if (!sameStamp) {
+            thread->jitVarCache.clear();
+            thread->megaScalarBindingsReady = false;
+            thread->megaScalarBindings.fill(nullptr);
+        }
+        if (!thread->megaScalarBindingsReady) {
+            bool valid = ids.size() <= thread->megaScalarBindings.size();
+            if (valid) {
+                for (size_t k = 0; k < ids.size(); ++k) {
+                    Variable* binding =
+                        thread->target->lookupVariableById(ids[k]);
+                    if (!binding || binding->type != Variable::kScalarType) {
+                        valid = false;
+                        break;
+                    }
+                    thread->megaScalarBindings[k] = binding;
+                }
+            }
+            if (!valid) {
+                thread->megaScalarBindings.fill(nullptr);
+                break;
+            }
+            thread->megaBoundTarget = thread->target;
+            thread->megaBoundStage = stamp.stage;
+            thread->megaLocalGeneration = stamp.localGeneration;
+            thread->megaStageGeneration = stamp.stageGeneration;
+            thread->megaScalarBindingsReady = true;
+        }
+        const auto numeric = [&](size_t idx) -> Variable* {
+            Variable* binding = thread->megaScalarBindings[idx];
+            if (!binding || !binding->value.isNumber() ||
+                !std::isfinite(binding->value.asNumberUnchecked()))
+                return nullptr;
+            return binding;
+        };
+        Variable* variable = numeric(0);
+        if (!variable) break;
+        Variable* second = nullptr;
+        if (ids.size() >= 2 && (!conditional || hasElse)) {
+            second = numeric(1);
+            if (!second) break;
+        }
+        Variable* conditionVariable = nullptr;
+        if (conditional) {
+            conditionVariable = numeric(hasElse ? 2u : 1u);
+            if (!conditionVariable) break;
+        }
+        Variable* thenSecondVariable = nullptr;
+        Variable* elseSecondVariable = nullptr;
+        if (thenSecond || elseSecond) {
+            const size_t next = hasElse ? 3u : 2u;
+            if (thenSecond) {
+                thenSecondVariable = numeric(next);
+                if (!thenSecondVariable) break;
+            }
+            if (elseSecond) {
+                elseSecondVariable =
+                    numeric(next + uint32_t(thenSecond));
+                if (!elseSecondVariable) break;
+            }
+        }
+        members[consumed] = thread;
+        values[consumed] = variable;
+        items[consumed] = {
+            variable, second, conditionVariable,
+            thenSecondVariable, elseSecondVariable,
+            &thread->megaPc, &thread->megaRemaining};
+        ++consumed;
+    }
+    // One trailing live Thread currently falls back through the full
+    // jitStepThread/JitCtx path even though the same source, binding,
+    // numeric-value and PC proofs above make a one-item LLVM batch safe.
+    // Keep this strictly opt-in until isolated one-survivor benchmarks
+    // justify changing the scheduler default.
+    if (consumed == 0 || (consumed == 1 && !singleDispatch)) {
+        consumed = 0;
+        return false;
+    }
+    // The generated function does not call the host or mutate target
+    // structure. The ordered floating-point additions are not combined.
+    if (multiPc) {
+        if (consumed == 1 && code->multiPcSingleEntry)
+            code->multiPcSingleEntry(items.data());
+        else
+            code->multiPcBatchEntry(items.data(), consumed);
+    } else {
+        if (consumed == 1 && code->scalarSingleEntry)
+            code->scalarSingleEntry(values[0]);
+        else
+            code->scalarBatchEntry(values.data(), consumed);
+    }
+    ++megaScalarBatchCalls_;
+    megaScalarBatchThreads_ += consumed;
+    for (size_t i = 0; i < consumed; ++i) {
+        Thread& thread = *members[i];
+        activeThread = &thread;
+        thread.pendingShortBroadcast = false;
+        thread.hasWarpTimer = false;
+        if (!multiPc) thread.megaPc = UINT32_MAX;
+        if (thread.megaPc == UINT32_MAX) {
+            thread.megaDispatch.reset();
+            retireThread(thread);
+            stopped = true;
+        } else {
+            // Return after ONE body; next pass may resume via the odd PC.
+            thread.status = STATUS_RUNNING;
+            ++active;
+        }
+    }
+    return true;
+}
+
+// Coalesce several *complete* scheduler passes over two to eight source-
+// certified repeats. Unlike independent per-Thread bursts, this invokes
+// every Thread once in original array order before starting the next pass;
+// distinct and aliased Scratch variables therefore keep exact FAdd order.
+// Completion, yield and host notifications remain with the normal scheduler.
+bool Sequencer::tryMegaMultiRepeatBurst() {
+    static const bool enabled = [] {
+        const char* flag = std::getenv("XYO_JIT_MEGA_MULTI_REPEAT_BURST");
+        const char* burst = std::getenv("XYO_JIT_MEGA_REPEAT_BURST");
+        return flag && flag[0] == '1' && flag[1] == '\0' &&
+               burst && burst[0] == '1';
+    }();
+    static const bool waitRegistry = [] {
+        const char* env = std::getenv("XYO_WAIT_WAKE_REGISTRY");
+        return env && env[0] == '1';
+    }();
+    const size_t count = runtime.threads.size();
+    if (!enabled || count < 2 || count > 8 || waitRegistry ||
+        runtime.renderer || runtime.blockCountEnabled ||
+        std::getenv("XYO_PROF") || std::getenv("XYO_TOPPROF") ||
+        std::getenv("XYO_TOPTRACE") ||
+        std::getenv("XYO_SCHED_READY_INDEX") ||
+        !runtime.waitQueue.empty() || !parBatch_.empty())
+        return false;
+    const Thread* first = runtime.threads.front();
+    if (!first || !first->megaDispatch) return false;
+    const auto code = first->megaDispatch;
+    if (!code->directScalar || !code->multiPcBatchEntry ||
+        !code->multiRepeatBurstEntry || !code->sourceBlocks ||
+        code->sourceBlocks->revision() != code->sourceRevision)
+        return false;
+
+    std::array<MegaDispatchCode::MultiPcItem, 8> items{};
+    uint64_t minRemaining = 256;
+    for (size_t i = 0; i < count; ++i) {
+        Thread* thread = runtime.threads[i];
+        if (!thread || thread->megaDispatch != code ||
+            thread->blockContainer != code->sourceBlocks ||
+            !thread->target || !thread->isCompiled ||
+            thread->status != STATUS_RUNNING || thread->stack.empty() ||
+            thread->isKilled || thread->stackClick ||
+            thread->updateMonitor || thread->jitCtx || thread->fiber ||
+            thread->interpreterStarted || thread->osrActive ||
+            thread->nestedOsrActive || thread->megaReturnDepth != 0 ||
+            thread->megaBroadcastPending ||
+            !thread->megaJoinRefs.empty() || thread->eventWaitArmed ||
+            thread->hasWarpTimer || thread->pendingShortBroadcast)
+            return false;
+        const auto* compiled =
+            static_cast<const CompiledScript*>(thread->compiled);
+        if (!compiled || !compiled->entry || compiled->mainThread ||
+            compiled->wasm || compiled->coroResume ||
+            compiled->aotSourceRevision)
+            return false;
+        const uint32_t pc = thread->megaPc;
+        const uint32_t slot = pc / 2;
+        if ((pc & 1u) == 0 || thread->megaRemaining < 2 ||
+            slot >= code->entries ||
+            slot >= code->multiRepeatSourceArity.size() ||
+            slot >= code->scalarVariableIds.size() ||
+            slot >= code->multiPcRepetitions.size() ||
+            thread->megaRemaining > code->multiPcRepetitions[slot])
+            return false;
+        const uint8_t arity = code->multiRepeatSourceArity[slot];
+        if ((arity != 1 && arity != 2) ||
+            code->scalarVariableIds[slot].size() != arity)
+            return false;
+        // A saved Variable* cannot be examined until the target and
+        // all structural generations have been checked.
+        const auto stamp = thread->target->variableBindingStamp();
+        if (!thread->megaScalarBindingsReady ||
+            thread->megaBoundTarget != thread->target ||
+            thread->megaBoundStage != stamp.stage ||
+            thread->megaLocalGeneration != stamp.localGeneration ||
+            thread->megaStageGeneration != stamp.stageGeneration)
+            return false;
+        Variable* value = thread->megaScalarBindings[0];
+        if (!value || value->type != Variable::kScalarType ||
+            !value->value.isNumber() ||
+            !std::isfinite(value->value.asNumberUnchecked()))
+            return false;
+        Variable* second = nullptr;
+        if (arity == 2) {
+            second = thread->megaScalarBindings[1];
+            if (!second ||
+                second->type != Variable::kScalarType ||
+                !second->value.isNumber() ||
+                !std::isfinite(second->value.asNumberUnchecked()))
+                return false;
+        }
+        items[i] = {
+            value, second, nullptr, nullptr, nullptr,
+            &thread->megaPc, &thread->megaRemaining};
+        minRemaining = std::min(minRemaining, thread->megaRemaining);
+    }
+    if (minRemaining < 2) return false;
+    const uint64_t passes = code->multiRepeatBurstEntry(
+        items.data(), count, minRemaining);
+    if (passes == 0 || passes > minRemaining) return false;
+    ++megaMultiBurstCalls_;
+    megaMultiBurstTurns_ += passes * count;
+    ++megaScalarBatchCalls_;
+    megaScalarBatchThreads_ += passes * count;
+    activeThread = runtime.threads[count - 1];
+    return true;
+}
+
+// Run a bounded number of pure repeat turns in ONE LLVM invocation,
+// exclusively inside stepThreads' outer clock-budget loop. Direct calls to
+// runSchedulerPass still execute exactly one Scratch turn per Thread.
+// This is opt-in because batching changes the granularity at which the
+// host can observe the script state within a headless scheduler tick.
+bool Sequencer::tryMegaRepeatBurst() {
+    static const bool enabled = [] {
+        const char* flag = std::getenv("XYO_JIT_MEGA_REPEAT_BURST");
+        const char* single = std::getenv("XYO_JIT_MEGA_SINGLE_DISPATCH");
+        const char* scan = std::getenv("XYO_JIT_MEGA_SINGLE_FAST_SCAN");
+        const char* proof = std::getenv("XYO_JIT_MEGA_SINGLE_PREPROVE");
+        return flag && flag[0] == '1' && flag[1] == '\0' &&
+               single && single[0] == '1' &&
+               scan && scan[0] == '1' &&
+               proof && proof[0] == '1';
+    }();
+    static const bool waitRegistry = [] {
+        const char* env = std::getenv("XYO_WAIT_WAKE_REGISTRY");
+        return env && env[0] == '1';
+    }();
+    if (!enabled || waitRegistry || runtime.renderer ||
+        runtime.blockCountEnabled ||
+        std::getenv("XYO_PROF") || std::getenv("XYO_TOPPROF") ||
+        std::getenv("XYO_TOPTRACE") ||
+        std::getenv("XYO_SCHED_READY_INDEX") ||
+        !runtime.waitQueue.empty() || !parBatch_.empty() ||
+        runtime.threads.size() != 1)
+        return false;
+    Thread* thread = runtime.threads[0];
+    if (!thread || !thread->megaDispatch || !thread->target ||
+        !thread->blockContainer || !thread->isCompiled ||
+        thread->status != STATUS_RUNNING || thread->stack.empty() ||
+        thread->isKilled || thread->stackClick || thread->updateMonitor ||
+        thread->jitCtx || thread->fiber || thread->interpreterStarted ||
+        thread->osrActive || thread->nestedOsrActive ||
+        thread->megaReturnDepth != 0 || thread->megaBroadcastPending ||
+        !thread->megaJoinRefs.empty() || thread->eventWaitArmed ||
+        thread->hasWarpTimer)
+        return false;
+    const auto code = thread->megaDispatch;
+    if (!code->directScalar || !code->multiPcSingleEntry ||
+        code->sourceBlocks != thread->blockContainer ||
+        code->sourceBlocks->revision() != code->sourceRevision)
+        return false;
+    const auto* compiled =
+        static_cast<const CompiledScript*>(thread->compiled);
+    if (!compiled || !compiled->entry || compiled->mainThread ||
+        compiled->wasm || compiled->coroResume ||
+        compiled->aotSourceRevision)
+        return false;
+    const uint32_t pc = thread->megaPc;
+    const uint32_t slot = pc / 2;
+    if ((pc & 1u) == 0 || thread->megaRemaining == 0 ||
+        slot >= code->entries ||
+        slot >= code->singleFastSourceKinds.size() ||
+        code->singleFastSourceKinds[slot] != 2 ||
+        slot >= code->repeatBurstEntries.size() ||
+        !code->repeatBurstEntries[slot] ||
+        slot >= code->multiPcRepetitions.size() ||
+        thread->megaRemaining > code->multiPcRepetitions[slot])
+        return false;
+    // Structural generations are verified BEFORE touching the cached
+    // Variable pointer: deleting and re-creating a variable invalidates
+    // the fast route, even if it reuses the original ID.
+    const auto stamp = thread->target->variableBindingStamp();
+    if (!thread->megaScalarBindingsReady ||
+        thread->megaBoundTarget != thread->target ||
+        thread->megaBoundStage != stamp.stage ||
+        thread->megaLocalGeneration != stamp.localGeneration ||
+        thread->megaStageGeneration != stamp.stageGeneration)
+        return false;
+    Variable* variable = thread->megaScalarBindings[0];
+    if (!variable || variable->type != Variable::kScalarType ||
+        !variable->value.isNumber() ||
+        !std::isfinite(variable->value.asNumberUnchecked()))
+        return false;
+    // The bounded LLVM loop rounds each FAdd in original order and stops
+    // after the first overflow, so the NEXT pass can take the ordinary
+    // Scratch numeric conversion path. At most 256 FAdds run without a
+    // host clock checkpoint or a chance to observe a new scheduler turn.
+    constexpr uint64_t kMaxBurst = 256;
+    const uint64_t budget = std::min(
+        kMaxBurst, thread->megaRemaining);
+    const uint64_t executed = code->repeatBurstEntries[slot](
+        variable, &thread->megaRemaining, budget);
+    ++megaRepeatBurstCalls_;
+    megaRepeatBurstTurns_ += executed;
+    ++megaScalarBatchCalls_;
+    megaScalarBatchThreads_ += executed;
+    activeThread = thread;
+    return executed > 0;
+}
+
 // Preserve active-list order while retiring completed script identities.
 // Thread reclamation remains owned by Runtime, not this compaction pass.
 void Sequencer::compactFinishedThreads(std::vector<Thread*>& doneThreads) {
+    static const bool profile = [] {
+        const char* env = std::getenv("XYO_SCHED_CLEANUP_PROFILE");
+        return env && env[0] == '1';
+    }();
+    const auto started = profile ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
+    const size_t initialSlots = runtime.threads.size();
+    size_t relocated = 0;
+    size_t removed = 0;
+    const auto record = [&] {
+        if (!profile) return;
+        ++cleanupProfile_.compactionCalls;
+        cleanupProfile_.scannedSlots += initialSlots;
+        cleanupProfile_.relocatedThreads += relocated;
+        cleanupProfile_.removedThreads += removed;
+        cleanupProfile_.compactionNs += uint64_t(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - started).count());
+    };
+    static const bool suffixCompaction = [] {
+        const char* value = std::getenv("XYO_SCHED_COMPACT_SUFFIX");
+        return value && value[0] == '1';
+    }();
+    // The live prefix never changes position, so in this optional path
+    // preserve its runtimeIndex without redundant writes. The first dead
+    // identity establishes the earliest possible destination for a move.
+    // Keep the original path for direct ON/OFF benchmarking.
     size_t nextActive = 0;
-    for (size_t i = 0; i < runtime.threads.size(); ++i) {
+    if (suffixCompaction) {
+        while (nextActive < runtime.threads.size()) {
+            Thread* t = runtime.threads[nextActive];
+            if (t->stack.empty() || t->status == STATUS_DONE) break;
+            // runtime.threads is public: an editor or embedder may
+            // rearrange its entries without fixing the index hints.
+            // The original compactor repairs every live prefix hint.
+            if (t->runtimeIndex != nextActive)
+                t->runtimeIndex = nextActive;
+            ++nextActive;
+        }
+        // Stopped-thread observations from the pass can be conservative;
+        // maintain the original epoch publication even when none is dead.
+        if (nextActive == runtime.threads.size()) {
+            runtime.invalidateSchedulerReadySet();
+            record();
+            return;
+        }
+    }
+    for (size_t i = nextActive; i < runtime.threads.size(); ++i) {
         Thread* t = runtime.threads[i];
         if (!t->stack.empty() && t->status != STATUS_DONE) {
+            if (profile && nextActive != i) ++relocated;
             t->runtimeIndex = nextActive;
             runtime.threads[nextActive++] = t;
         } else {
+            if (profile) ++removed;
             // Some interpreter stop paths set STATUS_DONE directly without
             // calling retireThread. Remove reverse watches before this
             // identity is reclaimed or recycled.
             runtime.untrackWaitDependencies(*t);
-            runtime.threadMap.erase(t->getId());
+            // Sample one in 64 completed identities to avoid making the
+            // full trace mostly clock calls. Keep all three operations
+            // exactly in the original order even when profiling.
+            const bool sample = profile &&
+                ((cleanupProfile_.removedThreads + removed) & 63u) == 0;
+            const auto startSample = sample ?
+                std::chrono::steady_clock::now() :
+                std::chrono::steady_clock::time_point{};
+            if (profile) {
+                const size_t size = runtime.threadMap.size();
+                if (size == 0) ++cleanupProfile_.mapSizeZero;
+                else if (size == 1) ++cleanupProfile_.mapSizeOne;
+                else if (size == 2) ++cleanupProfile_.mapSizeTwo;
+                else if (size <= 4) ++cleanupProfile_.mapSizeThreeToFour;
+                else ++cleanupProfile_.mapSizeFivePlus;
+            }
+            // A restarted receiver may replace the threadMap entry
+            // using the same ID before the old identity is retired.
+            // Erasing by key alone would accidentally delete the NEW
+            // receiver's mapping. Preserve entries not owned by t.
+            // For very small maps the hash of the concatenated Scratch
+            // script ID costs more than scanning a few already-live nodes.
+            // Check BOTH pointer identity and exact ID before erasing: a
+            // user can mutate the public threadMap or restart a receiver.
+            // Larger maps retain the existing O(1) hash lookup.
+            static const bool smallScan = [] {
+                const char* env = std::getenv(
+                    "XYO_SCHED_THREADMAP_SMALL_SCAN");
+                return env && env[0] == '1';
+            }();
+            size_t erased = 0;
+            if (smallScan && runtime.threadMap.size() <= 4) {
+                for (auto it = runtime.threadMap.begin();
+                     it != runtime.threadMap.end(); ++it) {
+                    if (it->second == t && it->first == t->getId()) {
+                        runtime.threadMap.erase(it);
+                        erased = 1;
+                        break;
+                    }
+                }
+            } else {
+                const auto mapped = runtime.threadMap.find(t->getId());
+                if (mapped != runtime.threadMap.end() &&
+                    mapped->second == t) {
+                    runtime.threadMap.erase(mapped);
+                    erased = 1;
+                }
+            }
+            const auto afterMap = sample ?
+                std::chrono::steady_clock::now() :
+                std::chrono::steady_clock::time_point{};
             t->releaseFinished();
+            const auto afterRelease = sample ?
+                std::chrono::steady_clock::now() :
+                std::chrono::steady_clock::time_point{};
             doneThreads.push_back(t);
+            if (profile) {
+                cleanupProfile_.mapEraseHits += erased;
+                if (sample) {
+                    const auto afterAppend = std::chrono::steady_clock::now();
+                    ++cleanupProfile_.sampledRemovals;
+                    cleanupProfile_.sampledMapNs += uint64_t(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            afterMap - startSample).count());
+                    cleanupProfile_.sampledReleaseNs += uint64_t(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            afterRelease - afterMap).count());
+                    cleanupProfile_.sampledAppendNs += uint64_t(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            afterAppend - afterRelease).count());
+                }
+            }
         }
     }
     runtime.threads.resize(nextActive);
     runtime.invalidateSchedulerReadySet();
+    record();
 }
 
 // Execute exactly one Scratch scheduler pass. Iteration deliberately observes
@@ -614,6 +1456,16 @@ size_t Sequencer::runSchedulerPass(
             readySlots_.size() * 2 <= readySlotsLength_;
         if (waitReadySleep && sparsePass) ++waitReadyStats_.sparsePasses;
         if (waitReadySleep) waitSleepCandidates_.clear();
+        // Most Scratch Threads have no Mega dispatcher at all. Do not
+        // call the large batch scanner unless the current identity owns
+        // Mega code. This is logically equivalent to the scanner's own
+        // early return, and changes neither scheduling order nor policy.
+        // Defaults ON after independent paired sched_threads A/B trials
+        // (10/10 wins). Set XYO_JIT_MEGA_SCHED_PREFILTER=0 to bisect.
+        static const bool megaSchedulerPrefilter = [] {
+            const char* flag = std::getenv("XYO_JIT_MEGA_SCHED_PREFILTER");
+            return !flag || flag[0] != '0';
+        }();
         size_t nextIndex = 0;
         size_t sparseCursor = 0;
         for (;;) {
@@ -634,6 +1486,23 @@ size_t Sequencer::runSchedulerPass(
                 i = nextIndex;
             }
             nextIndex = i + 1;
+            if (!sparsePass && !eventDriven &&
+                (!megaSchedulerPrefilter ||
+                 ((*stepping)[i] && (*stepping)[i]->megaDispatch))) {
+                // Do not enter the batch scanner for ordinary Threads.
+                // The native scanner still verifies everything about
+                // candidates including compiled code, wait state and PC.
+                size_t batchCount = 0;
+                size_t batchActive = 0;
+                bool batchStopped = false;
+                if (tryMegaScalarBatch(i, allowParallel, batchCount,
+                                       batchActive, batchStopped)) {
+                    nextIndex = i + batchCount;
+                    numActiveThreads += batchActive;
+                    stoppedThread |= batchStopped;
+                    continue;
+                }
+            }
             Thread* activeThread = this->activeThread = (*stepping)[i];
             if (activeThread->stack.empty() ||
                 activeThread->status == STATUS_DONE) {
@@ -777,10 +1646,44 @@ std::vector<Thread*> Sequencer::stepThreads() {
     size_t numActiveThreads = SIZE_MAX;
     bool ranFirstTick = false;
     const bool allowParallel = parallelEnabled();
+    static const bool repeatBurstRequested = [] {
+        const char* flag = std::getenv("XYO_JIT_MEGA_REPEAT_BURST");
+        return flag && flag[0] == '1' && flag[1] == '\0';
+    }();
+    static const bool multiBurstRequested = [] {
+        const char* flag = std::getenv("XYO_JIT_MEGA_MULTI_REPEAT_BURST");
+        return flag && flag[0] == '1' && flag[1] == '\0';
+    }();
 
     while (!runtime.threads.empty() && numActiveThreads > 0 &&
            timer.timeElapsed() < WORK_TIME &&
            (runtime.turboMode || !runtime.redrawRequested)) {
+        // Only the outer scheduler loop can legally coalesce successive
+        // passes: callers of runSchedulerPass observe its one-pass contract.
+        // A pure, isolated headless Thread cannot wake other scripts or
+        // request a redraw, and this loop rechecks its time budget after
+        // every bounded LLVM burst.
+        if (repeatBurstRequested && ranFirstTick && !eventDriven) {
+            // Most programs do not contain an all-repeat Mega group at
+            // all. Checking its *compiled* source certificate before
+            // entering the validator avoids a costly negative probe on
+            // every Scratch scheduler pass (notably sched_restart).
+            if (multiBurstRequested &&
+                runtime.threads.size() >= 2 &&
+                runtime.threads.size() <= 8) {
+                Thread* first = runtime.threads.front();
+                if (first && first->megaDispatch &&
+                    first->megaDispatch->multiRepeatBurstEntry &&
+                    tryMegaMultiRepeatBurst()) {
+                    numActiveThreads = runtime.threads.size();
+                    continue;
+                }
+            }
+            if (tryMegaRepeatBurst()) {
+                numActiveThreads = 1;
+                continue;
+            }
+        }
         numActiveThreads = runSchedulerPass(
             ranFirstTick, eventDriven, isolatedWatch, allowParallel,
             doneThreads);
@@ -2347,7 +3250,8 @@ void Sequencer::jitStepThread(Thread& thread) {
     // enter a native Fiber in fiberless mode. Only a fresh script may start
     // in the interpreter; never replay a mid-procedure/OSR continuation.
     if (jitFiberlessEnabled() && compiled && compiled->mayYield &&
-        !compiled->wasm && !thread.jitCtx && !thread.fiber &&
+        !compiled->wasm && !compiled->coroResume &&
+        !thread.jitCtx && !thread.fiber &&
         !thread.osrActive && !thread.nestedOsrActive &&
         !thread.interpreterStarted && thread.stack.size() == 1 &&
         thread.peekStack() == thread.topBlock) {
@@ -2552,6 +3456,349 @@ void Sequencer::jitStepThread(Thread& thread) {
         return;
     }
     JitCtx* c = thread.jitCtx;
+    if (const auto mega = thread.megaDispatch;
+        mega && mega->yieldEntry) {
+        auto& megaProfile = megaJoinProfile();
+        MegaStepProfile profileStep(megaProfile);
+        // A genuine multi-script stackless switch(pc). Each invocation
+        // commits at most ONE ordinary repeat body and returns to the
+        // existing Scratch scheduler. Every live value across the handoff
+        // is Thread-owned: no native stack, Fiber, GC heap pointer or
+        // hidden LLVM coroutine activation survives between calls.
+        const bool sourceCurrent = thread.target && thread.blockContainer &&
+            mega->sourceBlocks == thread.blockContainer &&
+            mega->sourceRevision == thread.blockContainer->revision();
+        const bool firstEntry = !c && thread.megaRemaining == 0 &&
+            thread.megaPc != UINT32_MAX &&
+            (thread.megaPc % 2) == 0 &&
+            thread.megaPc / 2 < mega->entries;
+        if (!sourceCurrent || thread.isKilled ||
+            thread.status == STATUS_DONE) {
+            if (!sourceCurrent && firstEntry && thread.target &&
+                thread.blockContainer) {
+                thread.megaDispatch.reset();
+                thread.isCompiled = false;
+                thread.compiled = nullptr;
+                stepThreadBound(thread, 0);
+            } else {
+                retireThread(thread);
+            }
+            return;
+        }
+        static const bool fastBroadcastLatch = [] {
+            const char* flag = std::getenv("XYO_JIT_MEGA_FAST_BCAST_LATCH");
+            return flag && flag[0] == '1' && flag[1] == '\0';
+        }();
+        static const bool normalizeMegaYield = [] {
+            const char* flag = std::getenv("XYO_JIT_MEGA_NORMALIZE_YIELD");
+            return flag && flag[0] == '1' && flag[1] == '\0';
+        }();
+        // Source-proven single *sender* repeat/broadcast case. The only
+        // effects before the final suffix are Runtime::startBroadcastAndWait
+        // and scheduler yields; the repeat latch is a Thread-owned integer.
+        // Do not allocate JitCtx or reenter LLVM for the intermediate
+        // repetitions. No return-PC stack, source reporter, GC-managed
+        // SSA value or borrowed Variable* can cross this handoff.
+        //
+        // The normal compiled switch still runs the FINAL suffix exactly
+        // once, with its existing binding-generation fallback. This lane
+        // never executes more than one logical Scratch broadcast per turn.
+        if (fastBroadcastLatch && mega->entries == 1 && !c &&
+            thread.megaReturnDepth == 0 && thread.megaPc <= 1 &&
+            mega->broadcastRepeatFastCounts.size() == 1 &&
+            mega->broadcastRepeatFastCounts[0] > 0 &&
+            mega->broadcastNames.size() == 1 &&
+            mega->broadcastNames[0].has_value()) {
+            if (thread.megaPc == 0) {
+                thread.megaRemaining = mega->broadcastRepeatFastCounts[0];
+                thread.megaPc = 1;
+            }
+            if (!thread.megaBroadcastPending) {
+                thread.megaBroadcastPending = true;
+                thread.megaJoinRefs = runtime.startBroadcastAndWait(
+                    *mega->broadcastNames[0]);
+                if (thread.isKilled || thread.status == STATUS_DONE ||
+                    !runtime.containsThread(&thread) ||
+                    !thread.blockContainer ||
+                    thread.blockContainer != mega->sourceBlocks ||
+                    thread.blockContainer->revision() !=
+                        mega->sourceRevision)
+                    return;
+            }
+            bool waiting = false;
+            bool allWaiting = true;
+            for (Thread* recipient : thread.megaJoinRefs) {
+                if (!runtime.containsThread(recipient)) continue;
+                waiting = true;
+                if (recipient->status != STATUS_PROMISE_WAIT &&
+                    recipient->status != STATUS_YIELD_TICK &&
+                    !recipient->stack.empty() &&
+                    recipient->status != STATUS_DONE)
+                    allWaiting = false;
+            }
+            if (waiting) {
+                // A fiberless sender must honor the same handoff contract
+                // as the ordinary JIT Fiber: STATUS_YIELD is normalized
+                // to RUNNING before runSchedulerPass counts active Threads.
+                // Otherwise the host exits a whole frame after *each*
+                // broadcast rather than continuing until the time budget.
+                // Tick-stuck recipients must remain YIELD_TICK.
+                thread.status = allWaiting
+                    ? STATUS_YIELD_TICK
+                    : (normalizeMegaYield ? STATUS_RUNNING : STATUS_YIELD);
+                return;
+            }
+            thread.megaJoinRefs.clear();
+            thread.megaBroadcastPending = false;
+            // Keep the exact Scratch repeat latch: a completed join
+            // decrements the counter once, and the next broadcast starts
+            // only on the next scheduler selection.
+            if (!thread.megaRemaining) {
+                retireThread(thread);
+                return;
+            }
+            if (--thread.megaRemaining > 0) {
+                thread.status = STATUS_RUNNING;
+                return;
+            }
+            // The LLVM resume case decrements one final repetition before
+            // entering the source-certified suffix. It needs a JitCtx only
+            // on this final turn, not for the preceding N-1 broadcasts.
+            thread.megaRemaining = 1;
+            c = acquireJitCtx();
+            c->thread = &thread;
+            c->target = thread.target;
+            c->runtime = &runtime;
+            c->sequencer = this;
+            c->fiber = nullptr;
+            c->compatEc = &thread.compatibilityStackFrame;
+            thread.jitCtx = c;
+            thread.jitVarCache.clear();
+            thread.megaScalarBindings.fill(nullptr);
+            mega->yieldEntry(c, &thread.megaPc, &thread.megaRemaining,
+                             thread.megaReturnPcs.data(),
+                             &thread.megaReturnDepth,
+                             thread.megaScalarBindings.data());
+            if (thread.megaPc != UINT32_MAX) {
+                retireThread(thread);
+            } else {
+                finishNative();
+            }
+            releaseJitCtx(c);
+            thread.jitCtx = nullptr;
+            thread.megaDispatch.reset();
+            return;
+        }
+        if (!c) {
+            c = acquireJitCtx();
+            c->thread = &thread;
+            c->target = thread.target;
+            c->runtime = &runtime;
+            c->sequencer = this;
+            c->fiber = nullptr;
+            c->compatEc = &thread.compatibilityStackFrame;
+            thread.jitCtx = c;
+        } else {
+            c->target = thread.target;
+        }
+        const auto binding = thread.target->variableBindingStamp();
+        if (thread.megaBoundTarget != thread.target ||
+            thread.megaBoundStage != binding.stage ||
+            thread.megaLocalGeneration != binding.localGeneration ||
+            thread.megaStageGeneration != binding.stageGeneration) {
+            // The native helper caches Variable* by id/name. A host may
+            // delete/recreate a variable while the Thread is suspended.
+            // Clear its lookup cache before the next generated scalar write.
+            thread.jitVarCache.clear();
+            thread.megaScalarBindingsReady = false;
+            thread.megaScalarBindings.fill(nullptr);
+            thread.megaBoundTarget = thread.target;
+            thread.megaBoundStage = binding.stage;
+            thread.megaLocalGeneration = binding.localGeneration;
+            thread.megaStageGeneration = binding.stageGeneration;
+        }
+        const uint32_t slot = thread.megaPc / 2;
+        if (mega->directScalar && !thread.megaScalarBindingsReady &&
+            slot < mega->scalarVariableIds.size()) {
+            // Do not speculatively create Scratch variables here. If a
+            // source binding is absent or not scalar, leave ALL slots null
+            // for the traditional helper. This prevents a slow-path
+            // creation from invalidating an earlier direct Variable*.
+            const auto& ids = mega->scalarVariableIds[slot];
+            bool valid = ids.size() <= thread.megaScalarBindings.size();
+            if (valid) {
+                for (size_t i = 0; i < ids.size(); ++i) {
+                    Variable* variable =
+                        thread.target->lookupVariableById(ids[i]);
+                    if (!variable ||
+                        variable->type != Variable::kScalarType) {
+                        valid = false;
+                        break;
+                    }
+                    thread.megaScalarBindings[i] = variable;
+                }
+            }
+            if (!valid) thread.megaScalarBindings.fill(nullptr);
+            thread.megaScalarBindingsReady = true;
+        }
+        const bool broadcastJoin = thread.megaPc != UINT32_MAX &&
+            slot < mega->broadcastNames.size() &&
+            mega->broadcastNames[slot].has_value();
+        if (broadcastJoin) {
+            // Exactly once per initial source PC. The compiled switch
+            // advances the sender to its odd 'resume-after-join' PC,
+            // without performing either broadcast or numeric suffix.
+            if ((thread.megaPc & 1u) == 0) {
+                const auto llvmTime = megaProfile.enabled
+                    ? MegaClock::now() : MegaClock::time_point{};
+                mega->yieldEntry(c, &thread.megaPc, &thread.megaRemaining,
+                                 thread.megaReturnPcs.data(),
+                                 &thread.megaReturnDepth,
+                                 thread.megaScalarBindings.data());
+                if (megaProfile.enabled) {
+                    ++megaProfile.llvmCalls;
+                    megaProfile.llvmNs += megaElapsedNs(llvmTime);
+                }
+                if (thread.megaPc != slot * 2 + 1 &&
+                    thread.megaPc != UINT32_MAX) {
+                    retireThread(thread);
+                    return;
+                }
+            }
+            // For the loop variant the odd resume PC survives multiple
+            // complete broadcast/join iterations. Explicit Thread state
+            // distinguishes a new launch from a pending joined receiver.
+            // Repeat(0) already executed its sole suffix in native code.
+            if (thread.megaPc != UINT32_MAX &&
+                !thread.megaBroadcastPending) {
+                thread.megaBroadcastPending = true;
+                c->joinRefs = &thread.megaJoinRefs;
+                const auto startTime = megaProfile.enabled
+                    ? MegaClock::now() : MegaClock::time_point{};
+                thread.megaJoinRefs = runtime.startBroadcastAndWait(
+                    *mega->broadcastNames[slot]);
+                if (megaProfile.enabled) {
+                    ++megaProfile.launches;
+                    megaProfile.launchNs += megaElapsedNs(startTime);
+                }
+                if (std::getenv("XYO_JIT_MEGA_BCAST_TRACE"))
+                    std::fprintf(stderr,
+                        "[mega-bcast] start %s refs=%zu pc=%u status=%d\n",
+                        thread.topBlock.c_str(), thread.megaJoinRefs.size(),
+                        thread.megaPc, thread.status);
+                // A broadcast receiver may stop/restart the sender while
+                // its hats are being launched. In that case retirement
+                // owns the JitCtx lifetime; do not borrow c afterwards.
+                if (thread.isKilled || thread.status == STATUS_DONE ||
+                    !runtime.containsThread(&thread)) return;
+            }
+            if (thread.megaPc != UINT32_MAX &&
+                !thread.megaJoinRefs.empty()) {
+                const auto pollTime = megaProfile.enabled
+                    ? MegaClock::now() : MegaClock::time_point{};
+                bool waiting = false;
+                bool allWaiting = true;
+                for (Thread* recipient : thread.megaJoinRefs) {
+                    if (runtime.containsThread(recipient)) {
+                        waiting = true;
+                        if (recipient->status != STATUS_PROMISE_WAIT &&
+                            recipient->status != STATUS_YIELD_TICK &&
+                            !recipient->stack.empty() &&
+                            recipient->status != STATUS_DONE)
+                            allWaiting = false;
+                    }
+                }
+                if (megaProfile.enabled) {
+                    ++megaProfile.polls;
+                    megaProfile.pollNs += megaElapsedNs(pollTime);
+                }
+                if (waiting) {
+                    thread.status = allWaiting
+                        ? STATUS_YIELD_TICK
+                        : (normalizeMegaYield ? STATUS_RUNNING : STATUS_YIELD);
+                    if (std::getenv("XYO_JIT_MEGA_BCAST_TRACE"))
+                        std::fprintf(stderr,
+                            "[mega-bcast] wait %s status=%d refs=%zu\n",
+                            thread.topBlock.c_str(), thread.status,
+                            thread.megaJoinRefs.size());
+                    return;
+                }
+                c->joinRefs = nullptr;
+                thread.megaJoinRefs.clear();
+            }
+            // Empty join: all recipients finished (or none launched).
+            // The post-join LLVM case either executes the one-shot suffix
+            // or decrements a repeat counter. A subsequent iteration must
+            // launch its OWN receivers on the next scheduler selection.
+            if (thread.megaPc != UINT32_MAX) {
+                c->joinRefs = nullptr;
+                thread.megaJoinRefs.clear();
+                thread.megaBroadcastPending = false;
+                // The certified fixed-work loop's NOT(a < b) can be
+                // checked directly after the joined receivers finish.
+                // On (a < b), the original LLVM branch would only
+                // return the odd launch PC without any Scratch effects.
+                // Return to the scheduler here instead of reentering LLVM.
+                // Every variable is resolved live; the receiver may have
+                // modified its value or the editor may have rebound it.
+                static const bool fastPairJoin = [] {
+                    const char* flag = std::getenv(
+                        "XYO_JIT_MEGA_FAST_VAR_PAIR_JOIN");
+                    return flag && flag[0] == '1' && flag[1] == '\0';
+                }();
+                if (fastPairJoin &&
+                    slot < mega->fixedJoinPairs.size() &&
+                    mega->fixedJoinPairs[slot] &&
+                    (thread.megaPc & 1u) &&
+                    thread.megaRemaining > 0) {
+                    const auto& pair = *mega->fixedJoinPairs[slot];
+                    Variable* left = thread.target->lookupVariableById(
+                        pair.leftId);
+                    Variable* right = thread.target->lookupVariableById(
+                        pair.rightId);
+                    if (left && right &&
+                        left->type == Variable::kScalarType &&
+                        right->type == Variable::kScalarType &&
+                        xyo_lt(left->value.bits, right->value.bits)) {
+                        thread.status = STATUS_RUNNING;
+                        return;
+                    }
+                }
+                if (std::getenv("XYO_JIT_MEGA_BCAST_TRACE"))
+                    std::fprintf(stderr,
+                        "[mega-bcast] resume %s pc=%u remaining=%llu status=%d\n",
+                        thread.topBlock.c_str(), thread.megaPc,
+                        static_cast<unsigned long long>(thread.megaRemaining),
+                        thread.status);
+                const auto llvmTime = megaProfile.enabled
+                    ? MegaClock::now() : MegaClock::time_point{};
+                mega->yieldEntry(c, &thread.megaPc, &thread.megaRemaining,
+                                 thread.megaReturnPcs.data(),
+                                 &thread.megaReturnDepth,
+                                 thread.megaScalarBindings.data());
+                if (megaProfile.enabled) {
+                    ++megaProfile.llvmCalls;
+                    megaProfile.llvmNs += megaElapsedNs(llvmTime);
+                }
+            }
+        } else {
+            mega->yieldEntry(c, &thread.megaPc, &thread.megaRemaining,
+                                 thread.megaReturnPcs.data(),
+                                 &thread.megaReturnDepth,
+                                 thread.megaScalarBindings.data());
+        }
+        if (thread.megaPc == UINT32_MAX || thread.isKilled ||
+            thread.status == STATUS_DONE ||
+            !runtime.isActiveThread(&thread)) {
+            finishNative();
+            releaseJitCtx(c);
+            thread.jitCtx = nullptr;
+            thread.megaDispatch.reset();
+        } else {
+            thread.status = STATUS_RUNNING;
+        }
+        return;
+    }
     if (!c) {
         const CompiledScript* cs =
             static_cast<const CompiledScript*>(thread.compiled);
@@ -2591,15 +3838,41 @@ void Sequencer::jitStepThread(Thread& thread) {
 #endif
             c->fiber = nullptr;
             c->warpStartMs = runtime.currentMSecs;
-            (thread.nestedOsrActive ? cs->nestedOsrEntry :
-             thread.osrActive ? cs->osrEntry : cs->entry)(c);
+            const auto mega = thread.megaDispatch;
+            if (mega && mega->entry &&
+                mega->sourceBlocks == thread.blockContainer &&
+                mega->sourceRevision == thread.blockContainer->revision() &&
+                thread.megaPc < mega->entries &&
+                !thread.osrActive && !thread.nestedOsrActive) {
+                mega->entry(c, thread.megaPc);
+            } else if (mega) {
+                // Any invalidated owner/revision/PC must fail closed before
+                // the first effect. Never silently call the old individual
+                // JIT entry when the shared batch's source stamp changed.
+                thread.megaDispatch.reset();
+                releaseJitCtx(c);
+                thread.jitCtx = nullptr;
+                thread.isCompiled = false;
+                thread.compiled = nullptr;
+                if (!thread.target || !thread.blockContainer) {
+                    retireThread(thread);
+                    return;
+                }
+                stepThreadBound(thread, 0);
+                return;
+            } else {
+                (thread.nestedOsrActive ? cs->nestedOsrEntry :
+                 thread.osrActive ? cs->osrEntry : cs->entry)(c);
+            }
             finishNative();
             releaseJitCtx(c);
             thread.jitCtx = nullptr;
             return;
         }
-        thread.fiber = FiberPool::acquire(jitEntry, c);
-        c->fiber = thread.fiber;
+        if (!cs->coroResume) {
+            thread.fiber = FiberPool::acquire(jitEntry, c);
+            c->fiber = thread.fiber;
+        }
     }
     // Bounded post-native-yield deopt. The Fiber is suspended precisely
     // AFTER a complete counted warp loop body and its promoted-variable
@@ -2826,11 +4099,115 @@ void Sequencer::jitStepThread(Thread& thread) {
             return;
         }
     }
+#if !defined(XYO_DISABLE_RT_PROF)
+    const auto& resumeProfile = nativeResumeBreakdown();
+    static thread_local uint64_t resumeSampleSerial = 0;
+    const bool resumeProfileSample = resumeProfile.enabled &&
+        (++resumeSampleSerial & 63u) == 0;
+    const auto nativeProfileBegin = resumeProfileSample
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+#endif
     c->target = thread.target;
-    c->sampledWarpClockUs = sampledWarpClock();
-    c->sampledWarpDeadlineUs = sampledWarpDeadline();
-    c->sampledUnixMs = sampledUnixClock();
-    c->sampledUnixDaysBits = sampledUnixDays();
+    static const bool bundleSampledClocks = [] {
+        const char* env = std::getenv("XYO_JIT_CLOCK_PTR_BUNDLE");
+        return env && env[0] == '1';
+    }();
+    if (bundleSampledClocks) {
+        // A single acquire of armed_ replaces four redundant checks of
+        // that same watchdog state. During one serial scheduler dispatch
+        // the watchdog object remains stable; its sampled atomic values
+        // are still read by native code at their original sites.
+        WarpClockWatchdog* clock = warpWatchdog_.get();
+        if (clock && clock->armed()) {
+            c->sampledWarpClockUs = &clock->sampledUs;
+            c->sampledWarpDeadlineUs = &clock->deadlineUs;
+            const bool wall = clock->samplesWallClock();
+            c->sampledUnixMs = wall ? &clock->sampledUnixMs : nullptr;
+            c->sampledUnixDaysBits = wall
+                ? &clock->sampledUnixDaysBits : nullptr;
+        } else {
+            c->sampledWarpClockUs = nullptr;
+            c->sampledWarpDeadlineUs = nullptr;
+            c->sampledUnixMs = nullptr;
+            c->sampledUnixDaysBits = nullptr;
+        }
+    } else {
+        c->sampledWarpClockUs = sampledWarpClock();
+        c->sampledWarpDeadlineUs = sampledWarpDeadline();
+        c->sampledUnixMs = sampledUnixClock();
+        c->sampledUnixDaysBits = sampledUnixDays();
+    }
+#if !defined(XYO_DISABLE_RT_PROF)
+    const auto nativeProfileAfterClock = resumeProfileSample
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+#endif
+    if (compiled && compiled->coroResume) {
+        // Only the strict direct-yield source proof enables this path.
+        // A previously committed coroutine must never restart the entry.
+        const bool currentSource =
+            thread.blockContainer == compiled->coroSourceBlocks &&
+            thread.blockContainer &&
+            thread.blockContainer->revision() == compiled->coroSourceRevision;
+        if (!currentSource || thread.isKilled || thread.status == STATUS_DONE) {
+            retireThread(thread);
+            return;
+        }
+        // The LLVM body holds borrowed Variable* slots across suspend.
+        // Structural edits can erase those pointees even if the Blocks
+        // revision is unchanged. Check the binding stamp BEFORE resume,
+        // without dereferencing any old Variable pointer.
+        const auto binding = thread.target->variableBindingStamp();
+        if (!c->coroHandle) {
+            c->coroBoundTarget = thread.target;
+            c->coroBoundStage = binding.stage;
+            c->coroLocalGeneration = binding.localGeneration;
+            c->coroStageGeneration = binding.stageGeneration;
+            c->coroDestroyFn = compiled->coroDestroy;
+            // A suspended coroutine keeps its live Values (including
+            // SStr/SList pointers) only in the heap frame. Scan the frame
+            // conservatively until the coroutine is destroyed.
+            Gc::get().removeRootProvider(c);
+            Gc::get().addRootProvider(c, [c](Gc& g) {
+                if (c->coroFrame && c->coroFrameSize)
+                    g.scanRange(
+                        c->coroFrame,
+                        static_cast<const char*>(c->coroFrame) +
+                            c->coroFrameSize);
+                // Recursive procedure coroutines keep their frames in the
+                // JitCtx list; scan every live one while suspended.
+                xyo_coro_scan_frames(c, g);
+            });
+            compiled->entry(c);
+        } else {
+            if (c->coroBoundTarget != thread.target ||
+                c->coroBoundStage != binding.stage ||
+                c->coroLocalGeneration != binding.localGeneration ||
+                c->coroStageGeneration != binding.stageGeneration) {
+                retireThread(thread);
+                return;
+            }
+            compiled->coroResume(c->coroHandle);
+        }
+        if (!c->coroHandle) {
+            // Fail closed: entry must publish a real coroutine handle.
+            retireThread(thread);
+            return;
+        }
+        if (compiled->coroDone(c->coroHandle) ||
+            thread.isKilled || thread.status == STATUS_DONE ||
+            !runtime.isActiveThread(&thread)) {
+            compiled->coroDestroy(c->coroHandle);
+            c->coroHandle = nullptr;
+            finishNative();
+            releaseJitCtx(c);
+            thread.jitCtx = nullptr;
+        } else if (thread.status == STATUS_YIELD) {
+            thread.status = STATUS_RUNNING;
+        }
+        return;
+    }
 #if !defined(XYO_DISABLE_RT_PROF)
     std::optional<ProfScope> ps;
     if (prof().enabled) { ps.emplace(&prof().fiberNs); ++prof().nFiber; }
@@ -2884,8 +4261,15 @@ void Sequencer::jitStepThread(Thread& thread) {
     } else {
         c->fiber->resume();
     }
-    if (c->fiber->finished() || thread.status == STATUS_DONE ||
-        thread.isKilled || !runtime.isActiveThread(&thread)) {
+#if !defined(XYO_DISABLE_RT_PROF)
+    const auto nativeProfileAfterFiber = resumeProfileSample
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+#endif
+    const bool nativeFinished = c->fiber->finished() ||
+        thread.status == STATUS_DONE || thread.isKilled ||
+        !runtime.isActiveThread(&thread);
+    if (nativeFinished) {
         // A thread may be restarted or stopped while it is the currently
         // executing fiber (e.g. a broadcast restarting its own hat). It
         // becomes unreachable after this resume returns even if it yielded:
@@ -2945,9 +4329,41 @@ void Sequencer::jitStepThread(Thread& thread) {
         // (sched_pingpong が scratch-vm の 1/2000)。
         thread.status = STATUS_RUNNING;
     }
+#if !defined(XYO_DISABLE_RT_PROF)
+    if (resumeProfileSample) {
+        const auto nativeProfileAfterPost = std::chrono::steady_clock::now();
+        auto& stats = nativeResumeBreakdown();
+        stats.calls.fetch_add(1, std::memory_order_relaxed);
+        if (nativeFinished)
+            stats.completed.fetch_add(1, std::memory_order_relaxed);
+        stats.clockNs.fetch_add(
+            (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                nativeProfileAfterClock - nativeProfileBegin).count(),
+            std::memory_order_relaxed);
+        stats.fiberNs.fetch_add(
+            (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                nativeProfileAfterFiber - nativeProfileAfterClock).count(),
+            std::memory_order_relaxed);
+        stats.postNs.fetch_add(
+            (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                nativeProfileAfterPost - nativeProfileAfterFiber).count(),
+            std::memory_order_relaxed);
+    }
+#endif
 }
 
 void Sequencer::retireThread(Thread& thread) {
+    static const bool profile = [] {
+        const char* env = std::getenv("XYO_SCHED_CLEANUP_PROFILE");
+        return env && env[0] == '1';
+    }();
+    const auto started = profile ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
+    if (thread.jitCtx && thread.jitCtx->joinRefs == &thread.megaJoinRefs)
+        thread.jitCtx->joinRefs = nullptr;
+    thread.megaJoinRefs.clear();
+    thread.megaBroadcastPending = false;
+    thread.megaReturnDepth = 0;
     runtime.untrackWaitDependencies(thread);
     thread.pendingShortBroadcast = false;
     // A killed async Fiber does not unwind the C++ reporter's stack.
@@ -2985,10 +4401,28 @@ void Sequencer::retireThread(Thread& thread) {
         thread.fiber = nullptr;
         releaseJitCtx(thread.jitCtx);
         thread.jitCtx = nullptr;
-    } else if (thread.jitCtx && thread.fiber != currentFiber()) {
-        // fiber 無し・ctx あり（通常あり得ないが安全のため）
+    } else if (thread.jitCtx &&
+               (!thread.fiber || thread.fiber != currentFiber()) &&
+               // The JIT frame that is currently executing on this stack
+               // (plain entry or stackless coroutine) cannot be released by
+               // its own retire path: the generated code still reads its
+               // JitCtx (stopAll retires the caller too). Defer to the
+               // post-entry path or ~Thread, exactly like the current Fiber.
+               this->activeThread != &thread) {
+        // A suspended stackless LLVM coroutine also owns a heap frame.
+        if (thread.jitCtx->coroHandle) {
+            if (thread.jitCtx->coroDestroyFn)
+                thread.jitCtx->coroDestroyFn(thread.jitCtx->coroHandle);
+            thread.jitCtx->coroHandle = nullptr;
+        }
         releaseJitCtx(thread.jitCtx);
         thread.jitCtx = nullptr;
+    }
+    if (profile) {
+        ++cleanupProfile_.retirementCalls;
+        cleanupProfile_.retirementNs += uint64_t(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - started).count());
     }
 }
 
@@ -3105,6 +4539,55 @@ Sequencer::ParFlush Sequencer::flushParBatch() {
         return r;
     };
 
+    // An already-initialized, worker-safe native Fiber can be resumed
+    // without the intermediate C++ scheduler boundary. Both the existing
+    // all-writer case and the optional generic single-component case use
+    // exactly this proof; neither starts a new Fiber nor skips a Scratch
+    // yield. Do not chain source/GC handoff or profiler activations.
+    const auto tryResumeExistingChain = [&]() -> bool {
+        static const bool chainEnabled = [] {
+            const char* env = std::getenv("XYO_FIBER_CHAIN");
+            return !env || env[0] != '0';
+        }();
+        if (!chainEnabled || batch.size() < 2) return false;
+#if !defined(XYO_DISABLE_RT_PROF)
+        if (prof().enabled) return false;
+#endif
+        auto& fibers = parFibers_;
+        fibers.clear();
+        for (Thread* t : batch) {
+            // Only worker-safe scripts are collected into parBatch_, and
+            // serial barriers flush the batch before any restart/spawn.
+            if (!t->isCompiled || !t->jitCtx || !t->fiber ||
+                t->fiber->finished() || t->isKilled ||
+                !runtime.isActiveThread(t) ||
+                (t->status != STATUS_RUNNING &&
+                 t->status != STATUS_YIELD)) return false;
+            t->jitCtx->target = t->target;
+            t->jitCtx->sampledWarpClockUs = sampledWarpClock();
+            t->jitCtx->sampledWarpDeadlineUs = sampledWarpDeadline();
+            t->jitCtx->sampledUnixMs = sampledUnixClock();
+            t->jitCtx->sampledUnixDaysBits = sampledUnixDays();
+            fibers.push_back(t->fiber);
+        }
+        ++parStats_.chainedPasses;
+        Fiber::resumeChain(fibers.data(), fibers.size());
+        for (Thread* t : batch) {
+            JitCtx* c = t->jitCtx;
+            if (t->fiber->finished() || t->status == STATUS_DONE ||
+                t->isKilled || !runtime.isActiveThread(t)) {
+                t->status = STATUS_DONE;
+                t->stack.clear();
+                FiberPool::release(c->fiber);
+                t->fiber = nullptr;
+                releaseJitCtx(c);
+                t->jitCtx = nullptr;
+            } else if (t->status == STATUS_YIELD) {
+                t->status = STATUS_RUNNING;
+            }
+        }
+        return true;
+    };
     if (batch.size() == 1) {
         jitStepThread(*batch[0]);
         return finish();
@@ -3138,58 +4621,9 @@ Sequencer::ParFlush Sequencer::flushParBatch() {
                 ++prof().parBatches;
             }
 #endif
-            // All scripts are serialized anyway. Once their fibers have
-            // started, run a direct fiber-to-fiber round-robin pass. Newborn
-            // scripts and profiler runs retain the ordinary scheduler.
-            static const bool chainEnabled = [] {
-                const char* env = std::getenv("XYO_FIBER_CHAIN");
-                return !env || env[0] != '0';
-            }();
-            bool chained = chainEnabled && batch.size() >= 2;
-#if !defined(XYO_DISABLE_RT_PROF)
-            chained = chained && !prof().enabled;
-#endif
-            auto& fibers = parFibers_;
-            fibers.clear();
-            if (chained) {
-                for (Thread* t : batch) {
-                    // A preceding serial script may have replaced a receiver.
-                    // Validate identity, not hat type. Within this worker-safe
-                    // batch no script can spawn/restart/stop another thread;
-                    // serial barriers are always flushed before entering it.
-                    if (!t->isCompiled || !t->jitCtx || !t->fiber ||
-                        t->fiber->finished() || t->isKilled ||
-                        !runtime.isActiveThread(t) ||
-                        (t->status != STATUS_RUNNING && t->status != STATUS_YIELD)) {
-                        chained = false;
-                        break;
-                    }
-                    t->jitCtx->target = t->target;
-                    t->jitCtx->sampledWarpClockUs = sampledWarpClock();
-                    t->jitCtx->sampledWarpDeadlineUs = sampledWarpDeadline();
-                    t->jitCtx->sampledUnixMs = sampledUnixClock();
-                    t->jitCtx->sampledUnixDaysBits = sampledUnixDays();
-                    fibers.push_back(t->fiber);
-                }
-            }
-            if (chained) {
-                ++parStats_.chainedPasses;
-                Fiber::resumeChain(fibers.data(), fibers.size());
-                for (Thread* t : batch) {
-                    JitCtx* c = t->jitCtx;
-                    if (t->fiber->finished() || t->status == STATUS_DONE ||
-                        t->isKilled || !runtime.isActiveThread(t)) {
-                        t->status = STATUS_DONE;
-                        t->stack.clear();
-                        FiberPool::release(c->fiber);
-                        t->fiber = nullptr;
-                        releaseJitCtx(c);
-                        t->jitCtx = nullptr;
-                    } else if (t->status == STATUS_YIELD) {
-                        t->status = STATUS_RUNNING;
-                    }
-                }
-            } else {
+            // Existing serialized writer path: same native chain proof as
+            // before, now shared with generic graph components.
+            if (!tryResumeExistingChain()) {
                 for (Thread* t : batch) jitStepThread(*t);
             }
             return finish();
@@ -3216,8 +4650,24 @@ Sequencer::ParFlush Sequencer::flushParBatch() {
     }
 #endif
     if (groups.size() <= 1) {
-        // 全員が同一衝突成分 — バッチ順に直列
-        for (Thread* t : batch) jitStepThread(*t);
+        // Even if there is no single common writer, the whole conflict
+        // graph can have one component. Preserve the original batch order
+        // and use the identical native-only chain proof as the writer case.
+        // Disabled by default until parity and paired benchmarks complete.
+        static const bool chainGenericComponent = [] {
+            const char* env = std::getenv("XYO_FIBER_CHAIN_COMPONENT");
+            return env && env[0] == '1';
+        }();
+        if (chainGenericComponent)
+            ++parStats_.genericComponentCandidates;
+        const bool chained = chainGenericComponent &&
+                             tryResumeExistingChain();
+        if (chained) {
+            ++parStats_.genericComponentChained;
+            parStats_.genericComponentThreads += batch.size();
+        } else {
+            for (Thread* t : batch) jitStepThread(*t);
+        }
         return finish();
     }
 

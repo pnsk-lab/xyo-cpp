@@ -534,6 +534,7 @@ void Gc::collectIfNeeded() {
 }
 
 void Gc::removeRootProvider(void* owner) {
+    std::lock_guard<std::mutex> lk(rootMtx_);
     for (auto it = rootProviders_.begin(); it != rootProviders_.end(); ++it) {
         if (it->owner == owner) { rootProviders_.erase(it); return; }
     }
@@ -678,7 +679,10 @@ void Gc::collect() {
 #endif
     }
 
-    for (auto& rp : rootProviders_) rp.fn(*this);
+    {
+        std::lock_guard<std::mutex> lk(rootMtx_);
+        for (auto& rp : rootProviders_) rp.fn(*this);
+    }
     // 根から辿った子を反復で消化（マーク中の再帰を無くす）
     drainPending();
 

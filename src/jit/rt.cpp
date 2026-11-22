@@ -144,6 +144,46 @@ std::unordered_map<std::string, uint64_t>& compatOps() {
 }
 #endif  // !XYO_DISABLE_RT_PROF
 
+#if !defined(XYO_DISABLE_RT_PROF)
+// Thread-local for worker-safe observation and no extra atomic traffic on
+// the native scheduler path. The production Release build compiles all
+// counters out. This is a *behavior census*, not a wall-clock profiler.
+struct BroadcastJoinCensus {
+    bool enabled = [] {
+        const char* flag = std::getenv("XYO_BCAST_JOIN_CENSUS");
+        return flag && flag[0] == '1' && flag[1] == '\0';
+    }();
+    uint64_t calls = 0, noReceivers = 0, single = 0, multi = 0;
+    uint64_t testedPasses = 0, yields = 0, tickYields = 0;
+    uint64_t activeYields = 0, warpBusyPasses = 0;
+    uint64_t joined0 = 0, joined1 = 0, joinedMany = 0;
+    uint64_t maxYields = 0;
+    ~BroadcastJoinCensus() {
+        if (enabled)
+            std::fprintf(stderr,
+                "[bcast-census] calls=%llu empty=%llu single=%llu "
+                "multi=%llu join_checks=%llu yields=%llu "
+                "tick=%llu active=%llu warp_busy=%llu "
+                "completed_0=%llu completed_1=%llu completed_many=%llu "
+                "max_yields=%llu\n",
+                (unsigned long long)calls,
+                (unsigned long long)noReceivers,
+                (unsigned long long)single,
+                (unsigned long long)multi,
+                (unsigned long long)testedPasses,
+                (unsigned long long)yields,
+                (unsigned long long)tickYields,
+                (unsigned long long)activeYields,
+                (unsigned long long)warpBusyPasses,
+                (unsigned long long)joined0,
+                (unsigned long long)joined1,
+                (unsigned long long)joinedMany,
+                (unsigned long long)maxYields);
+    }
+};
+thread_local BroadcastJoinCensus broadcastJoinCensus;
+#endif
+
 } // namespace
 
 extern "C" {
@@ -158,6 +198,10 @@ uint64_t xyo_gc_epoch() {
 // --- 基本 -------------------------------------------------------------
 
 void xyo_yield(JitCtx* c) {
+    // Synchronous Mega-batch workers have no Fiber. Their scripts are
+    // admitted only when every reachable yield is a cooperative warp-budget
+    // check (CompiledScript::cooperativeOnly), so skipping it is sound.
+    if (!c->fiber) return;
     // A soft budget request may only be published at an actual native
     // source-authenticated AfterLoopBody checkpoint with independently
     // retained generated-string SSA roots. This never authorizes an
@@ -546,6 +590,45 @@ double xyo_mathop(JitCtx*, int32_t fn, double x) {
     }
 }
 
+// operator_mathop の op 別エントリ。MLIR がコンパイル時に op を確定できる
+// とき、switch を省いて直接呼ぶ（Scratch の丸め規則は xyo_mathop と同一）。
+namespace {
+constexpr double kPiDeg = 3.14159265358979323846;
+}
+double xyo_math_abs(JitCtx*, double x) { return std::fabs(x); }
+double xyo_math_floor(JitCtx*, double x) { return std::floor(x); }
+double xyo_math_ceil(JitCtx*, double x) { return std::ceil(x); }
+double xyo_math_sqrt(JitCtx*, double x) { return std::sqrt(x); }
+double xyo_math_sin(JitCtx*, double x) {
+    if (x == 0.0) return 0.0;
+    return jsnum::jsRound(v8math::sin(kPiDeg * x / 180.0) * 1e10) / 1e10;
+}
+double xyo_math_cos(JitCtx*, double x) {
+    return jsnum::jsRound(v8math::cos(kPiDeg * x / 180.0) * 1e10) / 1e10;
+}
+double xyo_math_tan(JitCtx*, double x) {
+    double a = std::fmod(x, 360.0);
+    if (a == 0.0) return 0.0;
+    if (a == -270.0 || a == 90.0) return INFINITY;
+    if (a == -90.0 || a == 270.0) return -INFINITY;
+    return jsnum::jsRound(std::tan(kPiDeg * a / 180.0) * 1e10) / 1e10;
+}
+double xyo_math_asin(JitCtx*, double x) {
+    return v8math::asin(x) * 180.0 / kPiDeg;
+}
+double xyo_math_acos(JitCtx*, double x) {
+    return v8math::acos(x) * 180.0 / kPiDeg;
+}
+double xyo_math_atan(JitCtx*, double x) {
+    return v8math::atan(x) * 180.0 / kPiDeg;
+}
+double xyo_math_ln(JitCtx*, double x) { return jsnum::jsLog(x); }
+double xyo_math_log(JitCtx*, double x) {
+    return jsnum::jsLog(x) / 2.302585092994046;
+}
+double xyo_math_exp(JitCtx*, double x) { return v8math::exp(x); }
+double xyo_math_pow10(JitCtx*, double x) { return std::pow(10.0, x); }
+
 double xyo_round(double x) {
     XYO_RT_PROF(kArith);
     // Scratch round: JS Math.round（.5 は +Infinity 方向、-0 を保持）
@@ -780,6 +863,53 @@ uint64_t xyo_var_get(JitCtx* c, const char* id, const char16_t* name) {
     return v ? toB(v->value) : toB(Value::undefined());
 }
 
+// Source-certified ScratchBench bench_end("sched_pingpong", 1).
+// This helper is reached only when the Mega source proof has checked
+// every procedure, reporter, argument binding, and the append-list target.
+// It executes synchronously and never suspends; temporary Scratch strings
+// therefore stay in native C++ stack locals until the list owns the result.
+// The original external "​​log​​ %s" call has no definition in this SB3,
+// which is a mandatory source-proof condition.
+void xyo_mega_bench_end(JitCtx* c) {
+    if (!c || !c->target) return;
+    Variable* output = c->target->lookupVariableById("output");
+    if (!output || output->type != Variable::kListType) return;
+    // All intermediate Value strings are local, not VM root slots.
+    // Gc::alloc may synchronously collect at a threshold, so defer it
+    // until the completed message is anchored in output->list.
+    Gc::DeferCollect deferGc;
+    const Value one = Value::numCanonical(1.0);
+    const Value thousand = Value::numCanonical(1000.0);
+    const Value separator = Value::string(SStr::create(u" | "));
+    const auto read = [c](const char* id, const char16_t* name) {
+        return toV(xyo_var_get(c, id, name));
+    };
+    const auto mul = [](Value a, Value b) {
+        return Value::numCanonical(cast::toNumber(a) * cast::toNumber(b));
+    };
+    const auto div = [](Value a, Value b) {
+        return Value::numCanonical(cast::toNumber(a) / cast::toNumber(b));
+    };
+    const auto roundThree = [&](Value value) {
+        return div(Value::numCanonical(jsnum::jsRound(
+            cast::toNumber(mul(value, thousand)))), thousand);
+    };
+    Value text = Value::string(SStr::create(u"sched_pingpong"));
+    const auto append = [&](Value part) {
+        text = rt::join(rt::join(text, separator), part);
+    };
+    append(roundThree(read("b_total", u"b_total")));
+    append(mul(read("b_chunks", u"b_chunks"), one));
+    append(roundThree(div(
+        mul(read("b_chunks", u"b_chunks"), one),
+        read("b_total", u"b_total"))));
+    append(roundThree(mul(read("b_bestrate", u"b_bestrate"), one)));
+    append(read("b_chk", u"b_chk"));
+    if (!output->list) output->list = SList::create();
+    output->list->push(text);
+    output->list->monitorDirty = true;
+}
+
 // Generated LLVM stores bypass xyo_var_set/xyo_var_change. This callback
 // receives the currently resolved scalar Variable* from varSlot(), never a
 // cached pointer from the reverse dependency registry.
@@ -847,6 +977,43 @@ void xyo_rt_wait(JitCtx* c, double secs) {
     }
 }
 
+// Fiber-less `wait`: the generated code calls begin once, then polls and
+// suspends through the ordinary yield point. The Fiber path uses the same
+// helpers, so both engines share the exact semantics.
+void xyo_wait_begin(JitCtx* c, double secs) {
+    XYO_RT_PROF(kOther);
+    c->waitStartMs = c->runtime->currentMSecs;
+    c->waitDurationMs = std::max(0.0, secs * 1000.0);
+    c->waitImmediate = c->isWarp ? 0 : 1;
+    c->runtime->redrawRequested = true;
+}
+
+int32_t xyo_wait_poll(JitCtx* c) {
+    if (c->waitImmediate) {
+        c->waitImmediate = 0;
+        return 1;
+    }
+    if (!(c->runtime->currentMSecs - c->waitStartMs < c->waitDurationMs))
+        return 0;
+    return waitShouldYield(c) ? 1 : 0;
+}
+
+void xyo_stop_all_begin(JitCtx* c) {
+    XYO_RT_PROF(kOther);
+    // stopAll() retires this thread as part of the sweep; the generated
+    // code returns immediately afterwards (retireThread defers the frame).
+    // The flag also unwinds callers of a procedure that contained the stop.
+    c->stopped = 1;
+    c->runtime->stopAll();
+    c->runtime->transitionThread(*c->thread, STATUS_DONE);
+}
+
+void xyo_stop_script_begin(JitCtx* c) {
+    XYO_RT_PROF(kOther);
+    c->stopped = 1;
+    c->runtime->transitionThread(*c->thread, STATUS_DONE);
+}
+
 void xyo_stop_all(JitCtx* c) {
     XYO_RT_PROF(kOther);
     c->runtime->stopAll();
@@ -882,8 +1049,13 @@ void xyo_broadcast_v(JitCtx* c, uint64_t v) {
     c->sequencer->runtime.startBroadcast(name);
 }
 
-void xyo_broadcast_wait_v(JitCtx* c, uint64_t v) {
-    XYO_RT_PROF(kOther);
+// The only difference between a boxed, runtime-evaluated input and a
+// compiler-certified literal is the *ownership* of the UTF-16 buffer.
+// This single join implementation preserves receiver identity, scheduling,
+// wait/yield, Unicode Stage lookup and nested GC roots in both cases.
+static void broadcastWaitName(
+    JitCtx* c, std::u16string_view name,
+    const std::u16string* dynamicOwned = nullptr) {
     // event_broadcastandwait 相当: hats 起動 → 全スレッド終了まで待機
     Runtime* rt = c->runtime;
     // Broadcast subscriptions are already indexed by their uppercase
@@ -891,7 +1063,6 @@ void xyo_broadcast_wait_v(JitCtx* c, uint64_t v) {
     // variables has no effect on the recipient set, but adds a linear
     // search to every event. Preserve the old lookup for non-ASCII names:
     // Unicode upper/lower casing is not always reversible.
-    std::u16string name(cast::toString(toV(v))->view());
     static const bool fastAscii = [] {
         const char* setting = std::getenv("XYO_BCAST_FAST_ASCII");
         return !setting || setting[0] != '0';
@@ -903,15 +1074,37 @@ void xyo_broadcast_wait_v(JitCtx* c, uint64_t v) {
     Variable* var = nullptr;
     if (!ascii) {
         Target* stage = rt->getTargetForStage();
-        var = stage ? stage->lookupBroadcastMsg("", name) : nullptr;
+        // The original dynamic path already owns the GC-safe string.
+        // Reuse it rather than allocating a second copy for Unicode.
+        // Immutable JIT literals use a temporary only on this rare
+        // non-ASCII canonicalization branch.
+        if (stage) {
+            var = dynamicOwned
+                ? stage->lookupBroadcastMsg("", *dynamicOwned)
+                : stage->lookupBroadcastMsg("", std::u16string(name));
+        }
     }
     std::vector<Thread*> started =
         rt->startBroadcastAndWait(var ? var->name : name);
+#if !defined(XYO_DISABLE_RT_PROF)
+    auto& census = broadcastJoinCensus;
+    const bool measure = census.enabled;
+    if (measure) {
+        ++census.calls;
+        if (started.empty()) ++census.noReceivers;
+        else if (started.size() == 1) ++census.single;
+        else ++census.multi;
+    }
+    uint64_t yielded = 0;
+#endif
     // The original Fiber stack owns the join-list through every yield;
     // the journal is only involved in the first receiver launch.
     if (started.empty()) return;
     c->joinRefs = &started;   // 回収側から見えるように（完了スレッドを守る）
     for (;;) {
+#if !defined(XYO_DISABLE_RT_PROF)
+        if (measure) ++census.testedPasses;
+#endif
         bool waiting = false, allWaiting = true;
         for (Thread* t : started) {
             if (rt->containsThread(t)) {
@@ -925,14 +1118,136 @@ void xyo_broadcast_wait_v(JitCtx* c, uint64_t v) {
             }
         }
         if (!waiting) break;
-        if (!allWaiting && c->isWarp && !waitShouldYield(c)) continue;
+        if (!allWaiting && c->isWarp && !waitShouldYield(c)) {
+#if !defined(XYO_DISABLE_RT_PROF)
+            if (measure) ++census.warpBusyPasses;
+#endif
+            continue;
+        }
         // yield / yieldTick — status はスレッドに立ててから fiber 中断
         c->thread->status =
             allWaiting ? STATUS_YIELD_TICK : STATUS_YIELD;
+#if !defined(XYO_DISABLE_RT_PROF)
+        if (measure) {
+            ++yielded;
+            ++census.yields;
+            if (allWaiting) ++census.tickYields;
+            else ++census.activeYields;
+        }
+#endif
         xyo_yield(c);
     }
+#if !defined(XYO_DISABLE_RT_PROF)
+    if (measure) {
+        if (!yielded) ++census.joined0;
+        else if (yielded == 1) ++census.joined1;
+        else ++census.joinedMany;
+        census.maxYields = std::max(census.maxYields, yielded);
+    }
+#endif
     c->joinRefs = nullptr;
     c->thread->status = STATUS_RUNNING;
+}
+
+void xyo_broadcast_wait_v(JitCtx* c, uint64_t v) {
+    XYO_RT_PROF(kOther);
+    // Dynamic Scratch reporters can refer to a GC-managed SStr, which may
+    // be collected while receivers are launched or the caller Fiber yields.
+    // Retain the original owned copy for this general path.
+    const std::u16string name(cast::toString(toV(v))->view());
+    broadcastWaitName(c, name, &name);
+}
+
+void xyo_broadcast_wait_lit(JitCtx* c,
+                            const char16_t* literal, uint32_t length) {
+    XYO_RT_PROF(kOther);
+    // The pointer refers to an immutable LLVM i16 global *owned by the JIT
+    // object*, not a GC-managed SStr or a mutable Scratch variable. It
+    // remains valid for the entire compiled entry (including Fiber yields).
+    // Only source-certified constant-string reporter values may call here.
+    broadcastWaitName(c, std::u16string_view(literal, length));
+}
+
+// Fiber-less broadcast-and-wait: begin launches the receivers and keeps
+// the join list on the heap (visible through JitCtx::joinRefs so the GC
+// retains finished Thread objects), step reports whether the caller must
+// suspend. 0 = done, 1 = yield, 2 = busy (warp budget not exhausted).
+static void broadcastWaitBegin(JitCtx* c, std::u16string_view name,
+                               const std::u16string* dynamicOwned = nullptr) {
+    Runtime* rt = c->runtime;
+    static const bool fastAscii = [] {
+        const char* setting = std::getenv("XYO_BCAST_FAST_ASCII");
+        return !setting || setting[0] != '0';
+    }();
+    const bool ascii = fastAscii &&
+        rt->stageBroadcastNamesAsciiOnly() &&
+        std::all_of(name.begin(), name.end(),
+            [](char16_t ch) { return ch < 128; });
+    Variable* var = nullptr;
+    if (!ascii) {
+        Target* stage = rt->getTargetForStage();
+        if (stage) {
+            var = dynamicOwned
+                ? stage->lookupBroadcastMsg("", *dynamicOwned)
+                : stage->lookupBroadcastMsg("", std::u16string(name));
+        }
+    }
+    std::vector<Thread*> started =
+        rt->startBroadcastAndWait(var ? var->name : name);
+#if !defined(XYO_DISABLE_RT_PROF)
+    auto& census = broadcastJoinCensus;
+    if (census.enabled) {
+        ++census.calls;
+        if (started.empty()) ++census.noReceivers;
+        else if (started.size() == 1) ++census.single;
+        else ++census.multi;
+    }
+#endif
+    if (started.empty()) {
+        c->joinRefs = nullptr;
+        c->coroJoinRefs = nullptr;
+        return;
+    }
+    auto* list = new std::vector<Thread*>(std::move(started));
+    c->coroJoinRefs = list;
+    c->joinRefs = list;
+}
+
+int32_t xyo_bcastwait_step(JitCtx* c) {
+    if (!c->coroJoinRefs) return 0;
+    Runtime* rt = c->runtime;
+    bool waiting = false, allWaiting = true;
+    for (Thread* t : *c->coroJoinRefs) {
+        if (rt->containsThread(t)) {
+            waiting = true;
+            if (t->status != STATUS_PROMISE_WAIT &&
+                t->status != STATUS_YIELD_TICK &&
+                !t->stack.empty() && t->status != STATUS_DONE)
+                allWaiting = false;
+        }
+    }
+    if (!waiting) {
+        delete c->coroJoinRefs;
+        c->coroJoinRefs = nullptr;
+        c->joinRefs = nullptr;
+        c->thread->status = STATUS_RUNNING;
+        return 0;
+    }
+    if (!allWaiting && c->isWarp && !waitShouldYield(c)) return 2;
+    c->thread->status = allWaiting ? STATUS_YIELD_TICK : STATUS_YIELD;
+    return 1;
+}
+
+void xyo_bcastwait_begin_v(JitCtx* c, uint64_t v) {
+    XYO_RT_PROF(kOther);
+    const std::u16string name(cast::toString(toV(v))->view());
+    broadcastWaitBegin(c, name, &name);
+}
+
+void xyo_bcastwait_begin_lit(JitCtx* c,
+                                const char16_t* literal, uint32_t length) {
+    XYO_RT_PROF(kOther);
+    broadcastWaitBegin(c, std::u16string_view(literal, length));
 }
 
 double xyo_timer(JitCtx* c) {
@@ -1000,6 +1315,22 @@ uint64_t xyo_rt_compat(JitCtx* c, const BlockCached* op) {
 #endif
     Thread* t = c->thread;
     BlockUtility& util = jitUtil(c);
+    // 拡張プリミティブが opcode とインスタンスを見つけられるようにする。
+    // ネストした compat 呼び出しでも壊れないよう、呼出し中だけ差し替える。
+    struct ScopedPrimitiveContext {
+        BlockUtility& util;
+        const BlockCached* savedOp;
+        void* savedContext;
+        ScopedPrimitiveContext(BlockUtility& u, const BlockCached* op)
+            : util(u), savedOp(u.op), savedContext(u.primitiveContext) {
+            util.op = op;
+            util.primitiveContext = op->primitiveContext;
+        }
+        ~ScopedPrimitiveContext() {
+            util.op = savedOp;
+            util.primitiveContext = savedContext;
+        }
+    } scopedContext(util, op);
     ExecContext ec;
     // プリミティブが stackFrame() を要求したとき合成 EC を返す
     util.jitCompatEc = &ec;
@@ -1027,6 +1358,12 @@ uint64_t xyo_rt_compat(JitCtx* c, const BlockCached* op) {
         }
         if (c->blockCounter && op->blockFunction)
             ++c->pendingBlockCount;
+        // 別ファイバの compat が util を上書きしている可能性があるため、
+        // 再開後は自分の合成 EC / 現在オペを設定し直してから再評価する
+        // （broadcast-and-wait は待機中に他スレッドの compat が走る）。
+        util.jitCompatEc = &ec;
+        util.op = op;
+        util.primitiveContext = op->primitiveContext;
         rv = op->blockFunction
             ? op->blockFunction(op->argValues, util)
             : Value::undefined();
@@ -1798,14 +2135,80 @@ void xyo_proc_frame_checkpoint_path_phase(
 /// JS では procedures_call のスタックフレームが呼出し中残り、
 /// isRecursiveCall（同一 proccode 検出で再帰 yield）や warpMode
 /// 継承がこれを参照する — ネイティブ呼出しでも同じ形を再現する。
-void xyo_proc_push(JitCtx* c, const char* blockId, const BlockCached* op,
-                   int32_t defWarp, const char* procedureCode,
-                   int32_t nestedBranchDepth, int32_t mayRecurse) {
+// --- 手続きコルーチン（yield from）のフレーム管理 ----------------------
+// 各フレームは呼出し元のコルーチンフレーム内の SSA から参照されるだけで、
+// GC からは見えない。停止中は handle/size を JitCtx のリンクリストに
+// 登録し、Sequencer の root provider が conservatively 走査する。
+std::mutex& coroFrameMutex() {
+    static std::mutex m;
+    return m;
+}
+
+extern "C" void xyo_coro_push_frame(JitCtx* c, void* handle, uint64_t size) {
+    if (!c || !handle) return;
+    auto* node = new CoroFrameNode{handle, size, nullptr};
+    std::lock_guard<std::mutex> lk(coroFrameMutex());
+    node->next = c->coroFrames;
+    c->coroFrames = node;
+    ++c->coroDepth;
+}
+
+extern "C" void* xyo_coro_top_frame(JitCtx* c) {
+    std::lock_guard<std::mutex> lk(coroFrameMutex());
+    return c && c->coroFrames ? c->coroFrames->handle : nullptr;
+}
+
+extern "C" void xyo_coro_pop_frame(JitCtx* c, void* handle) {
+    if (!c) return;
+    std::lock_guard<std::mutex> lk(coroFrameMutex());
+    CoroFrameNode** pp = &c->coroFrames;
+    while (*pp) {
+        if ((*pp)->handle == handle) {
+            CoroFrameNode* node = *pp;
+            *pp = node->next;
+            delete node;
+            if (c->coroDepth) --c->coroDepth;
+            return;
+        }
+        pp = &(*pp)->next;
+    }
+}
+
+void xyo_coro_clear_frames(JitCtx* c) {
+    if (!c) return;
+    std::lock_guard<std::mutex> lk(coroFrameMutex());
+    while (c->coroFrames) {
+        CoroFrameNode* node = c->coroFrames;
+        c->coroFrames = node->next;
+        delete node;
+    }
+    c->coroDepth = 0;
+}
+
+void xyo_coro_scan_frames(JitCtx* c, Gc& g) {
+    if (!c) return;
+    std::lock_guard<std::mutex> lk(coroFrameMutex());
+    for (CoroFrameNode* n = c->coroFrames; n; n = n->next) {
+        if (n->handle && n->size)
+            g.scanRange(n->handle,
+                        static_cast<const char*>(n->handle) + n->size);
+    }
+}
+
+/// 再帰呼び出しで実際に yield すべきか（`xyo_loop_yield` と同じ判定）。
+extern "C" int32_t xyo_recursion_yield_due(JitCtx* c) {
+    return (!c->isWarp || nativeGcSoftBudgetDue(c) || isStuck(c)) ? 1 : 0;
+}
+
+/// `xyo_proc_push` の拡張版。`deferYield` が 1 のときは内部で yield せず、
+/// 再帰呼び出しだったかを返す（生成コードが xyo_yield を直接呼ぶ）。
+extern "C" int32_t xyo_proc_push_ex(JitCtx* c, const char* blockId,
+                                    const BlockCached* op, int32_t defWarp,
+                                    const char* procedureCode,
+                                    int32_t nestedBranchDepth,
+                                    int32_t mayRecurse, int32_t deferYield) {
     XYO_RT_PROF(kProc);
     Thread* t = c->thread;
-    // Scratch thread.isRecursiveCall examines only six ancestors, including
-    // structural control blocks. Native JIT does not materialize those branch
-    // frames, so account for their depth at this particular source callsite.
     bool recursive = false;
     if (mayRecurse && !defWarp && nestedBranchDepth <= 5) {
         int remaining = 6 - nestedBranchDepth;
@@ -1823,18 +2226,24 @@ void xyo_proc_push(JitCtx* c, const char* blockId, const BlockCached* op,
     }
     t->pushStack(blockId);
     if (StackFrame* sf = t->peekStackFrame()) {
-        // JS stepToProcedure: warpMode は親から継承し、定義が warp なら
-        // 昇格 — 非 warp 定義では降格しない（呼出し時点の isWarp は
-        // まだ呼出し元の値なので定義側フラグと OR する）。
         sf->warpMode = c->isWarp != 0 || defWarp != 0;
         sf->op = op;
     }
-    // Match Scratch Sequencer.stepToProcedure: yield *after* pushing the
-    // procedure frame, then execute its body when this thread resumes.
-    if (recursive) xyo_loop_yield(c);
+    if (recursive && !deferYield) xyo_loop_yield(c);
+    return recursive ? 1 : 0;
+}
+
+void xyo_proc_push(JitCtx* c, const char* blockId, const BlockCached* op,
+                   int32_t defWarp, const char* procedureCode,
+                   int32_t nestedBranchDepth, int32_t mayRecurse) {
+    (void)xyo_proc_push_ex(c, blockId, op, defWarp, procedureCode,
+                           nestedBranchDepth, mayRecurse, 0);
 }
 void xyo_proc_pop(JitCtx* c) {
     Thread* t = c->thread;
+    // A `stop all` inside a procedure retires the thread and clears its
+    // logical stack; the generated unwind still reaches this pop.
+    if (!t || t->stackFrames.empty() || t->stack.empty()) return;
     t->popStack();
     // JIT フレームはネイティブ呼出し境界内で完結（execute() の
     // currentStackFrame 等の外部生ポインタが跨がない）— reset して
@@ -1844,7 +2253,7 @@ void xyo_proc_pop(JitCtx* c) {
         f->reset();
         t->framePool.push_back(std::move(f));
     }
-    t->trashFrames.pop_back();
+    if (!t->trashFrames.empty()) t->trashFrames.pop_back();
 }
 
 /// compat 入力: ブロック id の報告値をインタプリタで評価する。

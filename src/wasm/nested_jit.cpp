@@ -93,6 +93,11 @@ bool numericExpressionsOnly(const Program& p) {
         case EK::And:
         case EK::Or:
         case EK::Not:
+        case EK::Timer:
+        case EK::MouseX:
+        case EK::MouseY:
+        case EK::MouseDown:
+        case EK::Loudness:
             break;
         default:
             return false;

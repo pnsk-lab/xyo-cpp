@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -166,6 +167,20 @@ inline bool jitFiberlessEnabled() {
 
 using ScriptFn = void (*)(struct JitCtx*);
 
+// Runtime helpers for procedure coroutines (implemented in rt.cpp).
+class Gc;
+extern "C" void xyo_coro_clear_frames(struct JitCtx* c);
+extern "C" void xyo_coro_scan_frames(struct JitCtx* c, Gc& g);
+
+/// A suspended procedure-coroutine frame owned by the caller's coroutine
+/// ("yield from"): the callee stores its handle here so the caller can
+/// resume/destroy it and the GC can scan its live SSA values.
+struct CoroFrameNode {
+    void* handle;
+    uint64_t size;
+    CoroFrameNode* next;
+};
+
 /// JIT コードと C++ ランタイムの橋渡しコンテキスト。
 /// レイアウトは生成コードから直接参照される（ABI 契約）。
 struct JitCtx {
@@ -207,6 +222,9 @@ struct JitCtx {
     /// 非 null）。完了スレッドの回収（Runtime::reclaimThreads）が生ポインタ
     /// 参照を辿るために公開する — 生成コードは触らない。
     std::vector<Thread*>* joinRefs;
+    // Heap-owned receiver list for a fiber-less broadcast-and-wait.
+    // joinRefs points at it while the wait is active.
+    std::vector<Thread*>* coroJoinRefs = nullptr;
 
     /// Monotonic time sampled asynchronously by the Sequencer watchdog.
     /// Null outside stepThreads() or when using a custom clock; those paths
@@ -271,6 +289,40 @@ struct JitCtx {
     uint64_t layqPolls = 0;
     uint64_t layqTaken = 0;
     uint64_t layqQSum = 0;
+    // Optional LLVM switched-resume frame, owned by this live JitCtx.
+    // Set once by the coroutine entry. Never points into a Fiber stack.
+    void* coroHandle = nullptr;
+    // Heap-owned coroutine frame. Suspended SSA values live only in this
+    // range, so the scheduler scans it conservatively as a GC root.
+    void* coroFrame = nullptr;
+    uint64_t coroFrameSize = 0;
+    // Nested procedure coroutine frames (recursive yield-from calls).
+    CoroFrameNode* coroFrames = nullptr;
+    uint32_t coroDepth = 0;
+    // Poll-based Scratch `wait` state (fiber-less continuations).
+    double waitStartMs = 0;
+    double waitDurationMs = 0;
+    uint8_t waitImmediate = 0;
+    // Poll-based glide state.
+    double glideStartMs = 0;
+    double glideDurationMs = 0;
+    double glideStartX = 0;
+    double glideStartY = 0;
+    double glideEndX = 0;
+    double glideEndY = 0;
+    uint8_t glideFirst = 0;
+    uint8_t glideInfinite = 0;
+    uint8_t glideActive = 0;
+    // The generated entry borrows native Variable* slots. Every resume
+    // must validate the complete local/stage binding generation before
+    // machine code can touch one of those borrowed pointers.
+    const Target* coroBoundTarget = nullptr;
+    const Target* coroBoundStage = nullptr;
+    uint64_t coroLocalGeneration = 0;
+    uint64_t coroStageGeneration = 0;
+    // Stored together with the heap frame so Thread retirement never
+    // dereferences a possibly invalidated CompiledScript metadata pointer.
+    void (*coroDestroyFn)(void*) = nullptr;
 };
 
 /// Publish an entire execution slice with one atomic RMW, including when a
@@ -310,6 +362,102 @@ extern "C" Variable* xyo_varslot_checked(JitCtx* c, uint64_t idx,
 // inline generation guard. Returns null for stage targets.
 extern "C" const Target* xyo_varslot_guard_stage(JitCtx* c);
 
+// Experimental cross-script mega dispatcher. The generated LLVM function
+// contains a switch(pc) and inlined bodies for several independent,
+// non-yielding Scratch scripts. Per-Thread JitCtx is still authoritative.
+struct MegaDispatchCode {
+    using Entry = void (*)(JitCtx*, uint32_t pc);
+    // One call executes up to one ordinary Scratch repeat iteration.
+    // pc is the next case to execute; UINT32_MAX denotes completion.
+    // The bounded return-PC stack and depth belong to the Scratch Thread.
+    // All pointers point into that Thread for the duration of this call.
+    using YieldEntry = void (*)(JitCtx*, uint32_t* pc, uint64_t* remaining,
+                                uint32_t* returnPcs, uint32_t* returnDepth,
+                                Variable** scalarBindings);
+    Entry entry = nullptr;
+    YieldEntry yieldEntry = nullptr;
+    // One native invocation for a consecutive, source-certified one-shot
+    // scalar receiver run. Inputs are validated, numeric Variable* only.
+    using ScalarBatchEntry = void (*)(Variable** variables, uint64_t count);
+    ScalarBatchEntry scalarBatchEntry = nullptr;
+    // Optional source-certified single-item entries. These keep the same
+    // Scratch scheduler turn semantics and require the same host proof.
+    using ScalarSingleEntry = void (*)(Variable* variable);
+    ScalarSingleEntry scalarSingleEntry = nullptr;
+    // Mixed one-shot / counted-repeat batch. Each native invocation advances
+    // each supplied Scratch Thread by at most one scheduler turn.
+    // Keep this ABI independent of the (non-standard-layout) Thread object.
+    struct MultiPcItem {
+        Variable* variable = nullptr;
+        Variable* secondVariable = nullptr;
+        // Additional operand for a source-certified numeric if/else.
+        // The first/second Variable* are its then/else write targets.
+        Variable* conditionVariable = nullptr;
+        Variable* thenSecondVariable = nullptr;
+        Variable* elseSecondVariable = nullptr;
+        uint32_t* pc = nullptr;
+        uint64_t* remaining = nullptr;
+    };
+    using MultiPcBatchEntry = void (*)(MultiPcItem* items, uint64_t count);
+    MultiPcBatchEntry multiPcBatchEntry = nullptr;
+    using MultiPcSingleEntry = void (*)(MultiPcItem* item);
+    MultiPcSingleEntry multiPcSingleEntry = nullptr;
+    // For each source slot: 0 = one-shot, 1 = counted repeat.
+    std::vector<uint8_t> multiPcKinds;
+    std::vector<uint64_t> multiPcRepetitions;
+    std::vector<bool> multiPcSecondChanges;
+    std::vector<bool> multiPcConditionals;
+    std::vector<bool> multiPcElseBranches;
+    std::vector<bool> multiPcThenSecondChanges;
+    std::vector<bool> multiPcElseSecondChanges;
+    // Compiler-certified single-variable source shape. 0 = unsupported,
+    // 1 = scalar one-shot, 2 = counted repeat. Runtime must still validate
+    // PC/remaining, Thread state, source revision and binding generations.
+    std::vector<uint8_t> singleFastSourceKinds;
+    // Optional source-specific strict-FP repeat runahead entry. Bounded
+    // by the scheduler's outer work-time loop; never called from a single
+    // runSchedulerPass() so its one-turn contract remains unchanged.
+    // Returns the number of exact ordered FAdds, stopping on overflow.
+    using RepeatBurstEntry = uint64_t (*)(Variable* variable,
+                                          uint64_t* remaining,
+                                          uint64_t maxIterations);
+    std::vector<RepeatBurstEntry> repeatBurstEntries;
+    // Run multiple certified pure-repeat Threads in original scheduler
+    // order, with one LLVM call spanning multiple complete scheduler passes.
+    // The host limits the pass count to the minimum remaining repeat count.
+    using MultiRepeatBurstEntry = uint64_t (*)(
+        MultiPcItem* items, uint64_t count, uint64_t maxPasses);
+    MultiRepeatBurstEntry multiRepeatBurstEntry = nullptr;
+    // Source-certified number of ordered scalar writes per repeat turn.
+    // Only populated if *all* sources in the Mega group are pure repeats,
+    // with exactly one or two direct numerical writes and no other effects.
+    std::vector<uint8_t> multiRepeatSourceArity;
+    Blocks* sourceBlocks = nullptr;
+    uint64_t sourceRevision = 0;
+    uint32_t entries = 0;
+    // Nullopt: numeric repeat. UTF-16: exact, source-certified broadcast
+    // message. The script must launch the message exactly once at its
+    // initial even PC; subsequent odd PCs resume only the join.
+    std::vector<std::optional<std::u16string>> broadcastNames;
+    // Nonzero only for exact source-proven broadcast-and-wait inside a
+    // constant-count non-warp repeat, with NO procedure return suffix.
+    // The host can then advance intermediate post-join latches without
+    // entering LLVM or allocating JitCtx; final suffix still uses LLVM.
+    std::vector<uint64_t> broadcastRepeatFastCounts;
+    // Optional source-certified live scalar pair for the repeat-until
+    // post-join continuation. Metadata contains IDs only; no cached
+    // Variable* may cross a scheduler yield or survive source mutation.
+    struct FixedJoinPair {
+        std::string leftId;
+        std::string rightId;
+    };
+    std::vector<std::optional<FixedJoinPair>> fixedJoinPairs;
+    // Direct scalar LLVM beta: one body binding plus ordered caller
+    // suffix bindings per switch slot. Resolved on the owning Thread.
+    std::vector<std::vector<std::string>> scalarVariableIds;
+    bool directScalar = false;
+};
+
 /// コンパイル済みスクリプト（target->blocks 共有 — クローン間で共有可）
 struct CompiledScript {
     ScriptFn entry = nullptr;
@@ -323,6 +471,11 @@ struct CompiledScript {
     std::unordered_map<std::string, ScriptFn> procedures;
     /// 生成コード内に yield 点が存在するか。false なら fiber なしで同期実行可。
     bool mayYield = true;
+    /// All reachable yields are cooperative warp-budget checks (no waits,
+    /// broadcasts, non-warp loops). Such a script may join the synchronous
+    /// Mega batch even though `mayYield` is true; a batch worker has no
+    /// Fiber, so those budget yields are skipped there.
+    bool cooperativeOnly = false;
     // A bounded, synchronous script executes faster in scheduler order than
     // through a dependency graph and worker dispatch. Calculated once from
     // the script's structural scan, never from benchmark names or input.
@@ -330,6 +483,10 @@ struct CompiledScript {
     /// Compat/reporter fallbacks or AOT-owned GPU programs require the caller
     /// thread even when opcode-level dependency analysis looks compute-only.
     bool mainThread = false;
+    /// Emitted by the MLIR-style frontend (src/mlir). Its yield/return shape is
+    /// already final, so the backend must not re-shape it (mega fusion or
+    /// stackless coroutine lowering would rewrite the wrong call sites).
+    bool mlirFrontend = false;
     // v3 only: all cached slots used by this script and its procedures.
     // Descriptor lifetime belongs to JitEngine::Impl.
     std::vector<AotLazyCachedSlot*> aotLazyWorkerSlots;
@@ -380,6 +537,20 @@ struct CompiledScript {
     // A nonzero sourceRevision requires exact owner and revision equality.
     Blocks* aotSourceBlocks = nullptr;
     uint64_t aotSourceRevision = 0;
+    // Native LLVM switched-resume coroutine. Only published for scripts
+    // with a verified direct-yield control flow and no suspending helpers.
+    // ScriptFn entry initializes coroHandle and runs the first slice.
+    using CoroResume = void (*)(void*);
+    using CoroDone = bool (*)(void*);
+    CoroResume coroResume = nullptr;
+    CoroDone coroDone = nullptr;
+    CoroResume coroDestroy = nullptr;
+    Blocks* coroSourceBlocks = nullptr;
+    uint64_t coroSourceRevision = 0;
+    // Opt-in mega-partial: number of Scratch procedure call sites
+    // inlined before the standard LLVM optimization pipeline.
+    // Diagnostic metadata only; never part of JitCtx or native ABI.
+    uint32_t megaPartialInlined = 0;
 };
 
 class JitEngine {
@@ -404,6 +575,13 @@ public:
     // Experimental: precompile a small number of expensive broadcast hats
     // before any user script starts. Only queues work, never executes blocks.
     void prefetchWarpBroadcasts(Runtime& runtime);
+    // Beta: combine already compiled, non-yielding green-flag scripts on the
+    // same target into one LLVM switch(pc) function. Never changes order.
+    void installMegaDispatch(Runtime& runtime);
+    // Beta opt-in: attach one stackless LLVM switch(pc) to a freshly started
+    // set of broadcast-and-wait receivers, preserving exact Thread identities.
+    void installMegaBroadcastReceivers(
+        Runtime& runtime, const std::vector<Thread*>& started);
     // Only for an interpreter thread that has executed no Scratch block yet.
     // Native AOT v3 requires a *current* source Blocks owner. If omitted,
     // only ordinary (non-AOT) JIT code can be returned.
@@ -484,6 +662,16 @@ private:
     };
     /// トップ Block* → コンパイル結果（Block は Blocks 所有でポインタ安定）
     std::unordered_map<const void*, ScriptEntry> cache_;
+    // Source-certified mega-batch for green flags and event receivers.
+    // Reuse the ORC switch(pc) when the source owner, source revision and
+    // ordered hat IDs match; clone Targets may share one Blocks owner.
+    struct MegaBatchCache {
+        Blocks* source = nullptr;
+        uint64_t revision = 0;
+        std::vector<std::string> topIds;
+        std::shared_ptr<MegaDispatchCode> code;
+    };
+    std::vector<MegaBatchCache> megaBatchCache_;
     // START-015: active native Fibers may still borrow CompiledScript*
     // after invalidate(). Retain v3 code objects until engine shutdown;
     // invalidate their source stamps so no old code is dispatched again.

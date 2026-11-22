@@ -219,6 +219,29 @@ private:
         c_.return_();
     }
 
+    /// Bail unless the tagged i64 local holds a Scratch number (kNan is a
+    /// number). Recursion frames must never retain unrooted heap strings:
+    /// a later host helper may allocate and sweep the GC while the frame
+    /// still holds the raw pointer.
+    void guardNumberBits(uint32_t local) {
+        c_.localGet(local);
+        c_.i64Const(48);
+        c_.i64ShrU();
+        c_.i64Const(0xFFF8);
+        c_.i64And();
+        c_.i64Const(0x7FF8);
+        c_.i64Eq();
+        c_.i32Eqz();
+        c_.localGet(local);
+        c_.i64Const(int64_t(xyo::val::kNan));
+        c_.i64Eq();
+        c_.i32Or();
+        c_.i32Eqz();
+        c_.if_();
+        bail();
+        c_.end();
+    }
+
     /// f64 を 1 つ消費し、NaN を 0 に落として 1 つ残す。
     void nanToZero() {
         c_.localSet(kTmp);                                  // x
@@ -333,6 +356,25 @@ private:
             c_.i64Load(3, scratch);
             return;
         }
+        if (e.k == EK::MouseDown) {
+            // Preserve Scratch's boolean tag at tagged boundaries even
+            // though the numeric emitter represents it as 0/1 f64.
+            const uint32_t num = nextLocal(ValType::F64);
+            emitExpr(idx);
+            c_.localSet(num);
+            c_.i64Const(int64_t(val::kTrue));
+            c_.i64Const(int64_t(val::kFalse));
+            c_.localGet(num);
+            c_.f64Const(0.0);
+            c_.f64Ne();
+            c_.select();
+            return;
+        }
+        if (e.k == EK::Username || e.k == EK::ColorConst) {
+            // emitExpr already returns the tagged value bits.
+            emitExpr(idx);
+            return;
+        }
         if (e.k == EK::ListGet) {
             if (!p_.useHostMath) {
                 bail();
@@ -445,7 +487,8 @@ private:
             kind == EK::ProcedureArgument ||
             kind == EK::ListGet || kind == EK::ListContents ||
             kind == EK::ConstText || kind == EK::StringJoin ||
-            kind == EK::StringLetter;
+            kind == EK::StringLetter || kind == EK::Username ||
+            kind == EK::ColorConst;
         if (!tagged || !p_.useHostMath) {
             emitExpr(idx);
             truthy();
@@ -498,6 +541,9 @@ private:
     void emitExpr(uint32_t idx) {
         const Expr& e = p_.exprs[idx];
         switch (e.k) {
+        case EK::ColorConst:
+            c_.i64Const(int64_t(e.bits));
+            return;
         case EK::ConstNum:
             c_.f64Const(e.num);
             return;
@@ -573,6 +619,7 @@ private:
             c_.localSet(kBits);
             emitImmediateToNumber();
             return;
+        case EK::Timer:
         case EK::DaysSince2000: {
             if (!p_.useHostMath) {
                 bail();
@@ -581,7 +628,7 @@ private:
             }
             const uint32_t scratch = uint32_t(
                 (p_.slotIds.size() + 1) * sizeof(uint64_t));
-            c_.i32Const(15);
+            c_.i32Const(e.k == EK::Timer ? 27 : 15);
             c_.localGet(0);
             c_.i32Const(int32_t(scratch));
             c_.i32Add();
@@ -591,6 +638,78 @@ private:
             requireGuard(ir::GuardReason::NumericValue);
             c_.localGet(0);
             c_.f64Load(3, scratch);
+            return;
+        }
+        case EK::Loudness:
+        case EK::MouseX:
+        case EK::MouseY: {
+            if (!p_.useHostMath) {
+                bail();
+                c_.f64Const(0.0);
+                return;
+            }
+            const uint32_t scratch = uint32_t(
+                (p_.slotIds.size() + 1) * sizeof(uint64_t));
+            c_.i32Const(e.k == EK::Loudness ? 31
+                       : (e.k == EK::MouseX ? 28 : 29));
+            c_.localGet(0);
+            c_.i32Const(int32_t(scratch));
+            c_.i32Add();
+            c_.i32Const(0);
+            c_.call(hostHelper_);
+            c_.i32Eqz();
+            requireGuard(ir::GuardReason::NumericValue);
+            c_.localGet(0);
+            c_.f64Load(3, scratch);
+            return;
+        }
+        case EK::Username: {
+            if (!p_.useHostMath) {
+                bail();
+                c_.i64Const(int64_t(val::kEmptyStr));
+                return;
+            }
+            const uint32_t scratch = uint32_t(
+                (p_.slotIds.size() + 1) * sizeof(uint64_t));
+            c_.i32Const(32);
+            c_.localGet(0);
+            c_.i32Const(int32_t(scratch));
+            c_.i32Add();
+            c_.i32Const(0);
+            c_.call(hostHelper_);
+            c_.i32Eqz();
+            c_.i32Eqz();
+            c_.if_();
+            bail();
+            c_.end();
+            c_.localGet(0);
+            c_.i64Load(3, scratch);
+            return;
+        }
+        case EK::MouseDown: {
+            // Numeric consumers (if/comparisons/arithmetic) receive 0/1;
+            // emitTaggedExpr converts to a tagged boolean where the exact
+            // Scratch tag is observable (join, boolean assignment).
+            if (!p_.useHostMath) {
+                bail();
+                c_.f64Const(0.0);
+                return;
+            }
+            const uint32_t scratch = uint32_t(
+                (p_.slotIds.size() + 1) * sizeof(uint64_t));
+            c_.i32Const(30);
+            c_.localGet(0);
+            c_.i32Const(int32_t(scratch));
+            c_.i32Add();
+            c_.i32Const(0);
+            c_.call(hostHelper_);
+            c_.i32Eqz();
+            requireGuard(ir::GuardReason::NumericValue);
+            c_.localGet(0);
+            c_.i64Load(3, scratch);
+            c_.i64Const(int64_t(xyo::val::kTrue));
+            c_.i64Eq();
+            c_.f64ConvertI32U();
             return;
         }
         case EK::ListLength:
@@ -1142,6 +1261,60 @@ private:
                 argumentLocals_.erase(arg);
             return;
         }
+        case SK::Effect: {
+            // Commit-only terminal effect. Nothing may bail after the host
+            // call: a rollback would replay the effect in the interpreter.
+            if (!p_.useHostMath || s.expr >= p_.exprs.size()) {
+                bail();
+                return;
+            }
+            const uint32_t scratch = uint32_t(
+                (p_.slotIds.size() + 1) * sizeof(uint64_t));
+            if (s.var == 22) {
+                emitTaggedExpr(s.expr);
+                const uint32_t tagged = nextLocal(ValType::I64);
+                c_.localSet(tagged);
+                c_.localGet(0);
+                c_.i32Const(int32_t(scratch));
+                c_.i32Add();
+                c_.localGet(tagged);
+                c_.i64Store(3, 0);
+            } else {
+                emitExpr(s.expr);
+                c_.localSet(kTmp);
+                c_.localGet(0);
+                c_.i32Const(int32_t(scratch));
+                c_.i32Add();
+                c_.localGet(kTmp);
+                c_.f64Store(3, 0);
+            }
+            c_.i32Const(40);
+            c_.localGet(0);
+            c_.i32Const(int32_t(scratch));
+            c_.i32Add();
+            int32_t effectCode = int32_t(s.var);
+            const int32_t kind = int32_t(s.extraExpr & 7);
+            switch (s.var) {
+            case 14: effectCode = 20 + kind; break;
+            case 15: effectCode = 30 + kind; break;
+            case 16: effectCode = 50 + kind; break;
+            case 17: effectCode = 60 + kind; break;
+            case 18: effectCode = 70; break;
+            case 19: effectCode = 71; break;
+            case 20: effectCode = 72; break;
+            case 21: effectCode = 73; break;
+            case 22: effectCode = 74; break;
+            default: break;
+            }
+            c_.i32Const(effectCode);
+            c_.call(hostHelper_);
+            c_.i32Eqz();
+            c_.i32Eqz();
+            c_.if_();
+            bail();
+            c_.end();
+            return;
+        }
         case SK::SetVar:
             emitExpr(s.expr);
             storeF64(s.var);
@@ -1185,8 +1358,9 @@ private:
         case SK::WarpReturnPcStack: {
             const size_t nArgs = s.argumentSlots.size();
             const size_t nSites = s.returnSites.size();
-            if (!p_.allowBoundedConditionalLoop || nSites == 0 ||
-                nSites > 2 || nArgs > 2 || s.elseBody.empty()) {
+            if ((!p_.allowBoundedConditionalLoop && !p_.allowBoundedRecursion) ||
+                nSites == 0 ||
+                nSites > 8 || nArgs > 8 || s.elseBody.empty()) {
                 bail();
                 return;
             }
@@ -1295,6 +1469,7 @@ private:
                     emitTaggedExpr(expr);
                     const uint32_t local = nextLocal(ValType::I64);
                     c_.localSet(local);
+                    guardNumberBits(local);
                     nextArgs.push_back(local);
                 }
                 for (size_t arg = 0; arg < nArgs; ++arg) {
@@ -1352,7 +1527,8 @@ private:
             return;
         }
         case SK::WarpReturnStack: {
-            if (!p_.allowBoundedConditionalLoop || s.body.empty() ||
+            if ((!p_.allowBoundedConditionalLoop && !p_.allowBoundedRecursion) ||
+                s.body.empty() ||
                 s.elseBody.empty() || !s.argumentExprs.empty() ||
                 !s.argumentSlots.empty()) {
                 bail();
@@ -1406,7 +1582,7 @@ private:
             return;
         }
         case SK::WarpTailRecurse: {
-            if (!p_.allowBoundedConditionalLoop ||
+            if ((!p_.allowBoundedConditionalLoop && !p_.allowBoundedRecursion) ||
                 s.argumentExprs.size() != s.argumentSlots.size()) {
                 bail();
                 return;
@@ -1449,6 +1625,7 @@ private:
                     emitTaggedExpr(argExpr);
                     const uint32_t fresh = nextLocal(ValType::I64);
                     c_.localSet(fresh);
+                    guardNumberBits(fresh);
                     nextArguments.push_back(fresh);
                 }
                 for (size_t i = 0; i < nextArguments.size(); ++i) {
@@ -1655,7 +1832,8 @@ std::vector<uint8_t> compileProgram(const Program& p) {
         if ((stmt.k == SK::WarpTailRecurse ||
              stmt.k == SK::WarpReturnStack ||
              stmt.k == SK::WarpReturnPcStack) &&
-            !p.allowBoundedConditionalLoop) return {};
+            !p.allowBoundedConditionalLoop && !p.allowBoundedRecursion)
+            return {};
         if (stmt.k == SK::Forever) return {};
         for (const auto& site : stmt.returnSites)
             pending.insert(pending.end(), site.before.begin(),
@@ -1784,7 +1962,9 @@ struct Lower {
             if (!last) return nullptr;
             id = last->next;
         }
-        if (visitedBlocks.size() < 2 || !last ||
+        // A procedure body of just "if (cond) call self" is valid tail
+        // recursion; there is no required prefix statement.
+        if (visitedBlocks.size() < 1 || !last ||
             last->opcode != "control_if") return nullptr;
         const BlockInput* trueBranch = last->inputs.find("SUBSTACK");
         if (!trueBranch || trueBranch->block.empty()) return nullptr;
@@ -1857,7 +2037,7 @@ struct Lower {
                         if (!call->inputs.find(argId)) complete = false;
                     if (!complete) return {};
                     sites.push_back(block);
-                    if (sites.size() > 2) return {};
+                    if (sites.size() > 8) return {};
                 }
             }
             id = block->next;
@@ -1870,9 +2050,9 @@ struct Lower {
         const std::vector<uint32_t>& slots,
         const std::vector<const Block*>& sites,
         std::vector<uint32_t>& outBody) {
-        if (!definition || sites.empty() || sites.size() > 2 ||
+        if (!definition || sites.empty() || sites.size() > 8 ||
             slots.size() != signature.argumentIds.size() ||
-            slots.size() > 2)
+            slots.size() > 8)
             return false;
         Stmt stack;
         stack.k = SK::WarpReturnPcStack;
@@ -1976,8 +2156,7 @@ struct Lower {
             cursor = source->next;
             if (cursor.empty()) return false;
         }
-        if (recur.body.empty() ||
-            !expr(inputOf(tail, "CONDITION"), recur.expr))
+        if (!expr(inputOf(tail, "CONDITION"), recur.expr))
             return false;
         // Capture the next recursive frame's argument expressions while
         // the original formal argument slots are still in scope. The
@@ -2039,6 +2218,55 @@ struct Lower {
             Expr clock;
             clock.k = EK::DaysSince2000;
             out = p.expr(clock);
+            return true;
+        }
+        if (op == "sensing_timer") {
+            Expr clock;
+            clock.k = EK::Timer;
+            out = p.expr(clock);
+            return true;
+        }
+        if (op == "sensing_mousex" || op == "sensing_mousey") {
+            Expr mouse;
+            mouse.k = op == "sensing_mousex" ? EK::MouseX : EK::MouseY;
+            out = p.expr(mouse);
+            return true;
+        }
+        if (op == "sensing_mousedown") {
+            Expr mouse;
+            mouse.k = EK::MouseDown;
+            out = p.expr(mouse);
+            return true;
+        }
+        if (op == "sensing_loudness") {
+            Expr level;
+            level.k = EK::Loudness;
+            out = p.expr(level);
+            return true;
+        }
+        if (op == "sensing_username") {
+            Expr name;
+            name.k = EK::Username;
+            out = p.expr(name);
+            return true;
+        }
+        if (op == "colour_picker") {
+            const auto it = blk->fields.find("COLOUR");
+            if (it == blk->fields.end() || !it->second.value.isString())
+                return false;
+            const std::string hex = SStr::toUtf8(
+                it->second.value.asStrPtr()->view());
+            int r = 0, g = 0, b = 0;
+            if (std::sscanf(hex.c_str(), "#%2x%2x%2x", &r, &g, &b) != 3)
+                return false;
+            if (r < 0) r = 0;
+            if (g < 0) g = 0;
+            if (b < 0) b = 0;
+            Expr color;
+            color.k = EK::ColorConst;
+            color.bits = xyo::val::kTagColor |
+                (uint64_t(r) << 16) | (uint64_t(g) << 8) | uint64_t(b);
+            out = p.expr(color);
             return true;
         }
         if (op == "operator_length") {
@@ -2201,7 +2429,9 @@ struct Lower {
             // tags before returning a number; a mixed-type list bails.
             op == "data_itemoflist" || op == "data_itemnumoflist" ||
             op == "operator_length" ||
-            op == "sensing_dayssince2000";
+            op == "sensing_mousex" || op == "sensing_mousey" ||
+            op == "sensing_loudness" ||
+            op == "sensing_timer" || op == "sensing_dayssince2000";
     }
 
     bool setVar(const Block* blk, SK kind, uint32_t& out) {
@@ -2302,7 +2532,7 @@ struct Lower {
             // so all recursive argument locals can remain numeric and
             // never keep unrooted GC-managed strings across iterations.
             const bool literalNumericArgument =
-                signature.argumentIds.size() <= 4 &&
+                signature.argumentIds.size() <= 8 &&
                 inlined.argumentExprs.size() == signature.argumentIds.size() &&
                 std::all_of(
                     inlined.argumentExprs.begin(),
@@ -2311,17 +2541,19 @@ struct Lower {
                         return expr < p.exprs.size() &&
                             p.exprs[expr].k == EK::ConstNum;
                     });
-            const Block* tail = warp && literalNumericArgument
+            // A procedure without loops or waits never yields even when it
+            // is not marked warp, so the same bounded numeric recursion can
+            // be emitted for it. The non-warp synchronous check below still
+            // rejects any loop/wait that ends up in the prefix or suffix.
+            const Block* tail = literalNumericArgument
                 ? tailRecursiveIf(definition, proccode, signature) : nullptr;
             // Non-tail recursion must restore the caller's return PC.
             // Only the zero-arg, one-site, numeric prefix/IF/suffix shape
             // is currently representable without a general frame stack.
-            const Block* nonTail = warp && !tail &&
-                signature.argumentIds.empty()
+            const Block* nonTail = !tail && signature.argumentIds.empty()
                 ? nonTailRecursiveIf(definition, proccode) : nullptr;
-            const auto pcSites = warp && !tail &&
-                literalNumericArgument &&
-                signature.argumentIds.size() <= 2
+            const auto pcSites = !tail && literalNumericArgument &&
+                signature.argumentIds.size() <= 8
                 ? recursiveReturnSites(definition, proccode, signature)
                 : std::vector<const Block*>{};
             // Zero-argument, single-site recursion continues to use the
@@ -2367,6 +2599,18 @@ struct Lower {
                             if (!self(self, child.body) ||
                                 !self(self, child.elseBody)) return false;
                             break;
+                        case SK::WarpTailRecurse:
+                        case SK::WarpReturnStack:
+                        case SK::WarpReturnPcStack:
+                            // Bounded numeric recursion has no Scratch loop
+                            // boundary. Its prefix/suffix must stay
+                            // loop/wait-free, which this same predicate
+                            // enforces recursively.
+                            if (!self(self, child.body) ||
+                                !self(self, child.elseBody)) return false;
+                            for (const auto& site : child.returnSites)
+                                if (!self(self, site.before)) return false;
+                            break;
                         default:
                             return false;
                         }
@@ -2410,6 +2654,237 @@ struct Lower {
                 !expr(inputOf(blk, "ITEM"), operation.extraExpr))
                 return false;
             out = p.stmt(std::move(operation));
+            return true;
+        }
+        if (blk->opcode == "motion_setx" || blk->opcode == "motion_sety" ||
+            blk->opcode == "motion_changexby" ||
+            blk->opcode == "motion_changeyby" ||
+            blk->opcode == "looks_setsizeto" ||
+            blk->opcode == "looks_changesizeby" ||
+            blk->opcode == "sound_setvolumeto" ||
+            blk->opcode == "sound_changevolumeby") {
+            const char* inputName =
+                blk->opcode == "motion_setx" ? "X" :
+                blk->opcode == "motion_sety" ? "Y" :
+                blk->opcode == "motion_changexby" ? "DX" :
+                blk->opcode == "motion_changeyby" ? "DY" :
+                blk->opcode == "looks_setsizeto" ? "SIZE" :
+                blk->opcode == "looks_changesizeby" ? "CHANGE" :
+                "VOLUME";
+            uint32_t value = 0;
+            if (!expr(inputOf(blk, inputName), value) ||
+                value >= p.exprs.size()) return false;
+            // Commit-only effects only take allocation-free numeric
+            // operands: the module has no rooted Scratch string for them.
+            switch (p.exprs[value].k) {
+            case EK::ConstNum:
+            case EK::VarGet:
+            case EK::ProcedureArgument:
+            case EK::Add: case EK::Sub: case EK::Mul: case EK::Div:
+            case EK::Mod: case EK::Round: case EK::MathOp: case EK::Neg:
+            case EK::LessThan: case EK::GreaterThan: case EK::Equals:
+            case EK::And: case EK::Or: case EK::Not:
+            case EK::DaysSince2000: case EK::Timer:
+            case EK::MouseX: case EK::MouseY: case EK::MouseDown:
+            case EK::Loudness:
+            case EK::ListLength: case EK::ListContains:
+            case EK::ListIndexOf:
+            case EK::StringLength: case EK::StringLengthValue:
+                break;
+            default:
+                return false;
+            }
+            Stmt effect;
+            effect.k = SK::Effect;
+            effect.var = blk->opcode == "motion_setx" ? 1 :
+                         blk->opcode == "motion_sety" ? 2 :
+                         blk->opcode == "motion_changexby" ? 3 :
+                         blk->opcode == "motion_changeyby" ? 4 :
+                         blk->opcode == "looks_setsizeto" ? 5 :
+                         blk->opcode == "looks_changesizeby" ? 6 :
+                         blk->opcode == "sound_setvolumeto" ? 7 : 8;
+            effect.expr = value;
+            out = p.stmt(std::move(effect));
+            return true;
+        }
+        if (blk->opcode == "pen_clear" || blk->opcode == "pen_penDown" ||
+            blk->opcode == "pen_penUp" || blk->opcode == "pen_stamp" ||
+            blk->opcode == "pen_setPenSizeTo" ||
+            blk->opcode == "pen_changePenSizeBy" ||
+            blk->opcode == "pen_setPenColorParamTo" ||
+            blk->opcode == "pen_changePenColorParamBy") {
+            Stmt effect;
+            effect.k = SK::Effect;
+            const bool sizeOp = blk->opcode == "pen_setPenSizeTo" ||
+                                blk->opcode == "pen_changePenSizeBy";
+            const bool paramOp =
+                blk->opcode == "pen_setPenColorParamTo" ||
+                blk->opcode == "pen_changePenColorParamBy";
+            if (!sizeOp && !paramOp) {
+                effect.var = blk->opcode == "pen_clear" ? 9 :
+                             blk->opcode == "pen_penDown" ? 10 :
+                             blk->opcode == "pen_penUp" ? 11 : 21;
+                effect.expr = p.exprNum(0);
+                out = p.stmt(std::move(effect));
+                return true;
+            }
+            uint32_t value = 0;
+            if (!expr(inputOf(blk, sizeOp ? "SIZE" : "VALUE"), value) ||
+                value >= p.exprs.size()) return false;
+            switch (p.exprs[value].k) {
+            case EK::ConstNum:
+            case EK::VarGet:
+            case EK::ProcedureArgument:
+            case EK::Add: case EK::Sub: case EK::Mul: case EK::Div:
+            case EK::Mod: case EK::Round: case EK::MathOp: case EK::Neg:
+            case EK::LessThan: case EK::GreaterThan: case EK::Equals:
+            case EK::And: case EK::Or: case EK::Not:
+            case EK::DaysSince2000: case EK::Timer:
+            case EK::MouseX: case EK::MouseY: case EK::MouseDown:
+            case EK::Loudness: case EK::ListLength: case EK::ListContains:
+            case EK::ListIndexOf:
+            case EK::StringLength: case EK::StringLengthValue:
+                break;
+            default:
+                return false;
+            }
+            effect.expr = value;
+            if (sizeOp) {
+                effect.var = blk->opcode == "pen_setPenSizeTo" ? 12 : 13;
+            } else {
+                const auto it = blk->fields.find("COLOR_PARAM");
+                if (it == blk->fields.end() || !it->second.value.isString())
+                    return false;
+                const std::string param = SStr::toUtf8(
+                    it->second.value.asStrPtr()->view());
+                int kind = param == "color" ? 0 :
+                           param == "saturation" ? 1 :
+                           param == "brightness" ? 2 :
+                           param == "transparency" ? 3 : -1;
+                if (kind < 0) return false;
+                effect.var = blk->opcode == "pen_setPenColorParamTo" ? 14 : 15;
+                effect.extraExpr = uint32_t(kind);
+            }
+            out = p.stmt(std::move(effect));
+            return true;
+        }
+        if (blk->opcode == "pen_setPenColorToColor") {
+            uint32_t value = 0;
+            if (!expr(inputOf(blk, "COLOR"), value) ||
+                value >= p.exprs.size()) return false;
+            switch (p.exprs[value].k) {
+            case EK::ColorConst:
+            case EK::VarGet:
+            case EK::ConstNum:
+            case EK::ProcedureArgument:
+            case EK::Add: case EK::Sub: case EK::Mul: case EK::Div:
+            case EK::Mod: case EK::Round: case EK::MathOp: case EK::Neg:
+            case EK::LessThan: case EK::GreaterThan: case EK::Equals:
+            case EK::And: case EK::Or: case EK::Not:
+            case EK::StringLength: case EK::StringLengthValue:
+            case EK::ListLength: case EK::ListIndexOf:
+            case EK::ListContains:
+                break;
+            default:
+                return false;
+            }
+            Stmt effect;
+            effect.k = SK::Effect;
+            effect.var = 22;
+            effect.expr = value;
+            out = p.stmt(std::move(effect));
+            return true;
+        }
+        if (blk->opcode == "looks_changeeffectby" ||
+            blk->opcode == "looks_seteffectto" ||
+            blk->opcode == "looks_cleargraphiceffects" ||
+            blk->opcode == "looks_show" || blk->opcode == "looks_hide") {
+            Stmt effect;
+            effect.k = SK::Effect;
+            if (blk->opcode == "looks_cleargraphiceffects") {
+                effect.var = 18;
+                effect.expr = p.exprNum(0);
+                out = p.stmt(std::move(effect));
+                return true;
+            }
+            if (blk->opcode == "looks_show" ||
+                blk->opcode == "looks_hide") {
+                effect.var = blk->opcode == "looks_show" ? 19 : 20;
+                effect.expr = p.exprNum(0);
+                out = p.stmt(std::move(effect));
+                return true;
+            }
+            uint32_t value = 0;
+            if (!expr(inputOf(blk, blk->opcode == "looks_seteffectto"
+                                       ? "VALUE" : "CHANGE"), value) ||
+                value >= p.exprs.size()) return false;
+            switch (p.exprs[value].k) {
+            case EK::ConstNum:
+            case EK::VarGet:
+            case EK::ProcedureArgument:
+            case EK::Add: case EK::Sub: case EK::Mul: case EK::Div:
+            case EK::Mod: case EK::Round: case EK::MathOp: case EK::Neg:
+            case EK::LessThan: case EK::GreaterThan: case EK::Equals:
+            case EK::And: case EK::Or: case EK::Not:
+            case EK::DaysSince2000: case EK::Timer:
+            case EK::MouseX: case EK::MouseY: case EK::MouseDown:
+            case EK::Loudness: case EK::ListLength: case EK::ListContains:
+            case EK::ListIndexOf:
+            case EK::StringLength: case EK::StringLengthValue:
+                break;
+            default:
+                return false;
+            }
+            const auto it = blk->fields.find("EFFECT");
+            if (it == blk->fields.end() || !it->second.value.isString())
+                return false;
+            std::string name = SStr::toUtf8(it->second.value.asStrPtr()->view());
+            for (char& c : name)
+                if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
+            int kind = name == "color" ? 0 :
+                       name == "fisheye" ? 1 :
+                       name == "whirl" ? 2 :
+                       name == "pixelate" ? 3 :
+                       name == "mosaic" ? 4 :
+                       name == "brightness" ? 5 :
+                       name == "ghost" ? 6 : -1;
+            if (kind < 0) return false;
+            effect.var = blk->opcode == "looks_seteffectto" ? 16 : 17;
+            effect.extraExpr = uint32_t(kind);
+            effect.expr = value;
+            out = p.stmt(std::move(effect));
+            return true;
+        }
+        if (blk->opcode == "motion_pointindirection" ||
+            blk->opcode == "motion_turnright" ||
+            blk->opcode == "motion_turnleft") {
+            uint32_t value = 0;
+            if (!expr(inputOf(blk, blk->opcode == "motion_pointindirection"
+                                       ? "DIRECTION" : "DEGREES"), value) ||
+                value >= p.exprs.size()) return false;
+            switch (p.exprs[value].k) {
+            case EK::ConstNum:
+            case EK::VarGet:
+            case EK::ProcedureArgument:
+            case EK::Add: case EK::Sub: case EK::Mul: case EK::Div:
+            case EK::Mod: case EK::Round: case EK::MathOp: case EK::Neg:
+            case EK::LessThan: case EK::GreaterThan: case EK::Equals:
+            case EK::And: case EK::Or: case EK::Not:
+            case EK::DaysSince2000: case EK::Timer:
+            case EK::MouseX: case EK::MouseY: case EK::MouseDown:
+            case EK::Loudness: case EK::ListLength: case EK::ListContains:
+            case EK::ListIndexOf:
+            case EK::StringLength: case EK::StringLengthValue:
+                break;
+            default:
+                return false;
+            }
+            Stmt effect;
+            effect.k = SK::Effect;
+            effect.var = blk->opcode == "motion_pointindirection" ? 78 :
+                         blk->opcode == "motion_turnright" ? 79 : 80;
+            effect.expr = value;
+            out = p.stmt(std::move(effect));
             return true;
         }
         if (blk->opcode == "data_setvariableto")
@@ -2500,6 +2975,10 @@ bool lowerCapturedScript(const ir::ScratchScript& script, Program& out) {
     Program candidate;
     Lower l{script, effectGraph, candidate};
     if (!l.chain(top->next, candidate.main)) return false;
+    // Commit-only effects need a hybrid terminal region; a whole-script
+    // plan could hit a guard after the effect and replay it.
+    for (const auto& statement : candidate.stmts)
+        if (statement.k == SK::Effect) return false;
     // Never publish a partially lowered module when an unsupported
     // effect/opcode requires the interpreter fallback.
     out = std::move(candidate);
@@ -2518,6 +2997,8 @@ bool lowerCapturedStatement(const ir::ScratchScript& script,
     uint32_t statement = 0;
     if (!lowering.stmt(block, statement)) return false;
     candidate.main.push_back(statement);
+    for (const auto& lowered : candidate.stmts)
+        if (lowered.k == SK::Effect) return false;
     out = std::move(candidate);
     return true;
 }
@@ -2548,7 +3029,9 @@ bool lowerCapturedRange(const ir::ScratchScript& script,
         uint32_t stmt = 0;
         if (!lowering.stmt(block, stmt)) return false;
         candidate.main.push_back(stmt);
+        const bool terminalEffect = candidate.stmts[stmt].k == SK::Effect;
         cursor = block->next;
+        if (terminalEffect && cursor != pastEnd) return false;
     }
     if (cursor != pastEnd || candidate.main.empty()) return false;
     out = std::move(candidate);

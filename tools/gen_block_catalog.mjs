@@ -656,9 +656,13 @@ function emit() {
     lines.push('    } },');
     lines.push('};');
     lines.push('');
+    lines.push('/// 実行時に登録された拡張ブロック（src/blockly/dynamic_catalog.cpp）。');
+    lines.push('const BlockDef* findDynamicBlock(std::string_view opcode);');
+    lines.push('');
     lines.push('inline const BlockDef* findBlock(std::string_view opcode) {');
     lines.push('    for (const auto& b : kBlockDefs) if (b.opcode == opcode) return &b;');
     lines.push('    for (const auto& b : kExtensionDefs) if (b.opcode == opcode) return &b;');
+    lines.push('    if (const BlockDef* d = findDynamicBlock(opcode)) return d;');
     lines.push('    return nullptr;');
     lines.push('}');
     lines.push('');

@@ -24,6 +24,7 @@ struct BlockCached;
 struct Blocks;
 struct Fiber;
 struct JitCtx;
+struct MegaDispatchCode;
 namespace ir { class NativeProcedureFrameSession; }
 namespace ir {
 struct SourceListReadEvents;
@@ -466,6 +467,38 @@ public:
     // Common sequence for scalar/list reporter observations, reset only
     // on Thread completion; 0 and UINT64_MAX signal overflow.
     uint64_t nativeSourceReporterReadSequence = 1;
+    // Beta: common no-yield LLVM dispatcher with per-Thread PC.
+    // This is not a replacement for stackless yielding continuations.
+    std::shared_ptr<const MegaDispatchCode> megaDispatch;
+    uint32_t megaPc = 0;
+    uint64_t megaRemaining = 0;
+    // The original broadcast-wait Fiber kept its join identities on its
+    // native stack. Mega continuation instead owns them on Thread. The
+    // Runtime reclamation closure must retain these referenced Threads.
+    std::vector<Thread*> megaJoinRefs;
+    bool megaBroadcastPending = false;
+    // Reset native scalar lookup caches when the Target/Stage variable map
+    // is mutated between suspended mega-goto slices. No stale Variable*
+    // may survive a Scratch scheduler handoff.
+    const Target* megaBoundTarget = nullptr;
+    const Target* megaBoundStage = nullptr;
+    uint64_t megaLocalGeneration = 0;
+    uint64_t megaStageGeneration = 0;
+    // Fixed, Thread-owned native return PCs. Only source-proven argumentless
+    // procedure chains may use these; no Scratch Value or native pointer
+    // survives a yield in this stack. A depth of zero means empty.
+    static constexpr size_t MegaReturnCapacity = 4;
+    std::array<uint32_t, MegaReturnCapacity> megaReturnPcs{};
+    uint32_t megaReturnDepth = 0;
+    // Append-only beta storage. These bindings are valid only under the
+    // current Target/Stage generation stamp recorded above. No native
+    // LLVM slice may retain them after that stamp changes.
+    // One or two in-order body statements, plus at most four caller
+    // suffixes. Every binding index emitted by LLVM must be in range.
+    static constexpr size_t MegaScalarBindingCapacity =
+        2 + MegaReturnCapacity;
+    std::array<Variable*, MegaScalarBindingCapacity> megaScalarBindings{};
+    bool megaScalarBindingsReady = false;
     static std::string getIdFromTargetAndBlock(const Target* target,
                                              const std::string& topBlock);
     /// target.id&topBlock — target セット後は不変なので遅延キャッシュ

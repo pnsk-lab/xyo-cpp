@@ -48,6 +48,7 @@
 #include "core/fileio.hpp"
 #include "core/sstr.hpp"
 #include "analysis/project_analysis.hpp"
+#include "analysis/complexity.hpp"
 #include "analysis/type_sites.hpp"
 #include "analysis/type_flow.hpp"
 #include "analysis/procedure_effects.hpp"
@@ -56,6 +57,9 @@
 #include "engine/translate_service.hpp"
 #include "engine/hot_start.hpp"
 #include "engine/opt_flags.hpp"
+#include "engine/mega_preset.hpp"
+#include "extensions/extension.hpp"
+#include "extensions/manifest.hpp"
 #include "load/sb3.hpp"
 #include "load/sb3_minify.hpp"
 #include "load/sb3_rewrite.hpp"
@@ -129,6 +133,9 @@ static int usage() {
         "  --string-short-intern on|off  (XYO_STRING_SHORT_INTERN=1; default off)\n"
         "  --opt-all  (XYO_OPT_ALL=1; 現在の作業ツリー diff の opt-in 最適化を一括 ON。\n"
         "              明示した個別 XYO_* は上書きしない)\n"
+        "  --mega / --no-mega  (XYO_JIT_MEGA=1/0; run/test は JIT モード未指定なら\n"
+        "           既定で Mega。Eager LLVM 限定の最強プロファイル。\n"
+        "           --no-mega / XYO_JIT_MODE / --jit / --block-count で従来経路)\n"
         "  xyo run <project.sb3> [--frames N] [--aot obj]"
         " [--jit hotspot|eager|off] [--jit-lazy auto|on|off] [--danger]\n"
         "          [--block-count]  (XYO_BLOCK_COUNT=1; exact interpreter count)\n"
@@ -157,6 +164,7 @@ static int usage() {
         "  xyo gui [dir]                   ランチャー GUI（引数なしでも起動）\n  xyo edit <project.sb3>             ビルトインエディタ\n"
         "  xyo dump <project.sb3>\n"
         "  xyo analyze <project.sb3> [--dot out.dot] [--top N] [--scripts N] [--type-flow]\n"
+        "              [--complexity]\n"
         "      実行せずに構造を解析（並列性・直列化キー・warp化候補・ループ内アンチパターン）\n"
         "      --dot: workerSafe スクリプトの衝突グラフを Graphviz DOT で出力\n"
         "      --top: 衝突キーの表示件数（既定 20）/ --scripts: スクリプト表の件数（0=全部）\n"
@@ -437,6 +445,11 @@ static int runLoaded(Runtime& rt, const Sb3LoadResult* r, int maxFrames,
         std::chrono::microseconds(fps > 0 ? 1000000 / fps : 0);
     bool finished = false;
     int executedFrames = 0;
+    // Edge-activated hats (when timer >, when touching) are polled by
+    // Runtime::step, not by a thread. A project whose only scripts are such
+    // hats has no active thread, but must still be stepped or the hat could
+    // never fire. Keep stepping them until the caller's frame limit.
+    const bool hasEdgeHats = rt.hasEdgeActivatedHatScripts();
 #ifdef XYO_JIT
     const bool showAotFrames = g_aotRun && bool(aotCliProgress("run"));
     const auto aotFrameStart = std::chrono::steady_clock::now();
@@ -450,7 +463,10 @@ static int runLoaded(Runtime& rt, const Sb3LoadResult* r, int maxFrames,
                 break;
             }
         }
-        if (!anyActive) { finished = true; break; }
+        if (!anyActive) {
+            if (!hasEdgeHats) { finished = true; break; }
+            // Keep stepping so Runtime::step keeps evaluating edge hats.
+        }
         // Local translation inference is I/O idle time, not a Scratch
         // frame. Only wait when all live scripts are suspended.
         if (fps <= 0 && rt.translationService &&
@@ -517,6 +533,18 @@ static int runLoaded(Runtime& rt, const Sb3LoadResult* r, int maxFrames,
                 std::this_thread::sleep_for(frameDur - dt);
         }
     }
+    // Reaching the frame limit with only idle edge hats is still a clean
+    // end; do not report it as an active-thread frame overrun.
+    if (!finished) {
+        bool activeAtEnd = false;
+        for (Thread* thread : rt.threads) {
+            if (!thread->stack.empty() && thread->status != STATUS_DONE) {
+                activeAtEnd = true;
+                break;
+            }
+        }
+        if (!activeAtEnd) finished = true;
+    }
     rt.finishBlockCount();
 #ifdef XYO_JIT
     if (showAotFrames)
@@ -580,7 +608,12 @@ static int cmdRun(const char* path, int maxFrames, int fps) {
     if (!ok) { std::fprintf(stderr, "cannot read %s\n", path); return 1; }
     g_hotFingerprint = hotStartFingerprint(data.data(), data.size());
 
+    ExtensionRegistry extensions;
     Runtime rt;
+    const ExtensionLoadReport extReport =
+        bootstrapExtensionsFromEnvironment(rt, extensions);
+    for (const std::string& error : extReport.errors)
+        std::fprintf(stderr, "extension: %s\n", error.c_str());
     timeMark("runtime-init");
     Sb3LoadResult r = loadSb3File(rt, data.data(), data.size());
     timeMark("sb3-parse");
@@ -633,6 +666,7 @@ static int cmdAnalyze(int argc, char** argv) {
     const char* path = argv[2];
     std::string dotPath;
     bool typeFlow = false;
+    bool complexity = false;
     analysis::Options opt;
     for (int i = 3; i < argc; ++i) {
         if ((!std::strcmp(argv[i], "--dot") || !std::strcmp(argv[i], "-o")) &&
@@ -644,6 +678,8 @@ static int cmdAnalyze(int argc, char** argv) {
             opt.topScripts = size_t(std::atoi(argv[++i]));
         else if (std::strcmp(argv[i], "--type-flow") == 0)
             typeFlow = true;
+        else if (std::strcmp(argv[i], "--complexity") == 0)
+            complexity = true;
         else
             return usage();
     }
@@ -659,6 +695,7 @@ static int cmdAnalyze(int argc, char** argv) {
     analysis::Report rep = analysis::analyzeProject(rt, path, opt);
     std::string text = analysis::formatText(rep, opt);
     text += analysis::formatTypeSites(analysis::analyzeTypeSites(rt));
+    if (complexity) text += analysis::formatComplexity(rep);
     if (typeFlow) {
         std::ostringstream out;
         out << "\n== CFG / 型集合の固定点解析 ==\n";
@@ -951,6 +988,7 @@ static TestResult runFixture(const std::string& path) {
     // 壁時計リミットを設ける。
     const auto wallStart = std::chrono::steady_clock::now();
     const auto wallLimit = std::chrono::seconds(25);
+    const bool hasEdgeHats = rt.hasEdgeActivatedHatScripts();
     bool threadsExhausted = false;
     for (int i = 0; i < 200000 && !done; ++i) {
         rt.step();
@@ -963,7 +1001,16 @@ static TestResult runFixture(const std::string& path) {
             if (th->status == STATUS_PROMISE_WAIT) anyWait = true;
             else if (th->status != STATUS_DONE) anyRunning = true;
         }
-        if (!anyThread) { threadsExhausted = true; break; }
+        if (!anyThread) {
+            if (!hasEdgeHats) { threadsExhausted = true; break; }
+            // An edge-activated hat with no other thread may still fire
+            // (e.g. when timer >). Poll at the 30fps cadence like the
+            // retired-hat branch below, bounded by the same wall limit.
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            if (std::chrono::steady_clock::now() - wallStart > wallLimit)
+                break;
+            continue;
+        }
         if (anyRunning) continue;
         // PROMISE_WAIT は waitQueue の実時間期限に依存 — 実時間を進める
         // （JS ハーネスは setInterval で VM を実時間駆動する）
@@ -1481,6 +1528,11 @@ int xyoShellPlay(const char* path, const char* aotObjPath, int scale,
     std::vector<uint8_t> data = readFile(path, ok);
     if (!ok) { std::fprintf(stderr, "cannot read %s\n", path); return 1; }
     Runtime rt;
+    ExtensionRegistry extensions;
+    const ExtensionLoadReport extReport =
+        bootstrapExtensionsFromEnvironment(rt, extensions);
+    for (const std::string& error : extReport.errors)
+        std::fprintf(stderr, "extension: %s\n", error.c_str());
     Sb3LoadResult r = loadSb3File(rt, data.data(), data.size());
     if (!r.ok) {
         std::fprintf(stderr, "load failed: %s\n", r.error.c_str());
@@ -1813,6 +1865,34 @@ int main(int argc, char** argv) {
     winInit(winArgs, argc, argv);
 #endif
     // 実行前設定（AOT 実行ファイルでも同じ経路で効かせる）
+    // Mega scheduler preset. `--mega` forces it and `--no-mega` disables it.
+    // A bare `run`/`test` (no explicit JIT configuration) defaults to the
+    // strongest headless profile: Eager + every source-certified Mega
+    // feature. Any explicit XYO_JIT_MODE / --jit / --block-count choice
+    // keeps the previous path, so existing harnesses and A/B runs are
+    // unaffected. `play`/`gui`/`edit` are renderer paths and stay HotSpot.
+    bool megaOff = false, megaOn = false, jitArg = false;
+    bool blockCountArg = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--mega") == 0) megaOn = true;
+        else if (std::strcmp(argv[i], "--no-mega") == 0) megaOff = true;
+        else if (std::strncmp(argv[i], "--jit", 5) == 0) jitArg = true;
+        else if (std::strcmp(argv[i], "--block-count") == 0)
+            blockCountArg = true;
+    }
+    if (megaOff) {
+        disableMegaPreset();
+    } else if (megaOn) {
+        requestMegaPreset();
+    } else if (!std::getenv("XYO_JIT_MEGA") &&
+               !std::getenv("XYO_JIT_MODE") &&
+               !std::getenv("XYO_JIT_DISABLE") && !jitArg &&
+               !blockCountArg && !blockCountEnabledFromEnv() && argc >= 2 &&
+               (std::strcmp(argv[1], "run") == 0 ||
+                std::strcmp(argv[1], "test") == 0)) {
+        requestMegaPreset();
+    }
+    applyMegaPreset();
     applyOptAllConfig(argc, argv);
     applyListLimitConfig(argc, argv);
     if (!applyStringStorageConfig(argc, argv)) return 2;

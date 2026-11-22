@@ -7,13 +7,21 @@
 // numeric SSA, and may contain GC-managed pointers.
 #pragma once
 
-#include "llvm_source_numeric_bindings.hpp"
 #include "scratch_script.hpp"
 #include "source_resume_phase.hpp"
+
+// The portable records below are consumed by interpreter and WASM/Binaryen
+// translation units, which have no LLVM headers. Keep the compiler-only
+// tracing declarations behind the same availability check that the LLVM
+// include path satisfies, so a non-LLVM build never fails to compile.
+#if __has_include(<llvm/IR/Module.h>)
+#include "llvm_source_numeric_bindings.hpp"
 
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/ValueHandle.h>
+#define XYO_LLVM_SOURCE_REPORTER_TRACE 1
+#endif
 
 #include <algorithm>
 #include <cstdint>
@@ -192,6 +200,7 @@ inline SourceReporterStorageSource frozenSourceReporterStorage(
     return owner;
 }
 
+#if defined(XYO_LLVM_SOURCE_REPORTER_TRACE)
 struct SourceReporterValueObservation {
     uint64_t sourcePc = 0; // frozen, sorted Scratch Block ID dictionary
     std::string sourceBlock;
@@ -216,6 +225,7 @@ struct SourceReporterCheckpointObservation {
     uint32_t portableLoopPathDepth = 0;
     std::vector<std::string> sourceLoopPath;
 };
+#endif // XYO_LLVM_SOURCE_REPORTER_TRACE
 
 // Compiler-only mapping to the existing RT-001 numeric SSA descriptor
 // space (id + bit width). The runtime capture and rooted source location
@@ -276,6 +286,7 @@ struct SourceReporterValueSummary {
     bool executable() const { return false; }
 };
 
+#if defined(XYO_LLVM_SOURCE_REPORTER_TRACE)
 // Run AFTER the compiler's regular inlining and IR rewrites but BEFORE
 // runtime native code emission. No LLVM IR mutation or runtime side effect.
 inline SourceReporterValueSummary traceSourceReporterValues(
@@ -535,5 +546,6 @@ inline SourceReporterValueSummary traceSourceReporterValues(
             static_cast<unsigned long long>(summary.checkpointSites));
     return summary;
 }
+#endif // XYO_LLVM_SOURCE_REPORTER_TRACE
 
 } // namespace xyo::ir

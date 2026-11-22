@@ -26,6 +26,10 @@ public:
     Thread* thread = nullptr;
     /// JIT compat 層用: 合成 ExecContext（設定中は stackFrame がこれを返す）
     ExecContext* jitCompatEc = nullptr;
+    /// 現在実行中の BlockCached。拡張プリミティブが自分の opcode を知るため。
+    const BlockCached* op = nullptr;
+    /// 拡張インスタンス（BlockCached::primitiveContext のコピー）。
+    void* primitiveContext = nullptr;
 
     Target* target() const;
     Runtime* runtime() const;

@@ -13,6 +13,15 @@
 #include "../core/value.hpp"
 #include "../core/jsnum.hpp"
 
+#if defined(__EMSCRIPTEN__)
+extern "C" void* xyo_wasm_get_host_runtime();
+extern "C" void xyo_wasm_set_host_runtime(void*);
+#endif
+
+#if defined(__EMSCRIPTEN__)
+extern "C" void xyo_wasm_set_host_target(void*);
+#endif
+
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -61,7 +70,7 @@ bool invokeSegment(const HotCode& code, int handle, Thread& thread,
     auto& slots = thread.wasmSlotBits;
     // [0,n): Scratch values; [n]: repeat/condition result;
     // [n+1,n+2]: exact fmod host-helper operands/results.
-    slots.resize(code.slotIds.size() + 3);
+    slots.resize(code.slotIds.size() + 3 + code.recursionFrameWords);
     slots[code.slotIds.size()] = Value::num(0).bits;
     for (size_t i = 0; i < code.slotIds.size(); ++i) {
         Variable* var = thread.target->lookupVariableById(code.slotIds[i]);
@@ -136,8 +145,20 @@ bool invokeSegment(const HotCode& code, int handle, Thread& thread,
             return abortSpeculation(ir::GuardReason::NumericValue);
         slots[overrideSlot] = Value::num(overrideValue).bits;
     }
+#if defined(__EMSCRIPTEN__)
+    // Modules are also invoked during greenFlag's immediate hat evaluation,
+    // before Runtime::step publishes its own pointer. Publish/restore here so
+    // every sensing/effect helper sees the live Runtime.
+    void* previousRuntime = xyo_wasm_get_host_runtime();
+    xyo_wasm_set_host_runtime(thread.target ? thread.target->runtime : nullptr);
+    xyo_wasm_set_host_target(thread.target);
+#endif
     const int status = invoke(handle,
         static_cast<int>(reinterpret_cast<uintptr_t>(slots.data())));
+#if defined(__EMSCRIPTEN__)
+    xyo_wasm_set_host_target(nullptr);
+    xyo_wasm_set_host_runtime(previousRuntime);
+#endif
     if (std::getenv("XYO_JIT_VERBOSE"))
         std::fprintf(stderr, "xyo-wasm-hot: wasm return=%d\n", status);
     if (status != 0)

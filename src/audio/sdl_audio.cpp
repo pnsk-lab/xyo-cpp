@@ -533,18 +533,21 @@ void SdlAudioBank::stopAllSounds(Target*) {
 void SdlAudioBank::stop(Target* t, int soundId) {
     const Sound* sound = soundFor(t, soundId);
     if (!sound) return;
+    // This runs on the main thread. A restart must complete the previous
+    // play-until-done immediately, not only on the next audio update().
+    // Never enter the scheduler while holding the SDL callback lock.
+    std::vector<Thread*> released;
     if (dev_) SDL_LockAudioDevice(dev_);
-    for (auto& v : voices_)
-        if (v.sound == sound)
-            done_.push_back(v);
+    for (const auto& v : voices_)
+        if (v.sound == sound && v.wait)
+            released.push_back(v.wait);
     voices_.erase(
         std::remove_if(voices_.begin(), voices_.end(),
                        [&](const Voice& v) { return v.sound == sound; }),
         voices_.end());
-    for (const auto& v : pendingVoices_) {
+    for (const auto& v : pendingVoices_)
         if (v.sound == sound && v.wait)
-            done_.push_back({nullptr, 0, v.target, v.wait});
-    }
+            released.push_back(v.wait);
     pendingVoices_.erase(
         std::remove_if(pendingVoices_.begin(), pendingVoices_.end(),
                        [&](const PendingVoice& v) {
@@ -552,6 +555,13 @@ void SdlAudioBank::stop(Target* t, int soundId) {
                        }),
         pendingVoices_.end());
     if (dev_) SDL_UnlockAudioDevice(dev_);
+    // Each suspended thread is resolved at most once even if it appeared
+    // in both the active and queued collections.
+    std::sort(released.begin(), released.end());
+    released.erase(std::unique(released.begin(), released.end()), released.end());
+    for (Thread* wait : released)
+        if (audioWaiterIsLive(rt_, wait))
+            resolveWait(*rt_->sequencer, *wait, Value::undefined());
 }
 
 void SdlAudioBank::stopAll() {

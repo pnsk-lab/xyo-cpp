@@ -6,7 +6,13 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
+
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#  define XYO_X86_SIMD 1
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -397,6 +403,77 @@ static bool sameValueZero(Value a, Value b) {
     return a == b;
 }
 
+namespace {
+
+/// 1 ブロック分をスカラで判定する（タグ付き要素は compareEqual）。
+inline uint32_t scanBlockScalar(const Value* items, uint32_t from, uint32_t to,
+                                double needle, const Value& item) {
+    for (uint32_t i = from; i < to; ++i) {
+        const uint64_t bits = items[i].bits;
+        bool found;
+        if (bits < static_cast<uint64_t>(val::kNan)) {
+            double d;
+            std::memcpy(&d, &bits, sizeof(d));
+            found = d == needle;
+        } else {
+            // 文字列・真偽値などは Scratch の比較規則で判定する。
+            // listContains の元実装に合わせ sameValueZero も見る
+            // （数値ニードルでは NaN 同士以外で差は出ない）。
+            found = sameValueZero(items[i], item) ||
+                    compareEqual(items[i], item);
+        }
+        if (found) return i;
+    }
+    return to;
+}
+
+#if defined(XYO_X86_SIMD) && defined(__GNUC__)
+__attribute__((target("avx2"))) uint32_t scanNumericAvx2(
+    const Value* items, uint32_t n, double needle, const Value& item) {
+    const __m256d nv = _mm256_set1_pd(needle);
+    uint32_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        const __m256d v = _mm256_loadu_pd(
+            reinterpret_cast<const double*>(items + i));
+        // NaN ボックス（タグ付き）は必ず unordered になる。
+        const int eq = _mm256_movemask_pd(_mm256_cmp_pd(v, nv, _CMP_EQ_OQ));
+        const int un = _mm256_movemask_pd(_mm256_cmp_pd(v, v, _CMP_UNORD_Q));
+        if ((eq | un) == 0) continue;  // 4 要素すべて不一致の素の数値
+        const uint32_t hit = scanBlockScalar(items, i, i + 4, needle, item);
+        if (hit < i + 4) return hit;
+    }
+    return scanBlockScalar(items, i, n, needle, item);
+}
+#endif
+
+/// 連続格納リストの数値走査。最初に一致した 0 始まり index、無ければ n。
+uint32_t scanNumericContiguous(const Value* items, uint32_t n, double needle,
+                               const Value& item) {
+#if defined(XYO_X86_SIMD)
+#  if defined(__GNUC__)
+    static const bool avx2 = __builtin_cpu_supports("avx2");
+    if (avx2) return scanNumericAvx2(items, n, needle, item);
+#  endif
+    // SSE2（x86_64 の基準命令セット）で 2 要素ずつ。
+    const __m128d nv = _mm_set1_pd(needle);
+    uint32_t i = 0;
+    for (; i + 2 <= n; i += 2) {
+        const __m128d v = _mm_loadu_pd(
+            reinterpret_cast<const double*>(items + i));
+        const int eq = _mm_movemask_pd(_mm_cmpeq_pd(v, nv));
+        const int un = _mm_movemask_pd(_mm_cmpunord_pd(v, v));
+        if ((eq | un) == 0) continue;
+        const uint32_t hit = scanBlockScalar(items, i, i + 2, needle, item);
+        if (hit < i + 2) return hit;
+    }
+    return scanBlockScalar(items, i, n, needle, item);
+#else
+    return scanBlockScalar(items, 0, n, needle, item);
+#endif
+}
+
+}  // namespace
+
 bool listContains(SList* list, Value item) {
     if (list && list->extra && xyo_list_storage_mode == 7)
         list->makeContiguous();
@@ -415,6 +492,16 @@ bool listContains(SList* list, Value item) {
         numericNeedle = cast::toNumberOrNaN(item);
         numericNeedleValid = !std::isnan(numericNeedle) &&
             !(numericNeedle == 0.0 && cast::isNotActuallyZero(item));
+    }
+    if (numericNeedleValid && list && !list->extra) {
+        const uint32_t hit = scanNumericContiguous(
+            list->items, list->len, numericNeedle, item);
+        noteScanned(hit + 1 <= list->len ? hit + 1 : list->len);
+        if (hit < list->len) {
+            noteHit(hit + 1);
+            return true;
+        }
+        return false;
     }
     for (uint32_t i = 0; i < list->len; ++i) {
         Value entry = list->get0(i);
@@ -438,6 +525,32 @@ double listIndexOf(SList* list, Value item) {
     if (list && list->extra && xyo_list_storage_mode == 7)
         list->makeContiguous();
     noteCall();
+    // 連続格納（extra == nullptr）は最内ループで extra を再読込せず、
+    // 間接呼び出しも挟まない。素の double 同士は値比較、タグ付き
+    // （文字列・真偽値など）だけ compareEqual に落とす。
+    if (list && !list->extra) {
+        const Value* items = list->items;
+        const uint32_t n = list->len;
+        if (item.isNumber() && !std::isnan(item.asNumberUnchecked())) {
+            const double needle = item.asNumberUnchecked();
+            const uint32_t hit = scanNumericContiguous(items, n, needle, item);
+            if (hit < n) {
+                noteScanned(hit + 1);
+                noteHit(hit + 1);
+                return hit + 1;
+            }
+        } else {
+            for (uint32_t i = 0; i < n; ++i) {
+                if (compareEqual(items[i], item)) {
+                    noteScanned(i + 1);
+                    noteHit(i + 1);
+                    return i + 1;
+                }
+            }
+        }
+        noteScanned(n);
+        return 0;
+    }
     if (item.isNumber() && !std::isnan(item.asNumberUnchecked())) {
         const double needle = item.asNumberUnchecked();
         for (uint32_t i = 0; i < list->len; ++i) {

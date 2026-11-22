@@ -3,6 +3,7 @@
 // jit 非依存コード側（runtime/thread/sequencer）に ifdef を散らさない。
 // compile は常に失敗扱い（nullptr）なので生成コード経路には到達しない。
 #include "jit.hpp"
+#include "../core/cast.hpp"
 
 namespace xyo {
 
@@ -41,11 +42,29 @@ bool JitEngine::prepareAotWorker(const CompiledScript&) const {
 }
 void JitEngine::invalidate() {}
 bool JitEngine::ok() const { return false; }
+// Mega dispatch / broadcast receivers are LLVM-only. Keep the no-JIT and
+// Emscripten builds linkable when the scheduler WIP calls them.
+void JitEngine::installMegaDispatch(Runtime&) {}
+void JitEngine::installMegaBroadcastReceivers(
+    Runtime&, const std::vector<Thread*>&) {}
 
 } // namespace xyo
 
 // 生成コードからのみ呼ばれる C ABI — no-JIT では到達しないが
 // 参照が残る箇所（compat 層等）のためにシンボルだけ提供する。
+//
+// xyo_lt is also used by the scheduler's opt-in
+// XYO_JIT_MEGA_FAST_VAR_PAIR_JOIN path. That block is compiled in every
+// build, so an interpreter-only build must still resolve the symbol with
+// exactly Scratch's comparison semantics. Compiled JIT builds keep using
+// the cached fast path in rt.cpp.
+extern "C" int32_t xyo_lt(uint64_t a, uint64_t b) {
+    xyo::Value va;
+    va.bits = a;
+    xyo::Value vb;
+    vb.bits = b;
+    return xyo::cast::compare(va, vb) < 0 ? 1 : 0;
+}
 extern "C" void xyo_yield(xyo::JitCtx*) {}
 extern "C" xyo::Variable* xyo_jitVar(xyo::JitCtx*, const char*,
                                    const char16_t*, int) {

@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
@@ -56,6 +57,10 @@
 #include "aot_emit.hpp"
 #include "nested_warp_osr.hpp"
 #include "procedure_frame_state.hpp"
+#include "stackless_coro_lower.hpp"
+#include "mega_goto.hpp"
+#include "mega_partial.hpp"
+#include "mega_yield_source.hpp"
 #include "guard_fallback_instrument.hpp"
 #ifdef XYO_RT001_ORC_FDE_PLUGIN
 #include "rt_orc_fde_lifecycle.hpp"
@@ -207,6 +212,7 @@ bool jitEmitScript(llvm::Module&, llvm::LLVMContext&, Runtime&, Target*,
 extern "C" {
 void xyo_yield(JitCtx*);
 void xyo_yield_fast(xyo::Fiber*);
+void xyo_yield_fast_direct(xyo::Fiber*);
 int32_t xyo_is_stuck(JitCtx*);
 int32_t xyo_wait_should_yield(JitCtx*);
 void xyo_wait_yield(JitCtx*);
@@ -241,14 +247,34 @@ int32_t xyo_and(uint64_t, uint64_t);
 int32_t xyo_or(uint64_t, uint64_t);
 uint64_t xyo_random(JitCtx*, uint64_t, uint64_t);
 double xyo_mathop(JitCtx*, int32_t, double);
+double xyo_math_abs(JitCtx*, double);
+double xyo_math_floor(JitCtx*, double);
+double xyo_math_ceil(JitCtx*, double);
+double xyo_math_sqrt(JitCtx*, double);
+double xyo_math_sin(JitCtx*, double);
+double xyo_math_cos(JitCtx*, double);
+double xyo_math_tan(JitCtx*, double);
+double xyo_math_asin(JitCtx*, double);
+double xyo_math_acos(JitCtx*, double);
+double xyo_math_atan(JitCtx*, double);
+double xyo_math_ln(JitCtx*, double);
+double xyo_math_log(JitCtx*, double);
+double xyo_math_exp(JitCtx*, double);
+double xyo_math_pow10(JitCtx*, double);
+int32_t xyo_letter_eq(uint64_t, uint64_t, int32_t);
+int32_t xyo_letter_eq_i(int32_t, uint64_t, int32_t);
 double xyo_round(double);
-uint64_t xyo_var_get(JitCtx*, const char*);
-void xyo_var_set(JitCtx*, const char*, uint64_t);
+uint64_t xyo_var_get(JitCtx*, const char*, const char16_t*);
+void xyo_var_set(JitCtx*, const char*, const char16_t*, uint64_t);
 void xyo_wait_notify_var_store(JitCtx*, Variable*);
-void xyo_var_change(JitCtx*, const char*, uint64_t);
+void xyo_var_change(JitCtx*, const char*, const char16_t*, uint64_t);
 uint64_t xyo_arg_get(JitCtx*, uint64_t);
 void xyo_rt_wait(JitCtx*, double);
+void xyo_wait_begin(JitCtx*, double);
+int32_t xyo_wait_poll(JitCtx*);
 void xyo_stop_all(JitCtx*);
+void xyo_stop_script_begin(JitCtx*);
+void xyo_stop_all_begin(JitCtx*);
 void xyo_stop_others(JitCtx*);
 void xyo_stop_script(JitCtx*);
 void xyo_broadcast_v(JitCtx*, uint64_t);
@@ -261,6 +287,10 @@ void xyo_ir001_effect_checkpoint(
     uint32_t);
 void xyo_ir001_vm_write(JitCtx*);
 void xyo_broadcast_wait_v(JitCtx*, uint64_t);
+void xyo_broadcast_wait_lit(JitCtx*, const char16_t*, uint32_t);
+void xyo_bcastwait_begin_v(JitCtx*, uint64_t);
+void xyo_bcastwait_begin_lit(JitCtx*, const char16_t*, uint32_t);
+int32_t xyo_bcastwait_step(JitCtx*);
 double xyo_timer(JitCtx*);
 uint64_t xyo_rt_compat(JitCtx*, const void*);
 const void* xyo_rt_aot_cached(void*);
@@ -279,6 +309,12 @@ void xyo_rt_nested_osr_quad_yield_checkpoint(
     JitCtx*, double, double, double, double);
 void xyo_proc_push(JitCtx*, const char*, const void*, int32_t,
                    const char*, int32_t, int32_t);
+int32_t xyo_proc_push_ex(JitCtx*, const char*, const void*, int32_t,
+                         const char*, int32_t, int32_t, int32_t);
+int32_t xyo_recursion_yield_due(JitCtx*);
+void xyo_coro_push_frame(JitCtx*, void*, uint64_t);
+void* xyo_coro_top_frame(JitCtx*);
+void xyo_coro_pop_frame(JitCtx*, void*);
 void xyo_proc_pop(JitCtx*);
 void xyo_proc_frame_init_root_verified(
     JitCtx*, uint64_t, uint64_t, uint64_t);
@@ -344,6 +380,7 @@ uint64_t xyo_list_item(JitCtx*, const char*, const char16_t*, uint64_t);
 uint64_t xyo_list_itemnum(JitCtx*, const char*, const char16_t*, uint64_t);
 uint64_t xyo_list_length(JitCtx*, const char*, const char16_t*);
 uint64_t xyo_list_contains(JitCtx*, const char*, const char16_t*, uint64_t);
+void xyo_mega_bench_end(JitCtx*);
 uint64_t xyo_list_contents(JitCtx*, const char*, const char16_t*);
 void xyo_var_monitor(JitCtx*, const char*, int32_t);
 void xyo_mot_movesteps(JitCtx*, uint64_t);
@@ -355,6 +392,12 @@ void xyo_mot_turnleft(JitCtx*, uint64_t);
 void xyo_mot_pointdir(JitCtx*, uint64_t);
 void xyo_mot_pointtowards(JitCtx*, uint64_t);
 void xyo_mot_glidexy(JitCtx*, uint64_t, uint64_t, uint64_t);
+void xyo_mot_glidebegin_xy(JitCtx*, uint64_t, uint64_t, uint64_t);
+void xyo_mot_glidebegin_to(JitCtx*, uint64_t, uint64_t);
+int32_t xyo_mot_glidestep(JitCtx*);
+void xyo_looks_saybegin(JitCtx*, uint64_t, uint64_t);
+void xyo_looks_thinkbegin(JitCtx*, uint64_t, uint64_t);
+void xyo_snd_playbegin(JitCtx*, uint64_t);
 void xyo_mot_glideto(JitCtx*, uint64_t, uint64_t);
 void xyo_mot_edgebounce(JitCtx*);
 void xyo_mot_setrotstyle(JitCtx*, uint64_t);
@@ -376,6 +419,8 @@ void xyo_looks_nextcostume(JitCtx*);
 void xyo_looks_switchbackdrop(JitCtx*, uint64_t);
 void xyo_looks_nextbackdrop(JitCtx*);
 void xyo_looks_switchbackdropwait(JitCtx*, uint64_t);
+void xyo_looks_backdropbegin(JitCtx*, uint64_t);
+int32_t xyo_looks_backdropstep(JitCtx*);
 void xyo_looks_changeeffect(JitCtx*, uint64_t, uint64_t);
 void xyo_looks_seteffect(JitCtx*, uint64_t, uint64_t);
 void xyo_looks_cleareffects(JitCtx*);
@@ -403,6 +448,7 @@ uint64_t xyo_sns_loudness(JitCtx*);
 uint64_t xyo_sns_loud(JitCtx*);
 uint64_t xyo_sns_answer(JitCtx*);
 void xyo_sns_askwait(JitCtx*, uint64_t);
+void xyo_sns_askbegin(JitCtx*, uint64_t);
 uint64_t xyo_sns_of(JitCtx*, uint64_t, uint64_t);
 uint64_t xyo_sns_username(JitCtx*);
 uint64_t xyo_sns_online(JitCtx*);
@@ -411,10 +457,15 @@ void xyo_ctl_incrcounter(JitCtx*);
 void xyo_ctl_clearcounter(JitCtx*);
 void xyo_ctl_createclone(JitCtx*, uint64_t);
 void xyo_ctl_deleteclone(JitCtx*);
+int32_t xyo_ctl_deleteclone_begin(JitCtx*);
 void xyo_snd_play(JitCtx*, uint64_t);
 void xyo_snd_playwait(JitCtx*, uint64_t);
 void xyo_snd_stopall(JitCtx*);
 void xyo_snd_seteffect(JitCtx*, uint64_t, uint64_t);
+int32_t xyo_snd_seteffect_begin(JitCtx*, uint64_t, uint64_t);
+int32_t xyo_snd_changeeffect_begin(JitCtx*, uint64_t, uint64_t);
+int32_t xyo_snd_setvolume_begin(JitCtx*, uint64_t);
+int32_t xyo_snd_changevolume_begin(JitCtx*, uint64_t);
 void xyo_snd_changeeffect(JitCtx*, uint64_t, uint64_t);
 void xyo_snd_cleareffects(JitCtx*);
 void xyo_snd_setvolume(JitCtx*, uint64_t);
@@ -689,6 +740,22 @@ const std::pair<const char*, void*> kRtSymbols[] = {
     {"xyo_or", (void*)&xyo_or},
     {"xyo_random", (void*)&xyo_random},
     {"xyo_mathop", (void*)&xyo_mathop},
+    {"xyo_math_abs", (void*)&xyo_math_abs},
+    {"xyo_math_floor", (void*)&xyo_math_floor},
+    {"xyo_math_ceil", (void*)&xyo_math_ceil},
+    {"xyo_math_sqrt", (void*)&xyo_math_sqrt},
+    {"xyo_math_sin", (void*)&xyo_math_sin},
+    {"xyo_math_cos", (void*)&xyo_math_cos},
+    {"xyo_math_tan", (void*)&xyo_math_tan},
+    {"xyo_math_asin", (void*)&xyo_math_asin},
+    {"xyo_math_acos", (void*)&xyo_math_acos},
+    {"xyo_math_atan", (void*)&xyo_math_atan},
+    {"xyo_math_ln", (void*)&xyo_math_ln},
+    {"xyo_math_log", (void*)&xyo_math_log},
+    {"xyo_math_exp", (void*)&xyo_math_exp},
+    {"xyo_math_pow10", (void*)&xyo_math_pow10},
+    {"xyo_letter_eq", (void*)&xyo_letter_eq},
+    {"xyo_letter_eq_i", (void*)&xyo_letter_eq_i},
     {"xyo_round", (void*)&xyo_round},
     {"xyo_log", (void*)&xyo_log},
         {"xyo_asin", (void*)&xyo_asin},
@@ -721,7 +788,11 @@ const std::pair<const char*, void*> kRtSymbols[] = {
     {"xyo_par_for", (void*)&xyo_par_for},
     {"xyo_arg_get", (void*)&xyo_arg_get},
     {"xyo_rt_wait", (void*)&xyo_rt_wait},
+    {"xyo_wait_begin", (void*)&xyo_wait_begin},
+    {"xyo_wait_poll", (void*)&xyo_wait_poll},
     {"xyo_stop_all", (void*)&xyo_stop_all},
+    {"xyo_stop_script_begin", (void*)&xyo_stop_script_begin},
+    {"xyo_stop_all_begin", (void*)&xyo_stop_all_begin},
     {"xyo_stop_others", (void*)&xyo_stop_others},
     {"xyo_stop_script", (void*)&xyo_stop_script},
     {"xyo_broadcast_v", (void*)&xyo_broadcast_v},
@@ -733,6 +804,10 @@ const std::pair<const char*, void*> kRtSymbols[] = {
      (void*)&xyo_ir001_effect_checkpoint},
     {"xyo_ir001_vm_write", (void*)&xyo_ir001_vm_write},
     {"xyo_broadcast_wait_v", (void*)&xyo_broadcast_wait_v},
+    {"xyo_broadcast_wait_lit", (void*)&xyo_broadcast_wait_lit},
+    {"xyo_bcastwait_begin_v", (void*)&xyo_bcastwait_begin_v},
+    {"xyo_bcastwait_begin_lit", (void*)&xyo_bcastwait_begin_lit},
+    {"xyo_bcastwait_step", (void*)&xyo_bcastwait_step},
     {"xyo_timer", (void*)&xyo_timer},
     {"xyo_rt_compat", (void*)&xyo_rt_compat},
     {"xyo_rt_aot_cached", (void*)&xyo_rt_aot_cached},
@@ -751,6 +826,11 @@ const std::pair<const char*, void*> kRtSymbols[] = {
     {"xyo_rt_nested_osr_quad_yield_checkpoint",
      (void*)&xyo_rt_nested_osr_quad_yield_checkpoint},
     {"xyo_proc_push", (void*)&xyo_proc_push},
+    {"xyo_proc_push_ex", (void*)&xyo_proc_push_ex},
+    {"xyo_recursion_yield_due", (void*)&xyo_recursion_yield_due},
+    {"xyo_coro_push_frame", (void*)&xyo_coro_push_frame},
+    {"xyo_coro_top_frame", (void*)&xyo_coro_top_frame},
+    {"xyo_coro_pop_frame", (void*)&xyo_coro_pop_frame},
     {"xyo_proc_pop", (void*)&xyo_proc_pop},
     {"xyo_rt_setarg", (void*)&xyo_rt_setarg},
     {"xyo_join", (void*)&xyo_join},
@@ -776,6 +856,7 @@ const std::pair<const char*, void*> kRtSymbols[] = {
     {"xyo_strlen", (void*)&xyo_strlen},
     {"xyo_strcontains", (void*)&xyo_strcontains},
     {"xyo_list_add", (void*)&xyo_list_add},
+    {"xyo_mega_bench_end", (void*)&xyo_mega_bench_end},
     {"xyo_list_delete", (void*)&xyo_list_delete},
     {"xyo_list_deleteall", (void*)&xyo_list_deleteall},
     {"xyo_list_insert", (void*)&xyo_list_insert},
@@ -805,6 +886,12 @@ const std::pair<const char*, void*> kRtSymbols[] = {
     {"xyo_mot_pointdir", (void*)&xyo_mot_pointdir},
     {"xyo_mot_pointtowards", (void*)&xyo_mot_pointtowards},
     {"xyo_mot_glidexy", (void*)&xyo_mot_glidexy},
+    {"xyo_mot_glidebegin_xy", (void*)&xyo_mot_glidebegin_xy},
+    {"xyo_mot_glidebegin_to", (void*)&xyo_mot_glidebegin_to},
+    {"xyo_mot_glidestep", (void*)&xyo_mot_glidestep},
+    {"xyo_looks_saybegin", (void*)&xyo_looks_saybegin},
+    {"xyo_looks_thinkbegin", (void*)&xyo_looks_thinkbegin},
+    {"xyo_snd_playbegin", (void*)&xyo_snd_playbegin},
     {"xyo_mot_glideto", (void*)&xyo_mot_glideto},
     {"xyo_mot_edgebounce", (void*)&xyo_mot_edgebounce},
     {"xyo_mot_setrotstyle", (void*)&xyo_mot_setrotstyle},
@@ -826,6 +913,8 @@ const std::pair<const char*, void*> kRtSymbols[] = {
     {"xyo_looks_switchbackdrop", (void*)&xyo_looks_switchbackdrop},
     {"xyo_looks_nextbackdrop", (void*)&xyo_looks_nextbackdrop},
     {"xyo_looks_switchbackdropwait", (void*)&xyo_looks_switchbackdropwait},
+    {"xyo_looks_backdropbegin", (void*)&xyo_looks_backdropbegin},
+    {"xyo_looks_backdropstep", (void*)&xyo_looks_backdropstep},
     {"xyo_looks_changeeffect", (void*)&xyo_looks_changeeffect},
     {"xyo_looks_seteffect", (void*)&xyo_looks_seteffect},
     {"xyo_looks_cleareffects", (void*)&xyo_looks_cleareffects},
@@ -853,6 +942,7 @@ const std::pair<const char*, void*> kRtSymbols[] = {
     {"xyo_sns_loud", (void*)&xyo_sns_loud},
     {"xyo_sns_answer", (void*)&xyo_sns_answer},
     {"xyo_sns_askwait", (void*)&xyo_sns_askwait},
+    {"xyo_sns_askbegin", (void*)&xyo_sns_askbegin},
     {"xyo_sns_of", (void*)&xyo_sns_of},
     {"xyo_sns_username", (void*)&xyo_sns_username},
     {"xyo_sns_online", (void*)&xyo_sns_online},
@@ -861,10 +951,15 @@ const std::pair<const char*, void*> kRtSymbols[] = {
     {"xyo_ctl_clearcounter", (void*)&xyo_ctl_clearcounter},
     {"xyo_ctl_createclone", (void*)&xyo_ctl_createclone},
     {"xyo_ctl_deleteclone", (void*)&xyo_ctl_deleteclone},
+    {"xyo_ctl_deleteclone_begin", (void*)&xyo_ctl_deleteclone_begin},
     {"xyo_snd_play", (void*)&xyo_snd_play},
     {"xyo_snd_playwait", (void*)&xyo_snd_playwait},
     {"xyo_snd_stopall", (void*)&xyo_snd_stopall},
     {"xyo_snd_seteffect", (void*)&xyo_snd_seteffect},
+    {"xyo_snd_seteffect_begin", (void*)&xyo_snd_seteffect_begin},
+    {"xyo_snd_changeeffect_begin", (void*)&xyo_snd_changeeffect_begin},
+    {"xyo_snd_setvolume_begin", (void*)&xyo_snd_setvolume_begin},
+    {"xyo_snd_changevolume_begin", (void*)&xyo_snd_changevolume_begin},
     {"xyo_snd_changeeffect", (void*)&xyo_snd_changeeffect},
     {"xyo_snd_cleareffects", (void*)&xyo_snd_cleareffects},
     {"xyo_snd_setvolume", (void*)&xyo_snd_setvolume},
@@ -952,6 +1047,10 @@ struct LLVMBackend final : JitBackend {
     std::shared_ptr<NumericJitCode> compileNumeric(
         std::shared_ptr<const ir::ScratchNumericKernel>,
         uint64_t serial) override;
+    std::shared_ptr<MegaDispatchCode> compileMegaDispatch(
+        const std::vector<Thread*>&, Runtime&, uint64_t serial) override;
+    std::shared_ptr<MegaDispatchCode> compileMegaYieldBatch(
+        const std::vector<Thread*>&, Runtime&, uint64_t serial) override;
     std::unique_ptr<PendingJitCompilation> prepareAsync(
         Thread&, Runtime&, const Block*, uint64_t serial) override;
     bool addObjectFile(const void* bytes, size_t len) override;
@@ -1675,9 +1774,32 @@ static void configureObjectDump(llvm::orc::LLJIT& jit) {
 static void registerRuntimeSymbols(llvm::orc::LLJIT& jit) {
     auto& es = jit.getExecutionSession();
     llvm::orc::SymbolMap symbols;
+    // Opt-in ORC symbol specialization: the emitted call name (and its
+    // yield-edge/StackMap identity) remains xyo_yield_fast. The direct
+    // address bypasses its per-yield environment/chain dispatch entirely.
+    // Fiber::resumeChain serializes when the required chain opt-out is set.
+    // Never use this specialization under ASan.
+    const auto flagEnabled = [](const char* key, char expected) {
+        const char* value = std::getenv(key);
+        return value && value[0] == expected && value[1] == '\0';
+    };
+#if defined(__SANITIZE_ADDRESS__)
+    constexpr bool asan = true;
+#elif defined(__clang__)
+    constexpr bool asan = __has_feature(address_sanitizer);
+#else
+    constexpr bool asan = false;
+#endif
+    const bool directSwitch = !asan &&
+        flagEnabled("XYO_JIT_DIRECT_SWITCH", '1') &&
+        flagEnabled("XYO_FIBER_DIRECT_YIELD", '1') &&
+        flagEnabled("XYO_FIBER_CHAIN", '0');
     for (auto& [name, addr] : kRtSymbols) {
+        void* target = (directSwitch &&
+            std::strcmp(name, "xyo_yield_fast") == 0)
+            ? reinterpret_cast<void*>(&xyo_yield_fast_direct) : addr;
         symbols[es.intern(name)] = llvm::orc::ExecutorSymbolDef(
-            llvm::orc::ExecutorAddr::fromPtr(addr),
+            llvm::orc::ExecutorAddr::fromPtr(target),
             llvm::JITSymbolFlags::Exported);
     }
     // バックエンドの libcall（fmod/log/bcmp 等）— 静的リンクでも解決できる
@@ -1816,6 +1938,1841 @@ bool LLVMBackend::ensureLazyJit() {
 
 LLVMBackend::~LLVMBackend() {
     if (jit) Gc::get().removeRootProvider(this);
+}
+
+// This deliberately has a narrow entry contract. The result is an actual
+// single LLVM Function with a switch(pc) over separately source-verified,
+// non-yielding Scratch scripts, NOT a trampoline of remaining native calls.
+// The sequencer still owns thread order and JitCtx initialization.
+std::shared_ptr<MegaDispatchCode> LLVMBackend::compileMegaDispatch(
+    const std::vector<Thread*>& threads, Runtime& runtime, uint64_t serial) {
+    if (!jit || threads.size() < 2 || threads.size() > 8 ||
+        runtime.blockCountEnabled || std::getenv("XYO_JIT_CALLFRAME") ||
+        std::getenv("XYO_PROF")) return {};
+    Blocks* blocks = threads.front()->blockContainer;
+    Target* target = threads.front()->target;
+    if (!blocks || !target) return {};
+    const uint64_t revision = blocks->revision();
+    const std::string symbol = "xyo_mega_batch_" + std::to_string(serial);
+    llvm::orc::ThreadSafeContext context(std::make_unique<llvm::LLVMContext>());
+    std::unique_ptr<llvm::Module> module;
+    bool okay = true;
+    const auto batchTrace = [] {
+        const char* v = std::getenv("XYO_JIT_MEGA_BATCH_TRACE");
+        return v && v[0] == '1';
+    };
+    auto fail = [&](const char* why) {
+        if (batchTrace()) std::fprintf(stderr, "[mega-batch-fail] %s\n", why);
+        okay = false;
+    };
+    llvmc::withContext(context, [&](llvm::LLVMContext* lc) {
+        module = std::make_unique<llvm::Module>(symbol, *lc);
+        module->setDataLayout(jit->getDataLayout());
+        module->setTargetTriple(llvmc::tripleArg(jit->getTargetTriple()));
+
+        llvm::Type* ptr = llvm::PointerType::getUnqual(*lc);
+        auto* dispatchType = llvm::FunctionType::get(
+            llvm::Type::getVoidTy(*lc), {ptr, llvm::Type::getInt32Ty(*lc)},
+            false);
+        auto* dispatch = llvm::Function::Create(
+            dispatchType, llvm::Function::ExternalLinkage, symbol,
+            module.get());
+        auto* entry = llvm::BasicBlock::Create(*lc, "entry", dispatch);
+        auto* invalid = llvm::BasicBlock::Create(*lc, "invalid", dispatch);
+        llvm::IRBuilder<> ir(*lc);
+        ir.SetInsertPoint(invalid);
+        ir.CreateRetVoid();
+        ir.SetInsertPoint(entry);
+        auto* ctx = dispatch->getArg(0);
+        auto* selector = ir.CreateSwitch(dispatch->getArg(1), invalid,
+                                         unsigned(threads.size()));
+        llvm::SmallVector<llvm::CallInst*, 8> calls;
+        std::vector<llvm::Function*> original;
+        original.reserve(threads.size());
+        // Yield-free procedure functions kept as out-of-line calls (recursive
+        // warp procedures cannot be fused into the entry).
+        std::vector<llvm::Function*> keptProcs;
+        std::unordered_set<std::string> allProcNames;
+
+        for (size_t i = 0; i < threads.size(); ++i) {
+            Thread* thread = threads[i];
+            if (!thread || thread->target != target ||
+                thread->blockContainer != blocks || !thread->isCompiled ||
+                thread->jitCtx || thread->fiber || thread->osrActive ||
+                thread->nestedOsrActive) {
+                okay = false;
+                return;
+            }
+            const auto* current =
+                static_cast<const CompiledScript*>(thread->compiled);
+            if (!current || !current->entry ||
+                (current->mayYield && !current->cooperativeOnly) ||
+                current->mainThread || current->wasm ||
+                current->coroResume || current->aotSourceRevision) {
+                okay = false;
+                return;
+            }
+            const Block* top = blocks->getBlock(thread->topBlock);
+            if (!top || top->opcode != "event_whenflagclicked") {
+                okay = false;
+                return;
+            }
+            auto captured = ir::ScratchCompilationUnit::capture(*blocks, top);
+            if (!captured.valid() || captured.sourceRevision != revision) {
+                okay = false;
+                return;
+            }
+            const std::string childName = symbol + "_slot_" + std::to_string(i);
+            CompiledScript compiled;
+            std::vector<std::string> fnNames;
+            std::map<std::string, std::string> procedures;
+            if (!jitEmitScript(*module, *lc, runtime, target, blocks,
+                               thread->topBlock, childName, compiled,
+                               pinned, fnNames, procedures, nullptr,
+                               nullptr, &captured) ||
+                (compiled.mayYield && !compiled.cooperativeOnly) ||
+                compiled.mainThread ||
+                !compiled.gpuProgs.empty()) {
+                okay = false;
+                return;
+            }
+            auto* child = module->getFunction(childName);
+            // Non-yielding scripts may still contain custom blocks. Fuse the
+            // reachable acyclic procedure graph into the script entry so the
+            // dispatcher keeps its single-executable-function invariant.
+            if (!procedures.empty()) {
+                const size_t procCount = procedures.size();
+                const auto fused = mega_goto::fuse(
+                    *module, childName, procedures, /*force=*/true);
+                if (const char* dbg = std::getenv("XYO_JIT_MEGA_BATCH_TRACE");
+                    dbg && dbg[0] == '1')
+                    std::fprintf(stderr,
+                        "[mega-proc] script=%s procs=%zu fused=%d reason=%s\n",
+                        thread->topBlock.c_str(), procCount,
+                        int(fused.fused), fused.reason);
+                if (!fused.fused) {
+                    // The ordinary emitter may already have inlined the
+                    // entry call, leaving a recursive procedure referenced
+                    // only by itself. Keep every procedure function that is
+                    // still used anywhere in the module.
+                    bool called = false;
+                    for (const auto& [key, symbol] : procedures) {
+                        (void)key;
+                        llvm::Function* fn = module->getFunction(symbol);
+                        if (fn && !fn->use_empty()) {
+                            called = true;
+                            break;
+                        }
+                    }
+                    if (called) {
+                        // A recursive warp procedure graph cannot be fused,
+                        // but the emitter proved the whole entry graph is
+                        // yield-free (compiled.mayYield == false). Keep the
+                        // procedure functions and let the dispatcher call
+                        // them natively: they never suspend, so no Fiber is
+                        // needed on the batch worker.
+                        if ((compiled.mayYield && !compiled.cooperativeOnly) ||
+                            compiled.coroResume) {
+                            fail("recursive graph still may yield");
+                            return;
+                        }
+                    } else {
+                        procedures.clear();
+                    }
+                }
+            }
+            for (const auto& [key, symbol] : procedures) {
+                (void)key;
+                allProcNames.insert(symbol);
+            }
+            if (!child || child->isDeclaration() ||
+                child->arg_size() != 1) {
+                okay = false;
+                return;
+            }
+            original.push_back(child);
+            auto* caseBlock = llvm::BasicBlock::Create(
+                *lc, "script_" + std::to_string(i), dispatch);
+            selector->addCase(
+                llvm::ConstantInt::get(
+                    llvm::Type::getInt32Ty(*lc), i), caseBlock);
+            ir.SetInsertPoint(caseBlock);
+            calls.push_back(ir.CreateCall(child, {ctx}));
+            ir.CreateRetVoid();
+        }
+        if (blocks->revision() != revision) {
+            okay = false;
+            return;
+        }
+        // Erase now-unreachable procedure bodies (fusion internalized
+        // them). Anything still used would be a hidden helper. A recursive
+        // child keeps its procedure functions alive instead.
+        for (auto it = module->begin(); it != module->end();) {
+            llvm::Function* fn = &*it++;
+            // `dispatch` has no in-module users despite its external
+            // linkage; erasing it would free the switch below.
+            if (fn == dispatch || fn->isDeclaration() ||
+                std::find(original.begin(), original.end(), fn) !=
+                    original.end())
+                continue;
+            if (!fn->use_empty()) {
+                // Keep only procedure functions that belong to a
+                // yield-free recursive graph.
+                if (!allProcNames.count(fn->getName().str())) {
+                    fail("used function is not a procedure");
+                    return;
+                }
+                keptProcs.push_back(fn);
+                continue;
+            }
+            fn->eraseFromParent();
+        }
+        // No untracked native helpers are permitted in this beta. This
+        // guarantees that after inlining there is exactly ONE executable
+        // LLVM Function, rather than a switch that simply calls out to
+        // hidden per-script helpers.
+        for (llvm::Function& fn : *module) {
+            if (fn.isDeclaration() || &fn == dispatch) continue;
+            if (std::find(original.begin(), original.end(), &fn) ==
+                    original.end() &&
+                std::find(keptProcs.begin(), keptProcs.end(), &fn) ==
+                    keptProcs.end()) {
+                fail("untracked helper function");
+                return;
+            }
+        }
+        llvm::InlineFunctionInfo inlineInfo;
+        for (llvm::CallInst* call : calls) {
+            if (!llvm::InlineFunction(*call, inlineInfo).isSuccess()) {
+                fail("inline child into dispatcher");
+                return;
+            }
+        }
+        for (llvm::Function* child : original) {
+            if (!child->use_empty()) {
+                okay = false;
+                return;
+            }
+            child->eraseFromParent();
+        }
+        if (llvm::verifyModule(*module, &llvm::errs())) {
+            fail("verify module");
+            return;
+        }
+        llvm::PassBuilder pb;
+        llvm::LoopAnalysisManager lam;
+        llvm::FunctionAnalysisManager fam;
+        llvm::CGSCCAnalysisManager cgam;
+        llvm::ModuleAnalysisManager mam;
+        pb.registerModuleAnalyses(mam);
+        pb.registerCGSCCAnalyses(cgam);
+        pb.registerFunctionAnalyses(fam);
+        pb.registerLoopAnalyses(lam);
+        pb.crossRegisterProxies(lam, fam, cgam, mam);
+        auto pipeline = pb.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O1);
+        pipeline.run(*module, mam);
+        if (llvm::verifyModule(*module, &llvm::errs())) fail("verify after passes");
+        if (const char* trace = std::getenv("XYO_JIT_MEGA_BATCH_TRACE");
+            trace && trace[0] == '1') {
+            size_t definitions = 0, indirectCalls = 0;
+            for (auto& fn : *module) {
+                if (!fn.isDeclaration()) ++definitions;
+                if (&fn == dispatch)
+                    for (auto& bb : fn)
+                        for (auto& instruction : bb)
+                            if (auto* call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+                                call && !call->getCalledFunction()) ++indirectCalls;
+            }
+            std::fprintf(stderr,
+                "[mega-batch] slots=%zu definitions=%zu indirect=%zu "
+                "source_revision=%llu valid=%d\n",
+                threads.size(), definitions, indirectCalls,
+                static_cast<unsigned long long>(revision), int(okay));
+        }
+    });
+    if (!okay || blocks->revision() != revision) return {};
+    llvm::Error err = jit->addIRModule(
+        llvm::orc::ThreadSafeModule(std::move(module), context));
+    if (err) {
+        llvm::consumeError(std::move(err));
+        return {};
+    }
+    auto address = jit->lookup(symbol);
+    if (!address) {
+        llvm::consumeError(address.takeError());
+        return {};
+    }
+    auto result = std::make_shared<MegaDispatchCode>();
+    result->entry = reinterpret_cast<MegaDispatchCode::Entry>(
+        address->getValue());
+    result->sourceBlocks = blocks;
+    result->sourceRevision = revision;
+    result->entries = uint32_t(threads.size());
+    return result;
+}
+
+// Experimental whole-batch stackless continuation for exactly one
+// ordinary source-certified repeat per green-flag Scratch script.
+// All script bodies live IN the single LLVM function. The continuation
+// pointer and repeat counter belong to Thread, not to a native C++ stack.
+std::shared_ptr<MegaDispatchCode> LLVMBackend::compileMegaYieldBatch(
+    const std::vector<Thread*>& threads, Runtime& runtime, uint64_t serial) {
+    static const bool singleYield = [] {
+        const char* receiver = std::getenv("XYO_JIT_MEGA_SINGLE_RECEIVER");
+        const char* sender = std::getenv("XYO_JIT_MEGA_SINGLE_SENDER");
+        return (receiver && receiver[0] == '1' && receiver[1] == '\0') ||
+               (sender && sender[0] == '1' && sender[1] == '\0');
+    }();
+    if (!jit || threads.empty() || threads.size() > 8 ||
+        (threads.size() == 1 && !singleYield) ||
+        runtime.blockCountEnabled || std::getenv("XYO_PROF") ||
+        std::getenv("XYO_JIT_CALLFRAME")) return {};
+    static_assert(Thread::MegaReturnCapacity ==
+                  mega_yield::kMaxProcedureDepth);
+    static_assert(Thread::MegaScalarBindingCapacity >=
+                  2 + mega_yield::kMaxProcedureDepth);
+    Blocks* blocks = threads.front()->blockContainer;
+    if (!blocks || !threads.front()->target) return {};
+    const uint64_t revision = blocks->revision();
+    static const bool directScalar = [] {
+        const char* env = std::getenv("XYO_JIT_MEGA_DIRECT_SCALAR");
+        return env && env[0] == '1';
+    }();
+    static const bool notifyWaits = [] {
+        const char* env = std::getenv("XYO_WAIT_WAKE_REGISTRY");
+        return env && env[0] == '1';
+    }();
+    static const bool requestScalarBatch = [] {
+        const char* env = std::getenv("XYO_JIT_MEGA_SCALAR_BATCH");
+        return env && env[0] == '1';
+    }();
+    static const bool requestMultiPcBatch = [] {
+        const char* env = std::getenv("XYO_JIT_MEGA_MULTI_PC_BATCH");
+        return env && env[0] == '1';
+    }();
+    // A single-Thread entry is created only for an explicitly enabled
+    // experiment. Normal batch code generation stays unchanged otherwise.
+    static const bool specializeSingle = [] {
+        const char* mode = std::getenv("XYO_JIT_MEGA_SINGLE_SPECIALIZE");
+        const char* single = std::getenv("XYO_JIT_MEGA_SINGLE_DISPATCH");
+        return mode && mode[0] == '1' && mode[1] == '\0' &&
+               single && single[0] == '1';
+    }();
+    static const bool repeatBurst = [] {
+        const char* flag = std::getenv("XYO_JIT_MEGA_REPEAT_BURST");
+        return flag && flag[0] == '1' && flag[1] == '\0';
+    }() && specializeSingle;
+    static const bool multiRepeatBurst = [] {
+        const char* flag = std::getenv(
+            "XYO_JIT_MEGA_MULTI_REPEAT_BURST");
+        return flag && flag[0] == '1' && flag[1] == '\0';
+    }() && repeatBurst;
+    std::vector<mega_yield::Source> sources;
+    sources.reserve(threads.size());
+    for (Thread* thread : threads) {
+        if (!thread || !thread->target ||
+            thread->blockContainer != blocks ||
+            !thread->isCompiled || thread->jitCtx || thread->fiber ||
+            thread->osrActive || thread->nestedOsrActive ||
+            thread->interpreterStarted) return {};
+        const Block* top = blocks->getBlock(thread->topBlock);
+        if (!top) return {};
+        mega_yield::Source source;
+        if (!mega_yield::prove(*blocks, *top, source) ||
+            (!source.hasBenchRound &&
+             !thread->target->lookupVariableById(source.variableId)) ||
+            (source.hasBenchRound &&
+             (!thread->target->lookupVariableById(source.benchRound.milliseconds.id) ||
+              !thread->target->lookupVariableById(source.benchRound.endTime.id) ||
+              !thread->target->lookupVariableById(source.benchRound.startTime.id) ||
+              !thread->target->lookupVariableById(source.benchRound.round.id) ||
+              !thread->target->lookupVariableById(source.benchRound.total.id) ||
+              !thread->target->lookupVariableById(source.benchRound.count.id) ||
+              !thread->target->lookupVariableById(source.benchRound.chunks.id) ||
+              !thread->target->lookupVariableById(source.benchRound.bestRate.id))) ||
+            !std::all_of(source.beginSets.begin(), source.beginSets.end(),
+                [&](const auto& set) {
+                    return thread->target->lookupVariableById(
+                        set.variableId) != nullptr;
+                }) ||
+            (source.hasSecondChange &&
+             !thread->target->lookupVariableById(
+                 source.secondVariableId)) ||
+            (source.kind == mega_yield::Source::Kind::BroadcastUntil &&
+             !source.untilClockReporter &&
+             !thread->target->lookupVariableById(
+                 source.conditionVariableId)) ||
+            (source.untilCompareVariable &&
+             !thread->target->lookupVariableById(
+                 source.untilOtherVariableId)) ||
+            (source.untilClockElapsedMs &&
+             !thread->target->lookupVariableById(
+                 source.untilStartVariableId)) ||
+            (source.hasBenchEnd &&
+             (!thread->target->lookupVariableById("output") ||
+              thread->target->lookupVariableById("output")->type !=
+                  Variable::kListType)) ||
+            (source.hasOuterUntil &&
+             (!thread->target->lookupVariableById(
+                  source.outerFirstSet.variableId) ||
+              !thread->target->lookupVariableById(
+                  source.outerSecondSet.variableId) ||
+              (source.hasOuterFinalSet
+                  ? (!thread->target->lookupVariableById(
+                         source.outerFinalSet.variableId) ||
+                     !thread->target->lookupVariableById(
+                         source.outerFinalSet.readVariableId))
+                  : !thread->target->lookupVariableById(
+                        source.outerSuffix.variableId)))) ||
+            (source.hasInnerAfterSets &&
+             (!thread->target->lookupVariableById(
+                  source.innerAfterFirstSet.variableId) ||
+              !thread->target->lookupVariableById(
+                  source.innerAfterSecondSet.variableId) ||
+              (source.innerAfterFirstSet.readVariable &&
+               !thread->target->lookupVariableById(
+                   source.innerAfterFirstSet.readVariableId)) ||
+              (source.innerAfterSecondSet.readVariable &&
+               !thread->target->lookupVariableById(
+                   source.innerAfterSecondSet.readVariableId)))) ||
+            (source.hasConditional &&
+             ((source.hasElseBranch &&
+               !thread->target->lookupVariableById(
+                   source.elseVariableId)) ||
+              !thread->target->lookupVariableById(
+                  source.conditionVariableId) ||
+              (source.hasThenSecondChange &&
+               !thread->target->lookupVariableById(
+                   source.thenSecondVariableId)) ||
+              (source.hasElseSecondChange &&
+               !thread->target->lookupVariableById(
+                   source.elseSecondVariableId)))) ||
+            !std::all_of(source.returnSuffixes.begin(),
+                         source.returnSuffixes.end(),
+                [&](const auto& suffix) {
+                    return thread->target->lookupVariableById(
+                        suffix.variableId) != nullptr;
+                })) return {};
+        sources.push_back(std::move(source));
+    }
+    if (blocks->revision() != revision) return {};
+    // This path has NO scheduler yields, helper calls, Type/GC side effects,
+    // or LLVM return PCs. In particular, keep reverse wait notifications
+    // on the ordinary entry until a proven equivalent bulk wake is added.
+    const bool scalarBatch =
+        requestScalarBatch && directScalar && !notifyWaits &&
+        std::all_of(sources.begin(), sources.end(),
+            [&](const auto& source) {
+                return source.kind == mega_yield::Source::Kind::Scalar &&
+                       !source.hasSecondChange &&
+                       !source.hasConditional &&
+                       source.returnSuffixes.empty() &&
+                       source.delta == sources.front().delta;
+            });
+    const bool multiPcBatch =
+        requestMultiPcBatch && requestScalarBatch &&
+        directScalar && !notifyWaits &&
+        std::all_of(sources.begin(), sources.end(),
+            [](const auto& source) {
+                return (source.kind == mega_yield::Source::Kind::Scalar ||
+                        source.kind == mega_yield::Source::Kind::Repeat) &&
+                       source.returnSuffixes.empty();
+            });
+    // A generic Mega batch may mix scalar, conditional or broadcast
+    // sources. None can be run ahead without changing Scratch semantics.
+    // Do not emit an unused LLVM burst function for those programs:
+    // enabling this opt-in flag must not perturb unrelated codegen.
+    const bool compileMultiRepeatBurst =
+        multiRepeatBurst && multiPcBatch &&
+        sources.size() >= 2 && sources.size() <= 8 &&
+        std::all_of(sources.begin(), sources.end(),
+            [](const auto& source) {
+                return source.kind == mega_yield::Source::Kind::Repeat &&
+                       !source.hasConditional && !source.hasElseBranch &&
+                       !source.hasThenSecondChange &&
+                       !source.hasElseSecondChange &&
+                       source.returnSuffixes.empty();
+            });
+    const std::string symbol = "xyo_mega_resume_" + std::to_string(serial);
+    llvm::orc::ThreadSafeContext context(std::make_unique<llvm::LLVMContext>());
+    std::unique_ptr<llvm::Module> module;
+    bool valid = true;
+    llvmc::withContext(context, [&](llvm::LLVMContext* lc) {
+        module = std::make_unique<llvm::Module>(symbol, *lc);
+        module->setDataLayout(jit->getDataLayout());
+        module->setTargetTriple(llvmc::tripleArg(jit->getTargetTriple()));
+        auto* voidType = llvm::Type::getVoidTy(*lc);
+        auto* ptrType = llvm::PointerType::getUnqual(*lc);
+        auto* i32 = llvm::Type::getInt32Ty(*lc);
+        auto* i64 = llvm::Type::getInt64Ty(*lc);
+        auto* type = llvm::FunctionType::get(
+            voidType,
+            {ptrType, ptrType, ptrType, ptrType, ptrType, ptrType}, false);
+        auto* dispatch = llvm::Function::Create(
+            type, llvm::Function::ExternalLinkage, symbol, module.get());
+        auto iter = dispatch->arg_begin();
+        llvm::Argument* ctx = &*iter++;
+        llvm::Argument* pcPtr = &*iter++;
+        llvm::Argument* remainingPtr = &*iter++;
+        llvm::Argument* returnStackPtr = &*iter++;
+        llvm::Argument* returnDepthPtr = &*iter++;
+        llvm::Argument* scalarBindings = &*iter;
+        if (scalarBatch) {
+            auto* batchType = llvm::FunctionType::get(
+                voidType, {ptrType, i64}, false);
+            auto* batch = llvm::Function::Create(
+                batchType, llvm::Function::ExternalLinkage,
+                symbol + "_scalar_batch", module.get());
+            auto* values = batch->getArg(0);
+            auto* count = batch->getArg(1);
+            auto* begin = llvm::BasicBlock::Create(*lc, "bulk.start", batch);
+            auto* header = llvm::BasicBlock::Create(*lc, "bulk.header", batch);
+            auto* body = llvm::BasicBlock::Create(*lc, "bulk.body", batch);
+            auto* finished = llvm::BasicBlock::Create(
+                *lc, "bulk.finished", batch);
+            llvm::IRBuilder<> bb(*lc);
+            bb.SetInsertPoint(begin);
+            bb.CreateBr(header);
+            bb.SetInsertPoint(header);
+            auto* index = bb.CreatePHI(i64, 2, "i");
+            index->addIncoming(bb.getInt64(0), begin);
+            bb.CreateCondBr(bb.CreateICmpULT(index, count), body, finished);
+            bb.SetInsertPoint(body);
+            auto* sourceSlot = bb.CreateInBoundsGEP(
+                ptrType, values, index);
+            auto* variable = bb.CreateLoad(ptrType, sourceSlot);
+            auto* valuePtr = bb.CreateInBoundsGEP(
+                bb.getInt8Ty(), variable,
+                bb.getInt64(static_cast<uint64_t>(
+                    offsetof(Variable, value))));
+            auto* currentBits = bb.CreateLoad(i64, valuePtr);
+            auto* currentNumber = bb.CreateBitCast(
+                currentBits, llvm::Type::getDoubleTy(*lc));
+            auto* added = bb.CreateFAdd(
+                currentNumber,
+                llvm::ConstantFP::get(
+                    llvm::Type::getDoubleTy(*lc), sources.front().delta));
+            // The host proves each operand is finite, and the source
+            // delta is finite. Overflow can yield +/-inf, but not NaN.
+            bb.CreateStore(bb.CreateBitCast(added, i64), valuePtr);
+            auto* nextIndex = bb.CreateAdd(index, bb.getInt64(1));
+            index->addIncoming(nextIndex, body);
+            bb.CreateBr(header);
+            bb.SetInsertPoint(finished);
+            bb.CreateRetVoid();
+            if (specializeSingle) {
+                // The caller has already proved a single numeric binding.
+                // One scalar FAdd is sufficient, without an array/loop.
+                auto* single = llvm::Function::Create(
+                    llvm::FunctionType::get(voidType, {ptrType}, false),
+                    llvm::Function::ExternalLinkage,
+                    symbol + "_scalar_single", module.get());
+                llvm::IRBuilder<> sb(llvm::BasicBlock::Create(
+                    *lc, "scalar.single", single));
+                auto* valuePtr = sb.CreateInBoundsGEP(
+                    sb.getInt8Ty(), single->getArg(0),
+                    sb.getInt64(offsetof(Variable, value)));
+                auto* oldBits = sb.CreateLoad(i64, valuePtr);
+                auto* number = sb.CreateBitCast(
+                    oldBits, llvm::Type::getDoubleTy(*lc));
+                auto* added = sb.CreateFAdd(number, llvm::ConstantFP::get(
+                    llvm::Type::getDoubleTy(*lc), sources.front().delta));
+                sb.CreateStore(sb.CreateBitCast(added, i64), valuePtr);
+                sb.CreateRetVoid();
+            }
+        }
+        if (multiPcBatch) {
+            // Scratch's source-PC and loop counter are Thread-owned. The
+            // LLVM function sees only three explicitly validated pointers
+            // per item. Each item is dispatched by its even/odd source PC,
+            // preserving one regular Scratch turn per source per pass.
+            static_assert(sizeof(MegaDispatchCode::MultiPcItem) ==
+                          sizeof(void*) * 7);
+            auto* bulkType = llvm::FunctionType::get(
+                voidType, {ptrType, i64}, false);
+            auto* bulk = llvm::Function::Create(
+                bulkType, llvm::Function::ExternalLinkage,
+                symbol + "_multi_pc_batch", module.get());
+            auto* batchItems = bulk->getArg(0);
+            auto* count = bulk->getArg(1);
+            auto* begin = llvm::BasicBlock::Create(*lc, "multi.begin", bulk);
+            auto* header = llvm::BasicBlock::Create(*lc, "multi.header", bulk);
+            auto* current = llvm::BasicBlock::Create(*lc, "multi.current", bulk);
+            auto* advance = llvm::BasicBlock::Create(*lc, "multi.advance", bulk);
+            auto* finished = llvm::BasicBlock::Create(*lc, "multi.end", bulk);
+            llvm::IRBuilder<> bb(*lc);
+            bb.SetInsertPoint(begin);
+            bb.CreateBr(header);
+            bb.SetInsertPoint(header);
+            auto* index = bb.CreatePHI(i64, 2, "i");
+            index->addIncoming(bb.getInt64(0), begin);
+            bb.CreateCondBr(bb.CreateICmpULT(index, count), current, finished);
+            bb.SetInsertPoint(current);
+            auto* item = bb.CreateInBoundsGEP(
+                bb.getInt8Ty(), batchItems,
+                bb.CreateMul(index, bb.getInt64(
+                    sizeof(MegaDispatchCode::MultiPcItem))));
+            auto* variable = bb.CreateLoad(ptrType, item);
+            auto* secondField = bb.CreateInBoundsGEP(
+                bb.getInt8Ty(), item, bb.getInt64(
+                    offsetof(MegaDispatchCode::MultiPcItem, secondVariable)));
+            auto* secondVariable = bb.CreateLoad(ptrType, secondField);
+            auto* conditionField = bb.CreateInBoundsGEP(
+                bb.getInt8Ty(), item, bb.getInt64(
+                    offsetof(MegaDispatchCode::MultiPcItem,
+                             conditionVariable)));
+            auto* conditionVariable = bb.CreateLoad(ptrType, conditionField);
+            auto* thenSecondField = bb.CreateInBoundsGEP(
+                bb.getInt8Ty(), item, bb.getInt64(
+                    offsetof(MegaDispatchCode::MultiPcItem,
+                             thenSecondVariable)));
+            auto* thenSecondVariable = bb.CreateLoad(ptrType, thenSecondField);
+            auto* elseSecondField = bb.CreateInBoundsGEP(
+                bb.getInt8Ty(), item, bb.getInt64(
+                    offsetof(MegaDispatchCode::MultiPcItem,
+                             elseSecondVariable)));
+            auto* elseSecondVariable = bb.CreateLoad(ptrType, elseSecondField);
+            auto* pcField = bb.CreateInBoundsGEP(
+                bb.getInt8Ty(), item,
+                bb.getInt64(offsetof(MegaDispatchCode::MultiPcItem, pc)));
+            auto* pcAddress = bb.CreateLoad(ptrType, pcField);
+            auto* remField = bb.CreateInBoundsGEP(
+                bb.getInt8Ty(), item,
+                bb.getInt64(offsetof(MegaDispatchCode::MultiPcItem, remaining)));
+            auto* remAddress = bb.CreateLoad(ptrType, remField);
+            auto* pcValue = bb.CreateLoad(i32, pcAddress);
+            auto* choice = bb.CreateSwitch(pcValue, advance);
+            // Each source case owns its own constant delta and repetitions.
+            // No aggregation or reordering of floating-point additions.
+            for (size_t i = 0; i < sources.size(); ++i) {
+                const auto& source = sources[i];
+                auto* sourceStart = llvm::BasicBlock::Create(
+                    *lc, "multi.source_" + std::to_string(i) + ".start", bulk);
+                auto* sourceResume = llvm::BasicBlock::Create(
+                    *lc, "multi.source_" + std::to_string(i) + ".resume", bulk);
+                auto* sourceWrite = llvm::BasicBlock::Create(
+                    *lc, "multi.source_" + std::to_string(i) + ".write", bulk);
+                auto* sourceDone = llvm::BasicBlock::Create(
+                    *lc, "multi.source_" + std::to_string(i) + ".done", bulk);
+                choice->addCase(bb.getInt32(uint32_t(2*i)), sourceStart);
+                choice->addCase(bb.getInt32(uint32_t(2*i+1)), sourceResume);
+                bb.SetInsertPoint(sourceStart);
+                if (source.kind == mega_yield::Source::Kind::Repeat) {
+                    bb.CreateStore(bb.getInt64(source.repetitions), remAddress);
+                    bb.CreateBr(sourceResume);
+                } else {
+                    bb.CreateBr(sourceWrite);
+                }
+                bb.SetInsertPoint(sourceResume);
+                if (source.kind == mega_yield::Source::Kind::Repeat) {
+                    auto* left = bb.CreateLoad(i64, remAddress);
+                    bb.CreateCondBr(
+                        bb.CreateICmpEQ(left, bb.getInt64(0)),
+                        sourceDone, sourceWrite);
+                } else {
+                    // One-shot scalar resume is invalid and unreachable after
+                    // host validation. Never replay the completed write.
+                    bb.CreateBr(sourceDone);
+                }
+                bb.SetInsertPoint(sourceWrite);
+                const auto numberType = llvm::Type::getDoubleTy(*lc);
+                const auto emitNumberAdd = [&](llvm::Value* target,
+                                               double delta) {
+                    auto* address = bb.CreateInBoundsGEP(
+                        bb.getInt8Ty(), target,
+                        bb.getInt64(offsetof(Variable, value)));
+                    auto* bits = bb.CreateLoad(i64, address);
+                    auto* number = bb.CreateBitCast(bits, numberType);
+                    auto* added = bb.CreateFAdd(
+                        number, llvm::ConstantFP::get(numberType, delta));
+                    bb.CreateStore(bb.CreateBitCast(added, i64), address);
+                };
+                if (source.hasConditional) {
+                    auto* conditionAddress = bb.CreateInBoundsGEP(
+                        bb.getInt8Ty(), conditionVariable,
+                        bb.getInt64(offsetof(Variable, value)));
+                    auto* conditionBits = bb.CreateLoad(i64, conditionAddress);
+                    auto* conditionNumber = bb.CreateBitCast(
+                        conditionBits, numberType);
+                    auto* literal = llvm::ConstantFP::get(
+                        numberType, source.conditionLiteral);
+                    llvm::Value* lhs = source.conditionLiteralLeft ?
+                        static_cast<llvm::Value*>(literal) : conditionNumber;
+                    llvm::Value* rhs = source.conditionLiteralLeft ?
+                        static_cast<llvm::Value*>(conditionNumber) : literal;
+                    llvm::Value* predicate = nullptr;
+                    switch (source.comparison) {
+                    case mega_yield::Source::Comparison::Greater:
+                        predicate = bb.CreateFCmpOGT(lhs, rhs);
+                        break;
+                    case mega_yield::Source::Comparison::Less:
+                        predicate = bb.CreateFCmpOLT(lhs, rhs);
+                        break;
+                    case mega_yield::Source::Comparison::Equal:
+                        predicate = bb.CreateFCmpOEQ(lhs, rhs);
+                        break;
+                    }
+                    auto* thenBlock = llvm::BasicBlock::Create(
+                        *lc, "multi.if.then." + std::to_string(i), bulk);
+                    auto* elseBlock = llvm::BasicBlock::Create(
+                        *lc, "multi.if.else." + std::to_string(i), bulk);
+                    auto* mergeBlock = llvm::BasicBlock::Create(
+                        *lc, "multi.if.merge." + std::to_string(i), bulk);
+                    bb.CreateCondBr(predicate, thenBlock, elseBlock);
+                    bb.SetInsertPoint(thenBlock);
+                    emitNumberAdd(variable, source.delta);
+                    if (source.hasThenSecondChange)
+                        emitNumberAdd(thenSecondVariable,
+                                      source.thenSecondDelta);
+                    bb.CreateBr(mergeBlock);
+                    bb.SetInsertPoint(elseBlock);
+                    if (source.hasElseBranch) {
+                        emitNumberAdd(secondVariable, source.elseDelta);
+                        if (source.hasElseSecondChange)
+                            emitNumberAdd(elseSecondVariable,
+                                          source.elseSecondDelta);
+                    }
+                    // Without ELSE, false is a genuine no-op, not a
+                    // synthetic addition of zero to a variable.
+                    bb.CreateBr(mergeBlock);
+                    bb.SetInsertPoint(mergeBlock);
+                } else {
+                    emitNumberAdd(variable, source.delta);
+                    if (source.hasSecondChange)
+                        emitNumberAdd(secondVariable, source.secondDelta);
+                }
+                if (source.kind == mega_yield::Source::Kind::Repeat) {
+                    auto* left = bb.CreateLoad(i64, remAddress);
+                    bb.CreateStore(bb.CreateSub(left, bb.getInt64(1)),
+                                   remAddress);
+                    bb.CreateStore(bb.getInt32(uint32_t(2*i+1)), pcAddress);
+                } else {
+                    bb.CreateStore(bb.getInt32(UINT32_MAX), pcAddress);
+                }
+                bb.CreateBr(advance);
+                bb.SetInsertPoint(sourceDone);
+                bb.CreateStore(bb.getInt32(UINT32_MAX), pcAddress);
+                bb.CreateBr(advance);
+            }
+            bb.SetInsertPoint(advance);
+            auto* next = bb.CreateAdd(index, bb.getInt64(1));
+            index->addIncoming(next, advance);
+            bb.CreateBr(header);
+            bb.SetInsertPoint(finished);
+            bb.CreateRetVoid();
+            if (specializeSingle) {
+                // Inline the exact existing multi-PC state machine with a
+                // constant trip count of one. O1 removes batch iteration,
+                // count compare and per-item index arithmetic. All source
+                // PC cases, FAdd order and Thread-owned state stay identical.
+                auto* single = llvm::Function::Create(
+                    llvm::FunctionType::get(voidType, {ptrType}, false),
+                    llvm::Function::ExternalLinkage,
+                    symbol + "_multi_pc_single", module.get());
+                llvm::IRBuilder<> sb(llvm::BasicBlock::Create(
+                    *lc, "multi.single", single));
+                auto* call = sb.CreateCall(
+                    bulk, {single->getArg(0), sb.getInt64(1)});
+                sb.CreateRetVoid();
+                llvm::InlineFunctionInfo info;
+                if (!llvm::InlineFunction(*call, info).isSuccess()) {
+                    valid = false;
+                    return;
+                }
+            }
+            if (compileMultiRepeatBurst) {
+                // One native call spans several complete Scratch passes,
+                // never executing one Thread's future iteration before
+                // another Thread's current iteration. Reusing the verified
+                // count-batch executor preserves writes to aliased variables
+                // in the exact original Thread order (including FP rounding).
+                auto* fn = llvm::Function::Create(
+                    llvm::FunctionType::get(i64,
+                        {ptrType, i64, i64}, false),
+                    llvm::Function::ExternalLinkage,
+                    symbol + "_multi_repeat_burst", module.get());
+                auto* items = fn->getArg(0);
+                auto* count = fn->getArg(1);
+                auto* maxPasses = fn->getArg(2);
+                auto* entryBlock = llvm::BasicBlock::Create(
+                    *lc, "multi_burst.entry", fn);
+                auto* passHead = llvm::BasicBlock::Create(
+                    *lc, "multi_burst.pass", fn);
+                auto* checkHead = llvm::BasicBlock::Create(
+                    *lc, "multi_burst.check", fn);
+                auto* checkBody = llvm::BasicBlock::Create(
+                    *lc, "multi_burst.check_body", fn);
+                auto* checkSecond = llvm::BasicBlock::Create(
+                    *lc, "multi_burst.check_second", fn);
+                auto* checkSecondBody = llvm::BasicBlock::Create(
+                    *lc, "multi_burst.check_second_body", fn);
+                auto* checkNext = llvm::BasicBlock::Create(
+                    *lc, "multi_burst.check_next", fn);
+                auto* afterCheck = llvm::BasicBlock::Create(
+                    *lc, "multi_burst.after_check", fn);
+                auto* finished = llvm::BasicBlock::Create(
+                    *lc, "multi_burst.done", fn);
+                auto* zero = llvm::BasicBlock::Create(
+                    *lc, "multi_burst.zero", fn);
+                llvm::IRBuilder<> mb(entryBlock);
+                mb.CreateCondBr(
+                    mb.CreateOr(
+                        mb.CreateICmpEQ(maxPasses, mb.getInt64(0)),
+                        mb.CreateICmpEQ(count, mb.getInt64(0))),
+                    zero, passHead);
+                mb.SetInsertPoint(zero);
+                mb.CreateRet(mb.getInt64(0));
+                mb.SetInsertPoint(passHead);
+                auto* iteration = mb.CreatePHI(i64, 2, "pass");
+                iteration->addIncoming(mb.getInt64(0), entryBlock);
+                auto* nextPass = mb.CreateAdd(
+                    iteration, mb.getInt64(1));
+                mb.CreateCall(bulk, {items, count});
+                mb.CreateBr(checkHead);
+                mb.SetInsertPoint(checkHead);
+                auto* itemIndex = mb.CreatePHI(i64, 2, "item");
+                itemIndex->addIncoming(mb.getInt64(0), passHead);
+                mb.CreateCondBr(
+                    mb.CreateICmpULT(itemIndex, count),
+                    checkBody, afterCheck);
+                mb.SetInsertPoint(checkBody);
+                auto* itemAddress = mb.CreateInBoundsGEP(
+                    mb.getInt8Ty(), items,
+                    mb.CreateMul(itemIndex, mb.getInt64(
+                        sizeof(MegaDispatchCode::MultiPcItem))));
+                // The first MultiPcItem field is Variable*; all supplied
+                // items were checked by C++ for type and structural stamps.
+                auto* variable = mb.CreateLoad(ptrType, itemAddress);
+                auto* valueAddress = mb.CreateInBoundsGEP(
+                    mb.getInt8Ty(), variable,
+                    mb.getInt64(offsetof(Variable, value)));
+                auto* bits = mb.CreateLoad(i64, valueAddress);
+                auto* exponent = mb.CreateAnd(
+                    bits, mb.getInt64(0x7ff0000000000000ull));
+                auto* expMask = mb.getInt64(0x7ff0000000000000ull);
+                mb.CreateCondBr(
+                    mb.CreateICmpNE(exponent, expMask),
+                    checkSecond, finished);
+                mb.SetInsertPoint(checkSecond);
+                // Source may contain two sequential writes, potentially
+                // to the same Variable*. Verify the second operand too.
+                // Null is the one-write source's ABI representation.
+                auto* secondField = mb.CreateInBoundsGEP(
+                    mb.getInt8Ty(), itemAddress, mb.getInt64(
+                        offsetof(MegaDispatchCode::MultiPcItem,
+                                 secondVariable)));
+                auto* secondVariable = mb.CreateLoad(
+                    ptrType, secondField);
+                mb.CreateCondBr(
+                    mb.CreateIsNotNull(secondVariable),
+                    checkSecondBody, checkNext);
+                mb.SetInsertPoint(checkSecondBody);
+                auto* secondValueAddress = mb.CreateInBoundsGEP(
+                    mb.getInt8Ty(), secondVariable, mb.getInt64(
+                        offsetof(Variable, value)));
+                auto* secondBits = mb.CreateLoad(i64, secondValueAddress);
+                auto* secondExponent = mb.CreateAnd(
+                    secondBits, expMask);
+                mb.CreateCondBr(
+                    mb.CreateICmpNE(secondExponent, expMask),
+                    checkNext, finished);
+                mb.SetInsertPoint(checkNext);
+                auto* incremented = mb.CreateAdd(
+                    itemIndex, mb.getInt64(1));
+                itemIndex->addIncoming(incremented, checkNext);
+                mb.CreateBr(checkHead);
+                mb.SetInsertPoint(afterCheck);
+                iteration->addIncoming(nextPass, afterCheck);
+                mb.CreateCondBr(
+                    mb.CreateICmpULT(nextPass, maxPasses),
+                    passHead, finished);
+                mb.SetInsertPoint(finished);
+                mb.CreateRet(nextPass);
+            }
+            if (repeatBurst) {
+                for (size_t slot = 0; slot < sources.size(); ++slot) {
+                    const auto& source = sources[slot];
+                    if (source.kind != mega_yield::Source::Kind::Repeat ||
+                        source.hasSecondChange || source.hasConditional ||
+                        source.hasElseBranch ||
+                        source.hasThenSecondChange ||
+                        source.hasElseSecondChange ||
+                        !source.returnSuffixes.empty())
+                        continue;
+                    // Pure fixed-delta repeats can retain their accumulator
+                    // in an FP register for one short scheduler time slice.
+                    // No fast-math/reassociation: each FAdd rounds exactly
+                    // as the corresponding individual Scratch iteration.
+                    auto* fn = llvm::Function::Create(
+                        llvm::FunctionType::get(i64,
+                            {ptrType, ptrType, i64}, false),
+                        llvm::Function::ExternalLinkage,
+                        symbol + "_repeat_burst_" + std::to_string(slot),
+                        module.get());
+                    auto* addr = fn->getArg(0);
+                    auto* remaining = fn->getArg(1);
+                    auto* count = fn->getArg(2);
+                    auto* entryBlock = llvm::BasicBlock::Create(
+                        *lc, "burst.entry", fn);
+                    auto* head = llvm::BasicBlock::Create(
+                        *lc, "burst.loop", fn);
+                    auto* finished = llvm::BasicBlock::Create(
+                        *lc, "burst.done", fn);
+                    auto* zero = llvm::BasicBlock::Create(
+                        *lc, "burst.zero", fn);
+                    llvm::IRBuilder<> rb(entryBlock);
+                    auto* valPtr = rb.CreateInBoundsGEP(
+                        rb.getInt8Ty(), addr,
+                        rb.getInt64(offsetof(Variable, value)));
+                    auto* originalBits = rb.CreateLoad(i64, valPtr);
+                    auto* original = rb.CreateBitCast(
+                        originalBits, llvm::Type::getDoubleTy(*lc));
+                    rb.CreateCondBr(rb.CreateICmpEQ(
+                        count, rb.getInt64(0)), zero, head);
+                    rb.SetInsertPoint(zero);
+                    rb.CreateRet(rb.getInt64(0));
+                    rb.SetInsertPoint(head);
+                    auto* index = rb.CreatePHI(i64, 2, "burst.index");
+                    index->addIncoming(rb.getInt64(0), entryBlock);
+                    auto* current = rb.CreatePHI(
+                        llvm::Type::getDoubleTy(*lc), 2, "burst.acc");
+                    current->addIncoming(original, entryBlock);
+                    auto* next = rb.CreateFAdd(current,
+                        llvm::ConstantFP::get(
+                            llvm::Type::getDoubleTy(*lc), source.delta));
+                    auto* nextIndex = rb.CreateAdd(index, rb.getInt64(1));
+                    index->addIncoming(nextIndex, head);
+                    current->addIncoming(next, head);
+                    auto* negInf = llvm::ConstantFP::getInfinity(
+                        llvm::Type::getDoubleTy(*lc), true);
+                    auto* posInf = llvm::ConstantFP::getInfinity(
+                        llvm::Type::getDoubleTy(*lc));
+                    // The normal one-item dispatch would reject nonfinite
+                    // values on its NEXT scheduler pass. Commit the first
+                    // overflow and return immediately for safe fallback.
+                    auto* finite = rb.CreateAnd(
+                        rb.CreateFCmpOGT(next, negInf),
+                        rb.CreateFCmpOLT(next, posInf));
+                    rb.CreateCondBr(
+                        rb.CreateAnd(rb.CreateICmpULT(nextIndex, count),
+                                     finite),
+                        head, finished);
+                    rb.SetInsertPoint(finished);
+                    rb.CreateStore(rb.CreateBitCast(next, i64), valPtr);
+                    auto* left = rb.CreateLoad(i64, remaining);
+                    rb.CreateStore(rb.CreateSub(left, nextIndex), remaining);
+                    rb.CreateRet(nextIndex);
+                }
+            }
+        }
+        auto* entry = llvm::BasicBlock::Create(*lc, "entry", dispatch);
+        auto* invalid = llvm::BasicBlock::Create(*lc, "invalid", dispatch);
+        auto* finish = llvm::BasicBlock::Create(*lc, "finish", dispatch);
+        auto* popReturn = llvm::BasicBlock::Create(
+            *lc, "procedure.pop", dispatch);
+        auto* loadReturn = llvm::BasicBlock::Create(
+            *lc, "procedure.load_return", dispatch);
+        llvm::IRBuilder<> b(*lc);
+        b.SetInsertPoint(invalid);
+        b.CreateStore(b.getInt32(UINT32_MAX), pcPtr);
+        b.CreateStore(b.getInt32(0), returnDepthPtr);
+        b.CreateRetVoid();
+        b.SetInsertPoint(finish);
+        b.CreateStore(b.getInt32(UINT32_MAX), pcPtr);
+        b.CreateStore(b.getInt32(0), returnDepthPtr);
+        b.CreateRetVoid();
+        b.SetInsertPoint(popReturn);
+        auto* depth = b.CreateLoad(i32, returnDepthPtr, "return_depth");
+        b.CreateCondBr(
+            b.CreateICmpEQ(depth, b.getInt32(0)), finish, loadReturn);
+        b.SetInsertPoint(loadReturn);
+        auto* safe = b.CreateICmpULE(
+            depth, b.getInt32(Thread::MegaReturnCapacity));
+        auto* readReturn = llvm::BasicBlock::Create(
+            *lc, "procedure.read_return", dispatch);
+        b.CreateCondBr(safe, readReturn, invalid);
+        b.SetInsertPoint(readReturn);
+        auto* topIndex = b.CreateSub(depth, b.getInt32(1));
+        auto* returnPtr = b.CreateInBoundsGEP(
+            i32, returnStackPtr, topIndex);
+        auto* nextPc = b.CreateLoad(i32, returnPtr, "return_pc");
+        b.CreateStore(topIndex, returnDepthPtr);
+        b.CreateStore(nextPc, pcPtr);
+        auto* returnSwitch = b.CreateSwitch(nextPc, invalid);
+        b.SetInsertPoint(entry);
+        auto* pc = b.CreateLoad(i32, pcPtr, "pc");
+        auto* sw = b.CreateSwitch(pc, invalid);
+        auto change = module->getOrInsertFunction(
+            "xyo_var_change",
+            llvm::FunctionType::get(
+                voidType, {ptrType, ptrType, ptrType, i64}, false));
+        auto notify = module->getOrInsertFunction(
+            "xyo_wait_notify_var_store",
+            llvm::FunctionType::get(
+                voidType, {ptrType, ptrType}, false));
+
+        // All constants and return addresses are baked into this ONE LLVM
+        // function. Scratch Thread memory owns the only persistent frames.
+        auto emitChange = [&](const std::string& variableId,
+                              const std::u16string& variableName,
+                              double delta, const std::string& label,
+                              uint32_t bindingIndex) {
+            auto* id = b.CreateGlobalString(variableId, symbol + label + "_id");
+            std::vector<uint16_t> wide;
+            wide.reserve(variableName.size() + 1);
+            for (char16_t c : variableName) wide.push_back(uint16_t(c));
+            wide.push_back(0);
+            auto* data = llvm::ConstantDataArray::get(
+                *lc, llvm::ArrayRef<uint16_t>(wide));
+            auto* global = new llvm::GlobalVariable(
+                *module, data->getType(), true,
+                llvm::GlobalValue::PrivateLinkage, data,
+                symbol + label + "_name");
+            auto* name = b.CreateInBoundsGEP(
+                data->getType(), global, {b.getInt32(0), b.getInt32(0)});
+            auto* deltaBits = b.getInt64(Value::numCanonical(delta).bits);
+            if (!directScalar) {
+                b.CreateCall(change, {ctx, id, name, deltaBits});
+                return;
+            }
+            // A bounded pointer array is owned by the currently selected
+            // Thread, refreshed only after its complete binding generation
+            // was checked by Sequencer. When any binding is missing, all
+            // entries are null, so a slow helper may create variables
+            // without invalidating another direct pointer in this slice.
+            auto* slot = b.CreateInBoundsGEP(
+                ptrType, scalarBindings, b.getInt32(bindingIndex));
+            auto* variable = b.CreateLoad(ptrType, slot);
+            auto* checkValue = llvm::BasicBlock::Create(
+                *lc, label + ".numeric_guard", dispatch);
+            auto* fastValue = llvm::BasicBlock::Create(
+                *lc, label + ".fast_add", dispatch);
+            auto* fallback = llvm::BasicBlock::Create(
+                *lc, label + ".fallback", dispatch);
+            auto* next = llvm::BasicBlock::Create(
+                *lc, label + ".next", dispatch);
+            b.CreateCondBr(b.CreateIsNotNull(variable), checkValue, fallback);
+            b.SetInsertPoint(checkValue);
+            static_assert(sizeof(Value) == sizeof(uint64_t));
+            const auto offset = static_cast<uint64_t>(
+                offsetof(Variable, value));
+            auto* valuePtr = b.CreateInBoundsGEP(
+                b.getInt8Ty(), variable, b.getInt64(offset));
+            auto* current = b.CreateLoad(i64, valuePtr);
+            // Scratch's cast::toNumber maps tagged NaN to zero. The fast
+            // lane accepts only ordinary IEEE754 values (not NaNs), and
+            // uses the original helper for tagged strings/bools/colors.
+            auto* tag = b.CreateAnd(
+                b.CreateLShr(current, b.getInt64(48)),
+                b.getInt64(0xFFF8));
+            auto* ieeeNumber = b.CreateICmpNE(
+                tag, b.getInt64(0x7FF8));
+            auto* asDouble = b.CreateBitCast(
+                current, llvm::Type::getDoubleTy(*lc));
+            auto* ordered = b.CreateFCmpORD(
+                asDouble, llvm::ConstantFP::get(
+                    llvm::Type::getDoubleTy(*lc), 0.0));
+            b.CreateCondBr(b.CreateAnd(ieeeNumber, ordered),
+                           fastValue, fallback);
+            b.SetInsertPoint(fastValue);
+            auto* result = b.CreateFAdd(
+                asDouble, llvm::ConstantFP::get(
+                    llvm::Type::getDoubleTy(*lc), delta));
+            // A finite delta plus an ordered IEEE number cannot yield
+            // NaN, but retain explicit canonicalization at the ABI edge.
+            auto* isNaN = b.CreateFCmpUNO(result, result);
+            auto* resultBits = b.CreateSelect(
+                isNaN, b.getInt64(val::kNan),
+                b.CreateBitCast(result, i64));
+            b.CreateStore(resultBits, valuePtr);
+            if (notifyWaits)
+                b.CreateCall(notify, {ctx, variable});
+            b.CreateBr(next);
+            b.SetInsertPoint(fallback);
+            b.CreateCall(change, {ctx, id, name, deltaBits});
+            b.CreateBr(next);
+            b.SetInsertPoint(next);
+        };
+        // The outer repeat's two setters and its completion suffix are
+        // emitted as explicit helper calls. Do not use the optional direct
+        // scalar slot here: those slots were proved for the INNER suffix,
+        // and aliasing them would write the wrong Scratch variable.
+        const auto emitOuterSet = [&](const mega_yield::Source::OuterSet& set,
+                                      const std::string& label) {
+            auto* id = b.CreateGlobalString(
+                set.variableId, symbol + label + "_id");
+            std::vector<uint16_t> wide;
+            wide.reserve(set.variableName.size() + 1);
+            for (char16_t ch : set.variableName)
+                wide.push_back(uint16_t(ch));
+            wide.push_back(0);
+            auto* array = llvm::ConstantDataArray::get(
+                *lc, llvm::ArrayRef<uint16_t>(wide));
+            auto* global = new llvm::GlobalVariable(
+                *module, array->getType(), true,
+                llvm::GlobalValue::PrivateLinkage, array,
+                symbol + label + "_name");
+            auto* name = b.CreateInBoundsGEP(
+                array->getType(), global, {b.getInt32(0), b.getInt32(0)});
+            llvm::Value* value = b.getInt64(
+                Value::numCanonical(set.literal).bits);
+            if (set.clock) {
+                auto days = module->getOrInsertFunction(
+                    "xyo_sns_dayssince2000",
+                    llvm::FunctionType::get(i64, {ptrType}, false));
+                value = b.CreateCall(days, {ctx});
+            } else if (set.readVariable) {
+                auto* readId = b.CreateGlobalString(
+                    set.readVariableId, symbol + label + "_read_id");
+                std::vector<uint16_t> readWide;
+                readWide.reserve(set.readVariableName.size() + 1);
+                for (char16_t ch : set.readVariableName)
+                    readWide.push_back(uint16_t(ch));
+                readWide.push_back(0);
+                auto* readArray = llvm::ConstantDataArray::get(
+                    *lc, llvm::ArrayRef<uint16_t>(readWide));
+                auto* readGlobal = new llvm::GlobalVariable(
+                    *module, readArray->getType(), true,
+                    llvm::GlobalValue::PrivateLinkage, readArray,
+                    symbol + label + "_read_name");
+                auto* readName = b.CreateInBoundsGEP(
+                    readArray->getType(), readGlobal,
+                    {b.getInt32(0), b.getInt32(0)});
+                auto getValue = module->getOrInsertFunction(
+                    "xyo_var_get", llvm::FunctionType::get(
+                        i64, {ptrType, ptrType, ptrType}, false));
+                value = b.CreateCall(
+                    getValue, {ctx, readId, readName});
+            }
+            auto setFn = module->getOrInsertFunction(
+                "xyo_var_set", llvm::FunctionType::get(
+                    voidType, {ptrType, ptrType, ptrType, i64}, false));
+            b.CreateCall(setFn, {ctx, id, name, value});
+        };
+        const auto emitOuterSuffix = [&](const mega_yield::ReturnSuffix& end,
+                                         const std::string& label) {
+            auto* id = b.CreateGlobalString(
+                end.variableId, symbol + label + "_id");
+            std::vector<uint16_t> wide;
+            wide.reserve(end.variableName.size() + 1);
+            for (char16_t ch : end.variableName)
+                wide.push_back(uint16_t(ch));
+            wide.push_back(0);
+            auto* array = llvm::ConstantDataArray::get(
+                *lc, llvm::ArrayRef<uint16_t>(wide));
+            auto* global = new llvm::GlobalVariable(
+                *module, array->getType(), true,
+                llvm::GlobalValue::PrivateLinkage, array,
+                symbol + label + "_name");
+            auto* name = b.CreateInBoundsGEP(
+                array->getType(), global, {b.getInt32(0), b.getInt32(0)});
+            b.CreateCall(change, {ctx, id, name,
+                b.getInt64(Value::numCanonical(end.delta).bits)});
+        };
+        // Direct LLVM lowering of the exact, source-certified ScratchBench
+        // bench_round procedure. Every variable is fetched in the original
+        // Scratch evaluation order and every write uses the usual tagged
+        // native helper (including wait-variable notifications).
+        // No temporaries or native CallFrame survive a joined broadcast.
+        const auto emitBenchRound = [&](const mega_yield::Source::BenchRound& spec,
+                                        size_t sourceIndex) {
+            const std::string label = "_bench_round_" +
+                std::to_string(sourceIndex);
+            const auto refs = [&](const mega_yield::Source::BenchVar& var,
+                                  const std::string& suffix) {
+                auto* id = b.CreateGlobalString(
+                    var.id, symbol + label + "_" + suffix + "_id");
+                std::vector<uint16_t> wide;
+                wide.reserve(var.name.size() + 1);
+                for (char16_t ch : var.name)
+                    wide.push_back(uint16_t(ch));
+                wide.push_back(0);
+                auto* array = llvm::ConstantDataArray::get(
+                    *lc, llvm::ArrayRef<uint16_t>(wide));
+                auto* global = new llvm::GlobalVariable(
+                    *module, array->getType(), true,
+                    llvm::GlobalValue::PrivateLinkage, array,
+                    symbol + label + "_" + suffix + "_name");
+                auto* name = b.CreateInBoundsGEP(
+                    array->getType(), global,
+                    {b.getInt32(0), b.getInt32(0)});
+                return std::pair<llvm::Value*, llvm::Value*>{id, name};
+            };
+            const auto get = [&](const mega_yield::Source::BenchVar& var,
+                                 const std::string& suffix) -> llvm::Value* {
+                auto [id, name] = refs(var, suffix);
+                auto getFn = module->getOrInsertFunction(
+                    "xyo_var_get", llvm::FunctionType::get(
+                        i64, {ptrType, ptrType, ptrType}, false));
+                return b.CreateCall(getFn, {ctx, id, name});
+            };
+            const auto set = [&](const mega_yield::Source::BenchVar& var,
+                                 const std::string& suffix, llvm::Value* value) {
+                auto [id, name] = refs(var, suffix);
+                auto setFn = module->getOrInsertFunction(
+                    "xyo_var_set", llvm::FunctionType::get(
+                        voidType, {ptrType, ptrType, ptrType, i64}, false));
+                b.CreateCall(setFn, {ctx, id, name, value});
+            };
+            const auto add = [&](const mega_yield::Source::BenchVar& var,
+                                 const std::string& suffix, llvm::Value* value) {
+                auto [id, name] = refs(var, suffix);
+                b.CreateCall(change, {ctx, id, name, value});
+            };
+            const auto binary = [&](const char* fn,
+                                    llvm::Value* lhs,
+                                    llvm::Value* rhs) -> llvm::Value* {
+                auto callee = module->getOrInsertFunction(
+                    fn, llvm::FunctionType::get(i64, {i64, i64}, false));
+                return b.CreateCall(callee, {lhs, rhs});
+            };
+            const auto greater = [&](llvm::Value* lhs, llvm::Value* rhs)
+                                -> llvm::Value* {
+                auto gt = module->getOrInsertFunction(
+                    "xyo_gt", llvm::FunctionType::get(i32, {i64, i64}, false));
+                return b.CreateICmpNE(
+                    b.CreateCall(gt, {lhs, rhs}), b.getInt32(0));
+            };
+
+            // First statement: b_ms = (b_t1 - b_t0) * 86400000.
+            // The order of reads, subtract and multiply matches the
+            // source reporter tree; do not reassociate under fast-math.
+            auto* finishTime = get(spec.endTime, "end_time");
+            auto* startTime = get(spec.startTime, "start_time");
+            auto* diff = binary("xyo_sub", finishTime, startTime);
+            auto* elapsed = binary("xyo_mul", diff,
+                b.getInt64(Value::numCanonical(86400000.0).bits));
+            set(spec.milliseconds, "ms", elapsed);
+
+            // Second statement: IF b_round > 0 then apply the two
+            // accumulators and the best-rate update.
+            auto* round = get(spec.round, "round_cond");
+            auto* positive = greater(round,
+                b.getInt64(Value::numCanonical(0.0).bits));
+            auto* thenBlock = llvm::BasicBlock::Create(
+                *lc, "bench_round." + std::to_string(sourceIndex) + ".then",
+                dispatch);
+            auto* after = llvm::BasicBlock::Create(
+                *lc, "bench_round." + std::to_string(sourceIndex) + ".after",
+                dispatch);
+            b.CreateCondBr(positive, thenBlock, after);
+            b.SetInsertPoint(thenBlock);
+
+            add(spec.total, "total", get(spec.milliseconds, "ms_total"));
+            add(spec.chunks, "chunks", get(spec.count, "n_chunks"));
+            // The current rate reporter is read during the comparison.
+            // When the IF succeeds the second Scratch reporter evaluates
+            // b_n / b_ms again for the assignment (no hoisting).
+            auto* numerator = get(spec.count, "n_rate_cmp");
+            auto* denominator = get(spec.milliseconds, "ms_rate_cmp");
+            auto* rate = binary("xyo_div", numerator, denominator);
+            auto* best = get(spec.bestRate, "best_cmp");
+            auto* improve = greater(rate, best);
+            auto* update = llvm::BasicBlock::Create(
+                *lc, "bench_round." + std::to_string(sourceIndex) + ".best",
+                dispatch);
+            auto* afterBest = llvm::BasicBlock::Create(
+                *lc, "bench_round." + std::to_string(sourceIndex) + ".best_end",
+                dispatch);
+            b.CreateCondBr(improve, update, afterBest);
+            b.SetInsertPoint(update);
+            auto* newNumerator = get(spec.count, "n_rate_set");
+            auto* newDenominator = get(spec.milliseconds, "ms_rate_set");
+            set(spec.bestRate, "best_set",
+                binary("xyo_div", newNumerator, newDenominator));
+            b.CreateBr(afterBest);
+            b.SetInsertPoint(afterBest);
+            b.CreateBr(after);
+
+            // Final unconditional statement: change b_round by 1.
+            b.SetInsertPoint(after);
+            add(spec.round, "round_add",
+                b.getInt64(Value::numCanonical(1.0).bits));
+        };
+        uint32_t nextReturnPc = uint32_t(sources.size() * 2);
+        for (size_t i = 0; i < sources.size(); ++i) {
+            const auto& source = sources[i];
+            auto* start = llvm::BasicBlock::Create(
+                *lc, "script_" + std::to_string(i) + ".start", dispatch);
+            auto* resume = llvm::BasicBlock::Create(
+                *lc, "script_" + std::to_string(i) + ".resume", dispatch);
+            auto* body = llvm::BasicBlock::Create(
+                *lc, "script_" + std::to_string(i) + ".body", dispatch);
+            auto* done = llvm::BasicBlock::Create(
+                *lc, "script_" + std::to_string(i) + ".done", dispatch);
+            sw->addCase(b.getInt32(uint32_t(2*i)), start);
+            sw->addCase(b.getInt32(uint32_t(2*i+1)), resume);
+
+            std::vector<uint32_t> returnPcs;
+            returnPcs.reserve(source.returnSuffixes.size());
+            for (size_t j = 0; j < source.returnSuffixes.size(); ++j)
+                returnPcs.push_back(nextReturnPc++);
+
+            llvm::BasicBlock* outerInit = nullptr;
+            llvm::BasicBlock* outerFinish = nullptr;
+            b.SetInsertPoint(start);
+            // The source-proven bench_begin executes exactly once on
+            // initial entry, never on join reentry.
+            for (size_t j = 0; j < source.beginSets.size(); ++j)
+                emitOuterSet(source.beginSets[j],
+                    "_bench_begin_" + std::to_string(i) + "_" +
+                    std::to_string(j));
+            // The call chain is statically proven acyclic. Push its return
+            // PC values OUTERMOST -> INNERMOST, so LIFO executes caller
+            // suffixes from the innermost frame to the green-flag script.
+            for (size_t j = 0; j < returnPcs.size(); ++j) {
+                auto* slot = b.CreateInBoundsGEP(
+                    i32, returnStackPtr, b.getInt32(uint32_t(j)));
+                b.CreateStore(b.getInt32(returnPcs[j]), slot);
+            }
+            b.CreateStore(
+                b.getInt32(uint32_t(returnPcs.size())), returnDepthPtr);
+            if (source.kind == mega_yield::Source::Kind::Scalar) {
+                b.CreateBr(body);
+                b.SetInsertPoint(resume);
+                // A one-shot scalar script has no valid resume state.
+                // Reject accidental reentry rather than replaying effects.
+                b.CreateBr(invalid);
+            } else if (source.kind == mega_yield::Source::Kind::BroadcastWait) {
+                b.CreateStore(b.getInt32(uint32_t(2*i+1)), pcPtr);
+                b.CreateRetVoid();
+                b.SetInsertPoint(resume);
+                b.CreateBr(body);
+            } else if (source.kind == mega_yield::Source::Kind::BroadcastUntil) {
+                // Both first entry and post-join reentry land on this LLVM
+                // condition block. The test is evaluated anew after every
+                // completed receiver join, never cached across a yield.
+                // This is a strict source-certified scalar vs literal
+                // comparison; use Scratch's tagged Value helpers, not a
+                // speculative floating-point comparison.
+                auto* conditionBlock = llvm::BasicBlock::Create(
+                    *lc, "script_" + std::to_string(i) + ".until.condition",
+                    dispatch);
+                auto* launch = llvm::BasicBlock::Create(
+                    *lc, "script_" + std::to_string(i) + ".until.launch",
+                    dispatch);
+                if (source.hasOuterUntil) {
+                    outerInit = llvm::BasicBlock::Create(
+                        *lc, "script_" + std::to_string(i) + ".outer.init",
+                        dispatch);
+                    outerFinish = llvm::BasicBlock::Create(
+                        *lc, "script_" + std::to_string(i) + ".outer.finish",
+                        dispatch);
+                    b.CreateStore(
+                        b.getInt64(source.repetitions), remainingPtr);
+                    b.CreateCondBr(
+                        b.getInt1(source.repetitions == 0),
+                        outerFinish, outerInit);
+                    b.SetInsertPoint(outerInit);
+                    emitOuterSet(source.outerFirstSet,
+                                 "_outer_first_" + std::to_string(i));
+                    emitOuterSet(source.outerSecondSet,
+                                 "_outer_second_" + std::to_string(i));
+                }
+                b.CreateBr(conditionBlock);
+                b.SetInsertPoint(resume);
+                b.CreateBr(conditionBlock);
+                b.SetInsertPoint(conditionBlock);
+                auto* conditionId = b.CreateGlobalString(
+                    source.conditionVariableId,
+                    symbol + "_until_condition_id_" + std::to_string(i));
+                std::vector<uint16_t> wide;
+                wide.reserve(source.conditionVariableName.size() + 1);
+                for (char16_t ch : source.conditionVariableName)
+                    wide.push_back(uint16_t(ch));
+                wide.push_back(0);
+                auto* array = llvm::ConstantDataArray::get(
+                    *lc, llvm::ArrayRef<uint16_t>(wide));
+                auto* global = new llvm::GlobalVariable(
+                    *module, array->getType(), true,
+                    llvm::GlobalValue::PrivateLinkage, array,
+                    symbol + "_until_condition_name_" + std::to_string(i));
+                auto* conditionName = b.CreateInBoundsGEP(
+                    array->getType(), global,
+                    {b.getInt32(0), b.getInt32(0)});
+                auto getValue = module->getOrInsertFunction(
+                    "xyo_var_get", llvm::FunctionType::get(
+                        i64, {ptrType, ptrType, ptrType}, false));
+                llvm::Value* current = nullptr;
+                if (source.untilClockReporter) {
+                    // Deliberately use the identical synchronous runtime
+                    // reporter as regular JIT, not an approximate clock
+                    // or a 1ms scheduler snapshot. A time condition can
+                    // change between any two broadcasts in one frame.
+                    auto getDays = module->getOrInsertFunction(
+                        "xyo_sns_dayssince2000",
+                        llvm::FunctionType::get(i64, {ptrType}, false));
+                    current = b.CreateCall(getDays, {ctx});
+                    if (source.untilClockElapsedMs) {
+                        auto* startId = b.CreateGlobalString(
+                            source.untilStartVariableId,
+                            symbol + "_until_start_id_" + std::to_string(i));
+                        std::vector<uint16_t> startWide;
+                        startWide.reserve(source.untilStartVariableName.size() + 1);
+                        for (char16_t ch : source.untilStartVariableName)
+                            startWide.push_back(uint16_t(ch));
+                        startWide.push_back(0);
+                        auto* startArray = llvm::ConstantDataArray::get(
+                            *lc, llvm::ArrayRef<uint16_t>(startWide));
+                        auto* startGlobal = new llvm::GlobalVariable(
+                            *module, startArray->getType(), true,
+                            llvm::GlobalValue::PrivateLinkage, startArray,
+                            symbol + "_until_start_name_" + std::to_string(i));
+                        auto* startName = b.CreateInBoundsGEP(
+                            startArray->getType(), startGlobal,
+                            {b.getInt32(0), b.getInt32(0)});
+                        auto* start = b.CreateCall(
+                            getValue, {ctx, startId, startName});
+                        // xyo_sub and xyo_mul preserve the same two
+                        // canonicalizations and operand evaluation order
+                        // as ordinary boxed Scratch JIT evaluation.
+                        auto subtract = module->getOrInsertFunction(
+                            "xyo_sub", llvm::FunctionType::get(
+                                i64, {i64, i64}, false));
+                        auto multiply = module->getOrInsertFunction(
+                            "xyo_mul", llvm::FunctionType::get(
+                                i64, {i64, i64}, false));
+                        auto* diff = b.CreateCall(
+                            subtract, {current, start});
+                        current = b.CreateCall(multiply, {
+                            diff,
+                            b.getInt64(Value::numCanonical(86400000.0).bits)
+                        });
+                    }
+                } else {
+                    current = b.CreateCall(
+                        getValue, {ctx, conditionId, conditionName});
+                }
+                const char* op = nullptr;
+                switch (source.comparison) {
+                case mega_yield::Source::Comparison::Greater:
+                    op = "xyo_gt"; break;
+                case mega_yield::Source::Comparison::Less:
+                    op = "xyo_lt"; break;
+                case mega_yield::Source::Comparison::Equal:
+                    op = "xyo_eq"; break;
+                }
+                auto compare = module->getOrInsertFunction(
+                    op, llvm::FunctionType::get(
+                        i32, {i64, i64}, false));
+                llvm::Value* literal = b.getInt64(
+                    Value::numCanonical(source.conditionLiteral).bits);
+                if (source.untilCompareVariable) {
+                    auto* otherId = b.CreateGlobalString(
+                        source.untilOtherVariableId,
+                        symbol + "_until_other_id_" + std::to_string(i));
+                    std::vector<uint16_t> otherWide;
+                    otherWide.reserve(
+                        source.untilOtherVariableName.size() + 1);
+                    for (char16_t ch : source.untilOtherVariableName)
+                        otherWide.push_back(uint16_t(ch));
+                    otherWide.push_back(0);
+                    auto* otherArray = llvm::ConstantDataArray::get(
+                        *lc, llvm::ArrayRef<uint16_t>(otherWide));
+                    auto* otherGlobal = new llvm::GlobalVariable(
+                        *module, otherArray->getType(), true,
+                        llvm::GlobalValue::PrivateLinkage, otherArray,
+                        symbol + "_until_other_name_" + std::to_string(i));
+                    auto* otherName = b.CreateInBoundsGEP(
+                        otherArray->getType(), otherGlobal,
+                        {b.getInt32(0), b.getInt32(0)});
+                    literal = b.CreateCall(
+                        getValue, {ctx, otherId, otherName});
+                }
+                llvm::Value* lhs = source.conditionLiteralLeft
+                    ? literal : current;
+                llvm::Value* rhs = source.conditionLiteralLeft
+                    ? current : literal;
+                auto* result = b.CreateCall(compare, {lhs, rhs});
+                llvm::Value* finishedCondition =
+                    b.CreateICmpNE(result, b.getInt32(0));
+                if (source.untilConditionNegated)
+                    finishedCondition = b.CreateNot(finishedCondition);
+                b.CreateCondBr(finishedCondition, body, launch);
+                b.SetInsertPoint(launch);
+                b.CreateStore(b.getInt32(uint32_t(2*i+1)), pcPtr);
+                b.CreateRetVoid();
+            } else if (source.kind == mega_yield::Source::Kind::BroadcastRepeat) {
+                b.CreateStore(b.getInt64(source.repetitions), remainingPtr);
+                if (source.repetitions == 0) {
+                    b.CreateBr(body);
+                } else {
+                    b.CreateStore(b.getInt32(uint32_t(2*i+1)), pcPtr);
+                    b.CreateRetVoid();
+                }
+                b.SetInsertPoint(resume);
+                auto* left = b.CreateLoad(i64, remainingPtr, "remaining");
+                auto* next = b.CreateSelect(
+                    b.CreateICmpEQ(left, b.getInt64(0)), b.getInt64(0),
+                    b.CreateSub(left, b.getInt64(1)));
+                b.CreateStore(next, remainingPtr);
+                b.CreateCondBr(b.CreateICmpEQ(next, b.getInt64(0)),
+                               body, done);
+            } else {
+                b.CreateStore(b.getInt64(source.repetitions), remainingPtr);
+                b.CreateBr(resume);
+                b.SetInsertPoint(resume);
+                auto* left = b.CreateLoad(i64, remainingPtr, "remaining");
+                b.CreateCondBr(b.CreateICmpEQ(left, b.getInt64(0)), done, body);
+            }
+            b.SetInsertPoint(body);
+            if (source.hasInnerAfterSets) {
+                // The dynamic until condition has just become true.
+                // Snapshot time first, then snapshot its live counter.
+                // Neither setter executes during joined broadcast waits.
+                emitOuterSet(source.innerAfterFirstSet,
+                             "_inner_after_first_" + std::to_string(i));
+                emitOuterSet(source.innerAfterSecondSet,
+                             "_inner_after_second_" + std::to_string(i));
+            }
+            if (source.hasConditional) {
+                // The ordinary one-Thread continuation remains authoritative
+                // whenever a Scratch operand is not finite numeric. Reuse
+                // the existing Scratch cast::compare helpers (rather than
+                // casting a tagged string as an IEEE double).
+                auto* conditionId = b.CreateGlobalString(
+                    source.conditionVariableId,
+                    symbol + "_if_condition_id_" + std::to_string(i));
+                std::vector<uint16_t> wide;
+                for (char16_t ch : source.conditionVariableName)
+                    wide.push_back(uint16_t(ch));
+                wide.push_back(0);
+                auto* literalArray = llvm::ConstantDataArray::get(
+                    *lc, llvm::ArrayRef<uint16_t>(wide));
+                auto* literalGlobal = new llvm::GlobalVariable(
+                    *module, literalArray->getType(), true,
+                    llvm::GlobalValue::PrivateLinkage, literalArray,
+                    symbol + "_if_condition_name_" + std::to_string(i));
+                auto* conditionName = b.CreateInBoundsGEP(
+                    literalArray->getType(), literalGlobal,
+                    {b.getInt32(0), b.getInt32(0)});
+                auto getValue = module->getOrInsertFunction(
+                    "xyo_var_get", llvm::FunctionType::get(
+                        i64, {ptrType, ptrType, ptrType}, false));
+                auto* currentValue = b.CreateCall(
+                    getValue, {ctx, conditionId, conditionName});
+                const char* op = nullptr;
+                switch (source.comparison) {
+                case mega_yield::Source::Comparison::Greater:
+                    op = "xyo_gt";
+                    break;
+                case mega_yield::Source::Comparison::Less:
+                    op = "xyo_lt";
+                    break;
+                case mega_yield::Source::Comparison::Equal:
+                    op = "xyo_eq";
+                    break;
+                }
+                auto compare = module->getOrInsertFunction(
+                    op, llvm::FunctionType::get(
+                        i32, {i64, i64}, false));
+                auto* boxedLiteral = b.getInt64(
+                    Value::numCanonical(source.conditionLiteral).bits);
+                llvm::Value* compareLeft = source.conditionLiteralLeft ?
+                    static_cast<llvm::Value*>(boxedLiteral) : currentValue;
+                llvm::Value* compareRight = source.conditionLiteralLeft ?
+                    static_cast<llvm::Value*>(currentValue) : boxedLiteral;
+                auto* comparison = b.CreateCall(
+                    compare, {compareLeft, compareRight});
+                auto* yes = llvm::BasicBlock::Create(
+                    *lc, "script_" + std::to_string(i) + ".then", dispatch);
+                auto* no = llvm::BasicBlock::Create(
+                    *lc, "script_" + std::to_string(i) + ".else", dispatch);
+                auto* merge = llvm::BasicBlock::Create(
+                    *lc, "script_" + std::to_string(i) + ".merge", dispatch);
+                b.CreateCondBr(
+                    b.CreateICmpNE(comparison, b.getInt32(0)), yes, no);
+                b.SetInsertPoint(yes);
+                emitChange(source.variableId, source.variableName,
+                           source.delta,
+                           "_if_then_" + std::to_string(i), 0);
+                if (source.hasThenSecondChange)
+                    emitChange(source.thenSecondVariableId,
+                               source.thenSecondVariableName,
+                               source.thenSecondDelta,
+                               "_if_then_second_" + std::to_string(i),
+                               source.hasElseBranch ? 3u : 2u);
+                b.CreateBr(merge);
+                b.SetInsertPoint(no);
+                if (source.hasElseBranch) {
+                    emitChange(source.elseVariableId,
+                               source.elseVariableName, source.elseDelta,
+                               "_if_else_" + std::to_string(i), 1);
+                    if (source.hasElseSecondChange)
+                        emitChange(source.elseSecondVariableId,
+                                   source.elseSecondVariableName,
+                                   source.elseSecondDelta,
+                                   "_if_else_second_" + std::to_string(i),
+                                   3u + uint32_t(source.hasThenSecondChange));
+                }
+                b.CreateBr(merge);
+                b.SetInsertPoint(merge);
+            } else if (source.hasBenchRound) {
+                emitBenchRound(source.benchRound, i);
+            } else {
+                emitChange(source.variableId, source.variableName, source.delta,
+                           "_body_" + std::to_string(i), 0);
+                if (source.hasSecondChange)
+                    emitChange(source.secondVariableId,
+                               source.secondVariableName, source.secondDelta,
+                               "_body_second_" + std::to_string(i), 1);
+            }
+            if (source.hasOuterUntil) {
+                // The inner dynamic until completed exactly once for this
+                // outer iteration. Its suffix has already committed.
+                // No LLVM stack/SSA state survives the next joined send:
+                // Thread::megaRemaining stores only the outer counter.
+                auto* left = b.CreateLoad(i64, remainingPtr);
+                auto* next = b.CreateSub(left, b.getInt64(1));
+                b.CreateStore(next, remainingPtr);
+                b.CreateCondBr(
+                    b.CreateICmpEQ(next, b.getInt64(0)),
+                    outerFinish, outerInit);
+                b.SetInsertPoint(outerFinish);
+                if (source.hasOuterFinalSet)
+                    emitOuterSet(source.outerFinalSet,
+                        "_outer_final_set_" + std::to_string(i));
+                else
+                    emitOuterSuffix(source.outerSuffix,
+                        "_outer_final_" + std::to_string(i));
+                if (source.hasBenchEnd) {
+                    auto emit = module->getOrInsertFunction(
+                        "xyo_mega_bench_end",
+                        llvm::FunctionType::get(voidType, {ptrType}, false));
+                    b.CreateCall(emit, {ctx});
+                }
+                b.CreateBr(popReturn);
+            } else if (source.kind != mega_yield::Source::Kind::Repeat) {
+                // Procedure completed. Run every saved caller return PC
+                // synchronously; do not introduce a scheduler yield here.
+                b.CreateBr(popReturn);
+            } else {
+                auto* left = b.CreateLoad(i64, remainingPtr);
+                b.CreateStore(b.CreateSub(left, b.getInt64(1)), remainingPtr);
+                b.CreateStore(b.getInt32(uint32_t(2*i+1)), pcPtr);
+                b.CreateRetVoid();
+            }
+
+            b.SetInsertPoint(done);
+            const bool repeatBroadcast =
+                source.kind == mega_yield::Source::Kind::BroadcastRepeat;
+            if (repeatBroadcast) {
+                b.CreateStore(b.getInt32(uint32_t(2*i+1)), pcPtr);
+                b.CreateRetVoid();
+            } else {
+                b.CreateBr(popReturn);
+            }
+            for (size_t j = 0; j < returnPcs.size(); ++j) {
+                const auto& suffix = source.returnSuffixes[j];
+                auto* returned = llvm::BasicBlock::Create(
+                    *lc, "script_" + std::to_string(i) + ".return_" +
+                         std::to_string(j), dispatch);
+                returnSwitch->addCase(b.getInt32(returnPcs[j]), returned);
+                b.SetInsertPoint(returned);
+                emitChange(suffix.variableId, suffix.variableName,
+                           suffix.delta,
+                           "_return_" + std::to_string(i) + "_" +
+                           std::to_string(j),
+                           uint32_t(j + 1 + source.hasSecondChange));
+                b.CreateBr(popReturn);
+            }
+        }
+        if (llvm::verifyModule(*module, &llvm::errs())) {
+            valid = false;
+            return;
+        }
+        llvm::PassBuilder pb;
+        llvm::LoopAnalysisManager lam;
+        llvm::FunctionAnalysisManager fam;
+        llvm::CGSCCAnalysisManager cgam;
+        llvm::ModuleAnalysisManager mam;
+        pb.registerModuleAnalyses(mam);
+        pb.registerCGSCCAnalyses(cgam);
+        pb.registerFunctionAnalyses(fam);
+        pb.registerLoopAnalyses(lam);
+        pb.crossRegisterProxies(lam, fam, cgam, mam);
+        auto pipeline = pb.buildPerModuleDefaultPipeline(
+            llvm::OptimizationLevel::O1);
+        pipeline.run(*module, mam);
+        if (llvm::verifyModule(*module, &llvm::errs())) {
+            valid = false;
+            return;
+        }
+        if (const char* trace = std::getenv("XYO_JIT_MEGA_BATCH_TRACE");
+            trace && trace[0] == '1') {
+            size_t definitions = 0;
+            for (auto& f : *module) if (!f.isDeclaration()) ++definitions;
+            std::fprintf(stderr,
+                "[mega-yield] slots=%zu definitions=%zu "
+                "states=%zu revision=%llu\n",
+                sources.size(), definitions, nextReturnPc,
+                static_cast<unsigned long long>(revision));
+        }
+    });
+    if (!valid || blocks->revision() != revision) return {};
+    if (auto err = jit->addIRModule(
+            llvm::orc::ThreadSafeModule(std::move(module), context))) {
+        llvm::consumeError(std::move(err));
+        return {};
+    }
+    auto entry = jit->lookup(symbol);
+    if (!entry) {
+        llvm::consumeError(entry.takeError());
+        return {};
+    }
+    auto result = std::make_shared<MegaDispatchCode>();
+    result->yieldEntry = reinterpret_cast<MegaDispatchCode::YieldEntry>(
+        entry->getValue());
+    if (scalarBatch) {
+        auto bulk = jit->lookup(symbol + "_scalar_batch");
+        if (!bulk) {
+            llvm::consumeError(bulk.takeError());
+        } else {
+            result->scalarBatchEntry =
+                reinterpret_cast<MegaDispatchCode::ScalarBatchEntry>(
+                    bulk->getValue());
+        }
+    }
+    if (scalarBatch && specializeSingle && result->scalarBatchEntry) {
+        auto single = jit->lookup(symbol + "_scalar_single");
+        if (single)
+            result->scalarSingleEntry =
+                reinterpret_cast<MegaDispatchCode::ScalarSingleEntry>(
+                    single->getValue());
+        else
+            llvm::consumeError(single.takeError());
+    }
+    if (multiPcBatch) {
+        auto bulk = jit->lookup(symbol + "_multi_pc_batch");
+        if (!bulk) {
+            llvm::consumeError(bulk.takeError());
+        } else {
+            result->multiPcBatchEntry =
+                reinterpret_cast<MegaDispatchCode::MultiPcBatchEntry>(
+                    bulk->getValue());
+            for (const auto& source : sources) {
+                result->multiPcKinds.push_back(
+                    source.kind == mega_yield::Source::Kind::Repeat ? 1 : 0);
+                result->multiPcRepetitions.push_back(source.repetitions);
+                result->multiPcSecondChanges.push_back(
+                    source.hasSecondChange);
+                result->multiPcConditionals.push_back(
+                    source.hasConditional);
+                result->multiPcElseBranches.push_back(
+                    source.hasElseBranch);
+                result->multiPcThenSecondChanges.push_back(
+                    source.hasThenSecondChange);
+                result->multiPcElseSecondChanges.push_back(
+                    source.hasElseSecondChange);
+                const bool oneVariable =
+                    !source.hasOuterUntil && !source.hasBenchRound &&
+                    !source.hasInnerAfterSets &&
+                    !source.hasSecondChange && !source.hasConditional &&
+                    !source.hasElseBranch && !source.hasThenSecondChange &&
+                    !source.hasElseSecondChange &&
+                    source.returnSuffixes.empty();
+                result->singleFastSourceKinds.push_back(
+                    oneVariable
+                        ? (source.kind == mega_yield::Source::Kind::Repeat
+                               ? uint8_t(2) : uint8_t(1))
+                        : uint8_t(0));
+            }
+        }
+    }
+    if (multiPcBatch && specializeSingle && result->multiPcBatchEntry) {
+        auto single = jit->lookup(symbol + "_multi_pc_single");
+        if (single)
+            result->multiPcSingleEntry =
+                reinterpret_cast<MegaDispatchCode::MultiPcSingleEntry>(
+                    single->getValue());
+        else
+            llvm::consumeError(single.takeError());
+    }
+    if (compileMultiRepeatBurst && result->multiPcBatchEntry) {
+        auto multi = jit->lookup(symbol + "_multi_repeat_burst");
+        if (multi) {
+            result->multiRepeatBurstEntry =
+                reinterpret_cast<MegaDispatchCode::MultiRepeatBurstEntry>(
+                    multi->getValue());
+            result->multiRepeatSourceArity.reserve(sources.size());
+            for (const auto& source : sources)
+                result->multiRepeatSourceArity.push_back(
+                    source.hasSecondChange ? 2u : 1u);
+        } else {
+            llvm::consumeError(multi.takeError());
+        }
+    }
+    if (repeatBurst && result->multiPcSingleEntry) {
+        result->repeatBurstEntries.resize(sources.size(), nullptr);
+        for (size_t slot = 0; slot < sources.size(); ++slot) {
+            const auto& source = sources[slot];
+            if (source.kind != mega_yield::Source::Kind::Repeat ||
+                source.hasSecondChange || source.hasConditional ||
+                source.hasElseBranch || source.hasThenSecondChange ||
+                source.hasElseSecondChange ||
+                !source.returnSuffixes.empty())
+                continue;
+            auto address = jit->lookup(
+                symbol + "_repeat_burst_" + std::to_string(slot));
+            if (address)
+                result->repeatBurstEntries[slot] =
+                    reinterpret_cast<MegaDispatchCode::RepeatBurstEntry>(
+                        address->getValue());
+            else
+                llvm::consumeError(address.takeError());
+        }
+    }
+    result->sourceBlocks = blocks;
+    result->sourceRevision = revision;
+    result->entries = uint32_t(threads.size());
+    result->directScalar = directScalar;
+    if (directScalar) {
+        result->scalarVariableIds.reserve(sources.size());
+        for (const auto& source : sources) {
+            std::vector<std::string> ids{source.variableId};
+            if (source.hasSecondChange)
+                ids.push_back(source.secondVariableId);
+            if (source.hasConditional) {
+                if (source.hasElseBranch)
+                    ids.push_back(source.elseVariableId);
+                ids.push_back(source.conditionVariableId);
+                if (source.hasThenSecondChange)
+                    ids.push_back(source.thenSecondVariableId);
+                if (source.hasElseSecondChange)
+                    ids.push_back(source.elseSecondVariableId);
+            }
+            for (const auto& suffix : source.returnSuffixes)
+                ids.push_back(suffix.variableId);
+            result->scalarVariableIds.push_back(std::move(ids));
+        }
+    }
+    result->broadcastNames.reserve(sources.size());
+    result->broadcastRepeatFastCounts.reserve(sources.size());
+    result->fixedJoinPairs.reserve(sources.size());
+    for (const auto& source : sources) {
+        if (source.kind == mega_yield::Source::Kind::BroadcastWait ||
+            source.kind == mega_yield::Source::Kind::BroadcastRepeat ||
+            source.kind == mega_yield::Source::Kind::BroadcastUntil)
+            result->broadcastNames.emplace_back(source.broadcastName);
+        else
+            result->broadcastNames.emplace_back(std::nullopt);
+        result->broadcastRepeatFastCounts.push_back(
+            source.kind == mega_yield::Source::Kind::BroadcastRepeat &&
+            source.returnSuffixes.empty() ? source.repetitions : 0);
+        if (source.kind == mega_yield::Source::Kind::BroadcastUntil &&
+            source.hasOuterUntil && source.untilVariablePair &&
+            source.untilConditionNegated &&
+            source.comparison == mega_yield::Source::Comparison::Less &&
+            source.conditionVariableId ==
+                source.outerFirstSet.variableId)
+            result->fixedJoinPairs.push_back(
+                MegaDispatchCode::FixedJoinPair{
+                    source.conditionVariableId,
+                    source.untilOtherVariableId});
+        else
+            result->fixedJoinPairs.emplace_back(std::nullopt);
+    }
+    return result;
 }
 
 std::shared_ptr<NumericJitCode> LLVMBackend::compileNumeric(
@@ -2141,6 +4098,7 @@ std::unique_ptr<CompiledScript> LLVMBackend::compile(
     double emitMs = 0, optMs = 0, submitMs = 0;
     size_t irFunctions = 0, irInstructions = 0;
     bool lazyThisScript = false;
+    bool megaFused = false;
     auto msBetween = [](Clock::time_point begin, Clock::time_point end) {
         return std::chrono::duration<double, std::milli>(end - begin).count();
     };
@@ -2181,6 +4139,123 @@ std::unique_ptr<CompiledScript> LLVMBackend::compile(
         emitOk = jitEmitScript(*mod, *lc, runtime, thread.target, blocks,
                                topId, entryName, *cs, pinned, fnNames,
                                procNameMap, nullptr, nullptr, &source);
+        // Beta mega-goto: the reachable acyclic Scratch-procedure graph
+        // becomes direct LLVM CFG branches inside ONE JIT entry function.
+        // Script-to-script scheduling and coroutine resume remain separate.
+        // Abort before any transformation if an oversized or recursive
+        // call graph cannot be represented as a bounded single function.
+        if (emitOk && !cs->mlirFrontend && !runtime.blockCountEnabled &&
+            !std::getenv("XYO_JIT_CALLFRAME") &&
+            !std::getenv("XYO_PROF") && mega_goto::enabled()) {
+            const auto mega = mega_goto::fuse(
+                *mod, entryName, procNameMap);
+            megaFused = mega.fused;
+            if (const char* trace = std::getenv("XYO_JIT_MEGA_TRACE");
+                trace && trace[0] == '1')
+                std::fprintf(stderr,
+                    "[mega-goto] script=%s fused=%d calls=%zu "
+                    "estimated_ir=%zu remaining=%zu reason=%s\n",
+                    topId.c_str(), int(mega.fused), mega.procedureCalls,
+                    mega.estimatedInstructions, mega.remainingCalls,
+                    mega.reason);
+            if (mega.reason == std::string_view("invalid-llvm"))
+                emitOk = false;
+        }
+        // Size-bounded partial fusion is deliberately separate from the
+        // all-or-nothing dispatcher. The IR remains callable through
+        // original procedure symbols when only a subset is inlined.
+        if (emitOk && !cs->mlirFrontend && !megaFused &&
+            !runtime.blockCountEnabled &&
+            !std::getenv("XYO_JIT_CALLFRAME") &&
+            !std::getenv("XYO_PROF") && mega_partial::enabled()) {
+            const auto partial = mega_partial::fuse(*mod, procNameMap);
+            cs->megaPartialInlined =
+                static_cast<uint32_t>(partial.inlined);
+            if (const char* trace = std::getenv("XYO_JIT_MEGA_TRACE");
+                trace && trace[0] == '1')
+                std::fprintf(stderr,
+                    "[mega-partial] script=%s selected=%zu inlined=%zu "
+                    "rejected_cycle=%zu rejected_size=%zu valid=%d\n",
+                    topId.c_str(), partial.selected, partial.inlined,
+                    partial.rejectedCycles, partial.rejectedSize,
+                    int(partial.valid));
+            if (!partial.valid) emitOk = false;
+        }
+        // Only a source-authenticated, simple direct-yield script can use
+        // the first stackless LLVM experiment. Never transform arbitrary
+        // callbacks, procedures, waits, reporters, OSR or AOT code.
+        const bool narrowCoro = stackless::eligible(*blocks, *top);
+        const bool generalCoro = !narrowCoro &&
+            stackless::generalCandidate(*blocks, *top);
+        const bool candidate =
+            emitOk && !cs->mlirFrontend && !runtime.blockCountEnabled &&
+            !std::getenv("XYO_JIT_CALLFRAME") &&
+            !std::getenv("XYO_PROF") &&
+            (narrowCoro || generalCoro);
+        bool lowered = false;
+        if (candidate) {
+            // Fold the reachable non-warp procedure graph into the entry so
+            // the coroutine frame owns all inlined call state.
+            bool ready = true;
+            if (generalCoro && !procNameMap.empty()) {
+                const size_t procCount = procNameMap.size();
+                const auto fused =
+                    mega_goto::fuse(*mod, entryName, procNameMap, true,
+                                      /*budgetOverride=*/8192);
+                if (const char* trace = std::getenv("XYO_JIT_CORO_TRACE");
+                    trace && trace[0] == '1')
+                    std::fprintf(stderr,
+                        "[coro-proc] script=%s procs=%zu fused=%d reason=%s\n",
+                        topId.c_str(), procCount, int(fused.fused),
+                        fused.reason);
+                // Codegen's small-procedure inliner may already have
+                // folded every callsite into the entry. That is exactly
+                // the state the coroutine lowering needs.
+                ready = fused.fused ||
+                    std::string_view(fused.reason) ==
+                        "no-reachable-procedure-calls";
+                if (ready && !fused.fused) procNameMap.clear();
+                if (!ready && stackless::recursionEnabled()) {
+                    // Recursive procedure graph: lower each procedure as a
+                    // coroutine and propagate suspension at every call site.
+                    std::vector<std::string> procSymbols;
+                    procSymbols.reserve(procNameMap.size());
+                    for (const auto& [key, symbol] : procNameMap) {
+                        (void)key;
+                        procSymbols.push_back(symbol);
+                    }
+                    lowered = stackless::lowerRecursive(
+                        *mod, entryName, procSymbols);
+                    if (const char* trace =
+                            std::getenv("XYO_JIT_CORO_TRACE");
+                        trace && trace[0] == '1')
+                        std::fprintf(stderr,
+                            "[coro-rec] script=%s procs=%zu lowered=%d\n",
+                            topId.c_str(), procSymbols.size(),
+                            int(lowered));
+                    if (lowered) ready = true;
+                    if (const char* dump = std::getenv("XYO_JIT_CORO_DUMP");
+                        dump && dump[0] == '1')
+                        mod->print(llvm::errs(), nullptr);
+                }
+            }
+            if (ready && !lowered) lowered = stackless::lower(*mod, entryName);
+        }
+        if (lowered) {
+            cs->coroSourceBlocks = blocks;
+            cs->coroSourceRevision = blocks->revision();
+            cs->mayYield = true;
+            // General coroutines carry their own heap frame and borrow no
+            // renderer state; the ordinary access-set analysis decides
+            // worker safety. The narrow experiment stays serial.
+            cs->mainThread = narrowCoro;
+        }
+        if (const char* trace = std::getenv("XYO_JIT_CORO_TRACE");
+            trace && trace[0] == '1' &&
+            (stackless::enabled() || stackless::generalEnabled()))
+            std::fprintf(stderr,
+                "[stackless-coro] script=%s candidate=%d lowered=%d\\n",
+                topId.c_str(), int(candidate), int(lowered));
         if (timing) emitMs = msBetween(tEmit, Clock::now());
         if (emitOk) {
             // PROF-009: map generated ORC procedure symbols to source
@@ -2263,7 +4338,7 @@ std::unique_ptr<CompiledScript> LLVMBackend::compile(
             // time-to-completion: deferred per-procedure materialization can
             // increase that total when most procedures are eventually called.
             const bool deferIR =
-                deferredCandidate &&
+                !megaFused && !cs->coroSourceRevision && deferredCandidate &&
                 (jitMode() != JitMode::Eager || runtime.renderer != nullptr ||
                  jitLazyMode() == JitLazyMode::On) &&
                 ensureLazyJit();
@@ -2326,6 +4401,24 @@ std::unique_ptr<CompiledScript> LLVMBackend::compile(
         return {};
     }
     cs->entry = reinterpret_cast<ScriptFn>(addrOr->getValue());
+    if (cs->coroSourceRevision) {
+        const auto lookupCoro = [&](const char* suffix) -> uintptr_t {
+            auto address = jit->lookup(entryName + suffix);
+            if (!address) {
+                llvm::consumeError(address.takeError());
+                return 0;
+            }
+            return static_cast<uintptr_t>(address->getValue());
+        };
+        cs->coroResume = reinterpret_cast<CompiledScript::CoroResume>(
+            lookupCoro("_resume"));
+        cs->coroDone = reinterpret_cast<CompiledScript::CoroDone>(
+            lookupCoro("_done"));
+        cs->coroDestroy = reinterpret_cast<CompiledScript::CoroResume>(
+            lookupCoro("_destroy"));
+        if (!cs->coroResume || !cs->coroDone || !cs->coroDestroy)
+            return {};
+    }
     cs->lazy = lazyThisScript;
     // Looking up every procedure in lazy mode defeats on-demand function
     // materialization. Generated Scratch code calls via ORC trampolines;

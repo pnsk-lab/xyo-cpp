@@ -1,6 +1,7 @@
 # --- ビルド生成物 ---
 build/
 build-*/
+.emcache/
 .windeps/
 
 # --- ローカル実行生成物 ---

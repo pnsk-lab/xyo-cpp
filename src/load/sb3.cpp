@@ -713,6 +713,10 @@ Target* loadTargetObject(Runtime& runtime, const JsonValue& obj,
             target->variables.emplace(v.id, std::move(v));
     }
 
+    // extensionStorage: 拡張ごとのターゲット状態（scratch-vm は target 単位）
+    if (obj.has("extensionStorage") && obj.get("extensionStorage").isObject())
+        target->extensionStorage = obj.get("extensionStorage").asObject();
+
     if (obj.has("x")) target->x = obj.get("x").asNumber();
     if (obj.has("y")) target->y = obj.get("y").asNumber();
     if (obj.has("direction"))
@@ -929,6 +933,11 @@ static Sb3LoadResult loadSb3Parsed(Runtime& runtime, const JsonValue& json,
         return result;
     }
     runtime.origin = json.get("meta").get("origin").asString();
+    // extensionStorage / extensionURLs は project 全体にも存在する
+    for (const auto& [id, value] : json.get("extensionStorage").asObject())
+        runtime.extensionStorage[id] = value;
+    for (const auto& [id, url] : json.get("extensionURLs").asObject())
+        if (url.isString()) runtime.extensionURLs[id] = url.asString();
 
     // targets: layerOrder ソートで parse → targetPaneOrder で並び戻す
     // Borrow target objects from the parsed JSON tree instead of copying

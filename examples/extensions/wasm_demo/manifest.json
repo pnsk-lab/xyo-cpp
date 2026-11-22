@@ -1,0 +1,68 @@
+{
+  "schema": 1,
+  "id": "wasmdemo",
+  "name": "WASM Demo",
+  "version": "0.1.0",
+  "color": "#0FBD8C",
+  "provider": "wasm",
+  "blocks": [
+    {
+      "opcode": "wasmdemo_double",
+      "label": "double %1",
+      "shape": "reporter",
+      "args": [
+        {
+          "name": "NUM",
+          "type": "number",
+          "default": "21"
+        }
+      ]
+    },
+    {
+      "opcode": "wasmdemo_add",
+      "label": "add %1 and %2",
+      "shape": "reporter",
+      "args": [
+        {
+          "name": "A",
+          "type": "number",
+          "default": "1"
+        },
+        {
+          "name": "B",
+          "type": "number",
+          "default": "2"
+        }
+      ]
+    },
+    {
+      "opcode": "wasmdemo_hello",
+      "label": "hello",
+      "shape": "reporter"
+    },
+    {
+      "opcode": "wasmdemo_echo",
+      "label": "echo %1",
+      "shape": "reporter",
+      "args": [
+        {
+          "name": "TEXT",
+          "type": "string",
+          "default": "hi"
+        }
+      ]
+    },
+    {
+      "opcode": "wasmdemo_sumcount",
+      "label": "arg0 + count %1",
+      "shape": "reporter",
+      "args": [
+        {
+          "name": "N",
+          "type": "number",
+          "default": "5"
+        }
+      ]
+    }
+  ]
+}

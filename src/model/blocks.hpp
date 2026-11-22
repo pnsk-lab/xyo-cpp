@@ -321,6 +321,9 @@ struct BlockCached {
 
     bool isHat = false;
     PrimFn blockFunction = nullptr;
+    /// Extension instance passed to the primitive via BlockUtility. Core
+    /// primitives leave this null; registerPrimitive(op, fn, ctx) sets it.
+    void* primitiveContext = nullptr;
     bool definedBlockFunction = false;
     bool isConditional = false;   // _flowing.conditional（拡張用）
     bool isLoop = false;

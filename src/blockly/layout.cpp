@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "label.hpp"
+#include "dynamic_catalog.hpp"
 #include "core/sstr.hpp"
 #include "model/blocks.hpp"
 
@@ -70,7 +71,8 @@ BlockStyle styleOf(Blocks* blocks, const Block* b) {
         s.secondary = rgb(d->secondary);
         s.tertiary = rgb(d->tertiary);
         s.ext = b->opcode.rfind("pen_", 0) == 0 ||
-                b->opcode.rfind("music_", 0) == 0;
+                b->opcode.rfind("music_", 0) == 0 ||
+                edit::isDynamicBlock(b->opcode);
         // procedures_call/prototype は mutation.proccode がラベル（%s/%b 付き）
         const std::string& op = b->opcode;
         if (op == "procedures_call") {
@@ -88,7 +90,8 @@ BlockStyle styleOf(Blocks* blocks, const Block* b) {
         return s;
     }
     const std::string& op = b->opcode;
-    s.ext = op.rfind("pen_", 0) == 0 || op.rfind("music_", 0) == 0;
+    s.ext = op.rfind("pen_", 0) == 0 || op.rfind("music_", 0) == 0 ||
+            edit::isDynamicBlock(op);
     if (op.rfind("procedures_", 0) == 0 || op.rfind("argument_", 0) == 0) {
         s.primary = rgb(0xFF6680);
         s.secondary = rgb(0xFF4D6A);

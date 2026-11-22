@@ -9,6 +9,7 @@
 #include "../wasm/wasm_emit.hpp"
 #include "../ir/cfg_lower_wasm.hpp"
 #include "../ir/scratch_numeric_kernel.hpp"
+#include "../ir/execution_abi.hpp"
 #include "../ir/scratch_pipeline.hpp"
 #include "../engine/thread.hpp"
 #include "../engine/runtime.hpp"
@@ -26,6 +27,21 @@
 
 namespace xyo {
 namespace {
+// The PC-stack recursion emitter writes CallFrameAbi frames after the scalar
+// slots and three helper words. The invocation buffer must reserve
+// 1024 * frameWords(nArgs) words or the generated code would write past the
+// end of thread.wasmSlotBits.
+static uint32_t recursionFrameWordsFor(const wasm::Program& program) {
+    size_t maxArgs = 0;
+    bool any = false;
+    for (const auto& statement : program.stmts) {
+        if (statement.k != wasm::SK::WarpReturnPcStack) continue;
+        any = true;
+        maxArgs = std::max(maxArgs, statement.argumentSlots.size());
+    }
+    return any ? uint32_t(ir::AtomicWarpExecutionAbi::frameWords(maxArgs))
+               : 0u;
+}
 
 // Compile a hybrid script from the same lossless Scratch compilation unit as
 // the ordinary full WASM path. A region is either a transactionally compiled
@@ -89,13 +105,73 @@ static std::unique_ptr<CompiledScript> compileHybridWasm(
                 if (!check(next, childWarp)) return false;
             for (uint32_t next : statement.elseBody)
                 if (!check(next, childWarp)) return false;
+            for (const auto& site : statement.returnSites)
+                for (uint32_t next : site.before)
+                    if (!check(next, true)) return false;
             return true;
         };
         for (uint32_t id : program.main)
             if (!check(id, false)) return false;
+        // Commit-only effects need a numeric-only prefix. Any writable
+        // slot that is not a number at completion aborts after the host
+        // call, which would replay an already-applied effect.
+        bool hasEffect = false;
+        for (const auto& statement : program.stmts)
+            if (statement.k == wasm::SK::Effect) hasEffect = true;
+        if (hasEffect) {
+            const auto numericExpr = [](wasm::EK kind) {
+                switch (kind) {
+                case wasm::EK::ConstNum:
+                case wasm::EK::VarGet:
+                case wasm::EK::ProcedureArgument:
+                case wasm::EK::Add: case wasm::EK::Sub: case wasm::EK::Mul:
+                case wasm::EK::Div: case wasm::EK::Mod: case wasm::EK::Round:
+                case wasm::EK::MathOp: case wasm::EK::Neg:
+                case wasm::EK::LessThan: case wasm::EK::GreaterThan:
+                case wasm::EK::Equals: case wasm::EK::And:
+                case wasm::EK::Or: case wasm::EK::Not:
+                case wasm::EK::DaysSince2000: case wasm::EK::Timer:
+                case wasm::EK::MouseX: case wasm::EK::MouseY:
+                case wasm::EK::MouseDown: case wasm::EK::Loudness:
+                case wasm::EK::ListLength: case wasm::EK::ListContains:
+                case wasm::EK::ListIndexOf:
+                case wasm::EK::StringLength:
+                case wasm::EK::StringLengthValue:
+                case wasm::EK::ColorConst:
+                    return true;
+                default:
+                    return false;
+                }
+            };
+            for (const auto& statement : program.stmts) {
+                switch (statement.k) {
+                case wasm::SK::SetVar:
+                case wasm::SK::ChangeVar:
+                case wasm::SK::If:
+                case wasm::SK::IfElse:
+                case wasm::SK::Effect:
+                    break;
+                default:
+                    return false;
+                }
+            }
+            for (const auto& expression : program.exprs)
+                if (!numericExpr(expression.k)) return false;
+        }
+        // Commit-only effects are safe only as the final top-level
+        // statement. Bodies and interior positions could bail after the
+        // effect and replay it in the interpreter.
+        for (size_t mi = 0; mi < program.main.size(); ++mi)
+            if (program.stmts[program.main[mi]].k == wasm::SK::Effect &&
+                mi + 1 != program.main.size())
+                return false;
+        for (size_t si = 0; si < program.stmts.size(); ++si)
+            if (program.stmts[si].k == wasm::SK::Effect &&
+                std::find(program.main.begin(), program.main.end(), si) ==
+                    program.main.end())
+                return false;
         return true;
     };
-
     auto hybrid = std::make_shared<wasm::HotCode>(
         -1, std::vector<std::string>{});
     size_t compiledCount = 0, compiledBytes = 0;
@@ -133,6 +209,10 @@ static std::unique_ptr<CompiledScript> compileHybridWasm(
             program = std::move(extended);
             end = j;
         }
+        // Recursive-warp statements are only produced for warp procedures.
+        // Emit them with the shared bounded fuel budget; exhaustion rolls
+        // back the whole region and lets the interpreter continue.
+        program.allowBoundedRecursion = true;
         // The host ABI is available even for pure numeric regions: a
         // variable may become a Scratch string between scheduler ticks.
         program.useHostMath = true;
@@ -149,6 +229,8 @@ static std::unique_ptr<CompiledScript> compileHybridWasm(
                 if (handle >= 0) {
                     regionCode = std::make_shared<wasm::HotCode>(
                         handle, program.slotIds);
+                    regionCode->recursionFrameWords =
+                        recursionFrameWordsFor(program);
                     regionCode->listIds = program.listIds;
                     regionCode->stringLiterals = program.stringLiterals;
                     regionCode->usesStringHost = !program.stringLiterals.empty();
@@ -281,7 +363,13 @@ public:
                 expr.k == wasm::EK::LessThan ||
                 expr.k == wasm::EK::GreaterThan ||
                 expr.k == wasm::EK::Equals ||
-                expr.k == wasm::EK::DaysSince2000)
+                expr.k == wasm::EK::DaysSince2000 ||
+                expr.k == wasm::EK::Timer ||
+                expr.k == wasm::EK::MouseX ||
+                expr.k == wasm::EK::MouseY ||
+                expr.k == wasm::EK::MouseDown ||
+                expr.k == wasm::EK::Loudness ||
+                expr.k == wasm::EK::Username)
                 program.useHostMath = true;
         if (!program.listIds.empty()) program.useHostMath = true;
         for (const auto& stmt : program.stmts)
@@ -335,7 +423,11 @@ public:
                 return compileHybridWasm(thread, source, top);
             }
         }
-        if (loopPositions.size() > 32)
+        // Each loop becomes 2-4 small modules. The old cap of 32 forced
+        // longer straight-line scripts to the interpreter even though every
+        // loop is independent and resumable; allow a bounded but much larger
+        // count instead.
+        if (loopPositions.size() > 128)
             return compileHybridWasm(thread, source, top);
         const bool hasLoop = !loopPositions.empty();
 
@@ -403,9 +495,21 @@ public:
                 return -1;
             }
             byteCount += result.bytes.size();
-            return wasm::instantiate(result.bytes.data(),
-                                    static_cast<int>(result.bytes.size()),
-                                    selection.hostOptimize);
+            if (const char* dump = std::getenv("XYO_WASM_DUMP")) {
+                if (FILE* file = std::fopen(dump, "wb")) {
+                    std::fwrite(result.bytes.data(), 1,
+                                result.bytes.size(), file);
+                    std::fclose(file);
+                }
+            }
+            const int handle = wasm::instantiate(
+                result.bytes.data(), static_cast<int>(result.bytes.size()),
+                selection.hostOptimize);
+            if (handle < 0 && std::getenv("XYO_JIT_VERBOSE"))
+                std::fprintf(stderr,
+                    "xyo-wasm-hot: instantiate failed bytes=%zu emitter=%s\n",
+                    result.bytes.size(), selection.name());
+            return handle;
         };
 
         // Count captures use a temporary value slot that is never committed
@@ -418,6 +522,11 @@ public:
             target.main.push_back(target.stmt(std::move(capture)));
             ++target.nSlots;
         };
+        // Whole-script plans may include a bounded warp-recursion statement
+        // lowered from a procedure call. It never yields, and the emitter's
+        // 1024-frame fuel bail is transactional, so it can run here instead
+        // of forcing the entire script to the interpreter.
+        program.allowBoundedRecursion = true;
         wasm::Program prefix = program;
         if (hasLoop) {
             prefix.main.assign(program.main.begin(),
@@ -427,14 +536,28 @@ public:
                 addCapture(prefix, first.expr);
         }
 
+        // A whole-script plan can fail late (for example a bounded
+        // recursion construct that the standalone emitter refuses). Do not
+        // discard the straight-line numeric regions around it: the hybrid
+        // planner can compile those and leave only the unsupported statement
+        // to the interpreter, matching LLVM's partial coverage instead of
+        // falling back to the interpreter for the whole script.
+        const auto fallbackHybrid = [&]() -> std::unique_ptr<CompiledScript> {
+            if (std::getenv("XYO_JIT_VERBOSE"))
+                std::fprintf(stderr,
+                    "xyo-wasm-hot: whole-script lowering failed; "
+                    "retrying hybrid regions\n");
+            return compileHybridWasm(thread, source, top);
+        };
         const int handle = compileModule(prefix);
-        if (handle < 0) return {};
+        if (handle < 0) return fallbackHybrid();
         // Keep the original slot IDs alive while compiling each segment:
         // host-math scratch offsets are derived from slotIds.size().
         // Moving them here used to make subsequent modules write to variable
         // slots instead of scratch (e.g. a modulo in a loop could clobber y).
         auto hot = std::make_shared<wasm::HotCode>(
             handle, program.slotIds);
+        hot->recursionFrameWords = recursionFrameWordsFor(program);
         hot->listIds = program.listIds;
         hot->stringLiterals = program.stringLiterals;
         hot->usesStringHost = !program.stringLiterals.empty();
@@ -475,7 +598,7 @@ public:
             wasm::Program body = program;
             body.main = stmt.body;
             loop.bodyHandle = compileModule(body);
-            if (loop.bodyHandle < 0) return {};
+            if (loop.bodyHandle < 0) return fallbackHybrid();
 
             if (loop.kind == wasm::HotCode::Loop::Kind::Until ||
                 loop.kind == wasm::HotCode::Loop::Kind::While ||
@@ -484,7 +607,7 @@ public:
                 condition.main.clear();
                 addCapture(condition, stmt.expr);
                 loop.conditionHandle = compileModule(condition);
-                if (loop.conditionHandle < 0) return {};
+                if (loop.conditionHandle < 0) return fallbackHybrid();
             }
 
             const size_t endPos = i + 1 < loopPositions.size()
@@ -498,7 +621,7 @@ public:
                     addCapture(suffix, next.expr);
             }
             loop.suffixHandle = compileModule(suffix);
-            if (loop.suffixHandle < 0) return {};
+            if (loop.suffixHandle < 0) return fallbackHybrid();
         }
 
         auto compiled = std::make_unique<CompiledScript>();

@@ -794,9 +794,13 @@ inline const std::vector<CategoryDef> kExtensionCategories = {
     } },
 };
 
+/// 実行時に登録された拡張ブロック（src/blockly/dynamic_catalog.cpp）。
+const BlockDef* findDynamicBlock(std::string_view opcode);
+
 inline const BlockDef* findBlock(std::string_view opcode) {
     for (const auto& b : kBlockDefs) if (b.opcode == opcode) return &b;
     for (const auto& b : kExtensionDefs) if (b.opcode == opcode) return &b;
+    if (const BlockDef* d = findDynamicBlock(opcode)) return d;
     return nullptr;
 }
 

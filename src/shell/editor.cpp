@@ -41,11 +41,13 @@
 #include <vector>
 
 #include "blockly/catalog.hpp"
+#include "blockly/dynamic_catalog.hpp"
 #include "blockly/geom.hpp"
 #include "blockly/label.hpp"
 #include "blockly/layout.hpp"
 #include "blockly/ops.hpp"
 #include "blockly/shape.hpp"
+#include "extensions/manifest.hpp"
 #include "core/cast.hpp"
 #include "core/fileio.hpp"
 #include "core/json.hpp"
@@ -142,6 +144,10 @@ struct Editor {
         cats_.push_back(edit::CategoryDef{"more", "My Blocks", 0xFF6680, {}});
         for (const auto& c : edit::kExtensionCategories)
             if (uses(c.id + "_")) cats_.push_back(c);
+        // インストール済みの動的拡張はプロジェクト未使用でも常に出す
+        // （Phase 1 では Add Extension の永続状態を持たないため）。
+        for (const auto& c : edit::dynamicExtensionCategories())
+            cats_.push_back(c);
     }
     const edit::CategoryDef& catAt(int i) const { return cats_[i]; }
     int catCount() const { return (int)cats_.size(); }
@@ -6158,6 +6164,13 @@ int editorMain(const char* path, bool danger) {
     std::vector<uint8_t> data = loadFile(path, ok);
     if (!ok) { std::fprintf(stderr, "cannot read %s\n", path); return 1; }
     std::unique_ptr<Runtime> rtOwn(new Runtime);
+    ExtensionRegistry extensions;
+    const ExtensionLoadReport extReport =
+        bootstrapExtensionsFromEnvironment(*rtOwn, extensions);
+    for (const ExtensionDef& def : extReport.loaded)
+        edit::registerExtensionDef(def);
+    for (const std::string& error : extReport.errors)
+        std::fprintf(stderr, "extension: %s\n", error.c_str());
     Sb3LoadResult res = loadSb3File(*rtOwn, data.data(), data.size());
     if (!res.ok) { std::fprintf(stderr, "load failed: %s\n", res.error.c_str()); return 1; }
     if (danger) rtOwn->dangerMode = true;

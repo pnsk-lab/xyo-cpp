@@ -52,6 +52,9 @@ def main():
     parser.add_argument('--cpu', type=int)
     parser.add_argument('--case', action='append', choices=sorted(SCHEDULER_CASES))
     parser.add_argument('--full', action='store_true', help='run original project and verify non-scheduler checksums')
+    parser.add_argument('--prepared-scheduler', action='store_true',
+                        help='input is already an isolated sched-only suite; '
+                             'keep its bytes and remove only unselected sched case calls')
     args = parser.parse_args()
     if args.runs < 1 or any(not f.startswith('XYO_') for f in args.flag):
         parser.error('positive --runs and XYO_ flags required')
@@ -60,6 +63,8 @@ def main():
         parser.error('--common-flag must be XYO_NAME=value and must not overlap --flag')
     if args.full and args.case:
         parser.error('--full and --case cannot be combined')
+    if args.full and args.prepared_scheduler:
+        parser.error('--full and --prepared-scheduler cannot be combined')
     if args.cpu is not None:
         os.sched_setaffinity(0, {args.cpu})
     args.out.mkdir(parents=True, exist_ok=True)
@@ -74,7 +79,10 @@ def main():
     source_snapshot.write_bytes(source_bytes)
     project = source_snapshot if args.full else args.out.resolve() / 'scheduler.sb3'
     if not args.full:
-        scheduler_project(source_snapshot, project)
+        if args.prepared_scheduler:
+            shutil.copy2(source_snapshot, project)
+        else:
+            scheduler_project(source_snapshot, project)
     expected_cases = set(args.case or SCHEDULER_CASES)
     if args.case:
         selected = args.out.resolve() / 'selected-scheduler.sb3'
@@ -138,6 +146,7 @@ def main():
         'binary_sha256': binary_hash,
         'source': str(args.project.resolve()), 'source_sha256': hashlib.sha256(source_bytes).hexdigest(),
         'source_snapshot': str(source_snapshot), 'full': args.full,
+        'prepared_scheduler': args.prepared_scheduler,
         'non_scheduler_checksum_count': len(reference_checksums or {}),
         'scheduler_sha256': digest(project), 'flags': args.flag,
         'common_flags': common, 'jit': args.jit, 'fps': 30, 'cpu': args.cpu, 'runs': args.runs,

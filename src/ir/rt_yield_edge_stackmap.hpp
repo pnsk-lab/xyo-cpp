@@ -139,6 +139,7 @@ inline bool knownPotentiallyYieldingHelper(llvm::StringRef name) {
         "xyo_yield", "xyo_yield_fast", "xyo_loop_yield",
         "xyo_wait_yield", "xyo_wait_event_yield", "xyo_rt_wait",
         "xyo_stop_all", "xyo_stop_script", "xyo_broadcast_wait_v",
+        "xyo_broadcast_wait_lit",
         "xyo_rt_compat", "xyo_rt_reporter", "xyo_rt_async_reporter",
         "xyo_rt_nested_osr_arg_get",
         "xyo_mot_glidexy", "xyo_mot_glideto",

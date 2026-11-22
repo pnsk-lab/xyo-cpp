@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(xyo-cpp VERSION 1.2.1 LANGUAGES C CXX ASM)
+project(xyo-cpp VERSION 1.3.0 LANGUAGES C CXX ASM)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,6 +11,11 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 option(XYO_JIT "Enable JIT support" ON)
+option(XYO_WASM_EXT "Enable native WASM extension provider (vendored wasm3)" ON)
+if(EMSCRIPTEN)
+  # ブラウザでは WebAssembly を JS 側で使う。wasm3 はネイティブ専用。
+  set(XYO_WASM_EXT OFF)
+endif()
 set(XYO_JIT_BACKEND "llvm" CACHE STRING "JIT backend implementation: llvm | wasm | none")
 set_property(CACHE XYO_JIT_BACKEND PROPERTY STRINGS llvm wasm none)
 if(NOT XYO_JIT_BACKEND STREQUAL "llvm" AND
@@ -183,11 +188,13 @@ file(GLOB_RECURSE XYO_CORE_SOURCES CONFIGURE_DEPENDS
   src/model/*.cpp
   src/engine/*.cpp
   src/blocks/*.cpp
+  src/extensions/*.cpp
   src/load/*.cpp
   src/project/*.cpp
   src/render/*.cpp
   src/rt/*.cpp
   src/ir/*.cpp
+  src/mlir/*.cpp
   src/interp/*.cpp
   src/audio/*.cpp
   src/gpu/*.cpp
@@ -259,7 +266,17 @@ endif()
 # Optional fast JSON reader for large Scratch SB3 project files.
 # The default parser remains self-contained; system yyjson is never bundled.
 option(XYO_JSON_YYJSON "Use system yyjson for native project JSON parsing" OFF)
+if(XYO_WASM_EXT)
+  # Vendored wasm3 core (MIT). The WASI/uvwasi adapters are not included.
+  file(GLOB XYO_WASM3_SOURCES CONFIGURE_DEPENDS
+       third_party/wasm3/source/*.c)
+  list(APPEND XYO_CORE_SOURCES ${XYO_WASM3_SOURCES})
+endif()
 add_library(xyo STATIC ${XYO_CORE_SOURCES})
+if(XYO_WASM_EXT)
+  target_compile_definitions(xyo PUBLIC XYO_WASM_EXT=1)
+  target_include_directories(xyo PRIVATE third_party/wasm3/source)
+endif()
 if(XYO_JSON_YYJSON)
   if(EMSCRIPTEN OR XYO_STATIC OR CMAKE_CROSSCOMPILING)
     message(FATAL_ERROR "XYO_JSON_YYJSON requires native dynamic linking")
@@ -685,7 +702,8 @@ if(XYO_BUILD_SHELL)
                  src/shell/editor.cpp
                  src/blockly/shape.cpp src/blockly/layout.cpp
                  src/blockly/geom.cpp
-                 src/blockly/label.cpp src/blockly/ops.cpp)
+                 src/blockly/label.cpp src/blockly/ops.cpp
+                 src/blockly/dynamic_catalog.cpp)
   target_link_libraries(xyo-cli PRIVATE xyo)
   if(XYO_LINK_JEMALLOC)
     # Keep the allocator in DT_NEEDED even when the executable has no direct
@@ -791,6 +809,23 @@ if(EMSCRIPTEN AND XYO_JIT AND XYO_JIT_BACKEND STREQUAL "wasm" AND
               "${CMAKE_CURRENT_SOURCE_DIR}/tests/differential/wasm_compat_fuzz.py"
               "$<TARGET_FILE:xyo-cli>" --out "${CMAKE_CURRENT_BINARY_DIR}"
               --cases 32
+      DEPENDS xyo-cli
+      USES_TERMINAL
+      VERBATIM)
+    # Cross-backend LLVM<->WASM compatibility sweep. Needs a native LLVM
+    # build of the same source tree to compare against:
+    #   cmake -DXYO_NATIVE_LLVM_XYO=/path/to/native/xyo ...
+    #   cmake --build <build> --target check-wasm-compat
+    # The Binaryen addon is optional; without it Binaryen-only suites SKIP.
+    set(XYO_NATIVE_LLVM_XYO "" CACHE FILEPATH
+        "Native LLVM xyo binary used by check-wasm-compat")
+    add_custom_target(check-wasm-compat
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/tests/differential/llvm_wasm_compat_sweep.py"
+              "$<TARGET_FILE:xyo-cli>"
+              --llvm "${XYO_NATIVE_LLVM_XYO}"
+              --addon "${CMAKE_CURRENT_BINARY_DIR}/binaryen-host.node"
+              --out "${CMAKE_CURRENT_BINARY_DIR}/compat-sweep"
       DEPENDS xyo-cli
       USES_TERMINAL
       VERBATIM)

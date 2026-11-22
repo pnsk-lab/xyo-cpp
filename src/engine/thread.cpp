@@ -1,6 +1,8 @@
 // xyo-cpp: engine/thread.js 移植。
 #include "thread.hpp"
 
+#include "../core/gc.hpp"
+
 #include "../jit/jit.hpp"
 #include "numeric_thread.hpp"
 #include "../jit/procedure_frame_state.hpp"
@@ -33,6 +35,17 @@ Thread::~Thread() {
     if (ir001SourceTraceEnabled())
         ir::NativeSourceEffectTimelineRegistry::get().erase(this);
     FiberPool::release(fiber);
+    if (jitCtx && jitCtx->coroHandle) {
+        if (jitCtx->coroDestroyFn)
+            jitCtx->coroDestroyFn(jitCtx->coroHandle);
+        jitCtx->coroHandle = nullptr;
+    }
+    if (jitCtx) Gc::get().removeRootProvider(jitCtx);
+    if (jitCtx && jitCtx->coroJoinRefs) {
+        if (jitCtx->joinRefs == jitCtx->coroJoinRefs) jitCtx->joinRefs = nullptr;
+        delete jitCtx->coroJoinRefs;
+        jitCtx->coroJoinRefs = nullptr;
+    }
     delete jitCtx;
 }
 
@@ -47,6 +60,18 @@ const std::string& Thread::getId() const {
 }
 
 void Thread::releaseFinished() {
+    megaDispatch.reset();
+    megaPc = 0;
+    megaRemaining = 0;
+    megaReturnDepth = 0;
+    megaScalarBindings.fill(nullptr);
+    megaScalarBindingsReady = false;
+    megaJoinRefs.clear();
+    megaBroadcastPending = false;
+    megaBoundTarget = nullptr;
+    megaBoundStage = nullptr;
+    megaLocalGeneration = 0;
+    megaStageGeneration = 0;
     pendingShortBroadcast = false;
     if (ir001SourceTraceEnabled())
         ir::NativeSourceEffectTimelineRegistry::get().erase(this);
@@ -144,6 +169,10 @@ void Thread::reuseStackForNextBlock(const std::string& blockId) {
 
 std::string Thread::popStack() {
     pendingShortBroadcast = false;
+    // stopAll() clears the logical stack of a retired thread while native
+    // callers are still unwinding (post-procedure bookkeeping). Popping an
+    // empty stack must be a no-op rather than reading stack.back().
+    if (stack.empty()) return {};
     while (stackFrames.size() < stack.size())
         stackFrames.emplace_back(std::make_unique<StackFrame>());
     std::string id = stack.back();
@@ -317,7 +346,7 @@ void Thread::tryCompile(const Block* topHint) {
         top->opcode == "control_start_as_clone" &&
         !rt->blockCountEnabled) {
         if (const CompiledScript* ready = rt->jit->readyScript(top, blockContainer);
-            ready && (!jitFiberlessEnabled() || !ready->mayYield || ready->wasm)) {
+            ready && (!jitFiberlessEnabled() || !ready->mayYield || ready->wasm || ready->coroResume)) {
             compiled = ready;
             isCompiled = true;
             return;
@@ -336,6 +365,29 @@ void Thread::tryCompile(const Block* topHint) {
         if (const CompiledScript* ready = rt->jit->readyScript(top, blockContainer);
             ready && ready->shortSync && !ready->mayYield &&
             !ready->mainThread) {
+            compiled = ready;
+            isCompiled = true;
+            return;
+        }
+    }
+
+    // Every Eager Thread would choose "compile" even when an immutable
+    // native script is already resident. For repeated broadcast receivers
+    // and clone starts that cannot use the special narrow fast paths above,
+    // avoid the decideCompile() and compile() cache probes altogether.
+    // The opt-in is Eager-only: HotSpot profiling/promotion and numeric
+    // common-CFG lowering continue unchanged. Keep edge-hat refusal and
+    // Fiberless mayYield restrictions identical to the normal JIT path.
+    static const bool eagerReadyFast = [] {
+        const char* env = std::getenv("XYO_JIT_READY_EAGER_FAST");
+        return env && env[0] == '1';
+    }();
+    if (eagerReadyFast && jitMode() == JitMode::Eager && !numericCfg &&
+        !rt->getIsEdgeActivatedHat(top->opcode) && rt->jit->ok()) {
+        if (const CompiledScript* ready =
+                rt->jit->readyScript(top, blockContainer);
+            ready && (!jitFiberlessEnabled() || !ready->mayYield ||
+                      ready->wasm || ready->coroResume)) {
             compiled = ready;
             isCompiled = true;
             return;
@@ -376,7 +428,7 @@ void Thread::tryCompile(const Block* topHint) {
         ++cp.n;
     }
 #endif
-    if (cs && (!jitFiberlessEnabled() || !cs->mayYield || cs->wasm)) {
+    if (cs && (!jitFiberlessEnabled() || !cs->mayYield || cs->wasm || cs->coroResume)) {
         compiled = cs;
         isCompiled = true;
     } else if (cs && jitFiberlessEnabled() && cs->mayYield) {

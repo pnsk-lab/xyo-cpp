@@ -28,6 +28,9 @@
 #include "core/json.hpp"
 #include "core/sstr.hpp"
 #include "engine/runtime.hpp"
+#if defined(XYO_JIT) && !defined(__EMSCRIPTEN__)
+#include "mlir/frontend.hpp"
+#endif
 #include "engine/sequencer.hpp"
 #include "engine/thread.hpp"
 #include "engine/warp_clock.hpp"
@@ -35,6 +38,18 @@
 #include "load/sb3.hpp"
 #include "model/target.hpp"
 #include "model/variable.hpp"
+
+// XYO_MLIR=1 では script が MLIR 前段でコンパイルされ、legacy codegen 固有の
+// 最適化（par-for / transient append 文字列）は走らない。意味論の検査は
+// そのまま行い、実装固有の検査だけを外す。
+static bool mlirFrontendActive() {
+#if defined(XYO_JIT) && !defined(__EMSCRIPTEN__)
+    return xyo::mlir::isEnabled();
+#else
+    return false;
+#endif
+}
+
 
 extern "C" int32_t xyo_wait_should_yield(xyo::JitCtx*);
 extern "C" int32_t xyo_warp_yield_due(xyo::JitCtx*);
@@ -261,7 +276,10 @@ void testTransientWarpInterleaving(JitMode mode) {
                          (initialPrefix.size() - 4) % 2 == 0;
     check(yielded && appender->status != STATUS_DONE,
           "warp published its partial prefix before a real yield");
-    if (mode == JitMode::Eager &&
+    // XYO_MLIR=1 ではこの script は MLIR フロントエンド側でコンパイルされ、
+    // legacy の transient append 文字列最適化は使われない（公開される値は
+    // 上で検査済みの partial prefix で意味は同じ）。
+    if (mode == JitMode::Eager && !mlirFrontendActive() &&
         (!std::getenv("XYO_JIT_TRANSIENT_STRINGS") ||
          std::getenv("XYO_JIT_TRANSIENT_STRINGS")[0] != '0')) {
         check(appender->isCompiled && var->value.isString() &&

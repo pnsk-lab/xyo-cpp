@@ -118,6 +118,8 @@ public:
     /// ルートプロバイダ登録: fn(gc) 内で gc.markValue/markPtr を呼ぶ。
     /// owner は removeRootProvider での解除キー（例: Runtime*）。
     void addRootProvider(void* owner, std::function<void(Gc&)> fn) {
+        // Coroutine frames may be registered from worker threads.
+        std::lock_guard<std::mutex> lk(rootMtx_);
         rootProviders_.push_back({owner, std::move(fn)});
     }
     void removeRootProvider(void* owner);
@@ -272,6 +274,7 @@ private:
         std::function<void(Gc&)> fn;
     };
     std::vector<RootProvider> rootProviders_;
+    std::mutex rootMtx_;
     /// マーク待ち（cons string の鎖・リストの入れ子を反復で辿る）
     std::vector<GcHeader*> pending_;
     std::atomic<size_t> bytesAllocated_{0};

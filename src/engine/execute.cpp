@@ -11,6 +11,7 @@
 #include "../ir/source_effect_runtime_trace.hpp"
 #include "../ir/source_interpreter_mutations.hpp"
 
+#include <cstdio>
 #include <cstdlib>
 
 namespace xyo {
@@ -47,6 +48,8 @@ struct ScopedBlockUtility {
         g_util.sequencer = &seq;
         g_util.thread = &thread;
         g_util.jitCompatEc = nullptr;
+        g_util.op = nullptr;
+        g_util.primitiveContext = nullptr;
     }
     ~ScopedBlockUtility() { g_util = saved; }
 };
@@ -79,6 +82,15 @@ static void handleReport(Value resolvedValue, Sequencer& seq, Thread& thread,
             const bool edge = hasOld
                 ? (!jsTruthy(oldV) && jsTruthy(resolvedValue))
                 : jsTruthy(resolvedValue);
+            if (std::getenv("XYO_HAT_TRACE")) {
+                std::fprintf(stderr,
+                    "[hat] id=%s op=%s num=%d hasOld=%d oldTruthy=%d "
+                    "newTruthy=%d edge=%d\n",
+                    currentBlockId.c_str(), op->opcode.c_str(),
+                    resolvedValue.isNumber() ? 1 : 0, int(hasOld),
+                    int(jsTruthy(oldV)), int(jsTruthy(resolvedValue)),
+                    int(edge));
+            }
             if (edge) thread.status = STATUS_RUNNING;
             else seq.retireThread(thread);
         } else if (jsTruthy(resolvedValue)) {
@@ -267,6 +279,10 @@ bool execute(Sequencer& sequencer, Thread& thread) {
                              opCached->opcode.c_str());
         }
 
+        if (opCached->primitiveContext) {
+            g_util.op = opCached;
+            g_util.primitiveContext = opCached->primitiveContext;
+        }
         const Value rv = opCached->blockFunction
             ? opCached->blockFunction(opCached->argValues, g_util)
             : Value::undefined();

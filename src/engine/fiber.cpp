@@ -149,6 +149,19 @@ void Fiber::resume() {
 
 void Fiber::resumeChain(Fiber* const* fibers, size_t count) {
     if (!count) return;
+    // A native fast-yield experiment may omit looking for a successor.
+    // Preserve the public API too: with chains explicitly disabled, all
+    // callers of resumeChain must execute serially via normal resume().
+    static const bool directYieldNoChain = [] {
+        const char* opt = std::getenv("XYO_FIBER_DIRECT_YIELD");
+        const char* chain = std::getenv("XYO_FIBER_CHAIN");
+        return opt && opt[0] == '1' &&
+               chain && chain[0] == '0';
+    }();
+    if (directYieldNoChain) {
+        for (size_t i = 0; i < count; ++i) fibers[i]->resume();
+        return;
+    }
 #ifdef XYO_ASAN
     for (size_t i = 0; i < count; ++i) fibers[i]->resume();
 #else
@@ -178,8 +191,36 @@ void Fiber::yield() {
     xyo_fiber_switch(&regs_, &detail::gSchedulerRegs);
 }
 
-// Same translation unit as Fiber::yield permits inlining its chain dispatch.
+// Called at source-certified non-warp loop yields by generated LLVM.
+// The experimental direct switch has NO successor lookup. It is legal
+// only if the entire process has explicitly disabled Fiber chains;
+// resumeChain also serializes in that configuration. Its return boundary
+// is still the SAME Scratch yield, not a second loop body or an OSR jump.
+// An ORC-only opt-in target. registerRuntimeSymbols selects this address
+// only when BOTH the native direct-yield mode and chain opt-out are active.
+// Keeping the ordinary xyo_yield_fast symbol unchanged preserves the
+// machine StackMap/yield-edge diagnostics and the default AOT ABI.
+extern "C" void xyo_yield_fast_direct(Fiber* f) {
+#if defined(XYO_ASAN) || defined(__SANITIZE_ADDRESS__)
+    f->yield();
+#else
+    xyo_fiber_switch(f->regs(), &detail::gSchedulerRegs);
+#endif
+}
+
 extern "C" void xyo_yield_fast(Fiber* f) {
+#if !defined(XYO_ASAN)
+    static const bool directYieldNoChain = [] {
+        const char* opt = std::getenv("XYO_FIBER_DIRECT_YIELD");
+        const char* chain = std::getenv("XYO_FIBER_CHAIN");
+        return opt && opt[0] == '1' &&
+               chain && chain[0] == '0';
+    }();
+    if (directYieldNoChain) {
+        xyo_fiber_switch(f->regs(), &detail::gSchedulerRegs);
+        return;
+    }
+#endif
     f->yield();
 }
 
@@ -237,15 +278,65 @@ std::atomic<size_t> gLeasedNativeFibers{0};
 std::atomic<size_t> gFiberlessAcquires{0};
 constexpr size_t kFiberPoolCap = 64;
 
-// Fibers leased and returned on one OS thread need no cross-thread lock.
-// Keep this strictly opt-in until the cost and OS-thread recycling semantics
-// are measured. Thread exit unmaps idle stacks rather than leaking mappings.
+#if !defined(XYO_DISABLE_RT_PROF)
+// Profile builds only: no counters, branches or per-Fiber atomics in the
+// normal Release binary. These totals count real pool ownership transfers,
+// not the much larger number of native context switches.
+struct FiberPoolTrace {
+    bool enabled = [] {
+        const char* env = std::getenv("XYO_FIBER_POOL_STATS");
+        return env && env[0] == '1';
+    }();
+    std::atomic<uint64_t> localAcquires{0}, sharedAcquires{0};
+    std::atomic<uint64_t> newStacks{0};
+    std::atomic<uint64_t> localReleases{0}, sharedReleases{0};
+    std::atomic<uint64_t> deletedStacks{0};
+    ~FiberPoolTrace() {
+        if (!enabled) return;
+        std::fprintf(stderr,
+            "[fiber-pool] local_acquire=%llu shared_acquire=%llu "
+            "new_stack=%llu local_release=%llu shared_release=%llu "
+            "deleted_stack=%llu\n",
+            (unsigned long long)localAcquires.load(std::memory_order_relaxed),
+            (unsigned long long)sharedAcquires.load(std::memory_order_relaxed),
+            (unsigned long long)newStacks.load(std::memory_order_relaxed),
+            (unsigned long long)localReleases.load(std::memory_order_relaxed),
+            (unsigned long long)sharedReleases.load(std::memory_order_relaxed),
+            (unsigned long long)deletedStacks.load(std::memory_order_relaxed));
+    }
+};
+FiberPoolTrace& fiberPoolTrace() {
+    static FiberPoolTrace stats;
+    return stats;
+}
+#endif
+
+// A single idle Fiber on each OS thread avoids repeated global mutex
+// acquisition for serial restart/clone churn. Default ON with a bounded
+// 1 MiB stack reservation per OS thread. Keep the shared pool for surplus
+// returns and allow XYO_FIBER_LOCAL_POOL=0 to reproduce the old policy.
 bool localFiberPoolEnabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("XYO_FIBER_LOCAL_POOL");
-        return v && v[0] == '1';
+        return !v || v[0] != '0';
     }();
     return enabled;
+}
+// A smaller idle cache bounds each OS thread's retained 1 MiB mappings
+// without changing leased Fiber ownership or the shared-pool fallback.
+// The previous opt-in default was 16; cap 16 remains available explicitly.
+size_t localFiberPoolCapacity() {
+    static const size_t capacity = [] {
+        const char* setting = std::getenv("XYO_FIBER_LOCAL_POOL_CAP");
+        if (!setting || !*setting) return size_t(1);
+        char* end = nullptr;
+        const unsigned long requested = std::strtoul(setting, &end, 10);
+        if (end == setting || !end || *end != '\0' ||
+            requested < 1 || requested > 16)
+            return size_t(1);
+        return size_t(requested);
+    }();
+    return capacity;
 }
 struct LocalFiberPool {
     static constexpr size_t kCapacity = 16;
@@ -269,6 +360,11 @@ Fiber* FiberPool::acquire(FiberEntry entry, void* arg) {
         gFiberlessAcquires.fetch_add(1, std::memory_order_relaxed);
     if (localFiberPoolEnabled() && gLocalFibers.count != 0) {
         Fiber* f = gLocalFibers.fibers[--gLocalFibers.count];
+#if !defined(XYO_DISABLE_RT_PROF)
+        if (fiberPoolTrace().enabled)
+            fiberPoolTrace().localAcquires.fetch_add(
+                1, std::memory_order_relaxed);
+#endif
         f->reset(entry, arg);
         gLeasedNativeFibers.fetch_add(1, std::memory_order_release);
         return f;
@@ -278,6 +374,11 @@ Fiber* FiberPool::acquire(FiberEntry entry, void* arg) {
         Fiber* f = gFiberPool.back();
         gFiberPool.pop_back();
         if (f->stackBase()) {
+#if !defined(XYO_DISABLE_RT_PROF)
+            if (fiberPoolTrace().enabled)
+                fiberPoolTrace().sharedAcquires.fetch_add(
+                    1, std::memory_order_relaxed);
+#endif
             f->reset(entry, arg);
             gLeasedNativeFibers.fetch_add(1, std::memory_order_release);
             return f;
@@ -285,6 +386,11 @@ Fiber* FiberPool::acquire(FiberEntry entry, void* arg) {
         delete f;   // mmap 失敗品はプールしない
     }
     Fiber* f = new Fiber(entry, arg);
+#if !defined(XYO_DISABLE_RT_PROF)
+    if (fiberPoolTrace().enabled)
+        fiberPoolTrace().newStacks.fetch_add(
+            1, std::memory_order_relaxed);
+#endif
     gLeasedNativeFibers.fetch_add(1, std::memory_order_release);
     return f;
 }
@@ -318,13 +424,31 @@ void FiberPool::release(Fiber* f) {
     if (!f->finished()) return;
 #endif
     if (localFiberPoolEnabled() && f->stackBase() &&
-        gLocalFibers.count < LocalFiberPool::kCapacity) {
+        gLocalFibers.count < localFiberPoolCapacity()) {
         gLocalFibers.fibers[gLocalFibers.count++] = f;
+#if !defined(XYO_DISABLE_RT_PROF)
+        if (fiberPoolTrace().enabled)
+            fiberPoolTrace().localReleases.fetch_add(
+                1, std::memory_order_relaxed);
+#endif
         return;
     }
     std::lock_guard<std::mutex> lk(gFiberPoolMtx);
-    if (gFiberPool.size() < kFiberPoolCap) gFiberPool.push_back(f);
-    else delete f;
+    if (gFiberPool.size() < kFiberPoolCap) {
+        gFiberPool.push_back(f);
+#if !defined(XYO_DISABLE_RT_PROF)
+        if (fiberPoolTrace().enabled)
+            fiberPoolTrace().sharedReleases.fetch_add(
+                1, std::memory_order_relaxed);
+#endif
+    } else {
+#if !defined(XYO_DISABLE_RT_PROF)
+        if (fiberPoolTrace().enabled)
+            fiberPoolTrace().deletedStacks.fetch_add(
+                1, std::memory_order_relaxed);
+#endif
+        delete f;
+    }
 }
 
 } // namespace xyo

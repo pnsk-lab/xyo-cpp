@@ -52,6 +52,8 @@ EM_JS(int, xyo___instantiate, (const void* ptr, int len, int optimize), {
   } catch (e) {
     if (Module['printErr'])
       Module['printErr']('xyo: wasm instantiate failed: ' + e);
+    else if (typeof console !== 'undefined' && console.error)
+      console.error('xyo: wasm instantiate failed: ' + e);
     return -1;
   }
 });

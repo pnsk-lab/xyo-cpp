@@ -630,6 +630,15 @@ foreach(mode rope flat append-log)
     ENVIRONMENT "XYO_STRING_STORAGE=${mode}" TIMEOUT 60)
 endforeach()
 
+# 自作拡張レジストリ（Phase 0）: interp / JIT eager で同じ結果になること。
+add_executable(xyo-extensions-unit extensions/extensions_unit.cpp
+               ../src/blockly/dynamic_catalog.cpp)
+target_link_libraries(xyo-extensions-unit PRIVATE xyo)
+target_compile_definitions(xyo-extensions-unit PRIVATE
+  XYO_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME xyo-extensions-unit COMMAND xyo-extensions-unit)
+set_tests_properties(xyo-extensions-unit PROPERTIES TIMEOUT 60)
+
 # xyo-tests has one main() (unit/test_cast.cpp). Standalone smoke tests
 # also live in unit/ and supply their own main(), so do not glob them.
 file(GLOB TEST_SOURCES CONFIGURE_DEPENDS unit/test_*.cpp)
@@ -647,6 +656,33 @@ if(TEST_SOURCES)
   # 即コンパイルする eager で JIT の意味論を検証する。
   set_tests_properties(xyo-tests PROPERTIES
     ENVIRONMENT "XYO_JIT_MODE=eager")
+  # One-switch Mega preset: every Mega scheduler feature must be on at once
+  # and the complete unit suite must stay green.
+  add_test(NAME xyo-mega-preset COMMAND xyo-tests)
+  set_tests_properties(xyo-mega-preset PROPERTIES
+    ENVIRONMENT "XYO_JIT_MEGA=1"
+    TIMEOUT 2400)
+  # Fixture-level Mega suite: interpreter-vs-preset parity plus the paired
+  # per-feature A/B harnesses (each asserts exact Scratch state).
+  if(Python3_EXECUTABLE AND TARGET xyo-cli)
+    add_test(NAME xyo-mega-fixtures
+      COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/mega/run_mega_suite.py"
+        --binary "$<TARGET_FILE:xyo-cli>"
+        --skip-unit --runs 1
+        --out "${CMAKE_BINARY_DIR}/mega-suite")
+    set_tests_properties(xyo-mega-fixtures PROPERTIES TIMEOUT 1800)
+  endif()
+endif()
+
+# MLIR 前段（src/mlir/）の意味論パリティ: 同じ sb3 をインタプリタと
+# XYO_MLIR=1 で実行し、全変数/リストの最終状態が一致することを検査する。
+if(Python3_EXECUTABLE AND TARGET xyo-cli AND XYO_JIT)
+  add_test(NAME xyo-mlir-frontend
+    COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/mlir/xcheck.py"
+      "$<TARGET_FILE:xyo-cli>")
+  set_tests_properties(xyo-mlir-frontend PROPERTIES TIMEOUT 300)
 endif()
 
 # START-016: the real editor (software SDL renderer) must commit each

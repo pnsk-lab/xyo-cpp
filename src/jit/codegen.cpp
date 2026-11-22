@@ -3,6 +3,7 @@
 // 値は i64 の NaN ボックス bit パターンとして受け渡しする。
 // 入力・スタック双方、未 lowering のものは compat 層へ落とす。
 #include "jit.hpp"
+#include "stackless_coro_lower.hpp"
 #include "layq.hpp"
 #include "llvm_compat.hpp"
 #include "llvm_helper_attributes.hpp"
@@ -24,6 +25,7 @@
 #include "../ir/source_reporter_ssa_location_bridge.hpp"
 #include "rt_ssa_extra_capture.hpp"
 #include "../ir/scratch_source_digest.hpp"
+#include "../mlir/frontend.hpp"
 
 #include <llvm/IR/IRBuilder.h>
 #if defined(__x86_64__) || defined(_M_X64)
@@ -96,6 +98,10 @@ struct Codegen {
     IRBuilder<> b;
     Runtime& runtime;
     JitPinned& pinned;
+    // A source-certified, non-warp scalar repeat never needs the generic
+    // LLVM fork between normal-yield and warp/deadline branches.
+    bool stacklessNormalLoop = false;
+    bool stacklessWarp = false;
     // Persisted before lowering: codegen must not silently overwrite the
     // source revision with a newer live Blocks revision during a delayed
     // asynchronous compile.
@@ -799,7 +805,8 @@ struct Codegen {
         }();
         if (cloneSerialHint &&
             (std::string_view(name) == "xyo_ctl_createclone" ||
-             std::string_view(name) == "xyo_ctl_deleteclone"))
+             std::string_view(name) == "xyo_ctl_deleteclone" ||
+             std::string_view(name) == "xyo_ctl_deleteclone_begin"))
             mainThread = true;
         auto callee = mod.getOrInsertFunction(
             name, FunctionType::get(ret, args, false));
@@ -815,6 +822,7 @@ struct Codegen {
     /// 手続き呼出しは callEdges で伝播計算するため、スクリプト全体の
     /// mayYield は entry からの到達集合で決まる。
     std::unordered_map<llvm::Function*, bool> fnDirect;
+    std::unordered_map<llvm::Function*, bool> fnSemanticYield;
     std::unordered_map<llvm::Function*, std::vector<llvm::Function*>>
         callEdges;
     /// 内部で fiber yield し得る extern "C" ヘルパ。
@@ -824,7 +832,8 @@ struct Codegen {
         static const std::unordered_set<std::string_view> k = {
             "xyo_yield", "xyo_yield_fast", "xyo_loop_yield",
             "xyo_wait_yield", "xyo_wait_event_yield", "xyo_rt_wait", "xyo_stop_all",
-            "xyo_stop_script", "xyo_broadcast_wait_v", "xyo_rt_compat",
+            "xyo_stop_script", "xyo_broadcast_wait_v",
+            "xyo_broadcast_wait_lit", "xyo_rt_compat",
             "xyo_rt_reporter", "xyo_rt_async_reporter",
             "xyo_rt_nested_osr_arg_get",
             "xyo_mot_glidexy", "xyo_mot_glideto",
@@ -837,7 +846,24 @@ struct Codegen {
         return k.count(n) != 0;
     }
     void noteCall(const char* n) {
-        if (helperMayYield(n) && fn) fnDirect[fn] = true;
+        if (helperMayYield(n) && fn) {
+            fnDirect[fn] = true;
+            // Ordinary yields suspend for scheduler/memory semantics.
+            fnSemanticYield[fn] = true;
+        }
+    }
+
+    /// Warp-budget sampling: this suspension is cooperative only (it never
+    /// advances another Scratch thread's observable state), so a synchronous
+    /// batch worker can skip it. Still counts as a yield point.
+    llvm::Value* callCooperativeYield() {
+        if (fn) fnDirect[fn] = true;
+        auto* call = b.CreateCall(decl("xyo_yield", voidt, {ptrt}), {ctxArg});
+        // Mark warp-budget sampling so the stackless lowering does not turn
+        // it into a coroutine suspension (it is a cooperative Fiber switch,
+        // not a semantic continuation).
+        call->setMetadata("xyo.coop", llvm::MDNode::get(lc, {}));
+        return call;
     }
 
     llvm::Value* call1(const char* n, Type* ret, llvm::Value* a) {
@@ -1537,6 +1563,78 @@ struct Codegen {
     }
 
     void emitLoopYield() {
+        if (stacklessNormalLoop && !stacklessWarp) {
+            // Plain script: every completed body yields once; the coroutine
+            // rewriter turns this into a direct llvm.coro.suspend.
+            llvm::Value* np = curYieldCnt
+                ? static_cast<llvm::Value*>(curYieldCnt)
+                : b.CreateConstGEP1_32(i8t, ctxArg, kYieldCheckNOff);
+            llvm::Value* n = b.CreateAdd(b.CreateLoad(i64t, np), ci64(1));
+            b.CreateStore(n, np);
+            transientBeforeHandoff();
+            spillPromoted();
+            call1("xyo_yield_fast", voidt, ctxPtr(4));
+            reloadPromoted();
+            transientAfterHandoff();
+            return;
+        }
+        if (stacklessNormalLoop) {
+            // Every completed non-warp body yields once; a warp body keeps
+            // running until the watchdog/GC budget is due. Both suspension
+            // points are direct xyo_yield calls, so the coroutine rewriter
+            // can turn them into llvm.coro.suspend without a Fiber stack.
+            llvm::Value* np = curYieldCnt
+                ? static_cast<llvm::Value*>(curYieldCnt)
+                : b.CreateConstGEP1_32(i8t, ctxArg, kYieldCheckNOff);
+            llvm::Value* n = b.CreateAdd(b.CreateLoad(i64t, np), ci64(1));
+            b.CreateStore(n, np);
+            llvm::Value* warp = curYieldWarp ? curYieldWarp : loadIsWarp();
+            BasicBlock* normalBB = BasicBlock::Create(lc, "", fn);
+            BasicBlock* warpCheckBB = BasicBlock::Create(lc, "", fn);
+            BasicBlock* warpYieldBB = BasicBlock::Create(lc, "", fn);
+            BasicBlock* done = BasicBlock::Create(lc, "", fn);
+            b.CreateCondBr(b.CreateICmpEQ(warp, ci32(0)),
+                           normalBB, warpCheckBB);
+            b.SetInsertPoint(normalBB);
+            transientBeforeHandoff();
+            spillPromoted();
+            // In a warp definition this branch is statically unreachable
+            // (isWarp is always 1), so it must not mark the function as
+            // semantically yielding.
+            if (curFnWarp)
+                b.CreateCall(decl("xyo_yield_fast", voidt, {ptrt}),
+                             {ctxPtr(4)});
+            else
+                call1("xyo_yield_fast", voidt, ctxPtr(4));
+            reloadPromoted();
+            transientAfterHandoff();
+            b.CreateBr(done);
+            b.SetInsertPoint(warpCheckBB);
+            // Match xyo_loop_yield's 64-iteration sampling: a warp body
+            // must not pay a watchdog check on every iteration.
+            BasicBlock* warpDueBB = BasicBlock::Create(lc, "", fn);
+            b.CreateCondBr(
+                b.CreateICmpEQ(b.CreateAnd(n, ci64(63)), ci64(0)),
+                warpDueBB, done);
+            b.SetInsertPoint(warpDueBB);
+            llvm::Value* due = call1("xyo_warp_yield_due", i32t, ctxArg);
+            b.CreateCondBr(b.CreateICmpNE(due, ci32(0)),
+                           warpYieldBB, done);
+            b.SetInsertPoint(warpYieldBB);
+            transientBeforeHandoff();
+            spillPromoted();
+            // Inside a warp definition the runtime `isWarp` is always 1, so
+            // this is purely the cooperative watchdog budget.
+            if (curFnWarp)
+                callCooperativeYield();
+            else
+                call1("xyo_yield", voidt, ctxArg);
+            reloadPromoted();
+            transientAfterHandoff();
+            b.CreateBr(done);
+            b.SetInsertPoint(done);
+            return;
+        }
         // non-warp は毎反復 yield。warp は 64 回に 1 回 stuck を検査。
         BasicBlock* chkBB = BasicBlock::Create(lc, "", fn);
         BasicBlock* done = BasicBlock::Create(lc, "", fn);
@@ -2145,6 +2243,10 @@ struct Codegen {
     // Conservative compile-time site filter to avoid overhead on string/mixed
     // lists. The runtime numericOnly guard is still mandatory for safety.
     std::unordered_map<std::string, bool> numericListSiteHints;
+    // Bitwise-table lowering: list id -> 2-input truth table (bit3..bit0 =
+    // f(1,1),f(1,0),f(0,1),f(0,0)). Missing entry = not yet probed.
+    std::unordered_map<std::string, uint8_t> bitwiseTableFunc;
+    std::unordered_set<std::string> bitwiseTableRejected;
     BasicBlock* readMemoPreheader = nullptr;
     bool readMemoAllowed = false;
 
@@ -3087,6 +3189,14 @@ struct Codegen {
         // A malformed/name-aliased project may address the same Variable
         // through different IDs. Never forward local SSA values in that
         // case: a store through an alternate ID can invalidate the fact.
+        return buildPromotionSlots(uniq, lists, loopBlk->id);
+    }
+
+    /// 収集済み vars/lists へのスロット割付け（ループ/手続き共通）。
+    /// flowStartId は CFG 型フロー分析の起点（ループ head / 手続き先頭）。
+    bool buildPromotionSlots(const std::vector<const BlockField*>& uniq,
+                             const std::vector<const BlockField*>& lists,
+                             const std::string& flowStartId) {
         localFactsAliasSafe = target != nullptr;
         std::unordered_set<const Variable*> resolvedVars;
         for (const BlockField* f : uniq) {
@@ -3133,7 +3243,7 @@ struct Codegen {
             const auto started = measureCfg
                 ? analysis::CfgTypeHintTelemetry::Clock::now()
                 : analysis::CfgTypeHintTelemetry::Clock::time_point{};
-            const auto flow = analysis::analyzeTypeFlow(*blocks, loopBlk->id,
+            const auto flow = analysis::analyzeTypeFlow(*blocks, flowStartId,
                                                          8192, target);
             if (measureCfg)
                 analysis::CfgTypeHintTelemetry::get().noteAnalysis(
@@ -3287,6 +3397,7 @@ struct Codegen {
         readMemoPreheader = promotingLoop ? b.GetInsertBlock() : nullptr;
         return promotingLoop;
     }
+
     // A list item/length reporter does not mutate Scratch's for-each index.
     // Permit it in the typed induction proof only when the list already
     // exists and resolves by the exact ID to a list on this target. This
@@ -3542,8 +3653,7 @@ struct Codegen {
         }
         // A yielded script may resize or clear a list. Keep only the SList*
         // invariant; len/items must be refreshed before any resumed access.
-        for (const PromotedList& list : promotedLists) {
-            llvm::Value* l = varListPtr(list.field);
+        for (const PromotedList& list : promotedLists) {            llvm::Value* l = varListPtr(list.field);
             BasicBlock* have = BasicBlock::Create(lc, "list.reload", fn);
             BasicBlock* empty = BasicBlock::Create(lc, "list.reload.empty", fn);
             BasicBlock* done = BasicBlock::Create(lc, "list.reload.done", fn);
@@ -6243,7 +6353,333 @@ struct Codegen {
             : ci64(0);
     }
 
+    // --- ビット単位テーブル lowering (xt[256*a+b+1] -> 整数演算) ---------
+    // Scratch にビット演算子は無いため sha256 等は 64KiB のバイト XOR 表を
+    // 引く。表全体が「各ビットに同じ 2 入力関数 f を適用したもの」であり、
+    // 添字が 256*A + B + 1 の形なら、ロードを整数演算に置き換えられる。
+    // ランダムアクセスでも表のロード自体が消えるため、BDD のような
+    // select 連鎖と違ってペイする。一般の論理式用に f は 16 通り全てを
+    // 受け付け、xor/and/or は 1 命令、それ以外は and/or/not 合成で出す。
+    Block* childBlock(Block* parent, const std::string& name) {
+        if (!parent) return nullptr;
+        const BlockInput* in = parent->inputs.find(name);
+        if (!in) return nullptr;
+        std::string id = !in->block.empty() ? in->block : in->shadow;
+        if (id.empty()) return nullptr;
+        return getBlock(id);
+    }
+    std::optional<double> constReporterNum(Block* blk) {
+        if (!blk) return std::nullopt;
+        if (blk->opcode == "math_number" ||
+            blk->opcode == "math_integer" ||
+            blk->opcode == "math_whole_number" ||
+            blk->opcode == "math_positive_number" ||
+            blk->opcode == "math_angle") {
+            auto it = blk->fields.find("NUM");
+            if (it == blk->fields.end()) return std::nullopt;
+            // sb3 の [4,"256"] は JSON 上文字列で来る。キャスト意味で読む。
+            if (it->second.value.isNumber())
+                return it->second.value.asNumberUnchecked();
+            return cast::toNumber(it->second.value);
+        }
+        return std::nullopt;
+    }
+    bool isPureValueTree(Block* blk, int depth = 0) {
+        if (!blk || depth > 24) return false;
+        if (blk->shadow) return true;
+        const std::string& op = blk->opcode;
+        if (op == "math_number" || op == "math_integer" ||
+            op == "math_whole_number" || op == "math_positive_number" ||
+            op == "math_angle" || op == "text" ||
+            op == "data_variable" ||
+            op.rfind("argument_", 0) == 0 ||
+            op == "data_itemoflist" || op == "data_lengthoflist" ||
+            op == "operator_add" || op == "operator_subtract" ||
+            op == "operator_multiply" || op == "operator_divide" ||
+            op == "operator_mod" || op == "operator_round" ||
+            op == "operator_mathop")
+            for (const auto& [name, in] : blk->inputs.items) {
+                std::string id =
+                    !in.block.empty() ? in.block : in.shadow;
+                if (id.empty()) continue;
+                if (!isPureValueTree(getBlock(id), depth + 1)) return false;
+            }
+        else
+            return false;
+        return true;
+    }
+    // mod(floor(div(P, kk)), 256) を P と shift に分解する。
+    bool matchByteExtract(Block* modBlk, Block*& valueOut, int& shiftOut) {
+        if (!modBlk || modBlk->opcode != "operator_mod") return false;
+        Block* lo = childBlock(modBlk, "NUM1");
+        Block* hi = childBlock(modBlk, "NUM2");
+        auto c256 = constReporterNum(hi);
+        if (!c256 || *c256 != 256.0) {
+            // 被除数・除数が逆順の生成系も許す。
+            std::swap(lo, hi);
+            c256 = constReporterNum(hi);
+            if (!c256 || *c256 != 256.0) return false;
+        }
+        if (!lo || lo->opcode != "operator_mathop") return false;
+        const BlockField* f = findField(lo, "OPERATOR");
+        std::string fname;
+        if (f && f->value.isString() && f->value.asStrPtr())
+            fname = SStr::toUtf8(f->value.asStrPtr()->view());
+        for (char& c : fname)
+            if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
+        if (fname != "floor") return false;
+        Block* divBlk = childBlock(lo, "NUM");
+        if (!divBlk || divBlk->opcode != "operator_divide") return false;
+        Block* p = childBlock(divBlk, "NUM1");
+        Block* kkBlk = childBlock(divBlk, "NUM2");
+        auto kk = constReporterNum(kkBlk);
+        if (!kk) return false;
+        int shift = -1;
+        if (*kk == 1.0) shift = 0;
+        else if (*kk == 256.0) shift = 8;
+        else if (*kk == 65536.0) shift = 16;
+        else if (*kk == 16777216.0) shift = 24;
+        else return false;
+        if (!p || !isPureValueTree(p)) return false;
+        valueOut = p;
+        shiftOut = shift;
+        return true;
+    }
+    // idx が add(mul(Amod,256), add(Bmod,1)) の形なら A/B の式と shift を返す。
+    bool matchTableIndex(Block* idxBlk, Block*& aOut, Block*& bOut,
+                         int& shiftOut) {
+        if (!idxBlk || idxBlk->opcode != "operator_add") return false;
+        Block* l = childBlock(idxBlk, "NUM1");
+        Block* r = childBlock(idxBlk, "NUM2");
+        // 左右どちらの addend が mul 側かは生成系で変わりうる。
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            Block* mulBlk = attempt == 0 ? l : r;
+            Block* add1Blk = attempt == 0 ? r : l;
+            if (!mulBlk || mulBlk->opcode != "operator_multiply")
+                continue;
+            if (!add1Blk || add1Blk->opcode != "operator_add") continue;
+            Block* m1 = childBlock(mulBlk, "NUM1");
+            Block* m2 = childBlock(mulBlk, "NUM2");
+            Block* aMod = nullptr;
+            auto c1 = constReporterNum(m1), c2 = constReporterNum(m2);
+            if (c1 && *c1 == 256.0)
+                aMod = m2;
+            else if (c2 && *c2 == 256.0)
+                aMod = m1;
+            else
+                continue;
+            Block* p1 = childBlock(add1Blk, "NUM1");
+            Block* p2 = childBlock(add1Blk, "NUM2");
+            Block* bMod = nullptr;
+            if (constReporterNum(p1) && *constReporterNum(p1) == 1.0)
+                bMod = p2;
+            else if (constReporterNum(p2) &&
+                     *constReporterNum(p2) == 1.0)
+                bMod = p1;
+            else
+                continue;
+            Block *pa = nullptr, *pb = nullptr;
+            int sa = -1, sb = -1;
+            if (!matchByteExtract(aMod, pa, sa)) continue;
+            if (!matchByteExtract(bMod, pb, sb)) continue;
+            if (sa != sb) continue;
+            aOut = pa;
+            bOut = pb;
+            shiftOut = sa;
+            return true;
+        }
+        return false;
+    }
+    // 凍結表の検証。64KiB・全要素が 0..255 の整数で、各ビットが同じ
+    // 2 入力関数ならその真理値表 (4bit) を返す。
+    std::optional<uint8_t> probeBitwiseTable(const BlockField* f) {
+        if (!f || f->id.empty() || !target || !blocks) return std::nullopt;
+        auto cached = bitwiseTableFunc.find(f->id);
+        if (cached != bitwiseTableFunc.end()) return cached->second;
+        if (bitwiseTableRejected.count(f->id)) return std::nullopt;
+        auto reject = [&](const char* why) {
+            if (verbose)
+                std::fprintf(stderr,
+                             "xyo-jit: bitwise reject %s: %s\n",
+                             f->id.c_str(), why);
+            bitwiseTableRejected.insert(f->id);
+            return std::optional<uint8_t>(std::nullopt);
+        };
+        const char* env = std::getenv("XYO_JIT_BITWISE_TABLE");
+        if (env && env[0] == '0') return reject("disabled");
+        Variable* v = target->lookupVariableById(f->id);
+        if (!v || v->type != Variable::kListType || !v->list)
+            return reject("no-list");
+        SList* list = v->list;
+        if (list->len != 65536) return reject("len");
+        // 書き込みが 1 箇所でもあれば意味論が変わるので触らない。
+        for (const auto& [id, w] : blocks->allBlocks()) {
+            if (w.opcode != "data_addtolist" &&
+                w.opcode != "data_deleteoflist" &&
+                w.opcode != "data_deletealloflist" &&
+                w.opcode != "data_insertatlist" &&
+                w.opcode != "data_replaceitemoflist")
+                continue;
+            auto it = w.fields.find("LIST");
+            if (it != w.fields.end() && it->second.id == f->id)
+                return reject("writer");
+        }
+        auto at = [&](uint32_t a, uint32_t b) -> std::optional<uint32_t> {
+            uint32_t i = a * 256 + b;
+            Value e = list->get0(i);
+            if (!e.isNumber()) return std::nullopt;
+            double d = e.asNumberUnchecked();
+            if (d < 0.0 || d > 255.0 || d != std::floor(d))
+                return std::nullopt;
+            return uint32_t(d);
+        };
+        auto v00 = at(0, 0), v01 = at(0, 1), v10 = at(1, 0),
+             v11 = at(1, 1);
+        if (!v00 || !v01 || !v10 || !v11) return reject("corner");
+        uint8_t func = uint8_t(((*v00 & 1) ? 1 : 0) |
+                               ((*v01 & 1) ? 2 : 0) |
+                               ((*v10 & 1) ? 4 : 0) |
+                               ((*v11 & 1) ? 8 : 0));
+        for (uint32_t a = 0; a < 256; ++a)
+            for (uint32_t b = 0; b < 256; ++b) {
+                auto e = at(a, b);
+                if (!e) return reject("non-byte");
+                uint32_t expect = 0;
+                for (int k = 0; k < 8; ++k) {
+                    int bit = (func >> (((a >> k) & 1) * 2 |
+                                        ((b >> k) & 1))) &
+                              1;
+                    expect |= uint32_t(bit) << k;
+                }
+                if (*e != expect) return reject("mismatch");
+            }
+        bitwiseTableFunc.emplace(f->id, func);
+        if (verbose)
+            std::fprintf(stderr, "xyo-jit: bitwise table %s func=0x%x\n",
+                         f->id.c_str(), func);
+        return func;
+    }
+    llvm::Value* emitBitwiseFunc(uint8_t func, llvm::Value* av,
+                                 llvm::Value* bv) {
+        switch (func) {
+        case 0x6: return b.CreateXor(av, bv);
+        case 0x8: return b.CreateAnd(av, bv);
+        case 0xe: return b.CreateOr(av, bv);
+        case 0x0: return llvm::ConstantInt::get(av->getType(), 0);
+        case 0xf: return llvm::ConstantInt::get(av->getType(), 255);
+        default: break;
+        }
+        llvm::Value* na =
+            b.CreateAnd(b.CreateNot(av), ci32(255));
+        llvm::Value* nb =
+            b.CreateAnd(b.CreateNot(bv), ci32(255));
+        llvm::Value* res = llvm::ConstantInt::get(av->getType(), 0);
+        auto term = [&](llvm::Value* x, llvm::Value* y, int bit) {
+            if ((func >> bit) & 1)
+                res = b.CreateOr(res, b.CreateAnd(x, y));
+        };
+        term(na, nb, 0);
+        term(na, bv, 1);
+        term(av, nb, 2);
+        term(av, bv, 3);
+        return b.CreateAnd(res, ci32(255));
+    }
+    // data_itemoflist のビットテーブル fast path。非対応なら nullptr。
+    llvm::Value* tryEmitBitwiseTableItem(Block* blk, const BlockField* f) {
+        auto func = probeBitwiseTable(f);
+        if (!func) return nullptr;
+        const BlockInput* in = blk->inputs.find("INDEX");
+        if (!in) return nullptr;
+        std::string idxId = !in->block.empty() ? in->block : in->shadow;
+        Block* idxBlk = idxId.empty() ? nullptr : getBlock(idxId);
+        Block *pa = nullptr, *pb = nullptr;
+        int shift = -1;
+        if (!matchTableIndex(idxBlk, pa, pb, shift)) {
+            if (verbose)
+                std::fprintf(stderr,
+                             "xyo-jit: bitwise index mismatch %s idx=%s\n",
+                             f->id.c_str(),
+                             idxBlk ? idxBlk->opcode.c_str() : "(null)");
+            return nullptr;
+        }
+        llvm::Value* epoch = beginListReadObservation();
+        llvm::Value* aBits = emitInputBlock(pa->id);
+        llvm::Value* bBits = emitInputBlock(pb->id);
+        llvm::Value* fa = emitToNumF64(aBits);
+        llvm::Value* fb = emitToNumF64(bBits);
+        auto inU32Range = [&](llvm::Value* d) {
+            return b.CreateAnd(
+                b.CreateFCmpOGE(d, cf64(0.0)),
+                b.CreateFCmpOLT(d, cf64(4294967296.0)));
+        };
+        llvm::Value* guard =
+            b.CreateAnd(inU32Range(fa), inU32Range(fb));
+        BasicBlock* fastBB = BasicBlock::Create(lc, "bitwise.fast", fn);
+        BasicBlock* slowBB = BasicBlock::Create(lc, "bitwise.slow", fn);
+        BasicBlock* merge = BasicBlock::Create(lc, "bitwise.merge", fn);
+        b.CreateCondBr(guard, fastBB, slowBB);
+        b.SetInsertPoint(fastBB);
+        llvm::Value* ai = b.CreateFPToUI(fa, i64t);
+        llvm::Value* bi = b.CreateFPToUI(fb, i64t);
+        // 整数でなければ丸め誤差なく落ちる（範囲内なので変換は安全）。
+        llvm::Value* integral = b.CreateAnd(
+            b.CreateFCmpOEQ(fa, b.CreateUIToFP(ai, f64t)),
+            b.CreateFCmpOEQ(fb, b.CreateUIToFP(bi, f64t)));
+        BasicBlock* calcBB = BasicBlock::Create(lc, "bitwise.calc", fn);
+        // 非整数は slow へ（guard と同じく純粋な値の再評価なので安全）。
+        b.CreateCondBr(integral, calcBB, slowBB);
+        b.SetInsertPoint(calcBB);
+        llvm::Value* a32 = b.CreateTrunc(ai, i32t);
+        llvm::Value* b32 = b.CreateTrunc(bi, i32t);
+        llvm::Value* abyte = b.CreateAnd(
+            b.CreateLShr(a32, ci32(uint32_t(shift))), ci32(255));
+        llvm::Value* bbyte = b.CreateAnd(
+            b.CreateLShr(b32, ci32(uint32_t(shift))), ci32(255));
+        llvm::Value* r32 = emitBitwiseFunc(*func, abyte, bbyte);
+        llvm::Value* fast =
+            emitCanonKnownNonNaN(b.CreateUIToFP(r32, f64t));
+        if (listStringNumFast) listNumericStringCandidates.insert(fast);
+        b.CreateBr(merge);
+        b.SetInsertPoint(slowBB);
+        // P/Q は純粋なので INDEX 全体の再評価は副作用を持たない。
+        // emitInputOf は内部で分岐を作るため、slow の値は slowBB 自身
+        // ではなく emit 終了時点のブロックで定義される。PHI にはその
+        // ブロックを登録する（slowBB 登録は無効 IR になる）。
+        llvm::Value* idx = emitInputOf(blk, "INDEX");
+        auto* slow = callN("xyo_list_item", i64t,
+                           {ctxArg, varSlot(f, true), idx});
+        BasicBlock* slowEnd = b.GetInsertBlock();
+        b.CreateBr(merge);
+        b.SetInsertPoint(merge);
+        PHINode* phi = b.CreatePHI(i64t, 2);
+        phi->addIncoming(fast, calcBB);
+        phi->addIncoming(slow, slowEnd);
+        // capture 有効時の trace は merge 側で参照するため、INDEX 値も
+        // PHI 経由にする。fast 側は元の式と等価な 256*A+B+1 を再構成する
+        //（整数入力では一致する。非整数は slow 側へ落ちている）。
+        llvm::Value* traceIdx = idx;
+        if (captureReporterListReadEvaluation) {
+            auto* saved = b.GetInsertBlock();
+            b.SetInsertPoint(calcBB->getTerminator());
+            llvm::Value* recomposed = b.CreateUIToFP(
+                b.CreateAdd(b.CreateAdd(b.CreateMul(abyte, ci32(256)),
+                                                       bbyte),
+                                          ci32(1)),
+                f64t);
+            llvm::Value* fastIdx =
+                emitCanonKnownNonNaN(recomposed);
+            b.SetInsertPoint(saved);
+            PHINode* idxPhi = b.CreatePHI(i64t, 2);
+            idxPhi->addIncoming(fastIdx, calcBB);
+            idxPhi->addIncoming(idx, slowEnd);
+            traceIdx = idxPhi;
+        }
+        return traceListItemEvaluation(blk, f, traceIdx, phi, epoch);
+    }
+
     llvm::Value* emitListItem(Block* blk, const BlockField* f) {
+        if (llvm::Value* lowered = tryEmitBitwiseTableItem(blk, f))
+            return lowered;
         if (xyo_list_storage_mode >= 4 && xyo_list_storage_mode <= 6) {
             llvm::Value* idx = emitInputOf(blk, "INDEX");
             llvm::Value* epoch = beginListReadObservation();
@@ -7620,6 +8056,21 @@ struct Codegen {
     void emitStopped() {
         // stopScript で suspend しなかった場合の安全弁
         b.CreateRetVoid();
+    }
+
+    /// stop-all / delete-this-clone inside a procedure sets ctx->stopped.
+    /// Once the call returns (fused: its continuation), unwind the whole
+    /// script instead of executing the caller's remaining blocks.
+    void emitStoppedUnwind() {
+        llvm::Value* st = b.CreateLoad(
+            i32t, b.CreateConstGEP1_32(
+                i8t, ctxArg, uint32_t(offsetof(JitCtx, stopped))));
+        BasicBlock* stopBB = BasicBlock::Create(lc, "", fn);
+        BasicBlock* contBB = BasicBlock::Create(lc, "", fn);
+        b.CreateCondBr(b.CreateICmpNE(st, ci32(0)), stopBB, contBB);
+        b.SetInsertPoint(stopBB);
+        b.CreateRetVoid();
+        b.SetInsertPoint(contBB);
     }
 
     int nestedBranchDepth = 0;
@@ -9116,6 +9567,45 @@ struct Codegen {
             if (cached && cached->blockFunction) emitBlockCount();
         }
 
+        if (stacklessNormalLoop && op == "control_repeat" &&
+            [] {
+                const char* enabled = std::getenv(
+                    "XYO_JIT_CORO_SIMPLE_LOOP");
+                return enabled && enabled[0] == '1';
+            }()) {
+            // The source proof guarantees exactly one numeric-literal
+            // repeated scalar write and no procedure/warp/reporter yield.
+            // Emit the scheduler yield in one lexical place, and let
+            // coro.split save the private remaining count in its frame.
+            const BlockInput* numInput = blk->inputs.find("TIMES");
+            const Block* literal = blocks->getBlock(numInput->block);
+            const double count = cast::toNumber(
+                literal->fields.at("NUM").value);
+            auto* remaining = entryAlloca(
+                i64t, 1, "stackless.repeat.remaining");
+            b.CreateStore(ci64(static_cast<uint64_t>(count)), remaining);
+            BasicBlock* head = newBB("stackless.repeat.head");
+            BasicBlock* body = newBB("stackless.repeat.body");
+            BasicBlock* done = newBB("stackless.repeat.done");
+            b.CreateBr(head);
+            b.SetInsertPoint(head);
+            llvm::Value* left = b.CreateLoad(i64t, remaining);
+            b.CreateCondBr(b.CreateICmpEQ(left, ci64(0)), done, body);
+            b.SetInsertPoint(body);
+            const auto* sub = blk->inputs.find("SUBSTACK");
+            emitChainBlocks(chainOf(sub->block), true);
+            if (!bbDone(b.GetInsertBlock())) {
+                llvm::Value* n = b.CreateLoad(i64t, remaining);
+                b.CreateStore(b.CreateSub(n, ci64(1)), remaining);
+                // Replaced by one llvm.coro.suspend by the strictly
+                // opt-in backend IR lowering.
+                call1("xyo_yield_fast", voidt, ctxPtr(4));
+                b.CreateBr(head);
+            }
+            b.SetInsertPoint(done);
+            return;
+        }
+
         if (op == "control_if" || op == "control_if_else") {
             const char* ifPhiSetting = std::getenv("XYO_JIT_IF_PHI");
             // Keep this optional until an independent workload corpus
@@ -9496,6 +9986,7 @@ struct Codegen {
             BasicBlock* emptyDone = nullptr;
             const BlockInput* repeatBody = blk->inputs.find("SUBSTACK");
             if ((!repeatBody || repeatBody->block.empty()) &&
+                !stacklessNormalLoop &&
                 !runtime.blockCountEnabled &&
                 !(osrFirstLoop && nestedOsrInFlightGuard)) {
                 BasicBlock* emptyFast = BasicBlock::Create(lc, "rep.empty.fast", fn);
@@ -9993,9 +10484,150 @@ struct Codegen {
             return;
         }
 
+        if (op == "sensing_askandwait") {
+            // The host question is queued by begin; the ordinary yield is
+            // the only suspension point, so the coroutine rewriter can
+            // resume it when the answer arrives.
+            llvm::Value* question = emitInputOf(blk, "QUESTION");
+            call2("xyo_sns_askbegin", voidt, ctxArg, question);
+            call1("xyo_yield", voidt, ctxArg);
+            return;
+        }
+
+        if (op == "motion_glidesecstoxy" || op == "motion_glideto" ||
+            op == "looks_sayforsecs" || op == "looks_thinkforsecs" ||
+            op == "sound_playuntildone") {
+            // Step loops (glide) and one-shot begins (bubble/audio) keep
+            // the only suspension points as explicit xyo_yield calls.
+            auto emitStepLoop = [&](const char* stepName) {
+                BasicBlock* head = BasicBlock::Create(lc, "", fn);
+                BasicBlock* checkOne = BasicBlock::Create(lc, "", fn);
+                BasicBlock* yieldBB = BasicBlock::Create(lc, "", fn);
+                BasicBlock* busyBB = BasicBlock::Create(lc, "", fn);
+                BasicBlock* done = BasicBlock::Create(lc, "", fn);
+                b.CreateBr(head);
+                b.SetInsertPoint(head);
+                llvm::Value* r = call1(stepName, i32t, ctxArg);
+                b.CreateCondBr(b.CreateICmpEQ(r, ci32(0)), done, checkOne);
+                b.SetInsertPoint(checkOne);
+                b.CreateCondBr(b.CreateICmpEQ(r, ci32(1)),
+                               yieldBB, busyBB);
+                b.SetInsertPoint(yieldBB);
+                call1("xyo_yield", voidt, ctxArg);
+                b.CreateBr(head);
+                b.SetInsertPoint(busyBB);
+                b.CreateBr(head);
+                b.SetInsertPoint(done);
+            };
+            if (op == "motion_glidesecstoxy") {
+                callN("xyo_mot_glidebegin_xy", voidt,
+                      {ctxArg, emitInputOf(blk, "SECS"),
+                       emitInputOf(blk, "X"), emitInputOf(blk, "Y")});
+                emitStepLoop("xyo_mot_glidestep");
+                return;
+            }
+            if (op == "motion_glideto") {
+                callN("xyo_mot_glidebegin_to", voidt,
+                      {ctxArg, emitInputOf(blk, "SECS"),
+                       emitInputOf(blk, "TO")});
+                emitStepLoop("xyo_mot_glidestep");
+                return;
+            }
+            if (op == "looks_sayforsecs" || op == "looks_thinkforsecs") {
+                callN(op == "looks_sayforsecs" ? "xyo_looks_saybegin"
+                                               : "xyo_looks_thinkbegin",
+                      voidt, {ctxArg, emitInputOf(blk, "MESSAGE"),
+                              emitInputOf(blk, "SECS")});
+                call1("xyo_yield", voidt, ctxArg);
+                return;
+            }
+            call2("xyo_snd_playbegin", voidt, ctxArg,
+                  emitInputOf(blk, "SOUND_MENU"));
+            call1("xyo_yield", voidt, ctxArg);
+            return;
+        }
+
+        if (op == "looks_switchbackdroptoandwait") {
+            call2("xyo_looks_backdropbegin", voidt, ctxArg,
+                  emitInputOf(blk, "BACKDROP"));
+            BasicBlock* head = BasicBlock::Create(lc, "", fn);
+            BasicBlock* checkOne = BasicBlock::Create(lc, "", fn);
+            BasicBlock* yieldBB = BasicBlock::Create(lc, "", fn);
+            BasicBlock* busyBB = BasicBlock::Create(lc, "", fn);
+            BasicBlock* done = BasicBlock::Create(lc, "", fn);
+            b.CreateBr(head);
+            b.SetInsertPoint(head);
+            llvm::Value* r =
+                call1("xyo_looks_backdropstep", i32t, ctxArg);
+            b.CreateCondBr(b.CreateICmpEQ(r, ci32(0)), done, checkOne);
+            b.SetInsertPoint(checkOne);
+            b.CreateCondBr(b.CreateICmpEQ(r, ci32(1)), yieldBB, busyBB);
+            b.SetInsertPoint(yieldBB);
+            call1("xyo_yield", voidt, ctxArg);
+            b.CreateBr(head);
+            b.SetInsertPoint(busyBB);
+            b.CreateBr(head);
+            b.SetInsertPoint(done);
+            return;
+        }
+
+        if (op == "control_delete_this_clone" && stacklessNormalLoop) {
+            llvm::Value* ended =
+                call1("xyo_ctl_deleteclone_begin", i32t, ctxArg);
+            BasicBlock* stopBB = BasicBlock::Create(lc, "", fn);
+            BasicBlock* contBB = BasicBlock::Create(lc, "", fn);
+            b.CreateCondBr(b.CreateICmpNE(ended, ci32(0)), stopBB, contBB);
+            b.SetInsertPoint(stopBB);
+            emitStopped();
+            b.SetInsertPoint(contBB);
+            return;
+        }
+
+        if ((op == "sound_seteffectto" || op == "sound_changeeffectby" ||
+             op == "sound_setvolumeto" ||
+             op == "sound_changevolumeby") && stacklessNormalLoop) {
+            // miscLimits makes these setters wait one tick. Keep the
+            // suspension explicit so the coroutine rewriter can own it.
+            llvm::Value* r;
+            if (op == "sound_seteffectto" || op == "sound_changeeffectby") {
+                const char* fn = op == "sound_seteffectto"
+                    ? "xyo_snd_seteffect_begin"
+                    : "xyo_snd_changeeffect_begin";
+                r = call3(fn, i32t, ctxArg, emitInputOf(blk, "VALUE"),
+                          fieldBits(blk, "EFFECT"));
+            } else {
+                const char* fn = op == "sound_setvolumeto"
+                    ? "xyo_snd_setvolume_begin"
+                    : "xyo_snd_changevolume_begin";
+                r = call2(fn, i32t, ctxArg, emitInputOf(blk, "VOLUME"));
+            }
+            BasicBlock* yieldBB = BasicBlock::Create(lc, "", fn);
+            BasicBlock* contBB = BasicBlock::Create(lc, "", fn);
+            b.CreateCondBr(b.CreateICmpNE(r, ci32(0)), yieldBB, contBB);
+            b.SetInsertPoint(yieldBB);
+            call1("xyo_yield", voidt, ctxArg);
+            b.CreateBr(contBB);
+            b.SetInsertPoint(contBB);
+            return;
+        }
+
         if (op == "control_wait") {
+            // Poll + ordinary yield instead of an opaque helper loop. This
+            // keeps the Fiber path identical while letting the coroutine
+            // rewriter suspend exactly here.
             llvm::Value* s = emitToNumF64(emitInputOf(blk, "DURATION"));
-            call2("xyo_rt_wait", voidt, ctxArg, s);
+            call2("xyo_wait_begin", voidt, ctxArg, s);
+            BasicBlock* waitHead = BasicBlock::Create(lc, "", fn);
+            BasicBlock* waitYield = BasicBlock::Create(lc, "", fn);
+            BasicBlock* waitDone = BasicBlock::Create(lc, "", fn);
+            b.CreateBr(waitHead);
+            b.SetInsertPoint(waitHead);
+            llvm::Value* more = call1("xyo_wait_poll", i32t, ctxArg);
+            b.CreateCondBr(b.CreateICmpNE(more, ci32(0)), waitYield, waitDone);
+            b.SetInsertPoint(waitYield);
+            call1("xyo_yield", voidt, ctxArg);
+            b.CreateBr(waitHead);
+            b.SetInsertPoint(waitDone);
             return;
         }
 
@@ -10019,15 +10651,28 @@ struct Codegen {
             // ordinary polling. Instrumented block counting also retains
             // every retry rather than eliding logically executed blocks.
             const bool eventPureWait = !aot && !runtime.blockCountEnabled &&
+                !stacklessNormalLoop &&
                 ((eventEnv && eventEnv[0] == '1') ||
                  isolatedEventWaitDependencyEnabled()) &&
                 blocks->isPureWaitCondition(blk);
-            if (eventPureWait)
+            if (eventPureWait) {
                 call2("xyo_wait_event_yield", voidt, ctxArg,
                       ci64(reinterpret_cast<uintptr_t>(blk)));
-            else
-                call1("xyo_wait_yield", voidt, ctxArg);
-            b.CreateBr(head);
+                b.CreateBr(head);
+            } else {
+                // Same predicate as xyo_wait_yield, but the yield is a real
+                // IR call so the coroutine rewriter can suspend at it.
+                llvm::Value* should =
+                    call1("xyo_wait_should_yield", i32t, ctxArg);
+                BasicBlock* spin = BasicBlock::Create(lc, "", fn);
+                BasicBlock* cont = BasicBlock::Create(lc, "", fn);
+                b.CreateCondBr(b.CreateICmpNE(should, ci32(0)), spin, cont);
+                b.SetInsertPoint(spin);
+                call1("xyo_yield", voidt, ctxArg);
+                b.CreateBr(cont);
+                b.SetInsertPoint(cont);
+                b.CreateBr(head);
+            }
             b.SetInsertPoint(done);
             if (eventPureWait)
                 call1("xyo_wait_event_done", voidt, ctxArg);
@@ -10040,7 +10685,10 @@ struct Codegen {
             if (f && f->value.isString() && f->value.asStrPtr())
                 opt = f->value.asStrPtr()->view();
             if (opt == u"all") {
-                call1("xyo_stop_all", voidt, ctxArg);
+                if (stacklessNormalLoop)
+                    call1("xyo_stop_all_begin", voidt, ctxArg);
+                else
+                    call1("xyo_stop_all", voidt, ctxArg);
                 emitStopped();  // 復帰しない — 後続は到達不能
             } else if (opt == u"other scripts in sprite" ||
                        opt == u"other scripts in stage") {
@@ -10052,7 +10700,10 @@ struct Codegen {
                 // セマンティクス — 早期 return イディオム）。
                 // exitBB 経由で isWarp 復帰も行う。
                 if (inProc) b.CreateBr(getExitBB());
-                else {
+                else if (stacklessNormalLoop) {
+                    call1("xyo_stop_script_begin", voidt, ctxArg);
+                    emitStopped();
+                } else {
                     call1("xyo_stop_script", voidt, ctxArg);
                     emitStopped();
                 }
@@ -10099,12 +10750,81 @@ struct Codegen {
         }
         if (op == "event_broadcastandwait") {
             llvm::Value* v = emitInputOf(blk, "BROADCAST_INPUT");
-            call2("xyo_broadcast_wait_v", voidt, ctxArg, v);
+            // Poll + ordinary yield instead of the opaque C++ join loop.
+            // 0 = done, 1 = yield now, 2 = warp busy poll.
+            auto emitJoinLoop = [&] {
+                BasicBlock* head = BasicBlock::Create(lc, "", fn);
+                BasicBlock* checkOne = BasicBlock::Create(lc, "", fn);
+                BasicBlock* yieldBB = BasicBlock::Create(lc, "", fn);
+                BasicBlock* busyBB = BasicBlock::Create(lc, "", fn);
+                BasicBlock* done = BasicBlock::Create(lc, "", fn);
+                b.CreateBr(head);
+                b.SetInsertPoint(head);
+                llvm::Value* r =
+                    call1("xyo_bcastwait_step", i32t, ctxArg);
+                BasicBlock* afterZero = BasicBlock::Create(lc, "", fn);
+                b.CreateCondBr(b.CreateICmpEQ(r, ci32(0)), done, afterZero);
+                b.SetInsertPoint(afterZero);
+                b.CreateCondBr(b.CreateICmpEQ(r, ci32(1)),
+                               yieldBB, busyBB);
+                b.SetInsertPoint(yieldBB);
+                call1("xyo_yield", voidt, ctxArg);
+                b.CreateBr(head);
+                b.SetInsertPoint(busyBB);
+                b.CreateBr(head);
+                b.SetInsertPoint(done);
+            };
+            // Only a proved immutable native-JIT string constant uses
+            // the no-copy helper. =0 restores the original boxed Scratch
+            // string path, including its owned GC-safe buffer.
+            static const bool staticBroadcast = [] {
+                const char* flag = std::getenv("XYO_JIT_BCAST_STATIC_LITERAL");
+                return !flag || flag[0] != '0';
+            }();
+            // A non-AOT ConstantInt can carry the address of a pinned SStr.
+            // Never dereference an arbitrary tagged reporter result: check
+            // that the exact pointer is in this compilation's pinned
+            // literal table first. Dynamic inputs and AOT remain unchanged.
+            if (staticBroadcast && !aot) {
+                if (auto* known = llvm::dyn_cast<llvm::ConstantInt>(v)) {
+                    const Value raw{known->getZExtValue()};
+                    const SStr* pinnedLiteral = nullptr;
+                    bool certified = raw.bits == val::kEmptyStr;
+                    if (raw.isString() && raw.bits != val::kEmptyStr) {
+                        SStr* ptr = raw.asStrPtr();
+                        const auto found = std::find(
+                            pinned.strings.begin(), pinned.strings.end(), ptr);
+                        if (found != pinned.strings.end()) {
+                            pinnedLiteral = *found;
+                            certified = true;
+                        }
+                    }
+                    if (certified) {
+                        const std::u16string literal = pinnedLiteral
+                            ? std::u16string(pinnedLiteral->view())
+                            : std::u16string{};
+                        if (literal.size() <= UINT32_MAX) {
+                            callN("xyo_bcastwait_begin_lit", voidt,
+                                  {ctxArg, u16g(literal),
+                                   ci32(uint32_t(literal.size()))});
+                            emitJoinLoop();
+                            if (std::getenv("XYO_JIT_BCAST_STATIC_TRACE"))
+                                std::fprintf(stderr,
+                                    "[jit-bcast-static] block=%s len=%zu\n",
+                                    blk->id.c_str(), literal.size());
+                            return;
+                        }
+                    }
+                }
+            }
+            call2("xyo_bcastwait_begin_v", voidt, ctxArg, v);
+            emitJoinLoop();
             return;
         }
 
         if (op == "procedures_call") {
             emitProcedureCall(blk);
+            emitStoppedUnwind();
             return;
         }
 
@@ -10423,6 +11143,10 @@ struct Codegen {
             // suspends the native fiber rather than entering the interpreter.
             "control_repeat_until", "control_repeat",
             "procedures_call",
+            // stop all / stop this script are emitted as yield-free helpers
+            // (`xyo_stop_all_begin` / an early return) and need no
+            // interpreter frame; the stopped flag unwinds the caller.
+            "control_stop",
         };
         const char* setting = std::getenv("XYO_JIT_RECURSIVE_FRAME_ELIDE");
         if (setting && setting[0] == '0') return false;
@@ -10475,9 +11199,62 @@ struct Codegen {
         return check(start);
     }
 
+    /// Recursive warp procedures whose frames were elided: they neither
+    /// keep interpreter frames nor suspend on recursive entry, so a call
+    /// cycle through them is yield-free.
+    std::unordered_set<llvm::Function*> safeRecursiveProcs;
+
     /// Remove interpreter stack frames from native procedure calls only when
     /// unobservable. Non-warp recursive procedures need the stack for the
     /// six-ancestor recursion check and may yield on recursive entry.
+    /// Non-warp recursive calls must yield, but `xyo_proc_push` hides that
+    /// suspension inside C++, where the stackless coroutine lowering cannot
+    /// see it. Rewrite the push into the explicit form:
+    ///
+    ///   r = xyo_proc_push_ex(..., mayRecurse=1, deferYield=1)
+    ///   if (r && xyo_recursion_yield_due(ctx)) xyo_yield(ctx)
+    ///
+    /// The condition matches `xyo_loop_yield`, so Fiber execution is
+    /// unchanged; the direct `xyo_yield` lets the lowering turn recursive
+    /// procedure calls into `llvm.coro.suspend` (procedure coroutines).
+    void rewriteRecursivePush(llvm::CallInst* push) {
+        if (!push || !push->getParent()) return;
+        if (const char* tr = std::getenv("XYO_JIT_CORO_TRACE");
+            tr && tr[0] == '1')
+            std::fprintf(stderr, "[proc-elide] rewrite push in %s\n",
+                         push->getFunction()->getName().str().c_str());
+        llvm::BasicBlock* bb = push->getParent();
+        llvm::Function* owner = bb->getParent();
+        llvm::Value* ctx = push->getArgOperand(0);
+        llvm::IRBuilder<> at(push);
+        llvm::SmallVector<llvm::Type*, 9> ts;
+        llvm::SmallVector<llvm::Value*, 9> vs;
+        for (unsigned i = 0; i < 6; ++i) {
+            ts.push_back(push->getArgOperand(i)->getType());
+            vs.push_back(push->getArgOperand(i));
+        }
+        ts.push_back(i32t); vs.push_back(ci32(1));   // mayRecurse
+        ts.push_back(i32t); vs.push_back(ci32(1));   // deferYield
+        llvm::Value* ex = at.CreateCall(
+            decl("xyo_proc_push_ex", i32t, llvm::ArrayRef<llvm::Type*>(ts)),
+            llvm::ArrayRef<llvm::Value*>(vs));
+        llvm::Value* due = at.CreateCall(
+            decl("xyo_recursion_yield_due", i32t, {ctx->getType()}), {ctx});
+        llvm::Value* both = at.CreateAnd(ex, due);
+        llvm::Value* need = at.CreateICmpNE(both, ci32(0));
+        llvm::BasicBlock* cont = bb->splitBasicBlock(
+            at.GetInsertPoint(), "recursion.cont");
+        llvm::BasicBlock* yieldBB = llvm::BasicBlock::Create(
+            bb->getContext(), "recursion.yield", owner, cont);
+        llvm::IRBuilder<> y(yieldBB);
+        y.CreateCall(decl("xyo_yield", voidt, {ctx->getType()}), {ctx});
+        y.CreateBr(cont);
+        bb->getTerminator()->eraseFromParent();
+        llvm::IRBuilder<> tail(bb);
+        tail.CreateCondBr(need, yieldBB, cont);
+        push->eraseFromParent();
+    }
+
     void elideLeafProcFrames() {
         if (procCallSites.empty()) return;
         const bool preservePortableFrames = portableCallFrames() && !aot;
@@ -10497,6 +11274,7 @@ struct Codegen {
         }
 
         std::unordered_set<Function*> safeRecursive;
+        safeRecursiveProcs.clear();
         for (Function* f : cyclic) {
             if (canElideWarpRecursiveFrames(f)) {
                 safeRecursive.insert(f);
@@ -10505,19 +11283,36 @@ struct Codegen {
             }
         }
 
+        // The explicit push/yield form is only needed when the stackless
+        // coroutine lowering may consume it; the plain Fiber JIT keeps the
+        // historical `xyo_proc_push` (which yields inside C++).
+        static const bool coroRecursionSites = [] {
+            const char* value = std::getenv("XYO_JIT_CORO_GENERAL");
+            return value && value[0] == '1';
+        }();
+        safeRecursiveProcs = safeRecursive;
+        if (const char* tr = std::getenv("XYO_JIT_CORO_TRACE");
+            tr && tr[0] == '1')
+            std::fprintf(stderr,
+                         "[proc-elide] sites=%zu cyclic=%zu safe=%zu procs=%zu\n",
+                         procCallSites.size(), cyclic.size(),
+                         safeRecursive.size(), procFns.size());
         for (auto& s : procCallSites) {
             if (preservePortableFrames) {
                 // Native recursion detection still depends on the old
                 // interpreter stack. Preserve that behavior even when the
                 // portable mirror is observing all procedure calls.
                 if (cyclic.contains(s.callee) &&
-                    !safeRecursive.contains(s.callee))
-                    s.push->setArgOperand(6, ci32(1));
+                    !safeRecursive.contains(s.callee)) {
+                    if (coroRecursionSites) rewriteRecursivePush(s.push);
+                    else s.push->setArgOperand(6, ci32(1));
+                }
                 continue;
             }
             if (cyclic.contains(s.callee)) {
                 if (!safeRecursive.contains(s.callee)) {
-                    s.push->setArgOperand(6, ci32(1));
+                    if (coroRecursionSites) rewriteRecursivePush(s.push);
+                    else s.push->setArgOperand(6, ci32(1));
                     continue;
                 }
                 if (verbose) std::fprintf(stderr,
@@ -10803,6 +11598,15 @@ bool jitEmitScript(llvm::Module& mod, llvm::LLVMContext& lc, Runtime& runtime,
                    const Block* osrStart,
                    const ir::ScratchCompilationUnit* source,
                    bool standaloneOsrLoop) {
+    // MLIR 風フロントエンド（ブロック木 → xyo dialect → LLVM IR）。
+    // 既定で有効（`XYO_MLIR=0` で無効化）。対応サブセットのスクリプトを
+    // 先に試し、失敗時は mod を変更せずに false を返すので、以下の既存
+    // 経路がそのまま走る（フォールバックは常に安全側）。
+    if (!aot && !osrStart && !standaloneOsrLoop &&
+        mlir::tryEmitScript(mod, lc, runtime, target, blocks, topBlockId,
+                            entryName, out, pinned, pendingFnNames,
+                            procNameMap))
+        return true;
     Codegen cg{lc, mod, IRBuilder<>(lc), runtime, pinned};
     cg.target = target;
     cg.blocks = blocks;
@@ -10850,6 +11654,19 @@ bool jitEmitScript(llvm::Module& mod, llvm::LLVMContext& lc, Runtime& runtime,
     // pointer identity; migrating those references requires further work.
     Block* top = blocks->getBlock(topBlockId);
     if (!top) return false;
+    // No scratch callback can enter warp in the strict direct-yield source
+    // graph. Preserve the full generated scheduler everywhere else.
+    cg.stacklessNormalLoop = !aot && !osrStart &&
+        !standaloneOsrLoop && !runtime.blockCountEnabled &&
+        !cg.portableCallFrames() && !std::getenv("XYO_PROF") &&
+        (stackless::eligible(*blocks, *top) ||
+         stackless::generalCandidate(*blocks, *top));
+    if (cg.stacklessNormalLoop) {
+        std::vector<std::string> procCalls;
+        if (stackless::collectProcedureCalls(*blocks, top, procCalls))
+            cg.stacklessWarp = stackless::reachableWarpProcedure(
+                *blocks, std::move(procCalls));
+    }
     // Normal synchronous JIT receives the same captured source as WASM.
     // AOT/async entrypoints capture locally until their callers are migrated.
     const auto captured = source ? ir::ScratchCompilationUnit{}
@@ -11875,12 +12692,18 @@ bool jitEmitScript(llvm::Module& mod, llvm::LLVMContext& lc, Runtime& runtime,
     out.mainThread = cg.mainThread;
     // mayYield = entry から到達可能な関数のいずれかが yield 点を持つか
     {
-        std::unordered_map<llvm::Function*, int> memo;
+        std::unordered_map<llvm::Function*, bool> memo;
+        std::unordered_set<llvm::Function*> visiting;
         std::function<bool(llvm::Function*)> yields =
             [&](llvm::Function* g) -> bool {
                 auto it = memo.find(g);
-                if (it != memo.end()) return it->second != 0;
-                memo[g] = 1;   // 再帰 → 保守的に true
+                if (it != memo.end()) return it->second;
+                if (!visiting.insert(g).second) {
+                    // Re-entering a cycle is only a suspension when the
+                    // callee keeps its interpreter frame (non-warp
+                    // recursion). Elided warp frames never yield.
+                    return !cg.safeRecursiveProcs.count(g);
+                }
                 bool v = false;
                 auto dit = cg.fnDirect.find(g);
                 if (dit != cg.fnDirect.end()) v = dit->second;
@@ -11890,10 +12713,33 @@ bool jitEmitScript(llvm::Module& mod, llvm::LLVMContext& lc, Runtime& runtime,
                         for (llvm::Function* c : cit->second)
                             if (yields(c)) { v = true; break; }
                 }
+                visiting.erase(g);
                 memo[g] = v;
                 return v;
             };
         out.mayYield = yields(f);
+        // Cooperative-only: no reachable function has a semantic yield.
+        std::unordered_map<llvm::Function*, bool> semMemo;
+        std::unordered_set<llvm::Function*> semVisiting;
+        std::function<bool(llvm::Function*)> semantic =
+            [&](llvm::Function* g) -> bool {
+                auto it = semMemo.find(g);
+                if (it != semMemo.end()) return it->second;
+                if (!semVisiting.insert(g).second) return false;
+                bool v = false;
+                auto dit = cg.fnSemanticYield.find(g);
+                if (dit != cg.fnSemanticYield.end()) v = dit->second;
+                if (!v) {
+                    auto cit = cg.callEdges.find(g);
+                    if (cit != cg.callEdges.end())
+                        for (llvm::Function* c : cit->second)
+                            if (semantic(c)) { v = true; break; }
+                }
+                semVisiting.erase(g);
+                semMemo[g] = v;
+                return v;
+            };
+        out.cooperativeOnly = !semantic(f);
     }
     procNameMap.clear();
     for (auto& [k, pf] : cg.procFns) procNameMap[k] = pf->getName().str();

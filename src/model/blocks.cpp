@@ -334,6 +334,7 @@ BlockCached* Blocks::getCachedExecute(const std::string& blockId) {
 
     self->isHat = runtime->getIsHat(self->opcode);
     self->blockFunction = runtime->getOpcodeFunction(self->opcode);
+    self->primitiveContext = runtime->getOpcodeContext(self->opcode);
     self->definedBlockFunction = self->blockFunction != nullptr;
 
     auto flow = runtime->getFlowing(self->opcode);

@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "id": "clock",
+  "name": "Clock",
+  "version": "0.1.0",
+  "color": "#123456",
+  "provider": "manifest",
+  "blocks": [
+    {
+      "opcode": "clock_now",
+      "label": "now",
+      "shape": "reporter"
+    },
+    {
+      "opcode": "clock_wait",
+      "label": "wait %1 seconds",
+      "shape": "stack",
+      "args": [
+        {"name": "SECS", "type": "number", "default": "1"}
+      ]
+    },
+    {
+      "opcode": "clock_mode",
+      "label": "mode %1",
+      "shape": "reporter",
+      "args": [
+        {"name": "MODE", "type": "dropdown", "options": ["fast", "slow"]}
+      ]
+    },
+    {
+      "opcode": "clock_ready",
+      "label": "when ready",
+      "shape": "hat",
+      "edge": true
+    }
+  ]
+}

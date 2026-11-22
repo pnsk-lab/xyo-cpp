@@ -6,7 +6,8 @@
 For every ``repro/*.sb3``:
 
   * scratch-vm (vendored, headless) dumps String(value) for every variable;
-  * xyo runs twice: default HotSpot mode and ``--jit off`` (interpreter);
+  * xyo runs three ways: the default Mega preset, true HotSpot
+    (``--no-mega``), and ``--jit off`` (interpreter);
   * the ``out`` list and the process exit status are compared.
 
 This script is informational: some cases are expected to differ until the
@@ -61,11 +62,15 @@ def scratch_out(sb3, steps):
     return code, data.get("Stage", {}).get("out")
 
 
-def xyo_out(xyo, sb3, steps, jit):
+def xyo_out(xyo, sb3, steps, jit=None, args=(), env=None):
     cmd = [xyo, "run", sb3, "--frames", str(steps)]
     if jit:
         cmd += ["--jit", jit]
-    code, stdout, stderr = run(cmd, env={"XYO_DUMPVARS": "1"})
+    cmd += list(args)
+    extra = {"XYO_DUMPVARS": "1"}
+    if env:
+        extra.update(env)
+    code, stdout, stderr = run(cmd, env=extra)
     # xyo writes the dump to stdout; tolerate invalid UTF-8 from lone
     # surrogates in unrelated fixtures.
     text = stdout.decode("utf-8", "surrogatepass")
@@ -86,13 +91,18 @@ def main():
     for name in files:
         sb3 = os.path.join(args.repro_dir, name)
         scode, sout = scratch_out(sb3, args.steps)
-        hcode, hout = xyo_out(args.xyo, sb3, args.steps, None)
+        pcode, pout = xyo_out(args.xyo, sb3, args.steps,
+                              env={"XYO_JIT_MEGA": "1"})
+        hcode, hout = xyo_out(args.xyo, sb3, args.steps, None,
+                              args=("--no-mega",))
         icode, iout = xyo_out(args.xyo, sb3, args.steps, "off")
         rows.append({
             "case": name,
             "scratch": {"exit": scode, "out": sout},
+            "preset": {"exit": pcode, "out": pout},
             "hotspot": {"exit": hcode, "out": hout},
             "interp": {"exit": icode, "out": iout},
+            "preset_differs": pout != sout or pcode != scode,
             "hotspot_differs": hout != sout or hcode != scode,
             "interp_differs": iout != sout or icode != scode,
         })
@@ -107,6 +117,10 @@ def main():
         print("  scratch : exit=%-3d out=%s" % (r["scratch"]["exit"],
                                                 json.dumps(r["scratch"]["out"],
                                                            ensure_ascii=False)))
+        print("  preset  : exit=%-3d out=%s%s" % (
+            r["preset"]["exit"],
+            json.dumps(r["preset"]["out"], ensure_ascii=False),
+            "   <-- DIFFERS" if r["preset_differs"] else ""))
         print("  hotspot : exit=%-3d out=%s%s" % (
             r["hotspot"]["exit"],
             json.dumps(r["hotspot"]["out"], ensure_ascii=False),
@@ -116,8 +130,10 @@ def main():
             json.dumps(r["interp"]["out"], ensure_ascii=False),
             "   <-- DIFFERS" if r["interp_differs"] else ""))
     print("=" * 72)
-    print("%d cases: %d differ in HotSpot mode, %d differ in interpreter mode"
-          % (len(rows), sum(r["hotspot_differs"] for r in rows),
+    print("%d cases: %d differ in Mega preset mode, %d differ in HotSpot "
+          "mode, %d differ in interpreter mode"
+          % (len(rows), sum(r["preset_differs"] for r in rows),
+             sum(r["hotspot_differs"] for r in rows),
              sum(r["interp_differs"] for r in rows)))
     return 0
 

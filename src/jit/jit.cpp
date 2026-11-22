@@ -2,9 +2,11 @@
 #include "jit.hpp"
 #include "compile_telemetry.hpp"
 #include "backend.hpp"
+#include "mega_yield_source.hpp"
 #include "aot_emit.hpp"
 #include "aot_lazy_cache.hpp"
 #include "aot_meta_view.hpp"
+#include "../engine/mega_preset.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -613,6 +615,603 @@ bool JitEngine::tryAttachNumeric(Thread& thread, const Block* top) {
     return attached;
 }
 
+void JitEngine::installMegaDispatch(Runtime& runtime) {
+    static const bool syncEnabled = [] {
+        const char* flag = std::getenv("XYO_JIT_MEGA_BATCH");
+        return flag && flag[0] == '1';
+    }();
+    static const bool yieldEnabled = [] {
+        const char* flag = std::getenv("XYO_JIT_MEGA_BATCH_YIELD");
+        return flag && flag[0] == '1';
+    }();
+    static const bool singleSender = [] {
+        const char* flag = std::getenv("XYO_JIT_MEGA_SINGLE_SENDER");
+        return flag && flag[0] == '1' && flag[1] == '\0';
+    }();
+    if ((!syncEnabled && !yieldEnabled)) return;
+    // Explain why the one-switch preset silently does nothing. Only the
+    // preset is diagnosed; individual flags stay quiet for tests/benches.
+    const auto unavailable = [](const char* reason) {
+        if (!megaPresetRequested()) return;
+        static bool warned = false;
+        if (warned) return;
+        warned = true;
+        std::fprintf(stderr, "[mega] disabled: %s\n", reason);
+    };
+    if (!ok() || jitMode() != JitMode::Eager) {
+        unavailable("Mega requires the Eager LLVM tier");
+        return;
+    }
+    if (runtime.renderer) {
+        unavailable("renderer attached (Mega runs headless only)");
+        return;
+    }
+    if (runtime.blockCountEnabled) {
+        unavailable("exact block counting is active");
+        return;
+    }
+
+    // These groups contain separate, ordered Scratch Thread identities.
+    // The first kind executes one complete native script per selection.
+    // The second kind executes ONE repeat body per selection, saving the
+    // remaining count and next switch PC in each owning Thread.
+    std::unordered_map<Target*, std::vector<Thread*>> syncGroups;
+    std::unordered_map<Target*, std::vector<Thread*>> yieldGroups;
+    static const bool groupTrace = [] {
+        const char* trace = std::getenv("XYO_JIT_MEGA_BATCH_TRACE");
+        return trace && trace[0] == '1';
+    }();
+    const auto skip = [&](Thread* thread, const char* reason) {
+        if (groupTrace)
+            std::fprintf(stderr, "[mega-skip] thread=%s reason=%s\n",
+                         thread && thread->topBlock.c_str()
+                             ? thread->topBlock.c_str() : "?",
+                         reason);
+    };
+    for (Thread* thread : runtime.threads) {
+        if (!thread || !thread->target || !thread->blockContainer ||
+            !thread->isCompiled || thread->stackClick ||
+            thread->updateMonitor || thread->interpreterStarted ||
+            thread->fiber || thread->jitCtx || thread->megaDispatch ||
+            thread->osrActive || thread->nestedOsrActive) {
+            skip(thread, "not-a-compiled-idle-thread");
+            continue;
+        }
+        const auto* compiled =
+            static_cast<const CompiledScript*>(thread->compiled);
+        if (!compiled || !compiled->entry ||
+            compiled->mainThread || compiled->wasm ||
+            compiled->coroResume || compiled->aotSourceRevision) {
+            skip(thread, "not-a-plain-entry");
+            continue;
+        }
+        const Block* top =
+            thread->blockContainer->getBlock(thread->topBlock);
+        if (!top || top->opcode != "event_whenflagclicked") {
+            skip(thread, "not-a-green-flag-hat");
+            continue;
+        }
+        // The source-proven yield dispatcher does not invoke the old
+        // script's separate procedure symbols at all. Thus an otherwise
+        // valid, tail-only procedure may be represented by a single
+        // stackless continuation even when the ordinary JIT compiled
+        // additional procedure functions.
+        // A script that never suspends belongs to the synchronous batch,
+        // even when it contains custom blocks: the batch compiler now fuses
+        // each reachable procedure graph. Only genuinely yielding scripts
+        // need the source-certified continuation proof.
+        if (syncEnabled && (!compiled->mayYield ||
+                            compiled->cooperativeOnly)) {
+            syncGroups[thread->target].push_back(thread);
+            continue;
+        }
+        if (groupTrace)
+            std::fprintf(stderr, "[mega-skip] thread=%s reason=%s\n",
+                         thread->topBlock.c_str(),
+                         syncEnabled ? "may-yield (sync group)" :
+                                       "sync batch disabled");
+        if (yieldEnabled && (compiled->mayYield ||
+                             !compiled->procedures.empty())) {
+            mega_yield::Source proof;
+            if (mega_yield::prove(*thread->blockContainer, *top, proof) &&
+                (proof.hasBenchRound ||
+                 thread->target->lookupVariableById(proof.variableId)) &&
+                (!proof.hasBenchRound ||
+                 (thread->target->lookupVariableById(proof.benchRound.milliseconds.id) &&
+                  thread->target->lookupVariableById(proof.benchRound.endTime.id) &&
+                  thread->target->lookupVariableById(proof.benchRound.startTime.id) &&
+                  thread->target->lookupVariableById(proof.benchRound.round.id) &&
+                  thread->target->lookupVariableById(proof.benchRound.total.id) &&
+                  thread->target->lookupVariableById(proof.benchRound.count.id) &&
+                  thread->target->lookupVariableById(proof.benchRound.chunks.id) &&
+                  thread->target->lookupVariableById(proof.benchRound.bestRate.id))) &&
+                std::all_of(proof.beginSets.begin(), proof.beginSets.end(),
+                    [&](const auto& set) {
+                        return thread->target->lookupVariableById(
+                            set.variableId) != nullptr;
+                    }) &&
+                (!proof.hasSecondChange ||
+                 thread->target->lookupVariableById(
+                     proof.secondVariableId)) &&
+                (proof.kind != mega_yield::Source::Kind::BroadcastUntil ||
+                 proof.untilClockReporter ||
+                 thread->target->lookupVariableById(
+                     proof.conditionVariableId)) &&
+                (!proof.untilCompareVariable ||
+                 thread->target->lookupVariableById(
+                     proof.untilOtherVariableId)) &&
+                (!proof.untilClockElapsedMs ||
+                 thread->target->lookupVariableById(
+                     proof.untilStartVariableId)) &&
+                (!proof.hasBenchEnd ||
+                 (thread->target->lookupVariableById("output") &&
+                  thread->target->lookupVariableById("output")->type ==
+                      Variable::kListType)) &&
+                (!proof.hasOuterUntil ||
+                 (thread->target->lookupVariableById(
+                      proof.outerFirstSet.variableId) &&
+                  thread->target->lookupVariableById(
+                      proof.outerSecondSet.variableId) &&
+                  (proof.hasOuterFinalSet
+                      ? (thread->target->lookupVariableById(
+                             proof.outerFinalSet.variableId) &&
+                         thread->target->lookupVariableById(
+                             proof.outerFinalSet.readVariableId))
+                      : (thread->target->lookupVariableById(
+                            proof.outerSuffix.variableId) != nullptr)))) &&
+                (!proof.hasInnerAfterSets ||
+                 (thread->target->lookupVariableById(
+                      proof.innerAfterFirstSet.variableId) &&
+                  thread->target->lookupVariableById(
+                      proof.innerAfterSecondSet.variableId) &&
+                  (!proof.innerAfterFirstSet.readVariable ||
+                   thread->target->lookupVariableById(
+                       proof.innerAfterFirstSet.readVariableId)) &&
+                  (!proof.innerAfterSecondSet.readVariable ||
+                   thread->target->lookupVariableById(
+                       proof.innerAfterSecondSet.readVariableId)))) &&
+                (!proof.hasConditional ||
+                 ((!proof.hasElseBranch ||
+                   thread->target->lookupVariableById(
+                       proof.elseVariableId)) &&
+                  thread->target->lookupVariableById(
+                      proof.conditionVariableId) &&
+                  (!proof.hasThenSecondChange ||
+                   thread->target->lookupVariableById(
+                       proof.thenSecondVariableId)) &&
+                  (!proof.hasElseSecondChange ||
+                   thread->target->lookupVariableById(
+                       proof.elseSecondVariableId)))) &&
+                std::all_of(proof.returnSuffixes.begin(),
+                            proof.returnSuffixes.end(),
+                    [&](const auto& suffix) {
+                        return thread->target->lookupVariableById(
+                            suffix.variableId) != nullptr;
+                    })) {
+                yieldGroups[thread->target].push_back(thread);
+                continue;
+            }
+        }
+    }
+    const auto install = [&](std::vector<Thread*>& group, bool suspending) {
+        if (group.empty() || group.size() > 8 ||
+            (group.size() == 1 && (!suspending || !singleSender))) return;
+        if (group.size() == 1) {
+            // This beta is specifically the lone BROADCAST SENDER. A
+            // one-Thread numeric repeat already has existing JIT/OSR
+            // scheduling and, in shared-target fixtures, deliberately
+            // participates in the native Fiber conflict chain. Do not
+            // silently replace those scripts when enabling this flag:
+            // otherwise tests requiring the Fiber chain lose their
+            // execution route despite identical variable results.
+            Thread* sender = group.front();
+            const Block* top = sender && sender->blockContainer
+                ? sender->blockContainer->getBlock(sender->topBlock)
+                : nullptr;
+            mega_yield::Source proof;
+            if (!top || !mega_yield::prove(*sender->blockContainer,
+                                          *top, proof) ||
+                (proof.kind != mega_yield::Source::Kind::BroadcastWait &&
+                 proof.kind != mega_yield::Source::Kind::BroadcastRepeat &&
+                 proof.kind != mega_yield::Source::Kind::BroadcastUntil))
+                return;
+        }
+        Blocks* source = group.front()->blockContainer;
+        const uint64_t revision = source->revision();
+        std::vector<std::string> topIds;
+        topIds.reserve(group.size());
+        for (Thread* thread : group) topIds.push_back(thread->topBlock);
+        std::shared_ptr<MegaDispatchCode> code;
+        for (const auto& cached : megaBatchCache_) {
+            if (cached.source == source &&
+                cached.revision == revision &&
+                cached.topIds == topIds &&
+                ((suspending && cached.code->yieldEntry) ||
+                 (!suspending && cached.code->entry))) {
+                code = cached.code;
+                break;
+            }
+        }
+        const bool cacheHit = static_cast<bool>(code);
+        if (!code) {
+            code = suspending
+                ? impl_->backend->compileMegaYieldBatch(
+                    group, runtime, scriptCounter_++)
+                : impl_->backend->compileMegaDispatch(
+                    group, runtime, scriptCounter_++);
+            if (code)
+                megaBatchCache_.push_back({
+                    source, revision, std::move(topIds), code});
+        }
+        if (!code || !(suspending ? bool(code->yieldEntry) : bool(code->entry)) ||
+            code->entries != group.size()) return;
+        bool current = true;
+        for (Thread* thread : group)
+            current &= thread->blockContainer == code->sourceBlocks &&
+                       thread->blockContainer &&
+                       thread->blockContainer->revision() ==
+                           code->sourceRevision;
+        if (!current) return;
+        for (size_t i = 0; i < group.size(); ++i) {
+            group[i]->megaDispatch = code;
+            group[i]->megaPc = uint32_t(suspending ? 2*i : i);
+            group[i]->megaRemaining = 0;
+            group[i]->megaReturnDepth = 0;
+            group[i]->megaScalarBindingsReady = false;
+            group[i]->megaScalarBindings.fill(nullptr);
+            group[i]->megaBroadcastPending = false;
+            group[i]->megaJoinRefs.clear();
+        }
+        if (const char* trace = std::getenv("XYO_JIT_MEGA_BATCH_TRACE");
+            trace && trace[0] == '1')
+            std::fprintf(stderr,
+                "[mega-batch] installed=%zu kind=%s target=%s "
+                "revision=%llu cache=%s\n",
+                group.size(), suspending ? "yield" : "sync",
+                group.front()->target->id.c_str(),
+                static_cast<unsigned long long>(code->sourceRevision),
+                cacheHit ? "hit" : "miss");
+    };
+    if (const char* trace = std::getenv("XYO_JIT_MEGA_BATCH_TRACE");
+        trace && trace[0] == '1')
+        std::fprintf(stderr,
+            "[mega-groups] live=%zu sync_groups=%zu yield_groups=%zu\n",
+            runtime.threads.size(), syncGroups.size(), yieldGroups.size());
+    for (auto& [target, group] : syncGroups) {
+        (void)target;
+        install(group, false);
+    }
+    for (auto& [target, group] : yieldGroups) {
+        (void)target;
+        install(group, true);
+    }
+}
+
+// Opt-in Mega-Yield for the EXACT set of receivers produced by an actual
+// broadcast-and-wait. Do not scan all live threads or start any new hats:
+// Runtime owns receiver identity/restart, and the sender's original join
+// vector remains authoritative throughout the nested wait.
+void JitEngine::installMegaBroadcastReceivers(
+    Runtime& runtime, const std::vector<Thread*>& started) {
+    static const bool enabled = [] {
+        const char* yield = std::getenv("XYO_JIT_MEGA_BATCH_YIELD");
+        const char* receivers = std::getenv("XYO_JIT_MEGA_BCAST_RECEIVERS");
+        return yield && yield[0] == '1' &&
+               receivers && receivers[0] == '1';
+    }();
+    static const bool singleReceiver = [] {
+        const char* flag = std::getenv("XYO_JIT_MEGA_SINGLE_RECEIVER");
+        return flag && flag[0] == '1' && flag[1] == '\0';
+    }();
+    if (!enabled || started.empty() ||
+        (started.size() == 1 && !singleReceiver) || !ok() ||
+        jitMode() != JitMode::Eager || runtime.renderer ||
+        runtime.blockCountEnabled || std::getenv("XYO_PROF") ||
+        std::getenv("XYO_JIT_CALLFRAME")) return;
+    if (started.size() == 1) {
+        // A single synchronous recipient already uses a very short native
+        // entry (no Fiber). Replacing it with an LLVM switch(pc) introduces
+        // more bookkeeping and substantially regresses ScratchBench
+        // sched_pingpong. Only a receiver which can suspend may benefit
+        // from Thread-owned continuation state. Reject before hash/cache
+        // lookup or any source-proof allocations on the hot scalar path.
+        const Thread* only = started.front();
+        if (!only || !only->isCompiled || !only->compiled) return;
+        const auto* ordinary =
+            static_cast<const CompiledScript*>(only->compiled);
+        static const bool traceSingle = [] {
+            const char* trace = std::getenv("XYO_JIT_MEGA_SINGLE_TRACE");
+            return trace && trace[0] == '1';
+        }();
+        if (traceSingle) {
+            static uint32_t observations = 0;
+            if (observations++ < 6)
+                std::fprintf(stderr,
+                    "[mega-single-probe] hat=%s mayYield=%d short=%d "
+                    "procedures=%zu\n", only->topBlock.c_str(),
+                    int(ordinary->mayYield), int(ordinary->shortSync),
+                    ordinary->procedures.size());
+        }
+        if (!ordinary->mayYield) return;
+    }
+
+    // Common case after the first broadcast: exactly the same ordered
+    // receiver hats started again. Their already source-verified native
+    // code is immutable for this Blocks revision. Avoid source traversal,
+    // argument mutation parsing, variable lookups, grouping and allocation
+    // on every repeated broadcast. Re-check each *fresh* Thread identity.
+    if (started.size() <= 8) {
+        Thread* first = started.front();
+        if (first && first->target && first->blockContainer) {
+            const Blocks* source = first->blockContainer;
+            const auto revision = source->revision();
+            for (const auto& cached : megaBatchCache_) {
+                if (!cached.code || !cached.code->yieldEntry ||
+                    cached.source != source || cached.revision != revision ||
+                    cached.topIds.size() != started.size() ||
+                    cached.code->entries != started.size()) continue;
+                bool current = true;
+                for (size_t i = 0; i < started.size(); ++i) {
+                    Thread* thread = started[i];
+                    if (!thread || !runtime.containsThread(thread) ||
+                        !thread->target ||
+                        thread->blockContainer != source ||
+                        thread->topBlock != cached.topIds[i] ||
+                        !thread->isCompiled || thread->interpreterStarted ||
+                        thread->fiber || thread->jitCtx ||
+                        thread->megaDispatch || thread->isKilled ||
+                        thread->status == STATUS_DONE ||
+                        thread->stackClick || thread->updateMonitor ||
+                        thread->osrActive || thread->nestedOsrActive) {
+                        current = false;
+                        break;
+                    }
+                    const auto* compiled =
+                        static_cast<const CompiledScript*>(thread->compiled);
+                    if (!compiled || !compiled->entry ||
+                        compiled->mainThread || compiled->wasm ||
+                        compiled->coroResume || compiled->aotSourceRevision) {
+                        current = false;
+                        break;
+                    }
+                }
+                if (!current || source->revision() != revision) continue;
+                for (size_t i = 0; i < started.size(); ++i) {
+                    Thread* thread = started[i];
+                    thread->megaDispatch = cached.code;
+                    thread->megaPc = uint32_t(2*i);
+                    thread->megaRemaining = 0;
+                    thread->megaReturnDepth = 0;
+                    thread->megaScalarBindingsReady = false;
+                    thread->megaScalarBindings.fill(nullptr);
+                    thread->megaBroadcastPending = false;
+                    thread->megaJoinRefs.clear();
+                }
+                if (const char* trace =
+                        std::getenv("XYO_JIT_MEGA_BATCH_TRACE");
+                    trace && trace[0] == '1')
+                    std::fprintf(stderr,
+                        "[mega-receivers] installed=%zu target=%s "
+                        "revision=%llu cache=hit\n",
+                        started.size(), first->target->id.c_str(),
+                        static_cast<unsigned long long>(revision));
+                return;
+            }
+        }
+    }
+
+    // Clones have different Target objects but share immutable Blocks.
+    // The generated code resolves variables from each Thread's JitCtx,
+    // so a single source-specialized entry is safe across clone targets.
+    // ScratchBench fanwait: dozens of clones receive the SAME hat from
+    // the SAME Blocks owner. After the first broadcast all 8-wide and
+    // tail-width batches already exist in the ORC cache. Do not repeatedly
+    // prove and hash every clone's identical AST on each later broadcast.
+    if (started.size() > 8) {
+        Thread* first = started.front();
+        if (first && first->blockContainer && first->target) {
+            const Blocks* source = first->blockContainer;
+            const uint64_t revision = source->revision();
+            const std::string& topId = first->topBlock;
+            bool valid = true;
+            for (Thread* thread : started) {
+                if (!thread || !runtime.containsThread(thread) ||
+                    !thread->target || thread->blockContainer != source ||
+                    thread->topBlock != topId || !thread->isCompiled ||
+                    thread->interpreterStarted || thread->fiber ||
+                    thread->jitCtx || thread->megaDispatch ||
+                    thread->isKilled || thread->status == STATUS_DONE ||
+                    thread->stackClick || thread->updateMonitor ||
+                    thread->osrActive || thread->nestedOsrActive) {
+                    valid = false;
+                    break;
+                }
+                const auto* compiled =
+                    static_cast<const CompiledScript*>(thread->compiled);
+                if (!compiled || !compiled->entry ||
+                    compiled->mainThread || compiled->wasm ||
+                    compiled->coroResume || compiled->aotSourceRevision) {
+                    valid = false;
+                    break;
+                }
+            }
+            if (valid && source->revision() == revision) {
+                // A distinct code object may be used for the final
+                // partial group; check every chunk BEFORE installing any.
+                std::vector<std::shared_ptr<MegaDispatchCode>> matches;
+                matches.reserve((started.size()+7)/8);
+                for (size_t off=0; off<started.size(); off+=8) {
+                    const size_t count = std::min(size_t(8), started.size() - off);
+                    if (count < 2) { valid = false; break; }
+                    std::shared_ptr<MegaDispatchCode> found;
+                    for (const auto& cached : megaBatchCache_) {
+                        if (!cached.code || !cached.code->yieldEntry ||
+                            cached.source != source ||
+                            cached.revision != revision ||
+                            cached.topIds.size() != count ||
+                            cached.code->entries != count) continue;
+                        bool same = true;
+                        for (const auto& id : cached.topIds)
+                            if (id != topId) { same = false; break; }
+                        if (same) { found = cached.code; break; }
+                    }
+                    if (!found) { valid = false; break; }
+                    matches.push_back(std::move(found));
+                }
+                if (valid && source->revision() == revision) {
+                    size_t offset = 0;
+                    for (const auto& code : matches) {
+                        for (size_t i = 0; i < code->entries; ++i) {
+                            Thread* thread = started[offset + i];
+                            thread->megaDispatch = code;
+                            thread->megaPc = uint32_t(2*i);
+                            thread->megaRemaining = 0;
+                            thread->megaReturnDepth = 0;
+                            thread->megaScalarBindingsReady = false;
+                            thread->megaScalarBindings.fill(nullptr);
+                            thread->megaBroadcastPending = false;
+                            thread->megaJoinRefs.clear();
+                        }
+                        offset += code->entries;
+                    }
+                    if (const char* trace =
+                            std::getenv("XYO_JIT_MEGA_BATCH_TRACE");
+                        trace && trace[0] == '1')
+                        std::fprintf(stderr,
+                            "[mega-receivers] homogeneous-clones=%zu "
+                            "batches=%zu revision=%llu cache=hit\n",
+                            started.size(), matches.size(),
+                            static_cast<unsigned long long>(revision));
+                    return;
+                }
+            }
+        }
+    }
+
+    std::unordered_map<Blocks*, std::vector<Thread*>> groups;
+    for (Thread* thread : started) {
+        if (!thread || !runtime.containsThread(thread) ||
+            thread->isKilled || thread->status == STATUS_DONE ||
+            !thread->target || !thread->blockContainer ||
+            !thread->isCompiled || thread->interpreterStarted ||
+            thread->stackClick || thread->updateMonitor ||
+            thread->fiber || thread->jitCtx || thread->megaDispatch ||
+            thread->osrActive || thread->nestedOsrActive)
+            continue;
+        const auto* compiled =
+            static_cast<const CompiledScript*>(thread->compiled);
+        if (!compiled || !compiled->entry || compiled->mainThread ||
+            compiled->wasm || compiled->coroResume ||
+            compiled->aotSourceRevision) continue;
+        const Block* hat =
+            thread->blockContainer->getBlock(thread->topBlock);
+        if (!hat || hat->opcode != "event_whenbroadcastreceived") continue;
+        mega_yield::Source proof;
+        if (!mega_yield::prove(*thread->blockContainer, *hat, proof) ||
+            !thread->target->lookupVariableById(proof.variableId) ||
+            (proof.hasSecondChange &&
+             !thread->target->lookupVariableById(
+                 proof.secondVariableId)) ||
+            (proof.hasConditional &&
+             ((proof.hasElseBranch &&
+               !thread->target->lookupVariableById(
+                   proof.elseVariableId)) ||
+              !thread->target->lookupVariableById(
+                  proof.conditionVariableId) ||
+              (proof.hasThenSecondChange &&
+               !thread->target->lookupVariableById(
+                   proof.thenSecondVariableId)) ||
+              (proof.hasElseSecondChange &&
+               !thread->target->lookupVariableById(
+                   proof.elseSecondVariableId)))) ||
+            !std::all_of(proof.returnSuffixes.begin(),
+                         proof.returnSuffixes.end(),
+                [&](const auto& suffix) {
+                    return thread->target->lookupVariableById(
+                        suffix.variableId) != nullptr;
+                })) continue;
+        groups[thread->blockContainer].push_back(thread);
+    }
+
+    for (auto& [sourceOwner, receivers] : groups) {
+        (void)sourceOwner;
+        for (size_t offset = 0; offset < receivers.size(); offset += 8) {
+            const size_t count = std::min(size_t(8), receivers.size()-offset);
+            if (count < 2 && !singleReceiver) continue;
+            std::vector<Thread*> group(
+                receivers.begin() + offset, receivers.begin() + offset + count);
+            Blocks* source = group.front()->blockContainer;
+            if (!source) continue;
+            const uint64_t revision = source->revision();
+            bool sameSource = true;
+            std::vector<std::string> topIds;
+            topIds.reserve(group.size());
+            for (Thread* thread : group) {
+                if (!thread || thread->blockContainer != source ||
+                    !thread->target || thread->fiber || thread->jitCtx ||
+                    thread->megaDispatch) sameSource = false;
+                topIds.push_back(thread->topBlock);
+            }
+            if (!sameSource) continue;
+            std::shared_ptr<MegaDispatchCode> code;
+            for (const auto& cached : megaBatchCache_) {
+                if (cached.source == source &&
+                    cached.revision == revision &&
+                    cached.topIds == topIds && cached.code &&
+                    cached.code->yieldEntry) {
+                    code = cached.code;
+                    break;
+                }
+            }
+            const bool cacheHit = bool(code);
+            if (!code) {
+                code = impl_->backend->compileMegaYieldBatch(
+                    group, runtime, scriptCounter_++);
+                if (code)
+                    megaBatchCache_.push_back({
+                        source, revision, std::move(topIds), code});
+            }
+            if (!code || !code->yieldEntry ||
+                code->entries != group.size() ||
+                source->revision() != revision) continue;
+
+            // Check again after ORC compilation. Any source mutation or
+            // synchronous recipient restart during compilation must reject
+            // the complete group rather than attach stale continuations.
+            bool current = true;
+            for (Thread* thread : group)
+                current &= thread && runtime.containsThread(thread) &&
+                           thread->blockContainer == code->sourceBlocks &&
+                           !thread->fiber && !thread->jitCtx &&
+                           !thread->megaDispatch && !thread->isKilled &&
+                           thread->status != STATUS_DONE &&
+                           thread->blockContainer->revision() ==
+                               code->sourceRevision;
+            if (!current) continue;
+            for (size_t i = 0; i < group.size(); ++i) {
+                Thread* thread = group[i];
+                thread->megaDispatch = code;
+                thread->megaPc = uint32_t(2*i);
+                thread->megaRemaining = 0;
+                thread->megaReturnDepth = 0;
+                thread->megaScalarBindingsReady = false;
+                thread->megaScalarBindings.fill(nullptr);
+                thread->megaBroadcastPending = false;
+                thread->megaJoinRefs.clear();
+            }
+            if (const char* trace =
+                    std::getenv("XYO_JIT_MEGA_BATCH_TRACE");
+                trace && trace[0] == '1')
+                std::fprintf(stderr,
+                    "[mega-receivers] installed=%zu target=%s "
+                    "revision=%llu cache=%s\n",
+                    group.size(), group.front()->target->id.c_str(),
+                    static_cast<unsigned long long>(revision),
+                    cacheHit ? "hit" : "miss");
+        }
+    }
+}
+
 const CompiledScript* JitEngine::compile(Thread& thread, Runtime& runtime,
                                          Sequencer& sequencer,
                                          const Block* topHint) {
@@ -1057,6 +1656,7 @@ void JitEngine::invalidate() {
         }
     }
     cache_.clear();
+    megaBatchCache_.clear();
     numericCache_.clear();
     numericRejected_.clear();
     profiles_.clear();

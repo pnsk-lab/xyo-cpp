@@ -119,6 +119,9 @@ public:
     struct ParallelStats {
         uint64_t batches = 0, dispatches = 0, threads = 0, groups = 0;
         uint64_t chainedPasses = 0;
+        uint64_t genericComponentCandidates = 0;
+        uint64_t genericComponentChained = 0;
+        uint64_t genericComponentThreads = 0;
     };
     const ParallelStats& parallelStats() const { return parStats_; }
 
@@ -129,8 +132,50 @@ public:
         uint64_t frameRechecks = 0;
     };
     const WaitReadyStats& waitReadyStats() const { return waitReadyStats_; }
+    // Measured calls to the beta's native one-shot scalar batch entry.
+    uint64_t megaScalarBatchCalls() const { return megaScalarBatchCalls_; }
+    uint64_t megaScalarBatchThreads() const {
+        return megaScalarBatchThreads_;
+    }
+    uint64_t megaSingleFastCalls() const { return megaSingleFastCalls_; }
+    uint64_t megaRepeatBurstCalls() const { return megaRepeatBurstCalls_; }
+    uint64_t megaRepeatBurstTurns() const { return megaRepeatBurstTurns_; }
+    uint64_t megaMultiBurstCalls() const { return megaMultiBurstCalls_; }
+    uint64_t megaMultiBurstTurns() const { return megaMultiBurstTurns_; }
 
 private:
+    bool tryMegaMultiRepeatBurst();
+    bool tryMegaRepeatBurst();
+    bool tryMegaScalarBatch(size_t start, bool allowParallel,
+                            size_t& consumed, size_t& active,
+                            bool& stopped);
+    uint64_t megaScalarBatchCalls_ = 0;
+    uint64_t megaScalarBatchThreads_ = 0;
+    uint64_t megaSingleFastCalls_ = 0;
+    uint64_t megaRepeatBurstCalls_ = 0;
+    uint64_t megaRepeatBurstTurns_ = 0;
+    uint64_t megaMultiBurstCalls_ = 0;
+    uint64_t megaMultiBurstTurns_ = 0;
+    struct ThreadCleanupProfile {
+        uint64_t compactionCalls = 0;
+        uint64_t scannedSlots = 0;
+        uint64_t removedThreads = 0;
+        uint64_t relocatedThreads = 0;
+        uint64_t compactionNs = 0;
+        uint64_t retirementCalls = 0;
+        uint64_t retirementNs = 0;
+        uint64_t mapEraseHits = 0;
+        uint64_t mapSizeZero = 0;
+        uint64_t mapSizeOne = 0;
+        uint64_t mapSizeTwo = 0;
+        uint64_t mapSizeThreeToFour = 0;
+        uint64_t mapSizeFivePlus = 0;
+        uint64_t sampledRemovals = 0;
+        uint64_t sampledMapNs = 0;
+        uint64_t sampledReleaseNs = 0;
+        uint64_t sampledAppendNs = 0;
+    };
+    ThreadCleanupProfile cleanupProfile_;
     // Nested interpreter statements can be compiled independently of the
     // event hat while the interpreter retains exact loop/procedure/yield
     // frames. No native JIT backend uses this cache.

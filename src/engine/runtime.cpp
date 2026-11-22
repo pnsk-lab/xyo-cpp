@@ -1,6 +1,11 @@
 // xyo-cpp: engine/runtime.js 移植。
 #include "runtime.hpp"
 
+#if defined(__EMSCRIPTEN__) && defined(XYO_WASM_HOTSPOT)
+extern "C" void xyo_wasm_set_host_project_timer(double);
+extern "C" void xyo_wasm_set_host_runtime(void*);
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -56,6 +61,10 @@ Runtime::Runtime()
 }
 
 Runtime::~Runtime() {
+    if (const char* enabled = std::getenv("XYO_SCHED_TOTAL_STEPS");
+        enabled && enabled[0] == '1')
+        std::fprintf(stderr, "[sched-total-steps] frames=%llu\n",
+                     static_cast<unsigned long long>(stepSerial));
     // Cancel first, so HTTP workers can abort instead of blocking shutdown.
     if (translationService) translationService->cancelAll();
     translationService.reset();
@@ -441,10 +450,25 @@ void initializeThreadRoot(Thread& thread) {
         const char* env = std::getenv("XYO_LAZY_ROOT_FRAME");
         return !env || env[0] != '0';
     }();
+    static const bool widerNativeRoot = [] {
+        const char* env = std::getenv("XYO_LAZY_ROOT_NATIVE_WIDE");
+        return env && env[0] == '1';
+    }();
     const auto* compiled = thread.isCompiled
         ? static_cast<const CompiledScript*>(thread.compiled) : nullptr;
-    if (lazyRootFrame && compiled && compiled->entry &&
-        compiled->shortSync && !compiled->mayYield)
+    // The root StackFrame can be materialized on demand by
+    // peekStackFrame(), pushStack() and popStack(). Extend the existing
+    // short synchronous native shortcut only to *non-yielding*,
+    // non-main-thread native entries with no compiled procedure frames.
+    // A native callback that needs a compatibility frame uses the lazy
+    // materialization path; interpreter and suspending scripts are unchanged.
+    const bool nativeRootSafe = compiled && compiled->entry &&
+        !compiled->mayYield &&
+        (compiled->shortSync ||
+         (widerNativeRoot && !compiled->mainThread &&
+          !compiled->lazy && compiled->procedures.empty() &&
+          !compiled->wasm && !compiled->coroResume));
+    if (lazyRootFrame && nativeRootSafe)
         thread.stack.push_back(thread.topBlock);
     else
         thread.pushStack(thread.topBlock);
@@ -454,16 +478,52 @@ void initializeThreadRoot(Thread& thread) {
 Thread* Runtime::pushThread(const std::string& id, Target* target,
                             bool stackClick, bool updateMonitor,
                             const Block* topHint) {
+    struct PushBreakdown {
+        const bool enabled = [] {
+            const char* v = std::getenv("XYO_PUSH_THREAD_PHASE_PROFILE");
+            return v && v[0] == '1' && v[1] == '\0';
+        }();
+        uint64_t count=0, allocNs=0, mapNs=0, jitNs=0, rootNs=0;
+        ~PushBreakdown() {
+            if (!enabled) return;
+            std::fprintf(stderr,
+                "[push-phase-prof] count=%llu alloc_ns=%llu "
+                "map_ns=%llu jit_ns=%llu root_ns=%llu\n",
+                (unsigned long long)count,
+                (unsigned long long)allocNs,
+                (unsigned long long)mapNs,
+                (unsigned long long)jitNs,
+                (unsigned long long)rootNs);
+        }
+    };
+    static PushBreakdown phases;
+    // Exclude the green-flag launcher (and its one-time JIT compile)
+    // so these totals reconcile with the indexed receiver's push_ns.
+    const bool profileThisPush =
+        phases.enabled && topHint &&
+        topHint->opcode == "event_whenbroadcastreceived";
+    const auto phaseStart = profileThisPush
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
 #if !defined(XYO_DISABLE_RT_PROF)
     struct PProf {
         bool enabled = std::getenv("XYO_PROF") != nullptr;
-        double allocNs = 0, mapNs = 0, compileNs = 0; uint64_t n = 0;
+        double allocNs = 0, mapNs = 0, compileNs = 0, rootNs = 0;
+        uint64_t n = 0, shortNative = 0, safeWide = 0;
+        uint64_t otherNative = 0, interpreted = 0;
         ~PProf() {
             if (enabled)
                 fprintf(stderr,
-                    "[prof] pushThread alloc=%.1f map=%.1f compile=%.1f ms(%llu)\n",
+                    "[prof] pushThread alloc=%.1f map=%.1f "
+                    "compile=%.1f root=%.1f ms(%llu) "
+                    "short_native=%llu safe_wide=%llu "
+                    "other_native=%llu interp=%llu\n",
                     allocNs/1e6, mapNs/1e6, compileNs/1e6,
-                    (unsigned long long)n);
+                    rootNs/1e6, (unsigned long long)n,
+                    (unsigned long long)shortNative,
+                    (unsigned long long)safeWide,
+                    (unsigned long long)otherNative,
+                    (unsigned long long)interpreted);
         }
     };
     static PProf pp;
@@ -481,16 +541,68 @@ Thread* Runtime::pushThread(const std::string& id, Target* target,
     threads.push_back(t);
     invalidateSchedulerReadySet();
     ownedThreads.push_back(std::move(thread));
+#if !defined(XYO_DISABLE_RT_PROF)
+    if (pp.enabled) {
+        pp.allocNs += std::chrono::duration<double, std::nano>(
+            now() - t0).count();
+        t0 = now();
+    }
+#endif
+    const auto phaseMap = profileThisPush
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+    if (profileThisPush)
+        phases.allocNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            phaseMap - phaseStart).count();
     if (!t->stackClick && !t->updateMonitor) {
         threadMap[t->getId()] = t;
     }
+    const auto phaseJit = profileThisPush
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+    if (profileThisPush)
+        phases.mapNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            phaseJit - phaseMap).count();
 #if !defined(XYO_DISABLE_RT_PROF)
-    if (pp.enabled) { pp.allocNs += std::chrono::duration<double,std::nano>(now()-t0).count(); t0 = now(); }
+    if (pp.enabled) {
+        pp.mapNs += std::chrono::duration<double, std::nano>(
+            now() - t0).count();
+        t0 = now();
+    }
 #endif
     if (!updateMonitor) t->tryCompile(topHint);
-    initializeThreadRoot(*t);
+    const auto phaseRoot = profileThisPush
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+    if (profileThisPush)
+        phases.jitNs += (uint64_t)std::chrono::duration_cast<
+            std::chrono::nanoseconds>(phaseRoot - phaseJit).count();
 #if !defined(XYO_DISABLE_RT_PROF)
-    if (pp.enabled) { pp.compileNs += std::chrono::duration<double,std::nano>(now()-t0).count(); ++pp.n; }
+    if (pp.enabled) {
+        pp.compileNs += std::chrono::duration<double, std::nano>(
+            now() - t0).count();
+        const auto* native = t->isCompiled
+            ? static_cast<const CompiledScript*>(t->compiled) : nullptr;
+        if (!native || !native->entry) ++pp.interpreted;
+        else if (native->shortSync && !native->mayYield) ++pp.shortNative;
+        else if (!native->mayYield && !native->mainThread) ++pp.safeWide;
+        else ++pp.otherNative;
+        t0 = now();
+    }
+#endif
+    initializeThreadRoot(*t);
+    if (profileThisPush) {
+        ++phases.count;
+        phases.rootNs += (uint64_t)std::chrono::duration_cast<
+            std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - phaseRoot).count();
+    }
+#if !defined(XYO_DISABLE_RT_PROF)
+    if (pp.enabled) {
+        pp.rootNs += std::chrono::duration<double, std::nano>(
+            now() - t0).count();
+        ++pp.n;
+    }
 #endif
     return t;
 }
@@ -744,6 +856,9 @@ std::vector<Thread*> Runtime::startHats(
             }, optTarget);
     }
 
+    if (std::getenv("XYO_HAT_TRACE"))
+        std::fprintf(stderr, "[hat] start %s -> %zu thread(s)\n",
+                     requestedHatOpcode.c_str(), newThreads.size());
     // Scratch 2 互換: 新スレッドのハット即時評価
     for (Thread* t : newThreads) {
         if (t->isCompiled) {
@@ -922,15 +1037,60 @@ void Runtime::journalBroadcast(std::u16string_view name,
 // matching/normalizing fields for every broadcast, and the generic hat walk.
 // Unlike fire-and-forget startBroadcast, it must preserve distinct Thread*
 // join handles until the caller has observed their completion.
+namespace {
+// Opt-in breakdown of indexed broadcast-and-wait startup. This is a
+// diagnostic only; without the flag no clocks are read. Independent from
+// XYO_PROF so it is available in a Release JIT build.
+struct BroadcastWaitProfile {
+    const bool enabled = [] {
+        const char* flag = std::getenv("XYO_BCAST_WAIT_PROFILE");
+        return flag && flag[0] == '1' && flag[1] == '\0';
+    }();
+    uint64_t calls = 0, receivers = 0, pushes = 0, restarts = 0;
+    uint64_t lookupNs = 0, dispatchNs = 0, hatNs = 0;
+    uint64_t pushNs = 0, restartNs = 0, attachNs = 0;
+    ~BroadcastWaitProfile() {
+        if (!enabled) return;
+        std::fprintf(stderr,
+            "[bcast-wait-prof] calls=%llu receivers=%llu pushes=%llu "
+            "restarts=%llu lookup_ns=%llu dispatch_ns=%llu "
+            "hat_ns=%llu push_ns=%llu restart_ns=%llu attach_ns=%llu\n",
+            (unsigned long long)calls, (unsigned long long)receivers,
+            (unsigned long long)pushes, (unsigned long long)restarts,
+            (unsigned long long)lookupNs, (unsigned long long)dispatchNs,
+            (unsigned long long)hatNs, (unsigned long long)pushNs,
+            (unsigned long long)restartNs, (unsigned long long)attachNs);
+    }
+};
+BroadcastWaitProfile& bcastWaitProfile() {
+    static BroadcastWaitProfile profile;
+    return profile;
+}
+using BcastClock = std::chrono::steady_clock;
+uint64_t bcastElapsedNs(BcastClock::time_point start) {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        BcastClock::now() - start).count();
+}
+} // namespace
+
 static std::vector<Thread*> startBroadcastAndWaitIndexed(
     Runtime& rt, std::u16string_view name) {
     static const std::string opcode = "event_whenbroadcastreceived";
     const auto hat = rt.hats.find(opcode);
     if (hat == rt.hats.end()) return {};
     const HatMeta meta = hat->second;
+    auto& profile = bcastWaitProfile();
+    const auto lookupStart = profile.enabled
+        ? BcastClock::now() : BcastClock::time_point{};
     const auto receivers = rt.broadcastReceivers(name);
+    if (profile.enabled) {
+        ++profile.calls;
+        profile.lookupNs += bcastElapsedNs(lookupStart);
+    }
     if (!receivers) return {};
 
+    const auto dispatchStart = profile.enabled
+        ? BcastClock::now() : BcastClock::time_point{};
     std::vector<Thread*> started;
     started.reserve(receivers->size());
     HatThreadSnapshot existing(rt.threads);
@@ -942,27 +1102,68 @@ static std::vector<Thread*> startBroadcastAndWaitIndexed(
             key.push_back('&');
             key.append(receiver.blockId);
             const auto it = rt.threadMap.find(key);
-            if (it != rt.threadMap.end())
+            if (it != rt.threadMap.end()) {
+                const auto start = profile.enabled
+                    ? BcastClock::now() : BcastClock::time_point{};
                 thread = rt.restartThread(it->second, receiver.top);
+                if (profile.enabled) {
+                    ++profile.restarts;
+                    profile.restartNs += bcastElapsedNs(start);
+                }
+            }
         } else if (existing.contains(receiver.target, receiver.blockId)) {
             continue;
         }
-        if (!thread)
+        if (!thread) {
+            const auto start = profile.enabled
+                ? BcastClock::now() : BcastClock::time_point{};
             thread = rt.pushThread(receiver.blockId, receiver.target,
                                    false, false, receiver.top);
+            if (profile.enabled) {
+                ++profile.pushes;
+                profile.pushNs += bcastElapsedNs(start);
+            }
+        }
         started.push_back(thread);
     }
+    if (profile.enabled) {
+        profile.receivers += started.size();
+        profile.dispatchNs += bcastElapsedNs(dispatchStart);
+    }
+    const auto hatStart = profile.enabled
+        ? BcastClock::now() : BcastClock::time_point{};
     for (Thread* thread : started) {
         if (!thread->isCompiled) {
             execute(*rt.sequencer, *thread);
             thread->goToNextBlock();
         }
     }
+    if (profile.enabled)
+        profile.hatNs += bcastElapsedNs(hatStart);
     return started;
 }
 
 std::vector<Thread*> Runtime::startBroadcastAndWait(
     std::u16string_view name) {
+    // The caller knows the exact receiver identities already. When the
+    // one-receiver beta is enabled, skip invoking the JIT fusion scanner for
+    // an ordinary synchronous receiver. This case dominates sched_pingpong;
+    // such a script cannot benefit from a Thread-owned *yield* PC.
+    static const bool singleReceiver = [] {
+        const char* flag = std::getenv("XYO_JIT_MEGA_SINGLE_RECEIVER");
+        return flag && flag[0] == '1' && flag[1] == '\0';
+    }();
+    const auto installReceivers = [&](const std::vector<Thread*>& started) {
+        if (!jit) return;
+        if (singleReceiver && started.size() == 1) {
+            const Thread* only = started.front();
+            if (only && only->isCompiled && only->compiled &&
+                !static_cast<const CompiledScript*>(
+                    only->compiled)->mayYield)
+                return;
+        }
+        jit->installMegaBroadcastReceivers(*this, started);
+    };
     // Keep the opt-in journal path's original synchronous commit semantics.
     // Allow an A/B comparison using identical native binaries. The legacy
     // path is also useful as a conservative fallback for diagnosis.
@@ -971,11 +1172,23 @@ std::vector<Thread*> Runtime::startBroadcastAndWait(
         return !env || *env != '0';
     }();
     if (!observableJournal) {
-        if (indexed)
-            return startBroadcastAndWaitIndexed(*this, name);
-        std::map<std::string, std::u16string> fields{
-            {"BROADCAST_OPTION", std::u16string(name)}};
-        return startHats("event_whenbroadcastreceived", &fields, nullptr);
+        std::vector<Thread*> started;
+        if (indexed) {
+            started = startBroadcastAndWaitIndexed(*this, name);
+        } else {
+            std::map<std::string, std::u16string> fields{
+                {"BROADCAST_OPTION", std::u16string(name)}};
+            started = startHats("event_whenbroadcastreceived", &fields, nullptr);
+        }
+        // Must attach AFTER the runtime has selected and restarted the
+        // precise identities. Never replace the join vector or its order.
+        const auto attachStart = bcastWaitProfile().enabled
+            ? BcastClock::now() : BcastClock::time_point{};
+        installReceivers(started);
+        auto& profile = bcastWaitProfile();
+        if (profile.enabled)
+            profile.attachNs += bcastElapsedNs(attachStart);
+        return started;
     }
     struct Delivery {
         Runtime* runtime;
@@ -989,6 +1202,7 @@ std::vector<Thread*> Runtime::startBroadcastAndWait(
             ctx.started = ctx.runtime->startHats(
                 "event_whenbroadcastreceived", &fields, nullptr);
         }, &delivery);
+    installReceivers(delivery.started);
     return std::move(delivery.started);
 }
 
@@ -1226,6 +1440,7 @@ void Runtime::greenFlag() {
         ioDevices.clock.resetProjectTimer();
     startHats("event_whenflagclicked", nullptr, nullptr);
     if (onGreenFlag) onGreenFlag();
+    if (jit) jit->installMegaDispatch(*this);
 }
 
 // ------------------------------------------------------------------ step --
@@ -1302,6 +1517,7 @@ void Runtime::reclaimThreads() {
         for (Thread* s : t->compatibilityStackFrame.startedThreads) retain(s);
         if (t->jitCtx && t->jitCtx->joinRefs)
             for (Thread* s : *t->jitCtx->joinRefs) retain(s);
+        for (Thread* s : t->megaJoinRefs) retain(s);
     }
     // Compact ownership, not just Thread payloads. Threads no longer
     // reachable through *any* join, runtime, frame or detached-pass reference
@@ -1329,6 +1545,13 @@ void Runtime::reclaimThreads() {
 
 void Runtime::step() {
     ++stepSerial;
+#if defined(__EMSCRIPTEN__) && defined(XYO_WASM_HOTSPOT)
+    // Compiled modules have no Runtime pointer. Snapshot the project timer
+    // once per step so their sensing_timer reads the exact value the
+    // interpreter sees during this step.
+    xyo_wasm_set_host_project_timer(ioDevices.clock.projectTimer());
+    xyo_wasm_set_host_runtime(this);
+#endif
     static const bool tracePhases = std::getenv("XYO_STEP_PHASES") != nullptr;
     using ProfileClock = std::chrono::steady_clock;
     const auto phaseStart = tracePhases ? ProfileClock::now()
@@ -1351,7 +1574,7 @@ void Runtime::step() {
                 const CompiledScript* ready =
                     jit->readyScript(t->topBlockPtr, t->blockContainer);
                 if (!ready || (jitFiberlessEnabled() && ready->mayYield &&
-                               !ready->wasm)) continue;
+                               !ready->wasm && !ready->coroResume)) continue;
                 const auto& nestedCalls = ready->nestedOsrCallPath;
                 const auto& nestedFrames = ready->nestedOsrFramePath;
                 const auto& nestedArms = ready->nestedOsrBranchArms;
@@ -1711,8 +1934,14 @@ void Runtime::step() {
     }
 
     // エッジ起動ハットを毎フレーム評価
+    if (std::getenv("XYO_HAT_TRACE"))
+        std::fprintf(stderr, "[hat] step hats=%zu\n", hats.size());
     for (auto& [hatType, meta] : hats) {
-        if (meta.edgeActivated) startHats(hatType, nullptr, nullptr);
+        if (meta.edgeActivated) {
+            if (std::getenv("XYO_HAT_TRACE"))
+                std::fprintf(stderr, "[hat] poll %s\n", hatType.c_str());
+            startHats(hatType, nullptr, nullptr);
+        }
     }
     redrawRequested = false;
     pushMonitors();
@@ -1811,6 +2040,10 @@ void Runtime::updateCurrentMSecs() {
         ? overrideClock[0] == '1'
         : (renderer != nullptr && audioEngine != nullptr);
     currentMSecs = realClock ? now : std::max(now, currentMSecs + 1.0);
+#if defined(__EMSCRIPTEN__) && defined(XYO_WASM_HOTSPOT)
+    // No module may run outside a step; drop the borrowed Runtime.
+    xyo_wasm_set_host_runtime(nullptr);
+#endif
 }
 
 void Runtime::enqueueWait(WaitEntry entry) {
@@ -2306,6 +2539,7 @@ void Runtime::markRoots(Gc& g) {
     markBlocks(g, flyoutBlocks.get());
     for (auto& [id, rec] : monitorState.records) g.markValue(rec.value);
     g.markValue(lastVisualReport.value);
+    if (usernameRoot) g.markValue(Value::string(usernameRoot));
     for (auto& w : waitQueue) g.markValue(w.resolveValue);
 }
 

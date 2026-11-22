@@ -551,9 +551,13 @@ Target* Target::makeClone() {
     const auto prepared = profile.enabled ? CloneClock::now() : CloneTime{};
     // JS: initDrawable — クローンはここで start_as_clone ハットを起動
     if (!c->isOriginal) {
+        // Enabled by default after paired headless clone-churn tests.
+        // Explicit =0 keeps the exact prior general startHats path.
+        // The callback guard below is mandatory: host/SDL callbacks may
+        // have started scripts on this clone before this point.
         static const bool fastCloneHats = [] {
             const char* value = std::getenv("XYO_CLONE_NEW_HATS_FAST");
-            return value && value[0] == '1';
+            return !value || value[0] != '0';
         }();
         // An external creation callback can start arbitrary scripts on the
         // new Target before we arrive here. Retain the generic snapshot

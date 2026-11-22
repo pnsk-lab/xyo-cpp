@@ -148,6 +148,8 @@ JsonObject targetToJson(Runtime& rt, Target& t,
     o["variables"] = JsonValue(std::move(vars));
     o["lists"] = JsonValue(std::move(lists));
     o["broadcasts"] = JsonValue(std::move(broadcasts));
+    if (!t.extensionStorage.empty())
+        o["extensionStorage"] = JsonValue(t.extensionStorage);
 
     JsonObject blocks;
     if (t.blocks)
@@ -275,6 +277,14 @@ Sb3SaveResult saveSb3(Runtime& runtime) {
     root["targets"] = JsonValue(std::move(targets));
     root["monitors"] = JsonValue(std::move(monitors));
     root["extensions"] = JsonValue(std::move(extArr));
+    if (!runtime.extensionURLs.empty()) {
+        JsonObject urls;
+        for (const auto& [id, url] : runtime.extensionURLs)
+            urls[id] = JsonValue(url);
+        root["extensionURLs"] = JsonValue(std::move(urls));
+    }
+    if (!runtime.extensionStorage.empty())
+        root["extensionStorage"] = JsonValue(runtime.extensionStorage);
     root["meta"] = JsonValue(std::move(meta));
 
     std::string json = jsonStringify(JsonValue(std::move(root)));

@@ -2,6 +2,7 @@
 // refs/scratch-vm/test/unit/util_cast.js の移植 + ES エッジケース。
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <string>
@@ -544,6 +545,64 @@ static void test_rt_list() {
     CHECK_EQ(ts(rt::listContents(list)), "a b c 1 xy");
 }
 
+// SIMD 走査（連続格納の数値リスト）の境界とタグ付き要素の混在。
+// ブロック境界（2/4 要素）をまたぐヒット、タグ付き要素を挟んだ
+// 文字列⇔数値の一致、-0、NaN、空リストを確認する。
+static void test_rt_list_search_simd() {
+    auto* list = SList::create();
+    // 空
+    CHECK(!rt::listContains(list, n(1)));
+    CHECK_EQ(rt::listIndexOf(list, n(1)), 0);
+
+    // 長い数値列: 各ブロック位置でヒットさせる
+    for (int i = 1; i <= 17; ++i) list->push(n(i * 10));
+    for (int i = 1; i <= 17; ++i) {
+        CHECK_EQ(rt::listIndexOf(list, n(i * 10)), i);
+        CHECK(rt::listContains(list, n(i * 10)));
+    }
+    CHECK_EQ(rt::listIndexOf(list, n(5)), 0);
+    CHECK_EQ(rt::listIndexOf(list, n(-1)), 0);
+    // 最後の要素・境界の前後
+    CHECK_EQ(rt::listIndexOf(list, n(170)), 17);
+    CHECK_EQ(rt::listIndexOf(list, n(160)), 16);
+
+    // -0.0 は 0 と等しい（ビット比較ではなく値比較であること）
+    auto* z = SList::create();
+    z->push(n(1));
+    z->push(n(0.0));
+    CHECK_EQ(rt::listIndexOf(z, n(-0.0)), 2);
+    CHECK(rt::listContains(z, n(-0.0)));
+
+    // タグ付き要素（文字列）を挟んだ一致: 数値 3 は文字列 "3" とも一致し、
+    // その手前のタグ付き要素は個別に比較される。
+    auto* t = SList::create();
+    t->push(s("1"));
+    t->push(n(2));
+    t->push(s("3"));
+    t->push(n(4));
+    CHECK_EQ(rt::listIndexOf(t, n(1)), 1);   // 文字列 "1" が数値 1 と一致
+    CHECK_EQ(rt::listIndexOf(t, n(3)), 3);   // 文字列 "3"
+    CHECK_EQ(rt::listIndexOf(t, n(4)), 4);
+    CHECK(!rt::listContains(t, n(5)));
+    // タグ付き要素の後ろの数値ヒットも正しい
+    CHECK_EQ(rt::listIndexOf(t, s("2")), 2);
+
+    // 真偽値エントリ
+    auto* bl = SList::create();
+    bl->push(b(true));
+    bl->push(b(false));
+    bl->push(n(7));
+    CHECK_EQ(rt::listIndexOf(bl, n(7)), 3);
+    CHECK_EQ(rt::listIndexOf(bl, b(true)), 1);
+
+    // NaN ニードルは決して一致しない
+    auto* nanList = SList::create();
+    nanList->push(n(1));
+    nanList->push(n(2));
+    CHECK(!rt::listContains(nanList, n(std::nan(""))));
+    CHECK_EQ(rt::listIndexOf(nanList, n(std::nan(""))), 0);
+}
+
 static void test_rgb() {
     auto c1 = cast::toRgbColorList(s("#ff8000"));
     CHECK_EQ(c1.r, 255); CHECK_EQ(c1.g, 128); CHECK_EQ(c1.b, 0);
@@ -597,6 +656,7 @@ extern int test_wasm_compile_main();
 extern int test_minify_main();
 extern int test_deps_main();
 extern int test_analysis_main();
+extern int test_complexity_main();
 extern int test_parfor_main();
 extern int test_pen_hoist_main();
 extern int test_rewrite_main();
@@ -621,7 +681,14 @@ extern int test_layq_main();
 extern int test_sstr_cons_main();
 extern int test_gc_pool_main();
 extern int test_opt_flags_main();
+extern int test_mlir_main();
 int main() {
+    // A small isolated executable-mode check for the opt-in LLVM coroutine.
+    // Most other tests explicitly require the legacy Fiber JIT; those tests
+    // must still be run with their normal default configuration.
+    if (const char* only = std::getenv("XYO_TEST_ONLY_STACKLESS_CORO");
+        only && only[0] == '1')
+        return test_scheduler_main();
     test_toNumber();
     test_digit_string_cache();
 #if defined(XYO_JIT)
@@ -638,6 +705,7 @@ int main() {
     test_rt_compare();
     test_rt_string();
     test_rt_list();
+    test_rt_list_search_simd();
     test_rgb();
     test_case_insensitive();
     test_gc();
@@ -650,6 +718,7 @@ int main() {
     int minifyFail = test_minify_main();
     int depsFail = test_deps_main();
     int analysisFail = test_analysis_main();
+    int complexityFail = test_complexity_main();
     int parforFail = test_parfor_main();
     int penHoistFail = test_pen_hoist_main();
     int rewriteFail = test_rewrite_main();
@@ -674,13 +743,14 @@ int main() {
     int sstrConsFail = test_sstr_cons_main();
     int gcPoolFail = test_gc_pool_main();
     int optFlagsFail = test_opt_flags_main();
+    int mlirFail = test_mlir_main();
     return (g_fail + e2eFail + penFail + aotFail + wasmEmitFail +
-            wasmCompileFail + minifyFail + depsFail + analysisFail + parforFail + penHoistFail + rewriteFail +
+            wasmCompileFail + minifyFail + depsFail + analysisFail + complexityFail + parforFail + penHoistFail + rewriteFail +
             parallelStringsFail + schedulerFail +
             equalityLiteralFail + colorFastFail + motionNumericFail + slotHoistFail +
             listCodegenBoundsFail + nanCodegenFail + literalContextFail + numericPromotionFail + typeProfileFail + dangerFail + listStringInternFail +
             glChunkPlanFail + scratchCompatFail + listLimitFail + listReadMemoFail + sstrConsFail + gcPoolFail +
-            optFlagsFail + layqFail)
+            optFlagsFail + layqFail + mlirFail)
                ? 1
                : 0;
 }

@@ -108,7 +108,7 @@ void waitThreads(JitCtx* c, std::vector<Thread*>& started) {
 }
 
 /// sayforsecs/thinkforsecs 相当: バブル更新 + WaitEntry + PROMISE_WAIT
-void bubbleForSecs(JitCtx* c, const char* type, Value msg, double secs) {
+void bubbleForSecsBegin(JitCtx* c, const char* type, Value msg, double secs) {
     updateBubble(c->target, type, msg);
     Target* t = c->target;
     Runtime* rt = c->runtime;
@@ -120,6 +120,10 @@ void bubbleForSecs(JitCtx* c, const char* type, Value msg, double secs) {
     w.bubbleUsageId = t->bubbleUsageId;
     rt->enqueueWait(w);
     c->runtime->transitionThread(*c->thread, STATUS_PROMISE_WAIT);
+}
+
+void bubbleForSecs(JitCtx* c, const char* type, Value msg, double secs) {
+    bubbleForSecsBegin(c, type, msg, secs);
     xyo_yield(c);
 }
 
@@ -134,13 +138,18 @@ void setMonitorVisible(JitCtx* c, const char* id, bool visible) {
     if (Block* b = edit.getBlock(id)) b->isMonitored = visible;
 }
 
-void promiseNextTick(JitCtx* c) {
+int32_t promiseNextTickBegin(JitCtx* c) {
     Runtime::WaitEntry w;
     w.thread = c->thread;
     w.nextTick = true;
     w.deadlineMs = c->runtime->currentMSecs + 1.0;
     c->runtime->enqueueWait(w);
     c->runtime->transitionThread(*c->thread, STATUS_PROMISE_WAIT);
+    return 1;
+}
+
+void promiseNextTick(JitCtx* c) {
+    promiseNextTickBegin(c);
     xyo_yield(c);
 }
 
@@ -184,6 +193,32 @@ uint64_t xyo_letterof(uint64_t letter, uint64_t s) {
     if (!ir::invokeHostEffect(ir::HostEffectOp::LetterOf, letter, s, 0, result))
         return val::kUndefined;
     return result;
+}
+// letter of <idx> == <1 文字定数> を、1 文字文字列を作らずに比較する。
+// 位置の解釈は rt::letterOf と同一（NaN→0、範囲外は不一致）。
+int32_t xyo_letter_eq(uint64_t letter, uint64_t str, int32_t ch) {
+    XYO_RT_PROF(kStr);
+    const Value l{letter};
+    const Value s{str};
+    double index = cast::toNumber(l) - 1.0;
+    if (std::isnan(index)) index = 0.0;
+    SStr* ss = cast::toString(s);
+    if (index < 0 || index >= static_cast<double>(ss->len)) return 0;
+    return ss->unitAt(static_cast<uint32_t>(index)) ==
+                   static_cast<char16_t>(ch)
+               ? 1
+               : 0;
+}
+/// 整数 SSA の添字版（toNumber を挟まない）。idx は 1 始まり。
+int32_t xyo_letter_eq_i(int32_t idx, uint64_t str, int32_t ch) {
+    XYO_RT_PROF(kStr);
+    SStr* ss = cast::toString(Value{str});
+    const int64_t i = static_cast<int64_t>(idx) - 1;
+    if (i < 0 || i >= static_cast<int64_t>(ss->len)) return 0;
+    return ss->unitAt(static_cast<uint32_t>(i)) ==
+                   static_cast<char16_t>(ch)
+               ? 1
+               : 0;
 }
 uint64_t xyo_strlen(uint64_t s) {
     XYO_RT_PROF(kStr);
@@ -506,6 +541,63 @@ void xyo_mot_glideto(JitCtx* c, uint64_t secs, uint64_t to) {
     if (getTargetXY(toV(to), *c->runtime, tx, ty))
         glideImpl(c, cast::toNumber(toV(secs)), tx, ty);
 }
+// Fiber-less glide: begin records the start/destination, step moves and
+// reports 0 = done, 1 = yield, 2 = warp busy.
+void xyo_mot_glidebegin_xy(JitCtx* c, uint64_t secs, uint64_t x, uint64_t y) {
+    const double s = cast::toNumber(toV(secs));
+    const double ex = cast::toNumber(toV(x));
+    const double ey = cast::toNumber(toV(y));
+    c->glideActive = 0;
+    if (s <= 0) {
+        c->target->setXY(ex, ey);
+        return;
+    }
+    c->glideStartMs = c->runtime->currentMSecs;
+    c->glideDurationMs = s * 1000.0;
+    c->glideInfinite = std::isfinite(s) ? 0 : 1;
+    c->glideStartX = c->target->x;
+    c->glideStartY = c->target->y;
+    c->glideEndX = ex;
+    c->glideEndY = ey;
+    // Non-warp glide records its destination and yields once without
+    // moving (another thread in the same frame sees the old position).
+    c->glideFirst = c->isWarp ? 0 : 1;
+    c->glideActive = 1;
+}
+
+void xyo_mot_glidebegin_to(JitCtx* c, uint64_t secs, uint64_t to) {
+    double tx, ty;
+    if (getTargetXY(toV(to), *c->runtime, tx, ty))
+        xyo_mot_glidebegin_xy(c, secs,
+                              toB(V(tx)), toB(V(ty)));
+}
+
+int32_t xyo_mot_glidestep(JitCtx* c) {
+    if (!c->glideActive) return 0;
+    Target* t = c->target;
+    if (c->glideFirst) {
+        c->glideFirst = 0;
+        if (!c->isWarp) {
+            c->thread->status = STATUS_YIELD;
+            return 1;
+        }
+    }
+    const double elapsed = c->runtime->currentMSecs - c->glideStartMs;
+    if (elapsed >= c->glideDurationMs) {
+        t->setXY(c->glideEndX, c->glideEndY);
+        c->glideActive = 0;
+        return 0;
+    }
+    const double fraction = elapsed / c->glideDurationMs;
+    t->setXY(c->glideStartX + fraction * (c->glideEndX - c->glideStartX),
+             c->glideStartY + fraction * (c->glideEndY - c->glideStartY));
+    if (!c->isWarp || c->glideInfinite || isStuck(c)) {
+        c->thread->status = STATUS_YIELD;
+        return 1;
+    }
+    return 2;
+}
+
 void xyo_mot_edgebounce(JitCtx* c) {
     XYO_RT_PROF(kBlocks);
     bounceOffEdge(c->target, c->runtime);
@@ -555,6 +647,14 @@ void xyo_looks_think(JitCtx* c, uint64_t msg) {
     XYO_RT_PROF(kBlocks);
     updateBubble(c->target, "think", toV(msg));
 }
+void xyo_looks_saybegin(JitCtx* c, uint64_t msg, uint64_t secs) {
+    XYO_RT_PROF(kBlocks);
+    bubbleForSecsBegin(c, "say", toV(msg), cast::toNumber(toV(secs)));
+}
+void xyo_looks_thinkbegin(JitCtx* c, uint64_t msg, uint64_t secs) {
+    XYO_RT_PROF(kBlocks);
+    bubbleForSecsBegin(c, "think", toV(msg), cast::toNumber(toV(secs)));
+}
 void xyo_looks_saysecs(JitCtx* c, uint64_t msg, uint64_t secs) {
     XYO_RT_PROF(kBlocks);
     bubbleForSecs(c, "say", toV(msg), cast::toNumber(toV(secs)));
@@ -584,6 +684,42 @@ void xyo_looks_nextbackdrop(JitCtx* c) {
         setBackdropArg(*c->runtime, stage,
                        V(stage->currentCostume + 1.0), true);
 }
+// Fiber-less "switch backdrop and wait": the started threads are kept on
+// the heap and polled with the same rules as waitThreads().
+void xyo_looks_backdropbegin(JitCtx* c, uint64_t backdrop) {
+    XYO_RT_PROF(kBlocks);
+    Target* stage = c->runtime->getTargetForStage();
+    if (!stage) return;
+    std::vector<Thread*> started =
+        setBackdropArg(*c->runtime, stage, toV(backdrop), false);
+    if (started.empty()) return;
+    auto* list = new std::vector<Thread*>(std::move(started));
+    c->coroJoinRefs = list;
+    c->joinRefs = list;
+}
+
+int32_t xyo_looks_backdropstep(JitCtx* c) {
+    if (!c->coroJoinRefs) return 0;
+    Runtime* rt = c->runtime;
+    bool waiting = false, allWaiting = true;
+    for (Thread* t : *c->coroJoinRefs) {
+        if (rt->containsThread(t)) {
+            waiting = true;
+            if (!rt->isWaitingThread(t)) allWaiting = false;
+        }
+    }
+    if (!waiting) {
+        delete c->coroJoinRefs;
+        c->coroJoinRefs = nullptr;
+        c->joinRefs = nullptr;
+        c->thread->status = STATUS_RUNNING;
+        return 0;
+    }
+    if (!allWaiting && c->isWarp && !waitShouldYield(c)) return 2;
+    c->thread->status = allWaiting ? STATUS_YIELD_TICK : STATUS_YIELD;
+    return 1;
+}
+
 void xyo_looks_switchbackdropwait(JitCtx* c, uint64_t backdrop) {
     XYO_RT_PROF(kBlocks);
     Target* stage = c->runtime->getTargetForStage();
@@ -767,7 +903,7 @@ uint64_t xyo_sns_answer(JitCtx* c) {
     XYO_RT_PROF(kBlocks);
     return toB(VS(c->runtime->answer));
 }
-void xyo_sns_askwait(JitCtx* c, uint64_t question) {
+static void askBegin(JitCtx* c, uint64_t question) {
     XYO_RT_PROF(kBlocks);
     Runtime* rt = c->runtime;
     Target* t = c->target;
@@ -791,6 +927,14 @@ void xyo_sns_askwait(JitCtx* c, uint64_t question) {
         }
     }
     c->runtime->transitionThread(*c->thread, STATUS_PROMISE_WAIT);
+}
+
+void xyo_sns_askbegin(JitCtx* c, uint64_t question) {
+    askBegin(c, question);
+}
+
+void xyo_sns_askwait(JitCtx* c, uint64_t question) {
+    askBegin(c, question);
     xyo_yield(c);
 }
 uint64_t xyo_sns_of(JitCtx* c, uint64_t obj, uint64_t prop) {
@@ -861,6 +1005,20 @@ void xyo_ctl_createclone(JitCtx* c, uint64_t opt) {
     if (!cloneTarget) return;
     createCloneForTarget(cloneTarget, c->runtime);
 }
+// Fiber-less "delete this clone": returns 1 when the thread ended, 0 when
+// the target is the original sprite (the script continues, matching the
+// legacy helper's early return).
+int32_t xyo_ctl_deleteclone_begin(JitCtx* c) {
+    XYO_RT_PROF(kBlocks);
+    Target* t = c->target;
+    if (t->isOriginal) return 0;
+    c->runtime->disposeTarget(t);
+    c->runtime->stopForTarget(t, nullptr);
+    c->stopped = 1;
+    c->runtime->transitionThread(*c->thread, STATUS_DONE);
+    return 1;
+}
+
 void xyo_ctl_deleteclone(JitCtx* c) {
     XYO_RT_PROF(kBlocks);
     Target* t = c->target;
@@ -882,6 +1040,16 @@ void xyo_snd_play(JitCtx* c, uint64_t menu) {
     int idx = getSoundIndex(toV(menu), t);
     if (idx >= 0)
         startSoundPlayback(t, t->sprite->sounds[idx].soundId, nullptr);
+}
+void xyo_snd_playbegin(JitCtx* c, uint64_t menu) {
+    XYO_RT_PROF(kBlocks);
+    Target* t = c->target;
+    if (!t->sprite || !t->sprite->soundBank) return;
+    int idx = getSoundIndex(toV(menu), t);
+    if (idx >= 0) {
+        c->runtime->transitionThread(*c->thread, STATUS_PROMISE_WAIT);
+        startSoundPlayback(t, t->sprite->sounds[idx].soundId, c->thread);
+    }
 }
 void xyo_snd_playwait(JitCtx* c, uint64_t menu) {
     XYO_RT_PROF(kBlocks);
@@ -924,6 +1092,54 @@ static void sndEffectImpl(JitCtx* c, uint64_t value, uint64_t effect,
     if (rt->miscLimits) promiseNextTick(c);
     else rt->redrawRequested = true;
 }
+static int32_t sndEffectBegin(JitCtx* c, uint64_t value, uint64_t effect,
+                               bool change) {
+    std::u16string e = u16lower(toV(effect));
+    std::string e8 = SStr::toUtf8(e);
+    double val = cast::toNumber(toV(value));
+    Target* t = c->target;
+    if (e8 != "pitch" && e8 != "pan") return 0;
+    if (!t->soundEffects.count(e8)) {
+        t->soundEffects["pitch"] = 0;
+        t->soundEffects["pan"] = 0;
+    }
+    if (change) t->soundEffects[e8] += val;
+    else t->soundEffects[e8] = val;
+    Runtime* rt = c->runtime;
+    double lo, hi;
+    if (e8 == "pitch") { lo = rt->miscLimits ? -360 : -1000;
+                         hi = rt->miscLimits ? 360 : 1000; }
+    else { lo = -100; hi = 100; }
+    t->soundEffects[e8] = std::min(std::max(t->soundEffects[e8], lo), hi);
+    if (rt->miscLimits) return promiseNextTickBegin(c);
+    rt->redrawRequested = true;
+    return 0;
+}
+
+static int32_t sndVolumeBegin(JitCtx* c, uint64_t vol, bool change) {
+    double volume = cast::toNumber(toV(vol));
+    if (change) volume += c->target->volume;
+    volume = std::min(std::max(volume, 0.0), 100.0);
+    c->target->volume = volume;
+    Runtime* rt = c->runtime;
+    if (rt->miscLimits) return promiseNextTickBegin(c);
+    rt->redrawRequested = true;
+    return 0;
+}
+
+int32_t xyo_snd_seteffect_begin(JitCtx* c, uint64_t value, uint64_t effect) {
+    return sndEffectBegin(c, value, effect, false);
+}
+int32_t xyo_snd_changeeffect_begin(JitCtx* c, uint64_t value, uint64_t effect) {
+    return sndEffectBegin(c, value, effect, true);
+}
+int32_t xyo_snd_setvolume_begin(JitCtx* c, uint64_t vol) {
+    return sndVolumeBegin(c, vol, false);
+}
+int32_t xyo_snd_changevolume_begin(JitCtx* c, uint64_t vol) {
+    return sndVolumeBegin(c, vol, true);
+}
+
 void xyo_snd_seteffect(JitCtx* c, uint64_t value, uint64_t effect) {
     XYO_RT_PROF(kBlocks);
     sndEffectImpl(c, value, effect, false);

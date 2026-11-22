@@ -5,12 +5,14 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace xyo {
 class Thread;
 class Runtime;
 struct Block;
 struct CompiledScript;
+struct MegaDispatchCode;
 namespace ir { struct ScratchNumericKernel; struct ScratchCompilationUnit; }
 
 // Callable shared-CFG numeric kernel. The backend owns executable code for
@@ -49,6 +51,14 @@ public:
     virtual std::shared_ptr<NumericJitCode> compileNumeric(
         std::shared_ptr<const ir::ScratchNumericKernel>,
         uint64_t) { return {}; }
+
+    // Opt-in: a single native switch(pc) for a small group of independent
+    // non-yielding Scratch threads. Unsupported backends return nullptr.
+    virtual std::shared_ptr<MegaDispatchCode> compileMegaDispatch(
+        const std::vector<Thread*>&, Runtime&, uint64_t) { return {}; }
+    // Stackless, per-Thread-PC repeat continuation. Never uses a Fiber.
+    virtual std::shared_ptr<MegaDispatchCode> compileMegaYieldBatch(
+        const std::vector<Thread*>&, Runtime&, uint64_t) { return {}; }
 
     // Optional native-object support for the pre-existing AOT format.
     // WebAssembly backends may reject native objects without affecting JIT.

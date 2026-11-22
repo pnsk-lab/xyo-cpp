@@ -319,6 +319,9 @@ public:
     std::unique_ptr<Blocks> flyoutBlocks;
     std::unordered_map<std::string, HatMeta> hats;
     std::unordered_map<std::string, PrimFn> primitives;
+    /// opcode → 拡張インスタンス（registerPrimitive の第3引数）。
+    /// 値は登録者の所有。Runtime は寿命を管理しない。
+    std::unordered_map<std::string, void*> primitiveContexts;
     std::unordered_map<std::string, FlowingFlags> flowing;
 
     /// monitorBlockInfo: opcode → {isSpriteSpecific, getId} 相当
@@ -393,6 +396,7 @@ public:
     // --- コアブロックパッケージ状態 ---
     double controlCounter = 0;                    // control_get_counter
     std::u16string answer;                        // sensing_answer
+    SStr* usernameRoot = nullptr;                 // rooted sensing_username
     struct AskEntry {                             // ask and wait キュー
         std::u16string question;
         Thread* thread;
@@ -440,6 +444,10 @@ public:
 
     bool compilerOptionsEnabled = true;   // argument 'is compiled?' 用
     std::string origin;                    // meta.origin（sb3）
+    /// 拡張のプロジェクト全体 storage（sb3 の extensionStorage）
+    std::map<std::string, JsonValue> extensionStorage;
+    /// 拡張 id → URL（sb3 の extensionURLs）。既定では自動取得しない。
+    std::map<std::string, std::string> extensionURLs;
 
     // --- 実行状態 ---
     int projectRunStatus = 0;
@@ -477,12 +485,35 @@ public:
         auto it = hats.find(opcode);
         return it != hats.end() && it->second.edgeActivated;
     }
+    /// True when any executable target has a script whose top block is an
+    /// edge-activated hat. Headless run loops use this to keep polling after
+    /// the last thread finished (a timer/touching hat may fire later).
+    bool hasEdgeActivatedHatScripts() {
+        for (auto& [opcode, meta] : hats) {
+            if (!meta.edgeActivated) continue;
+            for (Target* target : executableTargets) {
+                if (target && target->blocks &&
+                    !target->blocks->getRuntimeScripts(opcode).empty())
+                    return true;
+            }
+        }
+        return false;
+    }
     FlowingFlags getFlowing(const std::string& opcode) const {
         auto it = flowing.find(opcode);
         return it == flowing.end() ? FlowingFlags{} : it->second;
     }
-    void registerPrimitive(const std::string& opcode, PrimFn fn) {
+    void registerPrimitive(const std::string& opcode, PrimFn fn,
+                           void* context = nullptr) {
         primitives[opcode] = fn;
+        if (context)
+            primitiveContexts[opcode] = context;
+        else
+            primitiveContexts.erase(opcode);
+    }
+    void* getOpcodeContext(const std::string& opcode) const {
+        auto it = primitiveContexts.find(opcode);
+        return it == primitiveContexts.end() ? nullptr : it->second;
     }
     void registerHat(const std::string& opcode, HatMeta meta) { hats[opcode] = meta; }
     void registerFlowing(const std::string& opcode, FlowingFlags f) {

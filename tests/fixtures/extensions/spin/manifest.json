@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "id": "spin",
+  "name": "Spin (gas test)",
+  "color": "#123456",
+  "provider": "wasm",
+  "blocks": [
+    {"opcode": "spin_loop", "label": "spin forever", "shape": "stack"}
+  ]
+}

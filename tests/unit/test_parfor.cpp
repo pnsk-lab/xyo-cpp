@@ -14,9 +14,24 @@
 #include "jit/jit.hpp"
 #include "jit/parfor.hpp"
 #include "load/sb3.hpp"
+#if defined(XYO_JIT) && !defined(__EMSCRIPTEN__)
+#include "mlir/frontend.hpp"
+#endif
 #include "load/zip.hpp"
 #include "model/blocks.hpp"
 #include "model/target.hpp"
+
+// XYO_MLIR=1 では script が MLIR 前段でコンパイルされ、legacy codegen 固有の
+// 最適化（par-for / transient append 文字列）は走らない。意味論の検査は
+// そのまま行い、実装固有の検査だけを外す。
+static bool mlirFrontendActive() {
+#if defined(XYO_JIT) && !defined(__EMSCRIPTEN__)
+    return xyo::mlir::isEnabled();
+#else
+    return false;
+#endif
+}
+
 
 using namespace xyo;
 
@@ -310,7 +325,9 @@ void testRun(int64_t n, bool expectParallel) {
         CHECK(allOk);
     }
 #ifndef XYO_JIT_DISABLED
-    if (jitEnabled()) {
+    // XYO_MLIR=1 ではこの script 自体が MLIR フロントエンドでコンパイル
+    // されるため、legacy codegen の par-for 特殊化は走らない（結果は同じ）。
+    if (jitEnabled() && !mlirFrontendActive()) {
         if (expectParallel)
             CHECK(xyo_parfor_runs > before);
         else if (!std::getenv("XYO_PARFOR_PARALLEL_MIN") &&

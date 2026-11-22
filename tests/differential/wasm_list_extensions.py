@@ -94,8 +94,14 @@ def main() -> int:
             raise AssertionError(
                 f"{kind}: LLVM={baseline}\ninterp={interp}\n"
                 f"builtin={builtin}\nbinaryen={binaryen}")
-        if "emitter=binaryen-host" not in binaryen_log:
-            raise AssertionError(f"{kind}: Binaryen optimization not invoked")
+        # "selecting emitter=" precedes lowering; require a real compile
+        # marker so a silent interpreter fallback cannot pass this check.
+        if ("xyo-wasm-hot: compiled script=" not in binaryen_log and
+                "xyo-wasm-hot: hybrid script=" not in binaryen_log and
+                "xyo-wasm-hot: compiled shared CFG" not in binaryen_log):
+            raise AssertionError(
+                f"{kind}: Binaryen did not actually compile: "
+                f"{binaryen_log[-1500:]}")
         if kind == "late_bail" and "wasm return=1" not in binaryen_log:
             raise AssertionError("late-bail fixture failed to exercise rollback")
         print(f"PASS {kind}: LLVM / interpreter / builtin / Binaryen "

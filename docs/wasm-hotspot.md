@@ -30,7 +30,7 @@ Eligible static Scratch hats (green flag, broadcasts, key/click/backdrop events,
 
 Scripts with up to 32 sequential top-level loops (control_repeat, control_repeat_until, control_while or control_forever), excluding general nested loops, can run as resumable WASM HotSpot. The compiler creates an initial prefix, a body module per loop, a condition module for while/until, and an inter-loop suffix/prefix module which can capture the following repeat count. The Thread holds the current loop index, phase, and repeat count. Each body executes no more than one iteration between scheduler checkpoints. A forever loop does not naturally reach later statements or loops.
 
-At each non-warp loop checkpoint, the scheduler resumes the body; it never executes all iterations in one uninterruptible WASM call. Counts above one million are left to the interpreter to avoid excessive WASM host transitions. Unsupported script blocks, general non-warp nested repeats, recursive and yielding procedures, general mixed-type list mutation, drawing and I/O use the interpreter; compatible top-level regions on either side can still be JIT compiled. Common string joins, letter access, length, contains and mixed-type comparisons use the transactional host ABI. Guarded nonrecursive warp procedures with numeric arguments can be inlined; nested repeats inside these procedures use a 1024-iteration speculative fuel cap and deopt on exhaustion. Synchronous non-warp leaf procedures without loops or nested calls can also be inlined.
+At each non-warp loop checkpoint, the scheduler resumes the body; it never executes all iterations in one uninterruptible WASM call. Counts above one million are left to the interpreter to avoid excessive WASM host transitions. Unsupported script blocks, general non-warp nested repeats, non-warp or yielding recursion, recursion shapes beyond the bounded warp forms below, general mixed-type list mutation, drawing and I/O use the interpreter; compatible top-level regions on either side can still be JIT compiled. Common string joins, letter access, length, contains and mixed-type comparisons use the transactional host ABI. Guarded nonrecursive warp procedures with numeric arguments can be inlined; nested repeats inside these procedures use a 1024-iteration speculative fuel cap and deopt on exhaustion. Synchronous non-warp leaf procedures without loops or nested calls can also be inlined.
 
 ## Transactional execution and bailout
 
@@ -38,7 +38,7 @@ Every WASM segment reads the current target/stage scalar values into a per-threa
 
 When a later body/condition segment fails, the interpreter resumes at the precise loop block. For counted repeat it restores the remaining loop count on the StackFrame's ExecContext; for for-each it restores the exact induction index. For while/until/forever the interpreter re-evaluates the condition normally. Earlier successful iterations are never replayed. After a suffix failure, execution resumes directly at the suffix. The initial segment can fall back to the original entry without committing any writes. The generated code is main-thread-affine; a non-pthread Emscripten build disables the native worker pool and sampled-clock watchdog.
 
-The current model supports whole-script promotion and safe hybrid compilation on a fresh invocation, with bounded sequential-loop continuation. It does not provide arbitrary nested suspension points or general mid-loop on-stack replacement, nor native LLVM-style OSR, arbitrary recursive procedures, full mixed-type list manipulation, or native object AOT.
+The current model supports whole-script promotion and safe hybrid compilation on a fresh invocation, with bounded sequential-loop continuation. It does not provide arbitrary nested suspension points or general mid-loop on-stack replacement, nor native LLVM-style OSR, arbitrary (non-warp or argument-heavy) recursive procedures, full mixed-type list manipulation, or native object AOT. Bounded numeric warp self-recursion is compiled with a 1024-frame fuel cap and deopts to the interpreter on exhaustion.
 
 When a modulo reporter is compiled in HotSpot, it calls the existing C++ Scratch runtime fmod implementation via env.h with two f64 operand slots in the shared linear memory. This is necessary because WebAssembly has no native floating-point remainder, and n - trunc(n/m)*m can produce observably different results. Standalone emitted WASM without a host helper bails out on potentially imprecise modulo inputs rather than returning inaccurate values.
 
@@ -62,7 +62,7 @@ node web/xyo-node.mjs build-wasm-hotspot/xyo.js wasm-selftest
 
 The integration tests compare WASM HotSpot, Interpreter and optionally the native LLVM JIT on mathop operations (including NaN/infinity, unknown menu values and loop-body combinations) and numerical scripts, if/else, all four single-loop forms, broadcast and broadcast-and-wait event dispatch, string/NaN guard fallback, inter-thread type changes, and exact mid-loop/suffix interpreter continuation. Typed string joins and lexical comparisons are now compiled. Unsupported general procedures and waits are handled by hybrid interpreter regions, retaining exact scheduler behavior. Numeric list operations, string length and nonrecursive warp calls have separate regression tests. The deterministic seed-based test also exercises nested arithmetic, sequential loops and modulo, including NaN-to-number conversion and floating-point remainder precision. During fuzzing, a bug was found in loop-module construction: moving slotIds prematurely made the modulo host scratch area alias a Scratch variable. Segment compilation now retains its slot metadata until all loop modules have been emitted.
 
-**This does not mean full native LLVM-JIT feature equivalence.** The current WASM backend does not accelerate all Scratch operations or offer LLVM's compile-time optimizations, recursive call handling, OSR, async compilation or AOT. See jit-backend-compatibility.md.
+**This does not mean full native LLVM-JIT feature equivalence.** The current WASM backend does not accelerate all Scratch operations or offer LLVM's compile-time optimizations, the full range of recursive call shapes (bounded numeric warp self-recursion is supported), OSR, async compilation or AOT. See jit-backend-compatibility.md.
 
 General-purpose Scratch and cross-browser performance are not yet covered.
 
@@ -111,6 +111,21 @@ Reproduce the real Binaryen/LLVM tests:
       --sb3 scratch-bench/.cache/build/parity.sb3 \
       --addon build-wasm-hotspot-parity/binaryen-host.node
 
+One command runs the complete LLVM <-> WASM/Binaryen execution-compatibility
+sweep (13 parity/fuzz suites plus the 5 effect-ordering journal suites):
+
+    python3 tests/differential/llvm_wasm_compat_sweep.py \
+      build-wasm-hotspot-parity/xyo.js \
+      --llvm build-list-epoch/xyo \
+      --addon build-wasm-hotspot-parity/binaryen-host.node \
+      --out scratch-bench/results/compat-sweep
+
+`--quick` shortens the fuzz runs and `--only NAME` runs a single suite.
+The same harness is registered as `check-wasm-compat` in the Emscripten
+build (`-DXYO_NATIVE_LLVM_XYO=<native xyo>`). It asserts observable
+equivalence: identical final values, scheduler-visible effect counts and
+safe interpreter fallback for anything the WASM emitter does not compile.
+
 ## Typed UTF-16 string and list bridge (November 7, 2026)
 
 The compiled operator_join, operator_letter_of, operator_contains,
@@ -147,7 +162,7 @@ comparison, boolean truthiness, mixed-value list guards and late
 transactional rollback after 1000+ speculative string writes.
 
 The backend still does not compile all Scratch instructions. General
-suspension, recursive procedures, rendering/pen and sound need a fully
+suspension, non-warp/arbitrary recursive procedures, rendering/pen and sound need a fully
 effectful resumable shared IR, or the original interpreter. The 2026-11-07
 headless scratch-bench parity output matched all 2123 checks in interpreter,
 builtin WASM and Binaryen modes; the 224 graphical checks that cannot pass

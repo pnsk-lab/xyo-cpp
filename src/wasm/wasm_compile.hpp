@@ -46,6 +46,13 @@ enum class EK : uint8_t {
     ListContents, // original Scratch list formatting (tagged string)
     StringLength, // exact UTF-16 length of a rooted Scratch scalar
     DaysSince2000, // runtime host clock (millisecond precision)
+    Timer,      // project timer seconds (runtime clock snapshot per step)
+    MouseX,     // Scratch mouse x (runtime I/O device)
+    MouseY,     // Scratch mouse y
+    MouseDown,  // tagged boolean mouse button state
+    Loudness,   // sensing_loudness (runtime audio level, -1 without audio)
+    Username,   // sensing_username (rooted tagged string owned by Runtime)
+    ColorConst, // colour_picker literal (tagged color bits)
     ProcedureArgument, // numeric argument captured once at call entry
     Add,
     Sub,
@@ -69,6 +76,7 @@ struct Expr {
     uint32_t a = 0;   // 子（単項）
     uint32_t b = 0;   // 子（二項）
     uint32_t var = 0;
+    uint64_t bits = 0;  // ColorConst / tagged literal payload
 };
 
 /// 文ノード。
@@ -90,6 +98,7 @@ enum class SK : uint8_t {
     ListDelete, // numeric-only host-staged indexed deletion
     ListDeleteAll, // host-staged list clear
     ListInsert, // numeric-only indexed insertion
+    Effect,     // commit-only terminal host effect (motion x/y)
     InlineProcedure, // guard-safe, non-yielding warp procedure
     WarpTailRecurse, // bounded numeric-parameter warp tail recursion
     WarpReturnStack, // numeric warp non-tail self recursion; LIFO return continuations
@@ -136,6 +145,13 @@ struct Program {
     // execute a conditional loop in one transactional WASM invocation.
     // Non-warp loops must yield at Scratch's original scheduler boundary.
     bool allowBoundedConditionalLoop = false;
+    // HotSpot whole-script/hybrid emission additionally permits the bounded
+    // recursive-warp statements (WarpTailRecurse / WarpReturnStack /
+    // WarpReturnPcStack). They are only produced for warp procedures, never
+    // yield, and consume the same 1024-frame fuel budget so exhaustion bails
+    // back to the interpreter. Until/While/ForEach keep requiring
+    // allowBoundedConditionalLoop because they must yield per iteration.
+    bool allowBoundedRecursion = false;
     // Slot order for host ABI binding. Populated by lowerScript().
     // Manually constructed Programs may leave this empty.
     std::vector<std::string> slotIds;

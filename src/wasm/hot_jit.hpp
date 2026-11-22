@@ -34,6 +34,12 @@ struct HotCode {
     bool nestedWarpReturnStack = false;
     bool nestedWarpPcStack = false;
     uint32_t nestedFrameWords = 0;
+    // Host-reserved bounded recursion frames (AtomicWarpExecutionAbi layout)
+    // for whole-script/hybrid programs that emit WarpReturnPcStack. The
+    // generated code writes CallFrameAbi frames after the scalar slots and
+    // three helper words, so the invocation buffer must reserve them even
+    // though they are not Scratch variable slots.
+    uint32_t recursionFrameWords = 0;
     struct Loop {
         enum class Kind : uint8_t { Repeat, Until, While, Forever, ForEach };
         Kind kind = Kind::Repeat;
