@@ -1470,7 +1470,7 @@ int guiMain(const char* startDir) {
         view.hide();
         if (act == LauncherController::ResultEdit) {
             if (!runPath.empty())
-                editorMain(runPath.c_str());
+                editorMainQt(runPath.c_str());
             if (oneShot) return 0;
             continue;
         }

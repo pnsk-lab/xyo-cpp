@@ -670,6 +670,17 @@ SDL_Texture* SdlRenderer::costumeTexture(const Costume* c, double* lw,
     return s->tex;
 }
 
+bool SdlRenderer::costumePixels(const Costume* c, std::vector<uint8_t>& out,
+                                int* w, int* h) {
+    if (!c || !renderer_) return false;
+    Skin* s = decodeCostume(c);
+    if (!s || s->px.empty()) return false;
+    out = s->px;
+    if (w) *w = s->w;
+    if (h) *h = s->h;
+    return true;
+}
+
 SdlRenderer::~SdlRenderer() {
     // PBO fences and mappings require an active GL context: flush before
     // destroying SDL renderer and GL/Vulkan interop resources.

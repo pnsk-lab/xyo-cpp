@@ -27,6 +27,10 @@ void notchDown(Path& p, float x, float y);
 /// 左→右で引く天井バンプ版（C ブロックの口の天井）。
 void notchDownRev(Path& p, float x, float y);
 
+/// kind（opcode や "flag"/"tab_*"/"logo" 等）から埋め込みアイコン定義を引く。
+/// 対応するものが無ければ nullptr。
+const IconPx* iconPxFor(const std::string& kind);
+
 /// 1 ブロックを描く（lb は ws 論理座標。ox,oy = 画面上の原点、s = zoom）。
 /// sel: 選択アウトライン、glow: 実行中の黄色グロウ、alpha: 不透明度。
 /// 名前指定でブロックアイコン（埋め込み SVG 48px）を描画する。

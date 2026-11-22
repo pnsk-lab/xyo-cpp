@@ -131,6 +131,10 @@ public:
                                double* rcx, double* rcy);
     /// コスチュームの描画テクスチャ（Costumes タブ用）。装飾なしの素の見た目。
     SDL_Texture* costumeTexture(const Costume* c, double* lw, double* lh);
+    /// コスチュームのデコード済み RGBA8 ビットマップ（Qt サムネイル用）。
+    /// 見つからなければ false。out は w*h*4。
+    bool costumePixels(const Costume* c, std::vector<uint8_t>& out,
+                       int* w, int* h);
 
     /// SDL イベントを ioDevices/UI に流す。終了要求で false。
     bool pollEvents();

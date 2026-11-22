@@ -55,6 +55,46 @@ struct Path {
     void close() {}  // ポリラインは暗黙で閉じる
 };
 
+// ---- 描画先抽象 ----------------------------------------------------------
+/// icons_rgba.inc の 1 件分（埋め込み SVG アイコン、RGBA8）。
+struct IconPx { const char* name; const unsigned char* px; int w, h; };
+
+/// プリミティブの出力先。SDL 版は ui::DrawList、Qt 版は QPainter に
+/// マップされる実装を setCanvas() で設定する（フレーム先頭で 1 回）。
+/// 座標はすべてスケール適用後のデバイス px。
+class Canvas {
+public:
+    virtual ~Canvas() = default;
+    /// 凹ポリゴン塗り（xy は連続 float 配列）。
+    virtual void fillPoly(const float* xy, int n, Color c) = 0;
+    virtual void strokePoly(const float* xy, int n, Color c, float t,
+                            bool close) = 0;
+    virtual void fillRect(float x, float y, float w, float h, Color c) = 0;
+    virtual void strokeRect(float x, float y, float w, float h, Color c,
+                            float t) = 0;
+    virtual void fillRoundRect(float x, float y, float w, float h, float rad,
+                               Color c) = 0;
+    virtual void strokeRoundRect(float x, float y, float w, float h,
+                                 float rad, Color c, float t) = 0;
+    virtual void line(float x0, float y0, float x1, float y1, Color c,
+                      float t) = 0;
+    virtual void fillCircle(float cx, float cy, float rad, Color c) = 0;
+    virtual void strokeCircle(float cx, float cy, float rad, float t,
+                              Color c) = 0;
+    /// 埋め込みアイコン（48x48 RGBA）の描画。r は SDL バックエンドが
+    /// テクスチャを作るためのレンダラ（Qt 側は無視してよい）。
+    virtual void icon(const IconPx* ipx, SDL_Renderer* r, float x, float y,
+                      float w, float h, float alpha) = 0;
+    virtual void pushClip(float x0, float y0, float x1, float y1,
+                          bool intersect) = 0;
+    virtual void popClip() = 0;
+    /// アイコンのバックエンド側キャッシュを破棄（レンダラ再生成時）。
+    virtual void clearIcons() {}
+};
+
+void setCanvas(Canvas* c);
+Canvas* canvas();
+
 // ---- 塗り / 輪郭 ---------------------------------------------------------
 /// 凹ポリゴン対応の塗り（ear clipping で三角形化）。scale は描画倍率。
 void fillPath(SDL_Renderer* r, const Path& p, float s, Color c);

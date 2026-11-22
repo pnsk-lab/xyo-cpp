@@ -727,6 +727,7 @@ if(XYO_BUILD_SHELL)
                  src/shell/launcher.qrc
                  src/shell/wasm_command.cpp
                  src/shell/editor.cpp
+                 src/shell/editor_qt.cpp
                  src/blockly/shape.cpp src/blockly/layout.cpp
                  src/blockly/geom.cpp
                  src/blockly/label.cpp src/blockly/ops.cpp

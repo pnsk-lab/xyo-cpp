@@ -2042,7 +2042,7 @@ int main(int argc, char** argv) {
     if (std::strcmp(cmd, "analyze") == 0) return cmdAnalyze(argc, argv);
     if (std::strcmp(cmd, "minify") == 0) return cmdMinify(argc, argv);
     if (std::strcmp(cmd, "rewrite") == 0) return cmdRewrite(argc, argv);
-    if (std::strcmp(cmd, "edit") == 0) return editorMain(argv[2], g_danger);
+    if (std::strcmp(cmd, "edit") == 0) return editorMainQt(argv[2], g_danger);
     if (std::strcmp(cmd, "test") == 0) return cmdTest(argv[2]);
     return usage();
 }

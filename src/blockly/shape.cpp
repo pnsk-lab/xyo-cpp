@@ -280,31 +280,12 @@ static void emptySocket(SDL_Renderer* r, float x, float y, float w, float h,
 /// 埋め込み実 SVG ピクセル（tools/embed_icons.py 生成、48x48 RGBA8）。
 #include "icons_rgba.inc"
 
-/// アイコン名 → テクスチャ（レンダラ毎に 1 セット生成してキャッシュ）。
-static SDL_Texture* iconTex(SDL_Renderer* r, const std::string& kind) {
-    static std::map<std::string, SDL_Texture*> cache;
-    static SDL_Renderer* owner = nullptr;
-    if (owner != r) {
-        for (auto& [k, t] : cache) SDL_DestroyTexture(t);
-        cache.clear();
-        owner = r;
-    }
-    if (!r) return nullptr;
-    // kind（opcode や "flag"/"tab_*"/"logo" 等）からアイコン名を引く。
-    // 1) まず登録名と完全一致を試す（名前指定アイコン）
-    for (const auto& ic : kIconPxs) {
-        if (kind == ic.name) {
-            auto it0 = cache.find(kind);
-            if (it0 != cache.end()) return it0->second;
-            SDL_Texture* t = SDL_CreateTexture(r, SDL_PIXELFORMAT_RGBA32,
-                                               SDL_TEXTUREACCESS_STATIC, ic.w, ic.h);
-            if (!t) return nullptr;
-            SDL_UpdateTexture(t, nullptr, ic.px, ic.w * 4);
-            SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
-            cache[kind] = t;
-            return t;
-        }
-    }
+/// kind（opcode や "flag"/"tab_*"/"logo" 等）からアイコン定義を引く。
+const IconPx* iconPxFor(const std::string& kind) {
+    // 1) 登録名と完全一致（名前指定アイコン）
+    for (const auto& ic : kIconPxs)
+        if (kind == ic.name) return &ic;
+    // 2) opcode/種別からマッピング
     const char* name = nullptr;
     if (kind.rfind("tab_", 0) == 0 || kind == "logo" || kind == "globe")
         name = kind.c_str();
@@ -319,33 +300,21 @@ static SDL_Texture* iconTex(SDL_Renderer* r, const std::string& kind) {
     else if (kind.rfind("pen", 0) == 0) name = "pen";
     else if (kind.rfind("music", 0) == 0) name = "music";
     if (!name) return nullptr;
-    auto it = cache.find(name);
-    if (it != cache.end()) return it->second;
-    const IconPx* def = nullptr;
     for (const auto& ic : kIconPxs)
         if (std::string(name) == ic.name ||
-            kind.find(ic.name) != std::string::npos) { def = &ic; break; }
-    if (!def) return nullptr;
-    SDL_Texture* t = SDL_CreateTexture(r, SDL_PIXELFORMAT_RGBA32,
-                                     SDL_TEXTUREACCESS_STATIC, def->w, def->h);
-    if (!t) return nullptr;
-    SDL_UpdateTexture(t, nullptr, def->px, def->w * 4);
-    SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
-    cache[name] = t;
-    return t;
+            kind.find(ic.name) != std::string::npos) return &ic;
+    return nullptr;
 }
 
-void releaseIcons() { iconTex(nullptr, ""); }
+void releaseIcons() {
+    if (Canvas* c = canvas()) c->clearIcons();
+}
 
 bool drawBlockIcon(SDL_Renderer* r, const std::string& name,
                    float x, float y, float w, float h, float alpha) {
-    SDL_Texture* t = iconTex(r, name);
-    if (!t) return false;
-    ui::DrawList* dl = drawList();
-    if (!dl) return false;
-    int a = std::min(255, (int)(alpha * 255));
-    dl->AddImage((ui::TextureID)(uintptr_t)t, {x, y}, {x + w, y + h},
-                 {0, 0}, {1, 1}, ui::rgba(255, 255, 255, a));
+    const IconPx* ipx = iconPxFor(name);
+    if (!ipx || !canvas()) return false;
+    canvas()->icon(ipx, r, x, y, w, h, alpha);
     return true;
 }
 
@@ -353,14 +322,11 @@ bool drawBlockIcon(SDL_Renderer* r, const std::string& name,
 static void icon(SDL_Renderer* r, const std::string& kind, float x, float y,
                  float s, float alpha) {
     Color white{255, 255, 255, 255};
-    if (SDL_Texture* t = iconTex(r, kind)) {
-        if (ui::DrawList* dl = drawList()) {
-            int a = std::min(255, (int)(alpha * 255));
-            dl->AddImage((ui::TextureID)(uintptr_t)t, {x * s, y * s},
-                         {(x + 24) * s, (y + 24) * s}, {0, 0}, {1, 1},
-                         ui::rgba(255, 255, 255, a));
+    if (const IconPx* ipx = iconPxFor(kind)) {
+        if (Canvas* c = canvas()) {
+            c->icon(ipx, r, x * s, y * s, 24 * s, 24 * s, alpha);
+            return;
         }
-        return;
     }
     if (kind.find("stop") != std::string::npos ||
         kind.find("execute") != std::string::npos) {
