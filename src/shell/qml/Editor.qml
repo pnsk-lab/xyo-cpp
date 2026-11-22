@@ -25,6 +25,16 @@ Item {
     readonly property color cGreen: "#45993D"
     readonly property color cStop: "#EC5959"
 
+    // ステージサイズモード（scratch-gui stage-size-toggle 準拠:
+    // small / large / fullscreen）
+    property bool stageLarge: false
+    property bool stageFull: false
+    function setStageMode(m) {
+        stageLarge = (m >= 1)
+        stageFull = (m === 2)
+        if (m < 2) editor.persistStageMode(m)
+    }
+
     // ---- キー入力（ステージへ転送 + ショートカット）----
     Keys.onPressed: function(ev) {
         if (ev.modifiers & Qt.ControlModifier) {
@@ -45,6 +55,7 @@ Item {
 
     // ---- レイアウト ----
     // menuBar(44) + tabs(44) + 主行 + 右列。
+    Component.onCompleted: setStageMode(editor.loadStageMode())
     ColumnLayout {
         anchors.fill: parent
         spacing: 0
@@ -126,6 +137,9 @@ Item {
                 Layout.maximumWidth: 310
                 Layout.fillHeight: true
                 spacing: 0
+                // 大ステージ時はエディタ部を隠す（scratch-gui large-stage
+                // と同等: ステージ側が全幅を占める）
+                visible: !root.stageLarge
 
                 // タブ（Code / Costumes / Sounds）
                 Rectangle {
@@ -432,6 +446,7 @@ Item {
             Item {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
+                visible: !root.stageLarge
                 BlockCanvas {
                     id: wsCanvas
                     anchors.fill: parent
@@ -789,8 +804,10 @@ Item {
 
             // ---- 右列: 緑旗/停止 + ステージ + スプライト ----
             ColumnLayout {
-                Layout.preferredWidth: 500
-                Layout.maximumWidth: 500
+                Layout.preferredWidth: root.stageLarge ? -1 : 500
+                Layout.maximumWidth: root.stageLarge
+                                     ? Number.POSITIVE_INFINITY : 500
+                Layout.fillWidth: root.stageLarge
                 Layout.fillHeight: true
                 spacing: 0
 
@@ -834,6 +851,64 @@ Item {
                             }
                         }
                         Item { Layout.fillWidth: true }
+                        // ステージサイズ切替（toggle-buttons.css 準拠:
+                        // 連結 34×34 ボタン、選択=青薄 + フルスクリーン）
+                        Rectangle {
+                            width: 68; height: 34; radius: 4
+                            color: "white"; border.color: cBorder
+                            Row {
+                                anchors.fill: parent
+                                Rectangle {   // small stage
+                                    width: 34; height: 34; radius: 4
+                                    color: !root.stageLarge
+                                           ? "#CDDCF7" : "white"
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: "▫"
+                                        font.pixelSize: 15
+                                        color: root.stageLarge
+                                               ? "#8691A7" : "#4C97FF"
+                                    }
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        onClicked: root.setStageMode(0)
+                                    }
+                                }
+                                Rectangle { width: 1; height: 34
+                                            color: cBorder }
+                                Rectangle {   // large stage
+                                    width: 33; height: 34; radius: 4
+                                    color: root.stageLarge
+                                           ? "#CDDCF7" : "white"
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: "▢"
+                                        font.pixelSize: 15
+                                        color: root.stageLarge
+                                               ? "#4C97FF" : "#8691A7"
+                                    }
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        onClicked: root.setStageMode(1)
+                                    }
+                                }
+                            }
+                        }
+                        // フルスクリーン（stage-header の expand アイコン）
+                        Rectangle {
+                            width: 34; height: 34; radius: 4
+                            color: fullMa.containsMouse ? "#F0F4FA" : "white"
+                            border.color: cBorder
+                            Text {
+                                anchors.centerIn: parent
+                                text: "⛶"; font.pixelSize: 16; color: cFg
+                            }
+                            MouseArea {
+                                id: fullMa; anchors.fill: parent
+                                hoverEnabled: true
+                                onClicked: root.setStageMode(2)
+                            }
+                        }
                     }
                     Rectangle { anchors.bottom: parent.bottom
                                 width: parent.width; height: 1
@@ -884,7 +959,8 @@ Item {
                 Rectangle {
                     id: spInfoPanel
                     Layout.fillWidth: true
-                    Layout.preferredHeight: 76
+                    Layout.preferredHeight: (root.stageLarge || root.stageFull)
+                                            ? 44 : 76
                     color: cPanel
                     Rectangle { anchors.top: parent.top
                                 width: parent.width; height: 1
@@ -975,10 +1051,13 @@ Item {
                                 }
                             }
                         }
-                        // 行2: Show トグル + Size + Direction（stage は非表示）
+                        // 行2: Show トグル + Size + Direction（stage は非表示、
+                        // small stage 時も sprite-info.jsx small 分岐で非表示）
                         RowLayout {
                             spacing: 8
                             visible: editor.spriteInfo.length > 2
+                                     && !root.stageLarge
+                                     && !root.stageFull
                             Text { text: "Show"; color: cFgDim
                                    font.pixelSize: 11 }
                             // 連結トグル（toggle-buttons.css 準拠）
@@ -1044,10 +1123,12 @@ Item {
                             Text { text: "Direction"; color: cFgDim
                                    font.pixelSize: 11 }
                             Rectangle {
+                                id: dirInput
                                 Layout.preferredWidth: 52
                                 Layout.preferredHeight: 28; radius: 14
                                 color: "white"; border.color: cBorder
                                 TextInput {
+                                    id: dirText
                                     anchors.fill: parent
                                     horizontalAlignment: TextInput.AlignHCenter
                                     verticalAlignment: TextInput.AlignVCenter
@@ -1060,6 +1141,122 @@ Item {
                                         if (!activeFocus)
                                             editor.setSpriteDirection(
                                                 parseFloat(text))
+                                }
+                                // ダブルクリック/クリックで DirectionPicker
+                                MouseArea {
+                                    anchors.fill: parent
+                                    propagateComposedEvents: true
+                                    onClicked: function(m) {
+                                        dirPicker.popup(dirInput,
+                                                        dirInput.width + 4, 0)
+                                        m.accepted = true
+                                    }
+                                }
+                                // DirectionPicker 準拠: 方向ダイヤル +
+                                // 回転スタイル3ボタン
+                                Popup {
+                                    id: dirPicker
+                                    width: 190; height: 190
+                                    padding: 10
+                                    onOpened: dirDial.reqUpdate()
+                                    background: Rectangle {
+                                        color: "white"
+                                        border.color: "#DDDDDD"
+                                        radius: 4
+                                    }
+                                    contentItem: Item {
+                                        // 中央ダイヤル（方向へ回転する矢印）
+                                        Canvas {
+                                            id: dirDial
+                                            anchors.centerIn: parent
+                                            width: 150; height: 150
+                                            signal reqUpdate()
+                                            onReqUpdate: requestPaint()
+                                            onPaint: {
+                                                var ctx = getContext("2d")
+                                                ctx.reset()
+                                                var cx = 75, cy = 75, r = 66
+                                                ctx.fillStyle = "#F5F7FA"
+                                                ctx.beginPath()
+                                                ctx.arc(cx, cy, r, 0,
+                                                        Math.PI * 2)
+                                                ctx.fill()
+                                                ctx.strokeStyle = "#D5D9E2"
+                                                ctx.lineWidth = 1
+                                                ctx.stroke()
+                                                var d = editor.spriteInfo[4] || 0
+                                                var a = (d - 90) * Math.PI / 180
+                                                var len = 52
+                                                ctx.strokeStyle = "#4C97FF"
+                                                ctx.lineWidth = 3
+                                                ctx.beginPath()
+                                                ctx.moveTo(cx, cy)
+                                                ctx.lineTo(
+                                                    cx + Math.cos(a) * len,
+                                                    cy + Math.sin(a) * len)
+                                                ctx.stroke()
+                                                ctx.fillStyle = "#4C97FF"
+                                                ctx.beginPath()
+                                                ctx.arc(cx, cy, 4, 0,
+                                                        Math.PI * 2)
+                                                ctx.fill()
+                                            }
+                                            MouseArea {
+                                                anchors.fill: parent
+                                                function set(m) {
+                                                    var dx = m.x - 75
+                                                    var dy = m.y - 75
+                                                    var d = Math.atan2(dy, dx)
+                                                            * 180 / Math.PI + 90
+                                                    d = Math.round(d)
+                                                    if (d > 180) d -= 360
+                                                    editor.setSpriteDirection(d)
+                                                    dirDial.requestPaint()
+                                                }
+                                                onPressed: set
+                                                onPositionChanged: set
+                                            }
+                                        }
+                                        // 回転スタイル 3 ボタン（左列、上から）
+                                        Column {
+                                            x: 0; y: 0; spacing: 4
+                                            Repeater {
+                                                model: [
+                                                    { t: "↻", s: "all around" },
+                                                    { t: "↔", s: "left-right" },
+                                                    { t: "•", s: "don't rotate" }
+                                                ]
+                                                delegate: Rectangle {
+                                                    required property var modelData
+                                                    property int rev:
+                                                        editor.layoutRev
+                                                    property bool sel: {
+                                                        var n = rev
+                                                        return editor.spriteRotStyle()
+                                                               === modelData.s
+                                                    }
+                                                    width: 22; height: 22
+                                                    radius: 11
+                                                    color: sel ? "#CDDCF7"
+                                                               : "white"
+                                                    border.color: "#4C97FF"
+                                                    Text {
+                                                        anchors.centerIn: parent
+                                                        text: modelData.t
+                                                        font.pixelSize: 12
+                                                        color: "#4C97FF"
+                                                    }
+                                                    MouseArea {
+                                                        anchors.fill: parent
+                                                        onClicked: {
+                                                            editor.setSpriteRotStyle(
+                                                                modelData.s)
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1396,6 +1593,68 @@ Item {
                     }
                 }
             }
+        }
+    }
+
+    // ---- フルスクリーンステージ（stage-wrapper.css 準拠:
+    // $ui-white 背景・4:3 中央配置。Esc で復帰）----
+    Rectangle {
+        id: fullStage
+        visible: root.stageFull
+        anchors.fill: parent
+        color: "white"
+        z: 100
+        focus: visible
+        Keys.onEscapePressed: root.setStageMode(0)
+        Item {
+            anchors.centerIn: parent
+            width: Math.min(parent.width, parent.height * 4 / 3)
+            height: width * 0.75
+            StageItem {
+                anchors.fill: parent
+                ctrl: editor
+                onWidthChanged: editor.setStageDisplay(width, height)
+                onHeightChanged: editor.setStageDisplay(width, height)
+            }
+            // ステージ入力（既存 stageItem と同じ合成 SDL_Event 経路）
+            MouseArea {
+                anchors.fill: parent
+                onPressed: function(m) {
+                    var p = mapToItem(parent.children[0], m.x, m.y)
+                    editor.stageMouseDown(p.x, p.y)
+                }
+                onPositionChanged: function(m) {
+                    var p = mapToItem(parent.children[0], m.x, m.y)
+                    editor.stageMouseMove(p.x, p.y)
+                }
+                onReleased: function(m) {
+                    var p = mapToItem(parent.children[0], m.x, m.y)
+                    editor.stageMouseUp(p.x, p.y)
+                }
+            }
+        }
+        // 復帰ボタン（右上）
+        Rectangle {
+            anchors.top: parent.top
+            anchors.right: parent.right
+            anchors.margins: 12
+            width: 34; height: 34; radius: 4
+            color: shrinkMa.containsMouse ? "#F0F4FA" : "white"
+            border.color: cBorder
+            Text { anchors.centerIn: parent; text: "⛶"
+                   font.pixelSize: 16; color: cFg }
+            MouseArea {
+                id: shrinkMa; anchors.fill: parent
+                hoverEnabled: true
+                onClicked: root.setStageMode(0)
+            }
+        }
+        Text {
+            anchors.bottom: parent.bottom
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.bottomMargin: 12
+            text: "Esc or ⛶ to exit"
+            color: cFgDim; font.pixelSize: 11
         }
     }
 

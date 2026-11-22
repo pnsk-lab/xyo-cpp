@@ -25,6 +25,7 @@
 #include <QPolygonF>
 #include <QQmlContext>
 #include <QQmlEngine>
+#include <QSettings>
 #include <QQuickImageProvider>
 #include <QQuickItem>
 #include <QQuickPaintedItem>
@@ -2061,6 +2062,8 @@ public:
     float stageDispX = 0, stageDispY = 0, stageDispW = 480, stageDispH = 360;
     // キー状態 → ランタイム（ren.handleEvent へ合成 SDL_Event）
     bool mouseDown_ = false;
+    // 設定永続化（stageMode/zoom/catSel）
+    QSettings settings_{"xyo", "editor"};
 
     EditorController() { ed.tc = &tc_; }
     QtTextCtx tc_;
@@ -2099,6 +2102,7 @@ public:
         if (ed.catSel == v) return;
         ed.catSel = v;
         ed.flyDirty_ = true;
+        persistCategory();
         bumpLayout();
     }
     QVariantList spriteNames() const {
@@ -2152,6 +2156,17 @@ public:
         Target* t = ed.selected();
         if (!t || t->isStage) return;
         t->visible = v;
+        bumpLayout();
+    }
+    Q_INVOKABLE QString spriteRotStyle() const {
+        Target* t = const_cast<EdCore&>(ed).selected();
+        if (!t) return {};
+        return QString::fromStdString(t->rotationStyle);
+    }
+    Q_INVOKABLE void setSpriteRotStyle(const QString& s) {
+        Target* t = ed.selected();
+        if (!t || t->isStage) return;
+        t->rotationStyle = s.toStdString();
         bumpLayout();
     }
     /// 新規スプライト（生成コスチューム付き、editor.cpp::addSprite 準拠）
@@ -2573,6 +2588,29 @@ public:
         ed.addExtension(id.toStdString());
         bumpLayout();
     }
+    // ---- 設定永続化（scratch-gui の localStorage 相当:
+    // stageMode / zoom / catSel を QSettings へ）----
+    Q_INVOKABLE int loadStageMode() const {
+        return settings_.value("stageMode", 0).toInt();
+    }
+    Q_INVOKABLE void persistStageMode(int m) {
+        settings_.setValue("stageMode", m);
+        settings_.sync();
+    }
+    Q_INVOKABLE double loadZoom() const {
+        return settings_.value("zoom", 1.0).toDouble();
+    }
+    Q_INVOKABLE void persistZoom() {
+        settings_.setValue("zoom", (double)ed.zoom);
+        settings_.sync();
+    }
+    Q_INVOKABLE int loadCategory() const {
+        return settings_.value("catSel", 0).toInt();
+    }
+    Q_INVOKABLE void persistCategory() {
+        settings_.setValue("catSel", ed.catSel);
+        settings_.sync();
+    }
 
     // ---- 右クリックコンテキストメニュー ----
     /// ws 上で右クリック: メニュー項目を構築（QML が ctxItems() で表示）。
@@ -2784,10 +2822,12 @@ public:
         float s = ed.wsScale();
         ed.panX = float(x) - (float(x) - ed.panX) * s / old;
         ed.panY = float(y) - (float(y) - ed.panY) * s / old;
+        persistZoom();
         bumpLayout();
     }
     Q_INVOKABLE void zoomBy(double f) {
         ed.zoom = std::clamp(ed.zoom * float(f), 0.3f, 3.0f);
+        persistZoom();
         bumpLayout();
     }
     Q_INVOKABLE void zoomReset() { ed.zoom = 1.0f; bumpLayout(); }
@@ -3406,6 +3446,9 @@ int xyo::editorMainQt(const char* path, bool danger) {
     view.setTitle("xyo — " + qstr(path));
     view.resize(1280, 800);
     view.show();
+    // 設定復元（zoom / catSel。stageMode は QML の Component.onCompleted から）
+    ctrl.ed.zoom = (float)ctrl.loadZoom();
+    ctrl.setCategorySel(ctrl.loadCategory());
 
     // 実行/描画 tick: ランタイム step + ステージ再描画 + 再描画通知
     QTimer tickTimer;
@@ -3517,6 +3560,8 @@ int xyo::editorMainQt(const char* path, bool danger) {
                     ctrl.spriteReorder(p[0].toInt(), p[1].toInt());
             }
             else if (a == "spradd") ctrl.addSprite();
+            else if (a.startsWith("sprrot:"))
+                ctrl.setSpriteRotStyle(a.mid(7));
             else if (a.startsWith("addext:"))
                 ctrl.addExtension(a.mid(7));
             else if (a.startsWith("sprname:"))
@@ -3525,6 +3570,15 @@ int xyo::editorMainQt(const char* path, bool danger) {
                 ctrl.setSpriteX(a.mid(5).toDouble());
             else if (a.startsWith("spry:"))
                 ctrl.setSpriteY(a.mid(5).toDouble());
+            else if (a.startsWith("catg:"))
+                ctrl.setCategorySel(a.mid(5).toInt());
+            else if (a.startsWith("stage:")) {
+                // stage:<0|1|2> — small/large/fullscreen
+                if (QObject* ro = view.rootObject())
+                    QMetaObject::invokeMethod(ro, "setStageMode",
+                                              Q_ARG(QVariant,
+                                                    a.mid(6).toInt()));
+            }
             else if (a.startsWith("key:")) {
                 // key:<letter|space|up|down|left|right|return> — down+up
                 const QString k = a.mid(4);
