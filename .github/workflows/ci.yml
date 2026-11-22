@@ -102,7 +102,10 @@ jobs:
       # Long-running nested warp/OSR and native deopt use a separate Linux job.
       # Keep this job below its 45-minute timeout without dropping coverage.
       - name: Test (ctest; native continuation suite runs separately)
-        run: ctest --test-dir build --output-on-failure -E '^(xyo-nested-warp-|xyo-native-simple-deopt-parity$)'
+        # MLIR はユーザー向けに既定 ON だが、この ctest 群は従来 codegen の
+        # IR 形状・意味論を直接検査するため、従来経路を明示する
+        # （MLIR 自体は tests/mlir/xcheck.py と differential で検証している）。
+        run: XYO_MLIR=0 ctest --test-dir build --output-on-failure -E '^(xyo-nested-warp-|xyo-native-simple-deopt-parity$)'
 
       - name: Smoke (run / play / gui)
         run: |
