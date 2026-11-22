@@ -706,18 +706,116 @@ Item {
                     }
                     property var cur: (sel >= 0 && sel < items.length)
                                       ? items[sel] : null
+                    // paint-editor ツール（旧 editor.cpp 同様、選択状態のみ）
+                    property int paintTool: 0
+                    property real paintZoom: 1.0
+                    // tools row（fixed-tools.jsx/mode-tools.jsx 準拠:
+                    // 名前 | undo/redo | Group/Ungroup | Forward/Backward/
+                    // Front/Back）。サウンドタブでは名前行のみ。
+                    Row {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        visible: editor.tab === 1
+                        spacing: 4
+                        // undo/redo（fixed-tools.jsx の先頭相当、機能する）
+                        Repeater {
+                            model: ["↶", "↷"]
+                            delegate: Rectangle {
+                                required property var modelData
+                                required property int index
+                                width: 26; height: 24; radius: 12
+                                color: peUrMa.containsMouse
+                                       ? "#EDF1F5" : "white"
+                                border.color: cBorder
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: modelData
+                                    font.pixelSize: 12; color: cFg
+                                }
+                                MouseArea {
+                                    id: peUrMa; anchors.fill: parent
+                                    hoverEnabled: true
+                                    onClicked: index === 0 ? editor.undo()
+                                                           : editor.redo()
+                                }
+                            }
+                        }
+                        Repeater {
+                            model: ["Group", "Ungroup", "Forward",
+                                    "Backward", "Front", "Back"]
+                            delegate: Rectangle {
+                                required property var modelData
+                                required property int index
+                                width: index < 2 ? 66 : 60
+                                height: 24; radius: 12
+                                color: "white"; border.color: cBorder
+                                opacity: 0.45   // 旧版同様 disabled 表示
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: modelData
+                                    font.pixelSize: 10; color: cFg
+                                }
+                            }
+                        }
+                    }
                     Column {
                         anchors.centerIn: parent
                         spacing: 14
-                        // プレビュー（コスチューム画像 or 再生ボタン）
-                        Rectangle {
+                        // プレビュー（コスチューム画像 or 波形）
+                        // コスチュームタブは左に mode-selector ツール列
+                        Row {
                             anchors.horizontalCenter: parent.horizontalCenter
-                            width: 320; height: 240; radius: 8
-                            color: "white"; border.color: cBorder
-                            Image {
+                            spacing: 8
+                            // ツール列（mode-selector: 2 列 wrap、選択=紫）
+                            Flow {
+                                visible: editor.tab === 1
+                                width: 76; spacing: 3
+                                Repeater {
+                                    model: [
+                                        { i: "◱", n: "Select" },
+                                        { i: "◉", n: "Reshape" },
+                                        { i: "✎", n: "Brush" },
+                                        { i: "◌", n: "Eraser" },
+                                        { i: "▩", n: "Fill" },
+                                        { i: "T",  n: "Text" },
+                                        { i: "―", n: "Line" },
+                                        { i: "◯", n: "Oval" },
+                                        { i: "▭", n: "Rect" }
+                                    ]
+                                    delegate: Rectangle {
+                                        required property var modelData
+                                        required property int index
+                                        width: 36; height: 36; radius: 4
+                                        color: assetDetail.paintTool === index
+                                               ? "#CDDCF7" : "white"
+                                        border.color: assetDetail.paintTool
+                                                      === index
+                                                      ? "#4C97FF" : cBorder
+                                        Text {
+                                            anchors.centerIn: parent
+                                            text: modelData.i
+                                            font.pixelSize: 14
+                                            color: assetDetail.paintTool
+                                                   === index
+                                                   ? "#4C97FF" : cFgDim
+                                        }
+                                        MouseArea {
+                                            anchors.fill: parent
+                                            onClicked:
+                                                assetDetail.paintTool = index
+                                        }
+                                    }
+                                }
+                            }
+                            Rectangle {
+                                width: 320; height: 240; radius: 8
+                                color: "white"; border.color: cBorder
+                                clip: true
+                                Image {
                                 visible: editor.tab === 1
                                 anchors.fill: parent
                                 anchors.margins: 10
+                                scale: assetDetail.paintZoom
+                                transformOrigin: Item.Center
                                 source: assetDetail.cur
                                         ? "image://xyocostume/" +
                                           editor.selTarget + "_" +
@@ -725,6 +823,47 @@ Item {
                                           editor.layoutRev
                                         : ""
                                 fillMode: Image.PreserveAspectFit
+                            }
+                            // キャンバス右下の zoom グループ（−/⌂/+）
+                            Row {
+                                visible: editor.tab === 1
+                                anchors.right: parent.right
+                                anchors.bottom: parent.bottom
+                                anchors.margins: 6
+                                spacing: 2
+                                Repeater {
+                                    model: ["−", "⌂", "+"]
+                                    delegate: Rectangle {
+                                        required property var modelData
+                                        required property int index
+                                        width: 26; height: 26; radius: 4
+                                        color: zoomMa.containsMouse
+                                               ? "#EDF1F5" : "white"
+                                        border.color: cBorder
+                                        Text {
+                                            anchors.centerIn: parent
+                                            text: modelData
+                                            font.pixelSize: 12; color: cFg
+                                        }
+                                        MouseArea {
+                                            id: zoomMa
+                                            anchors.fill: parent
+                                            hoverEnabled: true
+                                            onClicked: {
+                                                if (index === 0)
+                                                    assetDetail.paintZoom =
+                                                        Math.max(0.25,
+                                                            assetDetail.paintZoom / 1.25)
+                                                else if (index === 1)
+                                                    assetDetail.paintZoom = 1
+                                                else
+                                                    assetDetail.paintZoom =
+                                                        Math.min(8,
+                                                            assetDetail.paintZoom * 1.25)
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             // 波形（sound-editor.jsx wavEnvelope 準拠:
                             // 120 バケット包絡、容器 hsla(300,53%,60%,.15)）
@@ -799,7 +938,8 @@ Item {
                                     }
                                 }
                             }
-                        }
+                            }   // preview Rectangle
+                        }       // ツール列+プレビュー Row
                         // 名前 + 操作ボタン
                         Row {
                             anchors.horizontalCenter: parent.horizontalCenter
