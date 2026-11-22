@@ -25,6 +25,22 @@ Item {
     readonly property color cGreen: "#45993D"
     readonly property color cStop: "#EC5959"
 
+    // ---- 寸法定数（scratch-gui src/css/units.css 準拠、1rem=16px 換算）----
+    // $space 0.5rem / menu-bar 3rem / stage-menu 2.75rem /
+    // sprite-info 6rem / menu-bar-button 2rem / form-radius space/2
+    readonly property int uSpace:   8   // $space
+    readonly property int uMenuH:  48   // $menu-bar-height
+    readonly property int uTabH:   44   // $stage-menu-height（タブ行と共用）
+    readonly property int uBtn:    34   // stage-button = 2rem + 2px 境界
+    readonly property int uFlag:   32   // green-flag / stop-all = 2rem
+    readonly property int uSprInfo:96   // $sprite-info-height
+    readonly property int uTabW:  250   // tab-list = toolbox 幅
+    readonly property int uRadius:  4   // $form-radius
+    readonly property int uRound:   8   // タイル/大きい面の角丸 = $space
+    readonly property int uFsBody: 12   // menu-bar-standard-font-size 0.75rem
+    readonly property int uFsLbl:  10   // ラベル系 0.625rem
+    readonly property int uFsSmall: 8   // 最小ラベル 0.5rem
+
     // ステージサイズモード（scratch-gui stage-size-toggle 準拠:
     // small / large / fullscreen）
     property bool stageLarge: false
@@ -80,28 +96,28 @@ Item {
     Keys.onReleased: function(ev) { editor.keyEvent(ev.key, false); }
 
     // ---- レイアウト ----
-    // menuBar(44) + tabs(44) + 主行 + 右列。
+    // menuBar(48) + 主行。寸法は上の u* 定数（scratch-gui units.css）準拠。
     Component.onCompleted: setStageMode(editor.loadStageMode())
     ColumnLayout {
         anchors.fill: parent
         spacing: 0
 
-        // ---- メニューバー ----
+        // ---- メニューバー ($menu-bar-height = 3rem = 48px) ----
         Rectangle {
             Layout.fillWidth: true
-            Layout.preferredHeight: 44
+            Layout.preferredHeight: uMenuH
             color: cMenu
             RowLayout {
                 anchors.fill: parent
-                anchors.leftMargin: 12
-                anchors.rightMargin: 12
-                spacing: 10
-                // ロゴ
+                anchors.leftMargin: uSpace
+                anchors.rightMargin: uSpace
+                spacing: uSpace
+                // ロゴ（$menu-bar-button-size 2rem = 32px）
                 Rectangle {
-                    width: 26; height: 26; radius: 13
+                    width: uFlag; height: uFlag; radius: uFlag / 2
                     color: "#FFFFFF"; opacity: 0.9
                     Text { anchors.centerIn: parent; text: "x"; color: cMenu
-                           font.pixelSize: 15; font.bold: true }
+                           font.pixelSize: 16; font.bold: true }
                 }
                 MenuButton {
                     text: "File"
@@ -119,7 +135,7 @@ Item {
                 Item { Layout.fillWidth: true }
                 // タイトル（点線で挟む）
                 RowLayout {
-                    spacing: 8
+                    spacing: uSpace
                     Repeater {
                         model: 3
                         Rectangle { width: 3; height: 3; radius: 1.5
@@ -127,7 +143,7 @@ Item {
                     }
                     Text {
                         text: editor.projectName
-                        color: "white"; font.pixelSize: 13
+                        color: "white"; font.pixelSize: uFsBody
                     }
                     Repeater {
                         model: 3
@@ -136,12 +152,13 @@ Item {
                     }
                 }
                 Item { Layout.fillWidth: true }
-                // Save ボタン
+                // Save ボタン（32px ピル）
                 Rectangle {
-                    width: 52; height: 28; radius: 14
+                    width: 56; height: uFlag; radius: uFlag / 2
                     color: saveHov.containsMouse ? cMenuDark : "#9A7BFF"
                     Text { anchors.centerIn: parent; text: "Save"
-                           color: "white"; font.pixelSize: 12; font.bold: true }
+                           color: "white"; font.pixelSize: uFsBody
+                           font.bold: true }
                     MouseArea {
                         id: saveHov; anchors.fill: parent
                         hoverEnabled: true
@@ -158,22 +175,28 @@ Item {
             spacing: 0
 
             // ---- 左: タブ + ツールボックス + フライアウト ----
+            // tab-list 幅 250px = toolbox 幅（scratch-gui gui.css）。
+            // カテゴリレール 72px + フライアウト 250px で 322px。
             ColumnLayout {
-                Layout.preferredWidth: 310
-                Layout.maximumWidth: 310
+                Layout.preferredWidth: 322
+                Layout.maximumWidth: 322
                 Layout.fillHeight: true
                 spacing: 0
                 // 大ステージ時はエディタ部を隠す（scratch-gui large-stage
                 // と同等: ステージ側が全幅を占める）
                 visible: !root.stageLarge
 
-                // タブ（Code / Costumes / Sounds）
+                // タブ（Code / Costumes / Sounds）。
+                // scratch-gui: 高さは行の 80%（選択時 90%）、角丸 1rem、
+                // 左右 -0.5rem で重なり、選択タブが最前に来る。
                 Rectangle {
                     Layout.fillWidth: true
-                    Layout.preferredHeight: 44
-                    color: cPanel
+                    Layout.preferredHeight: uTabH
+                    color: cToolboxBg
                     Row {
-                        anchors.fill: parent
+                        width: uTabW + 16   // -8px オーバーラップ×2 分
+                        height: parent.height
+                        spacing: -8
                         Repeater {
                             model: [
                                 { name: "Code",     col: "#4C97FF" },
@@ -181,30 +204,54 @@ Item {
                                 { name: "Sounds",   col: "#CF63CF" }
                             ]
                             delegate: Item {
-                                width: parent.width / 3; height: 44
+                                width: uTabW / 3; height: uTabH
+                                z: editor.tab === index ? 4 : 3 - index
                                 Rectangle {
-                                    anchors.fill: parent
-                                    color: editor.tab === index ? cPanel : "#D9E3F2"
-                                    Rectangle {   // 上部カラー帯
-                                        width: parent.width; height: 4
+                                    anchors.bottom: parent.bottom
+                                    width: parent.width
+                                    // 非選択 80% (35px)、選択 90% (40px)
+                                    height: editor.tab === index
+                                            ? uTabH * 0.9 : uTabH * 0.8
+                                    radius: uSpace * 2   // 上角 1rem
+                                    border.color: cBorder
+                                    border.width: 1
+                                    // 選択 = $ui-white、非選択 = $ui-tertiary
+                                    color: editor.tab === index
+                                           ? cPanel : "#E5F0FF"
+                                    // 上角だけ丸くするため下端を 4px だけ
+                                    // 削り矩形で覆う
+                                    Rectangle {
+                                        anchors.bottom: parent.bottom
+                                        width: parent.width
+                                        height: parent.height / 2
+                                        color: parent.color
+                                        Rectangle {
+                                            anchors.bottom: parent.bottom
+                                            width: parent.width; height: 1
+                                            color: editor.tab === index
+                                                   ? cPanel : "transparent"
+                                        }
+                                    }
+                                    // 上部カラー帯はタブ固有の慣習を維持
+                                    Rectangle {
+                                        width: parent.width - 12; height: 4
+                                        anchors.top: parent.top
+                                        anchors.topMargin: 6
+                                        anchors.horizontalCenter:
+                                            parent.horizontalCenter
+                                        radius: 2
                                         color: modelData.col
                                         visible: editor.tab === index
                                     }
-                                    Column {
+                                    Text {
                                         anchors.centerIn: parent
-                                        spacing: 0
-                                        Rectangle {
-                                            width: 20; height: 20; radius: 10
-                                            anchors.horizontalCenter: parent.horizontalCenter
-                                            color: modelData.col
-                                            visible: editor.tab !== index
-                                        }
-                                        Text {
-                                            anchors.horizontalCenter: parent.horizontalCenter
-                                            text: modelData.name
-                                            font.pixelSize: 11
-                                            color: editor.tab === index ? cFg : cFgDim
-                                        }
+                                        text: modelData.name
+                                        font.pixelSize: uFsBody
+                                        font.bold: editor.tab === index
+                                        // 選択 = $looks-secondary、
+                                        // 非選択 = $text-primary-transparent
+                                        color: editor.tab === index
+                                               ? "#9966FF" : "#9C9EA5"
                                     }
                                 }
                                 MouseArea {
@@ -223,9 +270,9 @@ Item {
                     spacing: 0
                     visible: editor.tab === 0
 
-                    // カテゴリツールボックス（60px）
+                    // カテゴリツールボックス（72px、scratch-blocks 相当）
                     Rectangle {
-                        Layout.preferredWidth: 60
+                        Layout.preferredWidth: 72
                         Layout.fillHeight: true
                         color: cToolboxBg
                         ListView {
@@ -234,11 +281,11 @@ Item {
                             // Add Extension ボタン（ツールボックス最下部、
                             // editor.cpp::addExtRect_ 相当）
                             footer: Item {
-                                width: 60; height: 52
+                                width: 72; height: 64
                                 Rectangle {
                                     width: 28; height: 28; radius: 14
                                     anchors.horizontalCenter: parent.horizontalCenter
-                                    y: 4
+                                    y: 10
                                     color: extMa.containsMouse
                                            ? "#6A4CA0" : "#855CD6"
                                     Text { anchors.centerIn: parent; text: "+"
@@ -247,10 +294,10 @@ Item {
                                 }
                                 Text {
                                     anchors.horizontalCenter: parent.horizontalCenter
-                                    y: 34; width: 58
+                                    y: 40; width: 70
                                     horizontalAlignment: Text.AlignHCenter
                                     text: "Add Ext."
-                                    font.pixelSize: 9; color: cFg
+                                    font.pixelSize: uFsLbl; color: cFg
                                 }
                                 MouseArea {
                                     id: extMa; anchors.fill: parent
@@ -283,7 +330,9 @@ Item {
                                 }
                             }
                             delegate: Item {
-                                width: 60; height: 46
+                                // scratch-blocks: アイテム 80px、上 8px
+                                // パッド、バブル 20px + ラベル 10.4px
+                                width: 72; height: 80
                                 Rectangle {
                                     anchors.fill: parent
                                     color: editor.categorySel === index
@@ -292,18 +341,19 @@ Item {
                                 Rectangle {   // カテゴリ色バブル
                                     width: 20; height: 20; radius: 10
                                     anchors.horizontalCenter: parent.horizontalCenter
-                                    y: 5
+                                    y: uSpace
                                     color: editor.categoryColors[index] || "#999"
                                 }
                                 Text {
                                     anchors.horizontalCenter: parent.horizontalCenter
-                                    y: 27
-                                    width: 58
+                                    y: 32
+                                    width: 70
                                     horizontalAlignment: Text.AlignHCenter
                                     elide: Text.ElideRight
                                     text: editor.categoryNames[index] || ""
-                                    font.pixelSize: 9
-                                    color: cFg
+                                    font.pixelSize: 10
+                                    color: editor.categorySel === index
+                                           ? cFg : cFgDim
                                 }
                                 MouseArea {
                                     anchors.fill: parent
@@ -311,9 +361,9 @@ Item {
                                 }
                             }
                         }
-                        // 下枠線
-                        Rectangle { anchors.bottom: parent.bottom
-                                    width: parent.width; height: 1
+                        // 右枠線（toolbox border-right 1px）
+                        Rectangle { anchors.right: parent.right
+                                    width: 1; height: parent.height
                                     color: cBorder }
                     }
 
@@ -361,7 +411,8 @@ Item {
                     }
                 }
 
-                // Costumes / Sounds タブ: 左にアセットセレクタ
+                // Costumes / Sounds タブ: 左にアセットセレクタ。
+                // scratch-gui asset-panel: 全パディング = $space 単位。
                 Rectangle {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
@@ -369,22 +420,22 @@ Item {
                     color: cPanel
                     Column {
                         anchors.fill: parent
-                        anchors.margins: 10
-                        spacing: 8
+                        anchors.margins: uSpace
+                        spacing: uSpace
                         Text {
                             text: editor.tab === 1 ? "Costumes" : "Sounds"
                             color: cFgDim
-                            font.pixelSize: 11; font.bold: true
+                            font.pixelSize: uFsLbl; font.bold: true
                         }
                         // アセットタイル一覧
                         Flickable {
                             width: parent.width
-                            height: parent.height - 54 - newBtn.height
+                            height: parent.height - 56 - newBtn.height
                             contentHeight: assetCol.height
                             clip: true
                             Column {
                                 id: assetCol
-                                spacing: 8
+                                spacing: uSpace
                                 Repeater {
                                     model: {
                                         var n = editor.layoutRev
@@ -395,7 +446,7 @@ Item {
                                     delegate: Rectangle {
                                         required property var modelData
                                         width: 200; height: 72
-                                        radius: 6
+                                        radius: uRound
                                         color: (editor.tab === 1
                                                 ? modelData.current
                                                 : editor.soundSel() === modelData.index)
@@ -410,7 +461,8 @@ Item {
                                                       ? 2 : 1
                                         Image {
                                             visible: editor.tab === 1
-                                            x: 8; y: 8; width: 56; height: 56
+                                            x: uSpace; y: uSpace
+                                            width: 56; height: 56
                                             source: "image://xyocostume/" +
                                                     editor.selTarget + "_" +
                                                     modelData.index + "/" +
@@ -419,7 +471,7 @@ Item {
                                         }
                                         Text {
                                             visible: editor.tab === 2
-                                            x: 8; y: 24; text: "🔊"
+                                            x: uSpace; y: 24; text: "🔊"
                                             font.pixelSize: 24
                                         }
                                         Text {
@@ -427,14 +479,15 @@ Item {
                                             width: 124
                                             text: modelData.name
                                             color: cFg
-                                            font.pixelSize: 12
+                                            font.pixelSize: uFsBody
                                             elide: Text.ElideRight
                                         }
                                         Text {
                                             visible: editor.tab === 2
                                             x: 72; y: 38
                                             text: Number(modelData.secs).toFixed(2) + " s"
-                                            color: cFgDim; font.pixelSize: 10
+                                            color: cFgDim
+                                            font.pixelSize: uFsLbl
                                         }
                                         MouseArea {
                                             anchors.fill: parent
@@ -452,7 +505,7 @@ Item {
                         // + ボタン（新規アセット）
                         Rectangle {
                             id: newBtn
-                            width: 44; height: 44; radius: 22
+                            width: 48; height: 48; radius: 24
                             color: "#4C97FF"
                             anchors.horizontalCenter: parent.horizontalCenter
                             Text {
@@ -1137,31 +1190,36 @@ Item {
             }
 
             // ---- 右列: 緑旗/停止 + ステージ + スプライト ----
+            // stage-and-target-wrapper: 左右 $space の余白、横幅はステージ
+            // 幅 + 2*(8+1)。small=408+18=426px、large= フル幅。
             ColumnLayout {
-                Layout.preferredWidth: root.stageLarge ? -1 : 500
+                Layout.preferredWidth: root.stageLarge ? -1 : 426
                 Layout.maximumWidth: root.stageLarge
-                                     ? Number.POSITIVE_INFINITY : 500
+                                     ? Number.POSITIVE_INFINITY : 426
                 Layout.fillWidth: root.stageLarge
                 Layout.fillHeight: true
                 spacing: 0
 
-                // ステージメニュー（旗・停止・拡大）
+                // ステージメニュー（stage-menu-height 44px、上下 $space 分の
+                // 高さを含む → 内側行は 28px 基準）
                 Rectangle {
                     Layout.fillWidth: true
-                    Layout.preferredHeight: 44
+                    Layout.preferredHeight: uTabH
                     color: cPanel
                     RowLayout {
                         anchors.fill: parent
-                        anchors.leftMargin: 10
-                        anchors.rightMargin: 10
-                        spacing: 8
-                        // 緑旗
+                        anchors.leftMargin: uSpace
+                        anchors.rightMargin: uSpace
+                        spacing: uSpace
+                        // 緑旗（scratch-gui green-flag.css: 白地+枠、
+                        // 中に緑の三角アイコン）
                         Rectangle {
-                            width: 36; height: 36; radius: 18
-                            color: flagMa.containsMouse ? "#3D8534" : cGreen
+                            width: uFlag; height: uFlag; radius: uRadius
+                            color: flagMa.containsMouse ? "#F0F4FA" : "white"
+                            border.color: cBorder
                             Text {
                                 anchors.centerIn: parent
-                                text: "▶"; color: "white"; font.pixelSize: 15
+                                text: "▶"; color: cGreen; font.pixelSize: 15
                             }
                             MouseArea {
                                 id: flagMa; anchors.fill: parent
@@ -1169,14 +1227,15 @@ Item {
                                 onClicked: editor.greenFlag()
                             }
                         }
-                        // 停止
+                        // 停止（stop-all.css: 白地+枠、赤い四角アイコン）
                         Rectangle {
-                            width: 36; height: 36; radius: 18
-                            color: stopMa.containsMouse ? "#D24C4C" : cStop
+                            width: uFlag; height: uFlag; radius: uRadius
+                            color: stopMa.containsMouse ? "#F0F4FA" : "white"
+                            border.color: cBorder
                             Rectangle {
                                 anchors.centerIn: parent
-                                width: 14; height: 14; radius: 2
-                                color: "white"
+                                width: 13; height: 13; radius: 2
+                                color: cStop
                             }
                             MouseArea {
                                 id: stopMa; anchors.fill: parent
@@ -1185,15 +1244,16 @@ Item {
                             }
                         }
                         Item { Layout.fillWidth: true }
-                        // ステージサイズ切替（toggle-buttons.css 準拠:
-                        // 連結 34×34 ボタン、選択=青薄 + フルスクリーン）
+                        // ステージサイズ切替（stage-button = 2rem+2px = 34px、
+                        // form-radius 4px、間隔 0.25rem = 4px）
                         Rectangle {
-                            width: 68; height: 34; radius: 4
+                            width: uBtn * 2; height: uBtn; radius: uRadius
                             color: "white"; border.color: cBorder
                             Row {
                                 anchors.fill: parent
                                 Rectangle {   // small stage
-                                    width: 34; height: 34; radius: 4
+                                    width: uBtn; height: uBtn
+                                    radius: uRadius
                                     color: !root.stageLarge
                                            ? "#CDDCF7" : "white"
                                     Text {
@@ -1208,10 +1268,11 @@ Item {
                                         onClicked: root.setStageMode(0)
                                     }
                                 }
-                                Rectangle { width: 1; height: 34
+                                Rectangle { width: 1; height: uBtn
                                             color: cBorder }
                                 Rectangle {   // large stage
-                                    width: 33; height: 34; radius: 4
+                                    width: uBtn - 1; height: uBtn
+                                    radius: uRadius
                                     color: root.stageLarge
                                            ? "#CDDCF7" : "white"
                                     Text {
@@ -1228,9 +1289,9 @@ Item {
                                 }
                             }
                         }
-                        // フルスクリーン（stage-header の expand アイコン）
+                        // フルスクリーン（34px、4px 間隔）
                         Rectangle {
-                            width: 34; height: 34; radius: 4
+                            width: uBtn; height: uBtn; radius: uRadius
                             color: fullMa.containsMouse ? "#F0F4FA" : "white"
                             border.color: cBorder
                             Text {
@@ -1249,14 +1310,15 @@ Item {
                                 color: cBorder }
                 }
 
-                // ステージ（4:3、radius 8 + 1px 境界）
+                // ステージ（4:3、左右 $space マージン + 1px 境界。
+                // stage-standard: radius 無し・細枠。視認のため 4px は残す）
                 Item {
                     Layout.fillWidth: true
                     Layout.preferredHeight: width * 0.75
                     Rectangle {
                         anchors.fill: parent
-                        anchors.margins: 10
-                        radius: 8
+                        anchors.margins: uSpace
+                        radius: uRadius
                         color: "white"
                         border.color: cBorder
                         clip: true
@@ -1271,7 +1333,7 @@ Item {
                     }
                     MouseArea {
                         anchors.fill: parent
-                        anchors.margins: 10
+                        anchors.margins: uSpace
                         hoverEnabled: true
                         onPressed: function(m) {
                             var p = mapToItem(stageItem, m.x, m.y)
@@ -1288,35 +1350,34 @@ Item {
                     }
                 }
 
-                // スプライト情報パネル（sprite-info.jsx 準拠:
-                // 名前/x/y + Show トグル + Size + Direction）
+                // スプライト情報パネル（$sprite-info-height = 6rem = 96px、
+                // 内部パディング 0.75rem = 12px）
                 Rectangle {
                     id: spInfoPanel
                     Layout.fillWidth: true
                     Layout.preferredHeight: (root.stageLarge || root.stageFull)
-                                            ? 44 : 76
+                                            ? uTabH : uSprInfo
                     color: cPanel
                     Rectangle { anchors.top: parent.top
                                 width: parent.width; height: 1
                                 color: cBorder }
                     property bool isStage: editor.selTarget === 0
+                    // sprite-info: パディング 0.75rem=12px、入力高 1.85rem≈30px
                     ColumnLayout {
                         anchors.fill: parent
-                        anchors.leftMargin: 12
-                        anchors.rightMargin: 12
-                        anchors.topMargin: 6
-                        anchors.bottomMargin: 8
-                        spacing: 4
+                        anchors.margins: 12
+                        spacing: uSpace
                         RowLayout {
-                            spacing: 8
+                            spacing: uSpace
                             Text {
                                 text: "Sprite"
-                                color: cFg; font.pixelSize: 11; font.bold: true
+                                color: cFg
+                                font.pixelSize: uFsLbl; font.bold: true
                             }
                             Rectangle {
                                 Layout.preferredWidth: 128
-                                Layout.preferredHeight: 28
-                                radius: 14
+                                Layout.preferredHeight: 30
+                                radius: 15
                                 color: "white"; border.color: cBorder
                                 TextInput {
                                     id: spNameInput
@@ -1324,7 +1385,7 @@ Item {
                                     anchors.leftMargin: 10
                                     anchors.rightMargin: 10
                                     verticalAlignment: TextInput.AlignVCenter
-                                    font.pixelSize: 12; color: cFg
+                                    font.pixelSize: uFsBody; color: cFg
                                     text: editor.spriteInfo.length > 0
                                           ? editor.spriteInfo[0] : ""
                                     enabled: !spInfoPanel.isStage
@@ -1340,16 +1401,17 @@ Item {
                                 spacing: 4
                                 visible: editor.spriteInfo.length > 2
                                 Text { text: "x"; color: cFg
-                                       font.pixelSize: 11; font.bold: true }
+                                       font.pixelSize: uFsLbl
+                                       font.bold: true }
                                 Rectangle {
                                     Layout.preferredWidth: 52
-                                    Layout.preferredHeight: 28; radius: 14
+                                    Layout.preferredHeight: 30; radius: 15
                                     color: "white"; border.color: cBorder
                                     TextInput {
                                         anchors.fill: parent
                                         horizontalAlignment: TextInput.AlignHCenter
                                         verticalAlignment: TextInput.AlignVCenter
-                                        font.pixelSize: 11; color: cFg
+                                        font.pixelSize: uFsLbl; color: cFg
                                         validator: DoubleValidator {}
                                         text: Math.round(
                                                   (editor.spriteInfo[1] || 0))
@@ -1362,16 +1424,17 @@ Item {
                                     }
                                 }
                                 Text { text: "y"; color: cFg
-                                       font.pixelSize: 11; font.bold: true }
+                                       font.pixelSize: uFsLbl
+                                       font.bold: true }
                                 Rectangle {
                                     Layout.preferredWidth: 52
-                                    Layout.preferredHeight: 28; radius: 14
+                                    Layout.preferredHeight: 30; radius: 15
                                     color: "white"; border.color: cBorder
                                     TextInput {
                                         anchors.fill: parent
                                         horizontalAlignment: TextInput.AlignHCenter
                                         verticalAlignment: TextInput.AlignVCenter
-                                        font.pixelSize: 11; color: cFg
+                                        font.pixelSize: uFsLbl; color: cFg
                                         validator: DoubleValidator {}
                                         text: Math.round(
                                                   (editor.spriteInfo[2] || 0))
@@ -1388,22 +1451,23 @@ Item {
                         // 行2: Show トグル + Size + Direction（stage は非表示、
                         // small stage 時も sprite-info.jsx small 分岐で非表示）
                         RowLayout {
-                            spacing: 8
+                            spacing: uSpace
                             visible: editor.spriteInfo.length > 2
                                      && !root.stageLarge
                                      && !root.stageFull
                             Text { text: "Show"; color: cFgDim
-                                   font.pixelSize: 11 }
-                            // 連結トグル（toggle-buttons.css 準拠）
+                                   font.pixelSize: uFsLbl }
+                            // 連結トグル（stage-button 34px 準拠）
                             Rectangle {
-                                Layout.preferredWidth: 64
-                                Layout.preferredHeight: 28
-                                radius: 4; color: "white"
+                                Layout.preferredWidth: uBtn * 2
+                                Layout.preferredHeight: uBtn
+                                radius: uRadius; color: "white"
                                 border.color: cBorder
                                 Row {
                                     anchors.fill: parent
                                     Rectangle {   // Show（左）
-                                        width: 32; height: 28; radius: 4
+                                        width: uBtn; height: uBtn
+                                        radius: uRadius
                                         color: editor.spriteInfo[5]
                                                ? "#CDDCF7" : "white"
                                         Text { anchors.centerIn: parent
@@ -1414,10 +1478,11 @@ Item {
                                                 editor.setSpriteVisible(true)
                                         }
                                     }
-                                    Rectangle { width: 1; height: 28
+                                    Rectangle { width: 1; height: uBtn
                                                 color: cBorder }
                                     Rectangle {   // Hide（右）
-                                        width: 31; height: 28; radius: 4
+                                        width: uBtn - 1; height: uBtn
+                                        radius: uRadius
                                         color: !editor.spriteInfo[5]
                                                ? "#CDDCF7" : "white"
                                         Text { anchors.centerIn: parent
@@ -1434,16 +1499,16 @@ Item {
                             }
                             Item { Layout.fillWidth: true }
                             Text { text: "Size"; color: cFgDim
-                                   font.pixelSize: 11 }
+                                   font.pixelSize: uFsLbl }
                             Rectangle {
                                 Layout.preferredWidth: 52
-                                Layout.preferredHeight: 28; radius: 14
+                                Layout.preferredHeight: 30; radius: 15
                                 color: "white"; border.color: cBorder
                                 TextInput {
                                     anchors.fill: parent
                                     horizontalAlignment: TextInput.AlignHCenter
                                     verticalAlignment: TextInput.AlignVCenter
-                                    font.pixelSize: 11; color: cFg
+                                    font.pixelSize: uFsLbl; color: cFg
                                     validator: DoubleValidator {}
                                     text: Math.round(editor.spriteInfo[3] || 0)
                                     onAccepted: editor.setSpriteSize(
@@ -1455,18 +1520,18 @@ Item {
                                 }
                             }
                             Text { text: "Direction"; color: cFgDim
-                                   font.pixelSize: 11 }
+                                   font.pixelSize: uFsLbl }
                             Rectangle {
                                 id: dirInput
                                 Layout.preferredWidth: 52
-                                Layout.preferredHeight: 28; radius: 14
+                                Layout.preferredHeight: 30; radius: 15
                                 color: "white"; border.color: cBorder
                                 TextInput {
                                     id: dirText
                                     anchors.fill: parent
                                     horizontalAlignment: TextInput.AlignHCenter
                                     verticalAlignment: TextInput.AlignVCenter
-                                    font.pixelSize: 11; color: cFg
+                                    font.pixelSize: uFsLbl; color: cFg
                                     validator: DoubleValidator {}
                                     text: Math.round(editor.spriteInfo[4] || 0)
                                     onAccepted: editor.setSpriteDirection(
@@ -1476,7 +1541,7 @@ Item {
                                             editor.setSpriteDirection(
                                                 parseFloat(text))
                                 }
-                                // ダブルクリック/クリックで DirectionPicker
+                                // クリックで DirectionPicker
                                 MouseArea {
                                     anchors.fill: parent
                                     propagateComposedEvents: true
@@ -1491,7 +1556,7 @@ Item {
                                 Popup {
                                     id: dirPicker
                                     width: 190; height: 190
-                                    padding: 10
+                                    padding: uSpace
                                     onOpened: dirDial.reqUpdate()
                                     background: Rectangle {
                                         color: "white"
@@ -1613,8 +1678,10 @@ Item {
                             delegate: Rectangle {
                                 id: tile
                                 required property int index
+                                // タイル 88x100（5 列相当の目安）、
+                                // 角丸 $space = 8px、名ラベル 0.625rem
                                 width: 88; height: 100
-                                radius: 6
+                                radius: uRound
                                 // ドラッグ中は半透明（旧 editor の sdr_ ghost 準拠）
                                 opacity: tileMa.dragging ? 0.4 : 1.0
                                 color: editor.selTarget === index ? cPanel : "#F5F7FA"
@@ -1622,9 +1689,9 @@ Item {
                                               ? cMenu : cBorder
                                 border.width: editor.selTarget === index ? 2 : 1
                                 Rectangle {   // コスチュームサムネイル
-                                    width: 48; height: 40; radius: 6
+                                    width: 56; height: 48; radius: uRadius
                                     anchors.horizontalCenter: parent.horizontalCenter
-                                    y: 8
+                                    y: uSpace
                                     color: index === 0 ? "#D9E3F2" : "#FFFFFF"
                                     border.color: cBorder
                                     clip: true
@@ -1639,17 +1706,17 @@ Item {
                                 }
                                 Text {
                                     anchors.horizontalCenter: parent.horizontalCenter
-                                    y: 54
-                                    width: parent.width - 8
+                                    y: 60
+                                    width: parent.width - uSpace
                                     horizontalAlignment: Text.AlignHCenter
                                     elide: Text.ElideRight
                                     text: editor.spriteNames[index] || ""
-                                    font.pixelSize: 11; color: cFg
+                                    font.pixelSize: uFsLbl; color: cFg
                                 }
                                 // 削除バッジ（ステージ以外・選択時）
                                 Rectangle {
                                     visible: index !== 0 && editor.selTarget === index
-                                    width: 18; height: 18; radius: 9
+                                    width: 20; height: 20; radius: 10
                                     x: parent.width - 14; y: -6
                                     color: cStop
                                     Text { anchors.centerIn: parent; text: "×"
@@ -1770,7 +1837,7 @@ Item {
                         visible: false
                         property int tileIndex: -1
                         property int ins: 0
-                        width: 88; height: 100; radius: 6
+                        width: 88; height: 100; radius: uRound
                         color: "white"; border.color: cMenu; border.width: 2
                         opacity: 0.75
                         z: 6
@@ -1854,19 +1921,19 @@ Item {
                 var n = rev
                 return editor.backpackOpen()
             }
-            Layout.preferredHeight: open ? 130 : 30
+            Layout.preferredHeight: open ? 136 : 32
             color: cPanel
             border.color: cBorder
             border.width: 1
             // ヘッダー（クリックで開閉）
             Rectangle {
                 anchors.top: parent.top
-                width: parent.width; height: 30
+                width: parent.width; height: 32
                 color: "transparent"
                 Text {
                     anchors.centerIn: parent
                     text: "Backpack"
-                    color: cFg; font.pixelSize: 13; font.bold: true
+                    color: cFg; font.pixelSize: uFsBody; font.bold: true
                 }
                 MouseArea {
                     anchors.fill: parent
@@ -1877,11 +1944,11 @@ Item {
             Flickable {
                 visible: bpBar.open
                 anchors.top: parent.top
-                anchors.topMargin: 34
+                anchors.topMargin: 36
                 anchors.bottom: parent.bottom
                 anchors.left: parent.left
                 anchors.right: parent.right
-                anchors.margins: 6
+                anchors.margins: uSpace
                 contentWidth: bpRow.width
                 clip: true
                 Row {
