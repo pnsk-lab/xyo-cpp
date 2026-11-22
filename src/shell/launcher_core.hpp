@@ -24,6 +24,7 @@ struct GuiRunOptions {
     int gpuMode = -1;   // -1 = normal, 0 = ray, 1 = path
     bool turbo = false;
     bool danger = false;
+    int theme = 0;      // 0 = light, 1 = dark
 };
 
 GuiRunOptions readRunOptions();

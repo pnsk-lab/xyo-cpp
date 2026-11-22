@@ -70,6 +70,8 @@ GuiRunOptions readRunOptions() {
             out.gpuMode = n;
         else if (key == "turbo" && (n == 0 || n == 1))
             out.turbo = n == 1;
+        else if (key == "theme" && (n == 0 || n == 1))
+            out.theme = n;
         // Do not persist "danger" on purpose; it always starts disabled.
     }
     return out;
@@ -90,7 +92,8 @@ void writeRunOptions(const GuiRunOptions& o) {
             << "jit=" << o.jitMode << '\n'
             << "lazy=" << o.lazyMode << '\n'
             << "gpu=" << o.gpuMode << '\n'
-            << "turbo=" << int(o.turbo) << '\n';
+            << "turbo=" << int(o.turbo) << '\n'
+            << "theme=" << o.theme << '\n';
         if (!out) return;
     }
     fs::rename(tmp, file, ec);

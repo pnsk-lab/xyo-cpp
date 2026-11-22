@@ -8,29 +8,39 @@ Item {
     height: 760
 
     // 落ち着いたデスクトップ・ツール調のカラーパレット（xyo / Scratch 系の紫をアクセントに）
+    // launcher.darkMode に連動してライト/ダークを切り替える。
     QtObject {
         id: pal
-        readonly property color windowBg:     "#F3F4F6"
-        readonly property color surface:      "#FFFFFF"
-        readonly property color surfaceAlt:   "#F8F9FB"
-        readonly property color sidebarBg:    "#ECEEF2"
-        readonly property color sidebarHover: "#E1E4EB"
-        readonly property color sidebarSel:   "#E3DCF8"
-        readonly property color border:       "#D5D9E2"
-        readonly property color borderLight:  "#E6E9EF"
-        readonly property color textPrimary:  "#1C2029"
-        readonly property color textSecond:   "#5B6374"
-        readonly property color textMuted:    "#8B93A4"
-        readonly property color accent:       "#7C4DFF"
-        readonly property color accentHover:  "#6B3EE8"
-        readonly property color accentSoft:   "#EFEAFF"
-        readonly property color accentBorder: "#C5B3F9"
-        readonly property color rowSelBg:     "#E9E3FC"
-        readonly property color rowHoverBg:   "#F2F4F8"
+        readonly property bool dark: launcher.darkMode
+        readonly property color windowBg:     dark ? "#17181D" : "#F3F4F6"
+        readonly property color surface:      dark ? "#1F2129" : "#FFFFFF"
+        readonly property color surfaceAlt:   dark ? "#272932" : "#F8F9FB"
+        readonly property color sidebarBg:    dark ? "#1A1C22" : "#ECEEF2"
+        readonly property color sidebarHover: dark ? "#262932" : "#E1E4EB"
+        readonly property color sidebarSel:   dark ? "#332C52" : "#E3DCF8"
+        readonly property color border:       dark ? "#34373F" : "#D5D9E2"
+        readonly property color borderLight:  dark ? "#2E3139" : "#E6E9EF"
+        readonly property color textPrimary:  dark ? "#E9EAF0" : "#1C2029"
+        readonly property color textSecond:   dark ? "#A9AEBD" : "#5B6374"
+        readonly property color textMuted:    dark ? "#6E7482" : "#8B93A4"
+        readonly property color accent:       dark ? "#9A7BFF" : "#7C4DFF"
+        readonly property color accentHover:  dark ? "#B39CFF" : "#6B3EE8"
+        readonly property color accentSoft:   dark ? "#2E2750" : "#EFEAFF"
+        readonly property color accentBorder: dark ? "#5B4B9E" : "#C5B3F9"
+        readonly property color rowSelBg:     dark ? "#322B4E" : "#E9E3FC"
+        readonly property color rowHoverBg:   dark ? "#262932" : "#F2F4F8"
+        readonly property color toolHover:    dark ? "#2B2E37" : "#E5E8EE"
+        readonly property color btnDisabled:  dark ? "#2A2D34" : "#ECEEF2"
+        readonly property color btnHover:     dark ? "#2C2F38" : "#F3F4F8"
+        readonly property color btnHoverLine: dark ? "#4A4E5B" : "#BFC5D2"
+        readonly property color rowZebra:     dark ? "#23252C" : "#FAFBFD"
+        readonly property color thumbBg:      dark ? "#262932" : "#EDEEF3"
+        readonly property color thumbBgAlt:   dark ? "#2A2D35" : "#EEF0F5"
         readonly property color folderMain:   "#E8B857"
         readonly property color folderTab:    "#D19E3B"
-        readonly property color ok:           "#2E9E5B"
-        readonly property color danger:       "#D64545"
+        readonly property color folderShine:  "#F4CE7C"
+        readonly property color ok:           dark ? "#41B36C" : "#2E9E5B"
+        readonly property color danger:       dark ? "#E06969" : "#D64545"
     }
 
     readonly property bool listMode: launcher.listView
@@ -114,6 +124,18 @@ Item {
             } else if (kind === "close") {
                 ctx.moveTo(w * 0.26, h * 0.26); ctx.lineTo(w * 0.74, h * 0.74)
                 ctx.moveTo(w * 0.74, h * 0.26); ctx.lineTo(w * 0.26, h * 0.74)
+            } else if (kind === "moon") {
+                // 三日月（2 円弧で構成）
+                ctx.arc(w * 0.54, h * 0.5, w * 0.30, Math.PI * 0.62, Math.PI * 1.44)
+                ctx.arc(w * 0.40, h * 0.5, w * 0.26, Math.PI * 1.52, Math.PI * 0.54)
+                ctx.closePath()
+            } else if (kind === "sun") {
+                ctx.arc(w * 0.5, h * 0.5, w * 0.17, 0, Math.PI * 2)
+                for (var j = 0; j < 8; ++j) {
+                    var aj = j * Math.PI / 4
+                    ctx.moveTo(w * 0.5 + Math.cos(aj) * w * 0.28, h * 0.5 + Math.sin(aj) * w * 0.28)
+                    ctx.lineTo(w * 0.5 + Math.cos(aj) * w * 0.40, h * 0.5 + Math.sin(aj) * w * 0.40)
+                }
             }
             ctx.stroke()
         }
@@ -131,7 +153,7 @@ Item {
             radius: 3; color: pal.folderMain
             Rectangle {
                 anchors.top: parent.top; anchors.left: parent.left; anchors.right: parent.right
-                height: 2; color: "#F4CE7C"
+                height: 2; color: pal.folderShine
             }
         }
     }
@@ -155,7 +177,7 @@ Item {
         Rectangle {
             anchors.fill: parent
             radius: parent.radius
-            color: "#E5E8EE"
+            color: pal.toolHover
             opacity: (parent.enabled && !parent.active && tma.containsMouse) ? 1.0 : 0.0
             Behavior on opacity { NumberAnimation { duration: 110; easing.type: Easing.OutCubic } }
         }
@@ -195,11 +217,11 @@ Item {
         property bool enabled: true
         implicitHeight: primary ? 38 : 32
         radius: 6
-        color: !enabled ? "#ECEEF2"
+        color: !enabled ? pal.btnDisabled
              : primary ? (ama.containsMouse ? pal.accentHover : pal.accent)
-             : (ama.containsMouse ? "#F3F4F8" : pal.surface)
+             : (ama.containsMouse ? pal.btnHover : pal.surface)
         border.width: primary && enabled ? 0 : 1
-        border.color: !enabled ? pal.borderLight : (ama.containsMouse ? "#BFC5D2" : pal.border)
+        border.color: !enabled ? pal.borderLight : (ama.containsMouse ? pal.btnHoverLine : pal.border)
         scale: ama.pressed && enabled ? 0.985 : 1.0
 
         Behavior on color { ColorAnimation { duration: 120 } }
@@ -294,7 +316,7 @@ Item {
                     color: pathEdit.visible ? pal.surface : pal.surfaceAlt
                     border.width: 1
                     border.color: pathEdit.visible ? pal.accent
-                                : (addrMa.containsMouse ? "#BFC5D2" : pal.border)
+                                : (addrMa.containsMouse ? pal.btnHoverLine : pal.border)
                     Behavior on border.color { ColorAnimation { duration: 120 } }
 
                     Row {
@@ -321,7 +343,7 @@ Item {
                                     width: crumbTxt.implicitWidth + 10
                                     radius: 4
                                     anchors.verticalCenter: parent.verticalCenter
-                                    color: cma.containsMouse ? "#E5E8EE" : "transparent"
+                                    color: cma.containsMouse ? pal.toolHover : "transparent"
                                     Text {
                                         id: crumbTxt
                                         anchors.centerIn: parent
@@ -462,6 +484,10 @@ Item {
                 ToolBtn {
                     textLabel: launcher.sortRecent ? "更新日順" : "名前順"
                     onClicked: launcher.sortRecent = !launcher.sortRecent
+                }
+                ToolBtn {
+                    iconKind: pal.dark ? "sun" : "moon"
+                    onClicked: launcher.darkMode = !launcher.darkMode
                 }
                 ToolBtn {
                     iconKind: "settings"
@@ -710,7 +736,7 @@ Item {
                             height: 36
                             readonly property bool sel: model.path === launcher.selectedPath
                             color: sel ? pal.rowSelBg
-                                 : (lma.containsMouse ? pal.rowHoverBg : (index % 2 === 1 ? "#FAFBFD" : pal.surface))
+                                 : (lma.containsMouse ? pal.rowHoverBg : (index % 2 === 1 ? pal.rowZebra : pal.surface))
                             Behavior on color { ColorAnimation { duration: 100 } }
 
                             Rectangle {
@@ -740,7 +766,7 @@ Item {
                                     Rectangle {
                                         anchors.fill: parent; radius: 3
                                         visible: !model.isDir
-                                        color: "#EDEEF3"
+                                        color: pal.thumbBg
                                         border.width: 1; border.color: pal.borderLight
                                         clip: true
                                         Image {
@@ -831,7 +857,7 @@ Item {
                             radius: 7
                             color: sel ? pal.accentSoft : (gma.containsMouse ? pal.surfaceAlt : pal.surface)
                             border.width: sel ? 2 : 1
-                            border.color: sel ? pal.accent : (gma.containsMouse ? "#BFC5D2" : pal.borderLight)
+                            border.color: sel ? pal.accent : (gma.containsMouse ? pal.btnHoverLine : pal.borderLight)
                             scale: gma.pressed ? 0.98 : 1.0
                             Behavior on color { ColorAnimation { duration: 110 } }
                             Behavior on border.color { ColorAnimation { duration: 110 } }
@@ -846,7 +872,7 @@ Item {
                                     Layout.fillWidth: true
                                     Layout.fillHeight: true
                                     radius: 4
-                                    color: model.isDir ? "transparent" : "#EEF0F5"
+                                    color: model.isDir ? "transparent" : pal.thumbBgAlt
                                     clip: true
 
                                     FolderIcon {
@@ -1251,6 +1277,11 @@ Item {
                     }
                 }
 
+                SegRow {
+                    title: "テーマ"; items: ["ライト", "ダーク"]
+                    current: launcher.darkMode ? 1 : 0
+                    onChosen: function(i) { launcher.darkMode = (i === 1) }
+                }
                 SegRow {
                     title: "画面倍率"; items: ["1×", "2×", "3×", "4×"]
                     current: launcher.optScale - 1

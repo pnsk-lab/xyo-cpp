@@ -459,6 +459,7 @@ class LauncherController : public QObject {
     Q_PROPERTY(int optGpu READ optGpu WRITE setOptGpu NOTIFY optionsChanged)
     Q_PROPERTY(bool optTurbo READ optTurbo WRITE setOptTurbo NOTIFY optionsChanged)
     Q_PROPERTY(bool optDanger READ optDanger WRITE setOptDanger NOTIFY optionsChanged)
+    Q_PROPERTY(bool darkMode READ darkMode WRITE setDarkMode NOTIFY optionsChanged)
     Q_PROPERTY(bool jitAvailable READ jitAvailable CONSTANT)
     Q_PROPERTY(bool playAvailable READ playAvailable CONSTANT)
     Q_PROPERTY(QString currentDirLabel READ currentDirLabel NOTIFY dirChanged)
@@ -642,6 +643,12 @@ public:
     void setOptDanger(bool v) {
         options_.danger = v;
         Q_EMIT optionsChanged();  // danger は永続化しない
+    }
+    bool darkMode() const { return options_.theme == 1; }
+    void setDarkMode(bool v) {
+        options_.theme = v ? 1 : 0;
+        persistOptions();
+        applyTheme();
     }
     bool jitAvailable() const {
 #ifdef XYO_JIT
@@ -987,6 +994,7 @@ public:
             setOptTurbo(a.substr(6) == "1");
         else if (a.rfind("danger:", 0) == 0)
             setOptDanger(a.substr(7) == "1");
+        else if (a == "dark") setDarkMode(!darkMode());
         else if (a == "view-list") setListView(true);
         else if (a == "view-icons") setListView(false);
         else if (a.rfind("click:", 0) == 0) {
@@ -1039,7 +1047,15 @@ public:
     }
     void setOptions(const GuiRunOptions& o) {
         options_ = o;
+        applyTheme();
         Q_EMIT optionsChanged();
+    }
+
+    // テーマに合わせてビューのクリア色を更新する（QML ロード前後どちらでも効く）。
+    void applyTheme() {
+        if (view_)
+            view_->setColor(options_.theme == 1 ? QColor(0x1A, 0x1C, 0x22)
+                                                : QColor(0xF4, 0xF6, 0xFB));
     }
 
     void openInitialDir(const std::string& d) { navigate(d, /*record=*/false); }
@@ -1385,7 +1401,8 @@ int guiMain(const char* startDir) {
                                                controller.proxyModel());
         view.setTitle(QStringLiteral("xyo — Project library"));
         view.setResizeMode(QQuickView::SizeRootObjectToView);
-        view.setColor(QColor(0xF4, 0xF6, 0xFB));
+        view.setColor(options.theme == 1 ? QColor(0x1A, 0x1C, 0x22)
+                                         : QColor(0xF4, 0xF6, 0xFB));
         view.setSource(QUrl("qrc:/xyo/qml/Launcher.qml"));
         if (view.status() == QQuickView::Error) {
             std::fprintf(stderr, "gui: QML の読み込みに失敗しました\n");
