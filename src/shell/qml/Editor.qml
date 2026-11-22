@@ -858,18 +858,24 @@ Item {
 
                 // スプライトセレクタ
                 Rectangle {
+                    id: sprPanel
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     color: cBody
                     Flow {
+                        id: sprFlow
                         anchors.fill: parent
                         anchors.margins: 10
                         spacing: 8
                         Repeater {
                             model: editor.spriteNames.length
                             delegate: Rectangle {
+                                id: tile
+                                required property int index
                                 width: 88; height: 100
                                 radius: 6
+                                // ドラッグ中は半透明（旧 editor の sdr_ ghost 準拠）
+                                opacity: tileMa.dragging ? 0.4 : 1.0
                                 color: editor.selTarget === index ? cPanel : "#F5F7FA"
                                 border.color: editor.selTarget === index
                                               ? cMenu : cBorder
@@ -913,11 +919,157 @@ Item {
                                     }
                                 }
                                 MouseArea {
+                                    id: tileMa
                                     anchors.fill: parent
                                     z: -1
-                                    onClicked: editor.selTarget = index
+                                    acceptedButtons: Qt.LeftButton | Qt.RightButton
+                                    property bool dragging: false
+                                    property real sx: 0
+                                    property real sy: 0
+                                    onPressed: function(m) {
+                                        if (m.button === Qt.RightButton) {
+                                            if (index !== 0) {
+                                                sprCtxMenu.tileIndex = index
+                                                sprCtxMenu.popup(
+                                                    m.x, m.y)
+                                            }
+                                            return
+                                        }
+                                        sx = m.x; sy = m.y; dragging = false
+                                        sprDragItem.tileIndex = index
+                                    }
+                                    onPositionChanged: function(m) {
+                                        if (!pressed) return
+                                        if (!dragging &&
+                                            Math.abs(m.x - sx) +
+                                            Math.abs(m.y - sy) < 6) return
+                                        if (index === 0) return  // Stage は動かせない
+                                        dragging = true
+                                        var gp = tile.mapToItem(sprPanel,
+                                                                m.x, m.y)
+                                        sprDragItem.x = gp.x - 44
+                                        sprDragItem.y = gp.y - 50
+                                        sprDragItem.visible = true
+                                        sprDragItem.ins =
+                                            sprInsertIndex(gp.x, gp.y)
+                                        sprInsLine.x =
+                                            sprInsLineX(sprDragItem.ins) - 1
+                                        sprInsLine.y =
+                                            sprInsLineY(sprDragItem.ins)
+                                        sprInsLine.visible = true
+                                    }
+                                    onReleased: function(m) {
+                                        if (dragging) {
+                                            editor.spriteReorder(
+                                                index, sprDragItem.ins)
+                                        }
+                                        dragging = false
+                                        sprDragItem.visible = false
+                                        sprInsLine.visible = false
+                                    }
+                                    onClicked: function(m) {
+                                        if (m.button === Qt.LeftButton)
+                                            editor.selTarget = index
+                                    }
+                                    // 挿入位置計算（旧 spriteInsertIndex 準拠:
+                                    // グリッド、行の先頭〜末尾を半分で区切る。
+                                    // mx,my は sprPanel 座標（margin 10 込み））
+                                    function sprInsertIndex(mx, my) {
+                                        var n = editor.spriteNames.length - 1
+                                        if (n <= 0) return 0
+                                        var tw = 88, th = 100, gap = 8
+                                        var cols = Math.max(1,
+                                            Math.floor(
+                                                (sprFlow.width - 20) / (tw + gap)))
+                                        var relY = my - 10, relX = mx - 10
+                                        var row = Math.max(0, Math.min(
+                                            Math.floor(
+                                                (relY + th / 2) / (th + gap)),
+                                            Math.floor((n - 1) / cols) + 1))
+                                        var first = row * cols
+                                        var last = Math.min(n, first + cols)
+                                        if (first >= n) return n
+                                        var ins = first
+                                        for (var i = first; i < last; ++i) {
+                                            var cx = (i % cols) * (tw + gap) + tw / 2
+                                            if (relX < cx) { ins = i; break }
+                                            ins = i + 1
+                                        }
+                                        return Math.max(0, Math.min(ins, n))
+                                    }
+                                    function sprInsLineX(ins) {
+                                        var tw = 88, gap = 8
+                                        var cols = Math.max(1,
+                                            Math.floor(
+                                                (sprFlow.width - 20) / (tw + gap)))
+                                        return 10 + (ins % cols) * (tw + gap) - gap / 2
+                                    }
+                                    function sprInsLineY(ins) {
+                                        var th = 100, gap = 8
+                                        var cols = Math.max(1,
+                                            Math.floor(
+                                                (sprFlow.width - 20) / (88 + gap)))
+                                        return 10 + Math.floor(ins / cols) * (th + gap)
+                                    }
                                 }
                             }
+                        }
+                    }
+                    // 挿入位置インジケータ（2px 紫線、旧 sdr_ 準拠）
+                    Rectangle {
+                        id: sprInsLine
+                        visible: false
+                        width: 2; height: 100
+                        color: "#855CD6"
+                        z: 5
+                    }
+                    // ドラッグゴースト
+                    Rectangle {
+                        id: sprDragItem
+                        visible: false
+                        property int tileIndex: -1
+                        property int ins: 0
+                        width: 88; height: 100; radius: 6
+                        color: "white"; border.color: cMenu; border.width: 2
+                        opacity: 0.75
+                        z: 6
+                        Image {
+                            width: 48; height: 40
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            y: 8
+                            fillMode: Image.PreserveAspectFit
+                            source: sprDragItem.tileIndex >= 0
+                                    ? "image://xyocostume/" +
+                                      sprDragItem.tileIndex + "/" +
+                                      editor.layoutRev : ""
+                        }
+                        Text {
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            y: 54
+                            width: parent.width - 8
+                            horizontalAlignment: Text.AlignHCenter
+                            elide: Text.ElideRight
+                            text: sprDragItem.tileIndex >= 0
+                                  ? editor.spriteNames[sprDragItem.tileIndex] : ""
+                            font.pixelSize: 11; color: cFg
+                        }
+                    }
+                    // スプライト右クリックメニュー
+                    // （context-menu.css 準拠: duplicate / export / delete）
+                    Menu {
+                        id: sprCtxMenu
+                        property int tileIndex: -1
+                        MenuItem {
+                            text: "duplicate"
+                            onTriggered: editor.duplicateSprite(sprCtxMenu.tileIndex)
+                        }
+                        MenuItem {
+                            text: "export"
+                            onTriggered: editor.exportSprite(sprCtxMenu.tileIndex)
+                        }
+                        MenuItem {
+                            text: "delete"
+                            onTriggered: editor.deleteSprite(sprCtxMenu.tileIndex)
                         }
                     }
                 }

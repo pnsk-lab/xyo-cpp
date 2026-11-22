@@ -1885,6 +1885,120 @@ struct EdCore {
         fedit_.buf.clear();
         fedit_.hasRect = false;
     }
+
+    // ---- スプライト並び替え・複製・書き出し ----
+    /// 非 stage スプライトの visual index ↔ target index
+    int spriteVisIndex(int ti) {
+        if (!rt) return -1;
+        int v = 0;
+        for (size_t i = 0; i < rt->targets.size(); ++i) {
+            if (rt->targets[i]->isStage) continue;
+            if ((int)i == ti) return v;
+            ++v;
+        }
+        return -1;
+    }
+    int spriteTiFromVis(int visIdx) {
+        if (!rt) return -1;
+        int v = 0;
+        for (size_t i = 0; i < rt->targets.size(); ++i) {
+            if (rt->targets[i]->isStage) continue;
+            if (v == visIdx) return (int)i;
+            ++v;
+        }
+        return -1;
+    }
+    /// targets / executableTargets を reorder（orderAt.js 相当:
+    /// stage は先頭固定、残りをスプライトタイル順に揃える）。
+    void spriteReorder(int ti, int ins) {
+        if (!rt) return;
+        std::vector<Target*> spr;
+        Target* moved = nullptr;
+        for (Target* t : rt->targets)
+            if (!t->isStage) {
+                if (t == rt->targets[ti]) moved = t;
+                else spr.push_back(t);
+            }
+        if (!moved) return;
+        ins = std::clamp(ins, 0, (int)spr.size());
+        spr.insert(spr.begin() + ins, moved);
+        std::vector<Target*> nt, ne;
+        for (Target* t : rt->targets) if (t->isStage) nt.push_back(t);
+        for (Target* t : spr) nt.push_back(t);
+        for (Target* t : nt)
+            if (std::find(rt->executableTargets.begin(),
+                          rt->executableTargets.end(), t) !=
+                rt->executableTargets.end())
+                ne.push_back(t);
+        rt->targets = std::move(nt);
+        rt->executableTargets = std::move(ne);
+        selTarget = spriteTiFromVis(
+            std::min(ins, (int)spr.size() - 1));
+        clearHistory();
+        wsDirty_ = true;
+        flyDirty_ = true;
+    }
+    void duplicateSprite(int ti) {
+        if (!rt || ti < 0 || ti >= (int)rt->targets.size()) return;
+        Target* src = rt->targets[ti];
+        if (!src || !src->sprite) return;
+        Sprite* ss = src->sprite;
+        auto spr = std::make_unique<Sprite>(rt);
+        Sprite* sp = spr.get();
+        rt->ownedSprites.push_back(std::move(spr));
+        // unusedName: 同名なら末尾数字を除き "name2"、"name3"…
+        {
+            std::string bn = utf16ToUtf8(ss->name);
+            auto exists = [&](const std::string& nm) {
+                for (Target* t : rt->targets)
+                    if (utf16ToUtf8(t->sprite->name) == nm) return true;
+                return false;
+            };
+            if (exists(bn)) {
+                while (!bn.empty() &&
+                       std::isdigit((unsigned char)bn.back()))
+                    bn.pop_back();
+                int i = 2;
+                while (exists(bn + std::to_string(i))) ++i;
+                bn += std::to_string(i);
+            }
+            sp->name = utf8ToU16(bn);
+        }
+        sp->costumes = ss->costumes;
+        sp->sounds = ss->sounds;
+        sp->soundBank = ss->soundBank;
+        sp->blocks = std::make_unique<Blocks>(rt);
+        if (ss->blocks)
+            sp->blocks->restoreState(ss->blocks->allBlocks(),
+                                     std::vector<std::string>(
+                                         ss->blocks->getScripts()));
+        Target* nt = sp->createClone();
+        nt->x = src->x; nt->y = src->y; nt->direction = src->direction;
+        nt->visible = src->visible; nt->size = src->size;
+        nt->draggable = src->draggable;
+        nt->rotationStyle = src->rotationStyle;
+        nt->currentCostume = src->currentCostume;
+        nt->volume = src->volume;
+        nt->variables = src->variables;
+        nt->effects = src->effects;
+        nt->soundEffects = src->soundEffects;
+        rt->addTarget(nt);
+        selTarget = (int)rt->targets.size() - 1;
+        clearHistory();
+        wsDirty_ = true;
+        flyDirty_ = true;
+    }
+    /// スプライト書き出し（.sprite3 = sprite.json + アセットの zip）。
+    bool exportSprite(int ti) {
+        if (!rt || ti < 0 || ti >= (int)rt->targets.size()) return false;
+        Target* t = rt->targets[ti];
+        if (!t || !t->sprite) return false;
+        std::string p = path;
+        auto dot = p.find_last_of('.');
+        if (dot != std::string::npos) p = p.substr(0, dot);
+        p += "-" + utf16ToUtf8(t->sprite->name) + ".sprite3";
+        return saveSprite3File(*rt, *t, p.c_str());
+    }
 };
 
 } // namespace
@@ -2330,6 +2444,19 @@ public:
         bumpLayout();
     }
     Q_INVOKABLE void deleteSprite(int i) { ed.deleteSprite(i); bumpLayout(); }
+    Q_INVOKABLE void duplicateSprite(int i) {
+        ed.duplicateSprite(i);
+        bumpLayout();
+        refreshCostumeThumbs();
+    }
+    Q_INVOKABLE bool exportSprite(int i) { return ed.exportSprite(i); }
+    /// スプライトタイルのドラッグ並び替え。
+    /// ti = target index、ins = 非 stage タイル上の挿入位置（0..n）。
+    Q_INVOKABLE void spriteReorder(int ti, int ins) {
+        ed.spriteReorder(ti, ins);
+        bumpLayout();
+        refreshCostumeThumbs();
+    }
 
     // ---- 右クリックコンテキストメニュー ----
     /// ws 上で右クリック: メニュー項目を構築（QML が ctxItems() で表示）。
@@ -3264,6 +3391,15 @@ int xyo::editorMainQt(const char* path, bool danger) {
             else if (a == "cmtcancel") ctrl.commentCancel();
             else if (a.startsWith("bppaste:"))
                 ctrl.backpackPasteAt(a.mid(8).toInt(), 700, 500);
+            else if (a.startsWith("sprdup:"))
+                ctrl.duplicateSprite(a.mid(7).toInt());
+            else if (a.startsWith("sprexp:"))
+                ctrl.exportSprite(a.mid(7).toInt());
+            else if (a.startsWith("sprord:")) {
+                QStringList p = a.mid(7).split(':');
+                if (p.size() == 2)
+                    ctrl.spriteReorder(p[0].toInt(), p[1].toInt());
+            }
             else if (a.startsWith("key:")) {
                 // key:<letter|space|up|down|left|right|return> — down+up
                 const QString k = a.mid(4);
