@@ -3971,9 +3971,19 @@ int xyo::editorMainQt(const char* path, bool danger) {
 
     // ネストイベントループ（ランチャーの app.exec() 内でも機能する）
     QEventLoop loop;
+    bool closed = false;
     QObject::connect(&view, &QQuickWindow::closing, &loop,
-                     &QEventLoop::quit);
-    loop.exec();
+                     [&]() { closed = true; loop.quit(); });
+    if (std::getenv("XYO_EDIT_DEBUG"))
+        std::fprintf(stderr, "[edqt] entering loop, vis=%d\n",
+                     (int)view.isVisible());
+    // ランチャー経由だと Qt が残留 Quit を処理して exec() が vis=1 の
+    // まま早抜けする場合がある。ウィンドウが生きている限り再入する。
+    while (!closed && view.isVisible())
+        loop.exec();
+    if (std::getenv("XYO_EDIT_DEBUG"))
+        std::fprintf(stderr, "[edqt] loop done, vis=%d\n",
+                     (int)view.isVisible());
 
     // 組み込みレンダラのテクスチャは保持中の SDL_Renderer が生きている間に
     // 解放する（editor.cpp と同じく placement new で空インスタンスに戻す）。
