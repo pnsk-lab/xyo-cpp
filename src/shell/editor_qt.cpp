@@ -2287,8 +2287,10 @@ public:
     Q_INVOKABLE void save() {
         const std::string& dst =
             ed.savePath.empty() ? ed.path : ed.savePath;
-        if (ed.save())
+        if (ed.save()) {
             std::fprintf(stderr, "editor: saved %s\n", dst.c_str());
+            Q_EMIT saved();
+        }
     }
     Q_INVOKABLE void undo() { ed.undo(); bumpLayout(); }
     Q_INVOKABLE void redo() { ed.redo(); bumpLayout(); }
@@ -2983,6 +2985,7 @@ public:
             }
         }
         if (ed.drag.active) {
+            dragVx_ = float(x); dragVy_ = float(y);
             if (ed.drag.fromFlyout) {
                 // QML が ws ローカル座標で呼ぶ（ゴースト位置は mx/my）
                 ed.drag.mx = lx;
@@ -3003,6 +3006,7 @@ public:
     }
     /// ws ビュー外（ツールボックス/フライアウト）で解放 = 削除ドロップ。
     Q_INVOKABLE void wsDropDelete() {
+        dragVx_ = dragVy_ = -1;
         if (ed.drag.active) {
             if (ed.drag.fromFlyout) {
                 if (ed.drag.snapshotTaken) { ed.popUndo(); ed.drag.snapshotTaken = false; }
@@ -3024,6 +3028,7 @@ public:
         return {ed.wsW - 160, ed.wsH - 56, 56.0, 44.0};
     }
     Q_INVOKABLE void wsMouseRelease(double x, double y) {
+        dragVx_ = dragVy_ = -1;
         if (ed.drag.active) {
             // 削除ゾーン上へのドロップ = 削除（ws ドラッグのみ）
             QVariantList tr = trashRect();
@@ -3082,6 +3087,61 @@ public:
         }
         wsPanning_ = false;
     }
+    /// Esc: ドラッグを始める前の状態へ巻き戻す。ws ドラッグは開始時に
+    /// pushUndo 済みなので undo() で復元し redo スタックを捨てる。
+    /// フライアウト発はまだ ws に挿入していないので捨てるだけ。
+    Q_INVOKABLE void cancelDrag() {
+        if (ed.drag.active) {
+            if (ed.drag.snapshotTaken) {
+                if (ed.drag.fromFlyout) ed.popUndo();
+                else { ed.undo(); ed.redoStack.clear(); }
+                ed.drag.snapshotTaken = false;
+            }
+            ed.drag.active = false;
+            ed.drag.pending = false;
+            ed.drag.connectionsReady = false;
+            dragVx_ = dragVy_ = -1;
+            bumpLayout();
+        } else if (ed.drag.pending) {
+            ed.drag.pending = false;
+            bumpLayout();
+        }
+    }
+    /// ホバーカーソル（Qt::CursorShape。ブロック上=手、フィールド上=I-beam
+    /// 等）。x,y は ws ビュー座標。
+    Q_INVOKABLE int wsCursor(double x, double y) {
+        if (ed.drag.active) return Qt::ClosedHandCursor;
+        float s = ed.wsScale();
+        float lx = (float(x) - ed.panX) / s, ly = (float(y) - ed.panY) / s;
+        if (ed.wsDirty_) ed.rebuildWs();
+        bl::LBlock* lb = ed.wsBlockAtLogical(lx, ly);
+        if (!lb) return Qt::ArrowCursor;
+        if (const bl::LSeg* g = lb->segAt(lx - lb->x, ly - lb->y)) {
+            switch (g->kind) {
+            case bl::SegKind::NumField:
+            case bl::SegKind::StrField:
+                return Qt::IBeamCursor;
+            case bl::SegKind::Dropdown:
+            case bl::SegKind::Variable:
+            case bl::SegKind::Swatch:
+                return Qt::PointingHandCursor;
+            default: break;
+            }
+        }
+        return Qt::OpenHandCursor;
+    }
+    /// フライアウト上のホバーカーソル。
+    Q_INVOKABLE int flyCursor(double x, double y, double viewW) {
+        if (ed.drag.active) return Qt::ClosedHandCursor;
+        if (EdCore::FlyItem* fi =
+                ed.flyItemAt(float(x), float(y), float(viewW))) {
+            if (fi->kind == EdCore::FlyItem::Button) return Qt::PointingHandCursor;
+            return Qt::OpenHandCursor;
+        }
+        return Qt::ArrowCursor;
+    }
+    /// 現在のワークスペースズーム（% 表示用）。
+    Q_INVOKABLE double zoomLevel() const { return ed.zoom; }
     Q_INVOKABLE void wsWheel(double x, double y, double dy) {
         float old = ed.wsScale();
         ed.zoom = std::clamp(ed.zoom * (dy > 0 ? 1.1f : 1 / 1.1f),
@@ -3157,6 +3217,7 @@ public:
             ed.pushUndo();
         }
         if (ed.drag.active) {
+            dragVx_ = float(x); dragVy_ = float(y);
             float s = ed.wsScale();
             ed.drag.mx = float((x - ed.panX) / s);
             ed.drag.my = float((y - ed.panY) / s);
@@ -3166,6 +3227,7 @@ public:
     }
     /// フライアウト上で解放（=キャンセル。ws 内は wsMouseRelease が拾う）。
     Q_INVOKABLE void flyMouseRelease() {
+        dragVx_ = dragVy_ = -1;
         if (ed.drag.active && ed.drag.fromFlyout) {
             if (ed.drag.snapshotTaken) { ed.popUndo(); ed.drag.snapshotTaken = false; }
             ed.drag.active = false;
@@ -3247,7 +3309,30 @@ public:
             rt->step();
             if (!rt->threads.empty()) bumpLayout();
         }
+        dragEdgeScroll();
         renderStage();
+    }
+    /// ブロックドラッグ中にポインタが ws 端に近づくと自動でパンする
+    /// （scratch-blocks の auto-scroll 相当）。ポインタを論理座標で不動に
+    /// 保つため mx/my へ逆分を足す。ws 外（ツールボックス方向）では動かない。
+    void dragEdgeScroll() {
+        if (!ed.drag.active) return;
+        if (dragVx_ < 0 || dragVy_ < 0) return;
+        if (dragVx_ >= ed.wsW || dragVy_ >= ed.wsH) return;
+        const float kEdge = 32.f, kStep = 12.f;
+        float dx = 0, dy = 0;
+        if (dragVx_ < kEdge) dx = -kStep;
+        else if (dragVx_ > ed.wsW - kEdge) dx = kStep;
+        if (dragVy_ < kEdge) dy = -kStep;
+        else if (dragVy_ > ed.wsH - kEdge) dy = kStep;
+        if (!dx && !dy) return;
+        ed.panX += dx;
+        ed.panY += dy;
+        float s = ed.wsScale();
+        ed.drag.mx -= dx / s;
+        ed.drag.my -= dy / s;
+        ed.updateDropTarget();
+        bumpLayout();
     }
     void renderStage() {
         if (!sdlR || !rt) return;
@@ -3306,10 +3391,13 @@ public:
     QPointF wsPress_;
     bool wsPanning_ = false;
     QPointF panStart_, panOrig_;
+    /// ドラッグ中ポインタの ws ビュー座標（エッジスクロール用。未使用は -1）
+    float dragVx_ = -1, dragVy_ = -1;
 
 Q_SIGNALS:
     void uiChanged();
     void layoutChanged();
+    void saved();   // 保存完了（QML の toast 用）
 };
 
 // ---------------------------------------------------------------------------

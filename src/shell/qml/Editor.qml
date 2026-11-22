@@ -39,12 +39,38 @@ Item {
     Keys.onPressed: function(ev) {
         if (ev.modifiers & Qt.ControlModifier) {
             if (ev.key === Qt.Key_S) { editor.save(); ev.accepted = true; return; }
+            if (ev.key === Qt.Key_D) {
+                editor.duplicateSelected(); ev.accepted = true; return;
+            }
             if (ev.key === Qt.Key_Z) {
                 if (ev.modifiers & Qt.ShiftModifier) editor.redo();
                 else editor.undo();
                 ev.accepted = true; return;
             }
             if (ev.key === Qt.Key_Y) { editor.redo(); ev.accepted = true; return; }
+            // Ctrl+1/2/3: Code/Costumes/Sounds タブ切替
+            if (ev.key === Qt.Key_1 || ev.key === Qt.Key_2 ||
+                ev.key === Qt.Key_3) {
+                editor.setTab(ev.key - Qt.Key_1);
+                ev.accepted = true; return;
+            }
+            // Ctrl+=/-/0: ワークスペースズーム
+            if (ev.key === Qt.Key_Equal || ev.key === Qt.Key_Plus) {
+                editor.zoomBy(1.25); ev.accepted = true; return;
+            }
+            if (ev.key === Qt.Key_Minus) {
+                editor.zoomBy(0.8); ev.accepted = true; return;
+            }
+            if (ev.key === Qt.Key_0) {
+                editor.zoomReset(); ev.accepted = true; return;
+            }
+        }
+        if (ev.key === Qt.Key_Escape) {
+            // ドラッグ → メニュー → フィールド編集 の順で閉じる
+            editor.cancelDrag();
+            editor.menuDismiss();
+            editor.fieldEditCancel();
+            ev.accepted = true; return;
         }
         if (ev.key === Qt.Key_Delete || ev.key === Qt.Key_Backspace) {
             editor.deleteSelected(); ev.accepted = true; return;
@@ -308,6 +334,10 @@ Item {
                             id: flyMa
                             anchors.fill: parent
                             hoverEnabled: true
+                            cursorShape: flyMa.containsMouse
+                                ? editor.flyCursor(flyMa.mouseX, flyMa.mouseY,
+                                                   flyCanvas.width)
+                                : Qt.ArrowCursor
                             onWheel: function(w) {
                                 editor.flyWheel(w.angleDelta.y, flyCanvas.height)
                             }
@@ -458,6 +488,10 @@ Item {
                     anchors.fill: parent
                     hoverEnabled: true
                     acceptedButtons: Qt.LeftButton | Qt.RightButton
+                    // ブロック上=手、フィールド上=I-beam、ドラッグ中=掴み手
+                    cursorShape: (wsMa.containsMouse || wsMa.pressed)
+                        ? editor.wsCursor(wsMa.mouseX, wsMa.mouseY)
+                        : Qt.ArrowCursor
                     onPressed: function(m) {
                         if (m.button === Qt.RightButton) {
                             editor.openWsContextMenu(m.x, m.y)
@@ -481,7 +515,7 @@ Item {
                         editor.wsWheel(w.x, w.y, w.angleDelta.y)
                     }
                 }
-                // ズームボタン（右下）
+                // ズームボタン（右下）+ 現在倍率
                 Column {
                     anchors.right: parent.right
                     anchors.bottom: parent.bottom
@@ -508,6 +542,41 @@ Item {
                                 }
                             }
                         }
+                    }
+                    Text {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        text: {
+                            var n = editor.layoutRev
+                            return Math.round(editor.zoomLevel() * 100) + "%"
+                        }
+                        color: cFgDim; font.pixelSize: 10
+                    }
+                }
+                // 保存完了トースト（中央上部、1.4 秒で消える）
+                Rectangle {
+                    id: saveToast
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    anchors.top: parent.top
+                    anchors.topMargin: 12
+                    width: saveTxt.implicitWidth + 24; height: 30
+                    radius: 15
+                    color: "#E6253E8C"; z: 30
+                    property bool toastOn: false
+                    opacity: toastOn ? 1 : 0
+                    visible: opacity > 0
+                    Behavior on opacity { NumberAnimation { duration: 200 } }
+                    Text { id: saveTxt; anchors.centerIn: parent
+                           text: "Saved"; color: "white"; font.pixelSize: 12 }
+                    Connections {
+                        target: editor
+                        function onSaved() {
+                            saveToast.toastOn = true
+                            saveToastTimer.restart()
+                        }
+                    }
+                    Timer {
+                        id: saveToastTimer; interval: 1400
+                        onTriggered: saveToast.toastOn = false
                     }
                 }
                 // コンテキストメニュー（scratch-blocks showContextMenu_ 準拠:
