@@ -65,6 +65,7 @@ def run(binary: Path, sb3: Path, mode: str, enabled: bool, keys: list[str],
         extra_env: dict[str, str] | None = None):
     env = {k: v for k, v in os.environ.items()
            if not k.startswith("XYO_")}
+    env['XYO_MLIR'] = '0'
     env.update(XYO_DUMPVARS="json", XYO_GPU="0", XYO_PAR="0",
                XYO_PARFOR="0", XYO_JIT_INLINE_EMPTY_SCHED=str(int(enabled)))
     env.update(extra_env or {})

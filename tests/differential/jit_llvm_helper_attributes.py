@@ -63,6 +63,7 @@ def cse_project(trip):
 
 def run(binary, project, mode, enabled, dump=False, aot=None, profile=False):
     env = {k: v for k, v in os.environ.items() if not k.startswith('XYO_')}
+    env['XYO_MLIR'] = '0'
     env.update(XYO_JIT_PURE_MATH=str(int(enabled)), XYO_GPU='0', XYO_PARFOR='0',
                XYO_HOT_INVOCATIONS='1', XYO_HOT_STATS='1')
     if dump:

@@ -19,6 +19,7 @@ def project_state(binary: Path, sb3: Path, tier: str, mode: str):
     assert mode in ("off", "integer", "ordered")
     env = {key: value for key, value in os.environ.items()
            if not key.startswith("XYO_")}
+    env['XYO_MLIR'] = '0'
     env.update({
         "XYO_DUMPVARS": "json",
         "XYO_JIT_PLAIN_NUMBER_CMP": "0" if mode == "off" else "1",

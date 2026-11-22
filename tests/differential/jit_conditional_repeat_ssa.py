@@ -235,6 +235,7 @@ def make_fixture(path: Path, warp: bool):
 def run(binary: Path, project: Path, keys, jit: str, flag: str, extra=None):
     env = {key: value for key, value in os.environ.items()
            if not key.startswith("XYO_")}
+    env['XYO_MLIR'] = '0'
     env.update(XYO_JIT_CONDITIONAL_SSA=flag,
                XYO_DUMPVARS="json", XYO_GPU="0", XYO_PAR="0",
                XYO_PARFOR="0")

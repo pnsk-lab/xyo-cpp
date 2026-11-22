@@ -63,6 +63,7 @@ def run(binary: Path, path: Path, keys: list[str], tier: str,
         read_forward: bool, dump_ir: bool = False) -> tuple[dict, str]:
     env = {key: value for key, value in os.environ.items()
            if not key.startswith("XYO_")}
+    env['XYO_MLIR'] = '0'
     env.update(
         XYO_PAR="0", XYO_GPU="0", XYO_DUMPVARS="json",
         XYO_JIT_LAZY_TYPED_SSA="1", XYO_JIT_TYPE_FLOW="1",

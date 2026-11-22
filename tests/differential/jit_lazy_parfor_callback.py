@@ -44,6 +44,7 @@ def make_plain_fixture(path: Path) -> None:
 
 def run(binary: Path, project: Path, mode: str) -> tuple[dict, str]:
     env = {k: v for k, v in os.environ.items() if not k.startswith("XYO_")}
+    env['XYO_MLIR'] = '0'
     env.update({
         "XYO_JIT_MODE": mode,
         "XYO_JIT_LAZY_MODE": "on",

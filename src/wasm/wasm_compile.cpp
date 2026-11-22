@@ -3018,6 +3018,15 @@ bool lowerCapturedRange(const ir::ScratchScript& script,
             return false;
         const Block* block = script.getBlock(cursor);
         if (!block) return false;
+        // Fail closed on externally observable or potentially yielding
+        // opcodes: a speculative WASM slice must never speculate across
+        // them (the interpreter keeps the authoritative scheduling).
+        if (const auto* node = effects.getBlock(cursor)) {
+            if (node->opaque ||
+                ir::hasEffect(node->effects, ir::ScratchEffect::Unknown) ||
+                ir::hasEffect(node->effects, ir::ScratchEffect::MayYield))
+                return false;
+        }
         // Nested/non-warp scheduling needs interpreter frames. Only compile
         // complete top-level straight-line/conditional statements here.
         if (block->opcode == "control_repeat" ||

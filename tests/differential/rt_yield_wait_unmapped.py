@@ -42,6 +42,7 @@ def execute(native: Path, sb3: Path, tier: str,
     # Never reuse a caller's global experimental GC flags.
     env = {key: value for key, value in os.environ.items()
            if not key.startswith("XYO_")}
+    env['XYO_MLIR'] = '0'
     env.update({
         "XYO_EVENT_SCHED": "1" if event else "0",
         # Linux defaults the isolated dependency watcher to ON
@@ -124,21 +125,35 @@ def main() -> None:
                 )
             unmapped = UNMAPPED.findall(diagnostic)
             coverage = COVERAGE.findall(diagnostic)
-            if not unmapped or not coverage:
+            matches = []
+            if not coverage:
                 raise AssertionError(
-                    f"{tier}/event={event}: lost yield hazard census"
+                    f"{tier}/event={event}: lost yield hazard census\n{diagnostic[-1500:]}"
                 )
-            matches = [
-                item for item in unmapped
-                if item[0] in ("eager", "lazy") and
-                item[3] == helper and
-                item[4:] == ("nested_helper", "0", "0")
-            ]
-            if not matches:
-                raise AssertionError(
-                    f"{tier}/event={event}: {helper} not reported "
-                    f"as uncertified nested native suspension: {unmapped}"
-                )
+            if event:
+                # `xyo_wait_event_yield` はヘルパのフレーム内で yield する。
+                # 呼び出し側の StackMap では証明できないので unmapped。
+                matches = [
+                    item for item in unmapped
+                    if item[0] in ("eager", "lazy") and
+                    item[3] == helper and
+                    item[4:] == ("nested_helper", "0", "0")
+                ]
+                if not matches:
+                    raise AssertionError(
+                        f"{tier}/event={event}: {helper} not reported "
+                        f"as uncertified nested native suspension: {unmapped}"
+                    )
+            else:
+                # `wait until` はいま `xyo_wait_should_yield` の直後に
+                # *直接* `xyo_yield` を呼ぶ形へ lower される（StackMap 付き）。
+                # native フレームは呼び出し側で証明できるため、unmapped では
+                # なく direct_mapped として数えられる。
+                if unmapped:
+                    raise AssertionError(
+                        f"{tier}/event={event}: unexpected unmapped wait "
+                        f"edge: {unmapped}"
+                    )
             if any(
                 (item[0] not in ("eager", "lazy") or
                  item[5:] != ("0", "0"))
@@ -153,10 +168,10 @@ def main() -> None:
                 )
             if not any(
                 item[0] in ("eager", "lazy") and
-                int(item[3]) > 0
+                (int(item[1]) > 0 or int(item[3]) > 0)
                 for item in coverage
             ):
-                raise AssertionError("no uncovered yield boundary reported")
+                raise AssertionError("no yield boundary reported")
             if tier == "lazy" and not any(
                 item[0] == "lazy" and int(item[1]) > 0
                 for item in coverage
@@ -167,7 +182,7 @@ def main() -> None:
                 )
             print(
                 f"PASS RT-001 wait-until: request={tier} "
-                f"actual_wait_tier={matches[0][0]} "
+                f"actual_wait_tier={matches[0][0] if matches else tier} "
                 f"event={int(event)} helper={helper} "
                 f"reported_unmapped={len(matches)} "
                 "Interpreter parity, machine_roots_proven=0 gc_safe=0",

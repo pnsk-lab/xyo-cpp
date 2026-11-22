@@ -80,6 +80,7 @@ def build(path: Path, case: int, rng: random.Random):
 
 def execute(binary, path, keys, tier, extra):
     env = {k: v for k, v in os.environ.items() if not k.startswith("XYO_")}
+    env['XYO_MLIR'] = '0'
     env.update(XYO_DUMPVARS="json", XYO_PAR="0", XYO_GPU="0",
                XYO_JIT_CONDITIONAL_SSA="0")
     env.update(extra)

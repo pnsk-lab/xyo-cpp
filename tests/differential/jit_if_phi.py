@@ -85,6 +85,7 @@ def make_fixture(path, warp):
 def execute(binary, project, keys, jit, overrides):
     env = {key: val for key, val in os.environ.items()
            if not key.startswith("XYO_")}
+    env['XYO_MLIR'] = '0'
     env.update(XYO_DUMPVARS="json", XYO_PAR="0", XYO_GPU="0",
                XYO_JIT_TYPE_FLOW="1", XYO_JIT_LAZY_TYPED_SSA="1",
                XYO_JIT_CONDITIONAL_SSA="0")

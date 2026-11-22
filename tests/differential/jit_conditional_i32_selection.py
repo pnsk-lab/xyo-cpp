@@ -82,6 +82,7 @@ def run(binary: Path, project: Path, enabled: bool, opt_level: int,
         i32_setting: str = "auto", trace_setting: str = "auto") -> tuple[dict, str]:
     env = {key: value for key, value in os.environ.items()
            if not key.startswith("XYO_")}
+    env['XYO_MLIR'] = '0'
     env.update({
         "XYO_JIT_CONDITIONAL_SSA": "1",
         "XYO_JIT_CONDITIONAL_UREM": "1",

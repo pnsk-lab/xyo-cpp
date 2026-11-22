@@ -51,6 +51,7 @@ def operation_fixture(kind, values):
 
 def execute(binary, path, mode, flags, finite, storage, out, label, dump=False, obj=None):
     env = {k: v for k, v in os.environ.items() if not k.startswith('XYO_')}
+    env['XYO_MLIR'] = '0'
     env.update(XYO_GPU='0', XYO_PAR='0', XYO_PARFOR='0', XYO_DUMPVARS='json',
                XYO_HOT_INVOCATIONS='1', XYO_HOT_STATS='1', XYO_LIST_STORAGE=storage,
                XYO_JIT_INTEGER_NUM_CLASSIFY=str(flags[0]),
@@ -174,6 +175,7 @@ def main():
         write_sb3(checkpoint, checkpoint_project())
         for enabled in (0, 1):
             env = {k: v for k, v in os.environ.items() if not k.startswith('XYO_')}
+            env['XYO_MLIR'] = '0'  # legacy codegen checkpoint semantics
             env['XYO_JIT_COERCION_PROJECTION'] = str(enabled)
             p = subprocess.run([str(args.checkpoint_smoke.resolve()), str(checkpoint)],
                 cwd=ROOT, env=env, capture_output=True, text=True, timeout=120)

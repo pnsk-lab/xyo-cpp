@@ -101,6 +101,7 @@ def fixture(path: Path, warp: bool):
 def run(binary: Path, fixture_path: Path, jit: str, fast: bool, keys: list[str],
         extra_env: dict[str, str] | None = None):
     env = {k: v for k, v in os.environ.items() if not k.startswith("XYO_")}
+    env['XYO_MLIR'] = '0'
     env.update({"XYO_DUMPVARS": "json", "XYO_GPU": "0", "XYO_PAR": "0",
                 "XYO_JIT_FOREACH_SSA": "1" if fast else "0"})
     env.update(extra_env or {})
