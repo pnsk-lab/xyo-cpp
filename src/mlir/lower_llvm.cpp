@@ -2859,7 +2859,11 @@ void Lowerer::emitOp(Op& op) {
         }
         LValue* trunc = b.CreateUnaryIntrinsic(llvm::Intrinsic::trunc, f);
         LValue* isInt = b.CreateFCmpOEQ(trunc, f);
-        vals[k0] = b.CreateAnd(b.CreateAnd(isNum, ordered),
+        // isNum はここでは問わない（f は数値化済み）。素の double で
+        // ない正確な整数（正準形の整数文字列 "0" 等）も通す。isNum を
+        // 掛けると文字列 entry が全滅し、guard/box が常に else/float 側へ
+        // 落ちる（found: suite list_read）。
+        vals[k0] = b.CreateAnd(ordered,
                                b.CreateAnd(b.CreateAnd(inRange, isInt),
                                            nonZero));
         return;
