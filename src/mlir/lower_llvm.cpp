@@ -66,6 +66,8 @@ struct Slot {
 struct Shared {
     /// 常に数値と証明できた変数 id（frontend が設定）。
     const std::unordered_set<std::string>* numericVars = nullptr;
+    /// xyo.call の呼び先効果解析用（lowerToLLVM が設定）。
+    const Module* module = nullptr;
     std::map<std::string, uint32_t> slotIndex;
     std::vector<Slot> slotDefs;
     std::map<std::string, llvm::Constant*> globals;
@@ -73,6 +75,10 @@ struct Shared {
     /// 呼出し側スレッドの affinity が要る（既存 codegen の mainThread
     /// マークと同じ規則）。entry 以外の手続き関数でも伝播する。
     bool mainThread = false;
+    /// xyo.parfor.try が作った並列本体関数とその region。
+    /// 全関数を lowering し終えてから中身を emit する（slotFor の
+    /// スロット集合が確定してからエントリ初期化と矛盾なく組める）。
+    std::vector<std::pair<llvm::Function*, Region*>> pendingParFors;
 };
 
 /// xyo.const.f64 の定数値。
@@ -408,6 +414,8 @@ struct Lowerer {
     void emitWhile(Op& op);
     void emitRepeat(Op& op);
     void emitForever(Op& op);
+    void emitParForTry(Op& op);
+    void emitPendingParFors();
     void emitCompat(Op& op, bool asValue);
     void emitAllAtOnce(Op& op);
     void emitForEach(Op& op);
@@ -464,16 +472,41 @@ struct Lowerer {
     /// 構造変化（伸縮）のあるリスト。replace のみは含まない
     /// （ヘッダ共有可）。
     std::unordered_set<std::string> structMutatedLists;
+        /// ループ内 xyo.call の呼び先が書く変数・リスト（再帰的に解決
+        /// 済み）。opaque（yield/副作用あり）は observable=true で
+        /// 表し、透明な呼び先だけここへ畳み込む。
+        std::unordered_set<std::string> callVarWrites;
+        std::unordered_set<std::string> callListMut;
+        std::unordered_set<std::string> callStructMut;
+        bool callAnyStruct = false;
         bool observable = false;
         std::vector<ListHeader> headers;
         std::vector<NumCacheEntry> numCache;
     };
+    /// xyo.call 呼び先の副作用（透過性解析）。
+    struct CalleeFx {
+        std::unordered_set<std::string> varWrites;
+        std::unordered_set<std::string> listMut;
+        std::unordered_set<std::string> structMut;
+        bool anyStruct = false;
+    };
+    std::unordered_map<std::string, int> calleeFxMemo_;  // 0=解析中/不透明, 1=透明
+    std::unordered_map<std::string, CalleeFx> calleeFxCache_;
+    bool calleeEffects(const Op* call, CalleeFx& out);
     std::vector<LoopScope> loopScopes_;
     /// getvar op → 数値キャッシュ alloca（アクティブなスコープの和）。
     std::unordered_map<const Op*, llvm::AllocaInst*> loopNumCache_;
     /// xyo.arg op → 数値キャッシュ alloca（proc 引数は呼出し中不変 —
     /// 関数エントリで 1 回だけ to_num して使い回す）。
     std::unordered_map<const Op*, llvm::AllocaInst*> argNumCache_;
+    /// par-for ワーカー本体の lowering 中だけ有効。
+    /// pfLists_/pfBases_ は SList** / i64*、pfIter_ は i64、
+    /// pfCtrD_ は反復ローカルカウンタの f64 値。
+    bool inPfBody_ = false;
+    LValue* pfLists_ = nullptr;
+    LValue* pfBases_ = nullptr;
+    LValue* pfIter_ = nullptr;
+    LValue* pfCtrD_ = nullptr;
     void popLoopScope() {
         for (const NumCacheEntry& e : loopScopes_.back().numCache)
             loopNumCache_.erase(e.gv);
@@ -484,7 +517,8 @@ struct Lowerer {
     LValue* listPtrFor(Op& op, LValue* var, ListHeader** out);
     void readListHeader(const ListHeader& h);
     std::vector<HoistEntry> hoistStack_;
-    llvm::AllocaInst* entryAlloca(llvm::Type* t, const char* name);
+    llvm::AllocaInst* entryAlloca(llvm::Type* t, const char* name,
+                                  uint32_t count = 0);
     void pushLoopScope(Block& body, bool warp, Block* extra = nullptr);
     void recomputeHoisted();
     bool tryHoistListRead(Op& op);
@@ -1067,10 +1101,12 @@ llvm::Function* Lowerer::modWideVariableFn() {
     return f;
 }
 
-llvm::AllocaInst* Lowerer::entryAlloca(llvm::Type* t, const char* name) {
+llvm::AllocaInst* Lowerer::entryAlloca(llvm::Type* t, const char* name,
+                                       uint32_t count) {
     llvm::BasicBlock& entry = fn->getEntryBlock();
     IRBuilder<> ib(&entry, entry.begin());
-    return ib.CreateAlloca(t, nullptr, name);
+    return ib.CreateAlloca(
+        t, count ? llvm::ConstantInt::get(i32(), count) : nullptr, name);
 }
 
 namespace {
@@ -1150,6 +1186,77 @@ bool listHeaderOptIn() {
 }
 }  // namespace
 
+/// xyo.call の呼び先が透過か（warp 手続き内の純粋な手続き呼出しか）。
+/// 透過なら out に書き込み先の変数・リストを集めて true。
+/// 不明・再帰・yield・副作用を含むなら false（observable 扱い）。
+bool Lowerer::calleeEffects(const Op* call, CalleeFx& out) {
+    if (!shared.module) return false;
+    const Attr* callee = call->attr("callee");
+    if (!callee || !callee->isStr()) return false;
+    const std::string name(callee->asStr());
+    auto cached = calleeFxCache_.find(name);
+    if (cached != calleeFxCache_.end()) {
+        out = cached->second;
+        return true;
+    }
+    if (calleeFxMemo_.count(name)) return false;  // 再帰/解析中
+    calleeFxMemo_[name] = 0;
+    const Module::Function* fn =
+        const_cast<Module*>(shared.module)->function(name);
+    CalleeFx fx;
+    bool transparent = fn && fn->body;
+    if (transparent) {
+        std::function<bool(Block&)> walk = [&](Block& blk) -> bool {
+            for (Op* o : blk.ops) {
+                const std::string& n = o->name;
+                if (n == "xyo.setvar")
+                    fx.varWrites.insert(std::string(o->attrStr("id")));
+                else if (n == "xyo.list.add" || n == "xyo.list.deleteall" ||
+                         n == "xyo.list.insert" || n == "xyo.list.delete") {
+                    if (!o->operands.empty() && o->operands[0].op &&
+                        o->operands[0].op->name == "xyo.list.ptr") {
+                        fx.listMut.insert(std::string(
+                            o->operands[0].op->attrStr("id")));
+                        fx.structMut.insert(std::string(
+                            o->operands[0].op->attrStr("id")));
+                    } else {
+                        fx.anyStruct = true;
+                    }
+                } else if (n == "xyo.list.replace" ||
+                           n == "xyo.list.replace.i") {
+                    if (!o->operands.empty() && o->operands[0].op &&
+                        o->operands[0].op->name == "xyo.list.ptr")
+                        fx.listMut.insert(std::string(
+                            o->operands[0].op->attrStr("id")));
+                    else
+                        fx.anyStruct = true;
+                } else if (n == "xyo.call") {
+                    // 先に解析した callee は透過なら効果を畳む。
+                    if (!calleeEffects(o, fx)) return false;
+                } else if (n == "xyo.warp_yield" || n == "xyo.loop_yield") {
+                    // 呼び先内部で yield すると他スクリプトが変数を
+                    // 書き換え得る → 呼出し側の numCache/ヘッダは信頼
+                    // できないので不透明扱い。
+                    return false;
+                } else if (hoistBarrier(n)) {
+                    return false;
+                }
+                for (auto& r : o->regions)
+                    if (r)
+                        for (auto& rcb : r->blocks)
+                            if (!walk(*rcb)) return false;
+            }
+            return true;
+        };
+        transparent = walk(*fn->body);
+    }
+    calleeFxMemo_.erase(name);
+    if (!transparent) return false;
+    calleeFxCache_[name] = fx;
+    out = fx;
+    return true;
+}
+
 void Lowerer::pushLoopScope(Block& body, bool warp, Block* extra) {
     LoopScope sc;
     sc.preheader = b.GetInsertBlock();
@@ -1167,7 +1274,27 @@ void Lowerer::pushLoopScope(Block& body, bool warp, Block* extra) {
                     o->operands[0].op->name == "xyo.list.ptr")
                     sc.structMutatedLists.insert(
                         std::string(o->operands[0].op->attrStr("id")));
-                if (hoistBarrier(o->name)) sc.observable = true;
+                if (hoistBarrier(o->name)) {
+                    // xyo.call は呼び先の効果だけ畳み込めば透明に扱える:
+                    // 不透明（yield・副作用・再帰・未解決）は observable
+                    // のまま落とすが、warp 手続き同士の呼出しなら書く
+                    // 変数/リストを特定して numCache/ヘッダを生かす
+                    // （sha256 の「repeat { call round(x) }」）。
+                    if (o->name == "xyo.call") {
+                        CalleeFx fx;
+                        if (calleeEffects(o, fx)) {
+                            sc.callVarWrites.insert(fx.varWrites.begin(),
+                                                    fx.varWrites.end());
+                            sc.callListMut.insert(fx.listMut.begin(),
+                                                  fx.listMut.end());
+                            sc.callStructMut.insert(
+                                fx.structMut.begin(), fx.structMut.end());
+                            if (fx.anyStruct) sc.callAnyStruct = true;
+                            continue;
+                        }
+                    }
+                    sc.observable = true;
+                }
                 for (auto& r : o->regions)
                     if (r)
                         for (auto& rcb : r->blocks) walk(*rcb);
@@ -1198,7 +1325,10 @@ void Lowerer::pushLoopScope(Block& body, bool warp, Block* extra) {
             if (p->name != "xyo.list.ptr") continue;
             std::string id(p->attrStr("id"));
             // replace のみのループは len/items が不変なので共有する。
-            if (sc.structMutatedLists.count(id)) continue;
+            // 呼び先が構造変化（append/deleteall）を起こすリストも
+            // 除外する（opaque 呼出しは observable で既に落ちている）。
+            if (sc.structMutatedLists.count(id) || sc.callAnyStruct ||
+                sc.callStructMut.count(id)) continue;
             used[id] = std::string(p->attrStr("name"));
         }
         for (auto& [id, name] : used) {
@@ -1249,6 +1379,7 @@ void Lowerer::pushLoopScope(Block& body, bool warp, Block* extra) {
         for (Op* o : sc.bodyOps) {
             if (o->name == "xyo.setvar" && !o->attrStr("id").empty())
                 written.insert(std::string(o->attrStr("id")));
+            for (const auto& w : sc.callVarWrites) written.insert(w);
             // 昇格変数は yield 点でメモリを往復する（間の getvar は
             // 古い値を読み得る）のでキャッシュ対象から外す。
             if (o->name == "xyo.warp_yield" ||
@@ -1476,6 +1607,10 @@ LValue* Lowerer::numberShadow(const Value& v) {
     // to_num(getvar/arg) で、その変数がループ内で書かれないときは
     // preheader で 1 回だけ求めたキャッシュ値を使う（legacy の昇格
     // 数値影に相当。yield 後は recomputeHoisted が読み直す）。
+    if (v.op && v.op->name == "xyo.pfctr" && pfCtrD_) {
+        numShadow_[key] = NumShadowEntry{pfCtrD_, b.GetInsertBlock()};
+        return pfCtrD_;
+    }
     if (v.op && (v.op->name == "xyo.getvar" || v.op->name == "xyo.arg")) {
         llvm::AllocaInst* cs = nullptr;
         auto cit = loopNumCache_.find(v.op);
@@ -1651,6 +1786,173 @@ LValue* Lowerer::emitToNumInline(LValue* bits) {
     return phi;
 }
 
+
+void Lowerer::emitParForTry(Op& op) {
+    // 「反復カウンタ + 各リストへ 1 個ずつ append」ループを
+    // ワーカープールで分割実行する（legacy codegen の tryEmitParFor
+    // と同じゲート・同じ意味論。結果 i1 = 並列で完結したか）。
+    LValue* n = numberShadow(op.operands[0]);
+    const std::string cid(op.attrStr("counter"));
+    const std::string cname(op.attrStr("cname"));
+    const double delta = op.attr("delta") ? op.attr("delta")->asDouble(1.0)
+                                          : 1.0;
+    // "id\x1fname\x1e..." を分解する。
+    std::vector<std::pair<std::string, std::string>> lists;
+    {
+        std::string raw(op.attrStr("lists"));
+        size_t pos = 0;
+        while (pos <= raw.size()) {
+            const size_t sep = raw.find('\x1e', pos);
+            const std::string part = raw.substr(
+                pos, sep == std::string::npos ? std::string::npos
+                                              : sep - pos);
+            if (part.empty()) break;
+            const size_t mid = part.find('\x1e');
+            if (mid == std::string::npos) break;
+            lists.emplace_back(part.substr(0, mid), part.substr(mid + 1));
+            if (sep == std::string::npos) break;
+            pos = sep + 1;
+        }
+    }
+    const uint32_t k = uint32_t(lists.size());
+    llvm::AllocaInst* listsArr = entryAlloca(ptr(), "pf.lists", k);
+    llvm::AllocaInst* basesArr = entryAlloca(i64(), "pf.bases", k);
+    LValue* allNonNull = b.getInt1(true);
+    for (uint32_t i = 0; i < k; ++i) {
+        LValue* var = slotVariable(lists[i].first, lists[i].second, true);
+        LValue* lp = b.CreateLoad(
+            ptr(), b.CreateConstGEP1_32(i8(), var,
+                                        uint32_t(offsetof(Variable, list))));
+        b.CreateStore(lp, b.CreateGEP(
+            ptr(), listsArr, llvm::ConstantInt::get(i64(), i)));
+        allNonNull = b.CreateAnd(
+            allNonNull,
+            b.CreateICmpNE(b.CreatePtrToInt(lp, i64()),
+                           llvm::ConstantInt::get(i64(), 0)));
+    }
+    // trip = floor(n + 0.5)（逐次ループの i>=0.5 と同値）+ 範囲ガード。
+    LValue* inRange = b.CreateFCmpOLE(
+        n, llvm::ConstantFP::get(f64(), 9.0e15));
+    LValue* usable = b.CreateAnd(
+        b.CreateFCmpOGE(n, llvm::ConstantFP::get(f64(), 0.5)), inRange);
+    LValue* safeN = b.CreateSelect(
+        usable, n, llvm::ConstantFP::get(f64(), 0.0));
+    LValue* trip = b.CreateFPToSI(
+        b.CreateFAdd(safeN, llvm::ConstantFP::get(f64(), 0.5)), i64());
+    static const int64_t parForMinTrip = [] {
+        const char* s = std::getenv("XYO_PARFOR_MIN");
+        int64_t r = s ? std::strtoll(s, nullptr, 10) : 512;
+        return r > 0 ? r : int64_t(512);
+    }();
+    LValue* isWarp = b.CreateLoad(
+        i32(), ctxField(uint32_t(offsetof(JitCtx, isWarp))));
+    LValue* cond = b.CreateAnd(
+        b.CreateICmpNE(isWarp, llvm::ConstantInt::get(i32(), 0)),
+        b.CreateAnd(allNonNull,
+                    b.CreateAnd(inRange,
+                                b.CreateICmpSGE(
+                                    trip, llvm::ConstantInt::get(
+                                              i64(), parForMinTrip)))));
+    BasicBlock* prep = BasicBlock::Create(lc, "pf.prep", fn);
+    BasicBlock* fb = BasicBlock::Create(lc, "pf.fallback", fn);
+    b.CreateCondBr(cond, prep, fb,
+                   llvm::MDNode::get(lc, {
+                       llvm::MDString::get(lc, "branch_weights"),
+                       llvm::ConstantAsMetadata::get(
+                           llvm::ConstantInt::get(i64(), 63)),
+                       llvm::ConstantAsMetadata::get(
+                           llvm::ConstantInt::get(i64(), 1))}));
+    b.SetInsertPoint(prep);
+    for (uint32_t i = 0; i < k; ++i) {
+        LValue* lp = b.CreateLoad(
+            ptr(), b.CreateGEP(ptr(), listsArr,
+                               llvm::ConstantInt::get(i64(), i)));
+        LValue* len = b.CreateZExt(
+            b.CreateLoad(i32(), b.CreateConstGEP1_32(
+                                    i8(), lp, uint32_t(offsetof(SList, len)))),
+            i64());
+        b.CreateStore(
+            len, b.CreateGEP(i64(), basesArr,
+                             llvm::ConstantInt::get(i64(), i)));
+    }
+    auto* ft = llvm::FunctionType::get(
+        llvm::Type::getVoidTy(lc),
+        {ptr(), i64(), f64(), ptr(), ptr()}, false);
+    llvm::Function* bf = llvm::Function::Create(
+        ft, llvm::GlobalValue::InternalLinkage,
+        fn->getName().str() + "_pf" +
+            std::to_string(shared.pendingParFors.size()),
+        &mod);
+    if (op.regions.size() >= 1 && op.regions[0])
+        shared.pendingParFors.push_back({bf, op.regions[0].get()});
+    // 開始時点のカウンタ値（init + iter*delta の基準）。
+    LValue* cvar = slotVariable(cid, cname, false);
+    LValue* cbits = b.CreateLoad(
+        i64(), b.CreateConstGEP1_32(i8(), cvar,
+                                    uint32_t(offsetof(Variable, value))));
+    LValue* initF = emitToNumInline(cbits);
+    std::vector<LValue*> pfArgs{
+        ctx, trip, initF, llvm::ConstantFP::get(f64(), delta),
+        listsArr, basesArr, llvm::ConstantInt::get(i64(), k), bf};
+    LValue* ok = b.CreateCall(
+        callee("xyo_par_for",
+               {ptr(), i64(), f64(), f64(), ptr(), ptr(), i64(), ptr()},
+               i32()),
+        pfArgs);
+    BasicBlock* okBB = BasicBlock::Create(lc, "pf.ok", fn);
+    b.CreateCondBr(b.CreateICmpNE(ok, llvm::ConstantInt::get(i32(), 0)),
+                   okBB, fb);
+    b.SetInsertPoint(okBB);
+    // カウンタの書き戻し（整数域なので厳密）。
+    LValue* fin = b.CreateFAdd(
+        initF, b.CreateFMul(b.CreateSIToFP(trip, f64()),
+                            llvm::ConstantFP::get(f64(), delta)));
+    b.CreateStore(b.CreateBitCast(fin, i64()),
+                  b.CreateConstGEP1_32(i8(), cvar,
+                                       uint32_t(offsetof(Variable, value))));
+    BasicBlock* succEnd = b.GetInsertBlock();
+    BasicBlock* merge = BasicBlock::Create(lc, "pf.merge", fn);
+    b.CreateBr(merge);
+    b.SetInsertPoint(fb);
+    b.CreateBr(merge);
+    b.SetInsertPoint(merge);
+    auto* phi = b.CreatePHI(b.getInt1Ty(), 2);
+    phi->addIncoming(b.getInt1(true), succEnd);
+    phi->addIncoming(b.getInt1(false), fb);
+    vals[keyOf(op.result(0))] = phi;
+}
+
+void Lowerer::emitPendingParFors() {
+    // 並列本体関数 void(JitCtx*, i64 iter, f64 ctr, SList**, i64*)。
+    // legacy emitPendingParFors 相当: 本体は値式だけ（counter の
+    // change は pfctr/捨てられる setvar に潰され、append は
+    // pfwrite が lists[k]->items[bases[k]+iter] へ直書きする）。
+    auto* savedFn = fn;
+    LValue* savedCtx = ctx;
+    for (auto& [bf, region] : shared.pendingParFors) {
+        Lowerer pf(mod, lc, shared);
+        pf.fn = bf;
+        pf.ctx = bf->getArg(0);
+        pf.inPfBody_ = true;
+        pf.pfIter_ = bf->getArg(1);
+        pf.pfCtrD_ = bf->getArg(2);
+        pf.pfLists_ = bf->getArg(3);
+        pf.pfBases_ = bf->getArg(4);
+        BasicBlock* entry = BasicBlock::Create(lc, "entry", bf);
+        pf.b.SetInsertPoint(entry);
+        pf.lowerBlock(*region->entry(), entry);
+        if (pf.error.empty()) {
+            llvm::BasicBlock* last = pf.b.GetInsertBlock();
+            if (last->empty() || !last->back().isTerminator())
+                pf.b.CreateRetVoid();
+        } else {
+            error = pf.error;
+        }
+    }
+    shared.pendingParFors.clear();
+    fn = savedFn;
+    ctx = savedCtx;
+}
 
 llvm::AllocaInst* Lowerer::yieldCounter() {
     if (yieldCnt_) return yieldCnt_;
@@ -4184,6 +4486,32 @@ void Lowerer::emitOp(Op& op) {
             args);
         return;
     }
+    if (n == "xyo.pfctr") {
+        // par-for ワーカーの反復ローカルカウンタ（canonical Value bits）。
+        vals[k0] = b.CreateBitCast(pfCtrD_, i64());
+        return;
+    }
+    if (n == "xyo.pfwrite") {
+        // 並列 append の 1 スロット書き込み:
+        //   lists[slot]->items[bases[slot] + iter] = item
+        // len は xyo_par_for が並列領域の前に確定済み（worker は触れない）。
+        const int64_t slot = op.attrInt("slot");
+        LValue* item = value(op.operands[0]);
+        LValue* list = b.CreateLoad(
+            ptr(), b.CreateGEP(ptr(), pfLists_,
+                               llvm::ConstantInt::get(i64(), slot)));
+        LValue* base = b.CreateLoad(
+            i64(), b.CreateGEP(i64(), pfBases_,
+                               llvm::ConstantInt::get(i64(), slot)));
+        LValue* items = b.CreateLoad(
+            ptr(), b.CreateConstGEP1_32(
+                       i8(), list, uint32_t(offsetof(SList, items))));
+        LValue* dest = b.CreateGEP(
+            llvm::ArrayType::get(i8(), 8), items,
+            b.CreateAdd(base, pfIter_));
+        b.CreateStore(item, dest);
+        return;
+    }
     if (n == "xyo.getvar") {
         LValue* var = slotVariable(op, false);
         vals[k0] = b.CreateLoad(
@@ -5186,6 +5514,7 @@ void Lowerer::emitOp(Op& op) {
         else emitLoopYield();
         return;
     }
+    if (n == "xyo.parfor.try") { emitParForTry(op); return; }
     if (n == "xyo.if") { emitIf(op); return; }
     if (n == "xyo.while") { emitWhile(op); return; }
     if (n == "xyo.repeat") { emitRepeat(op); return; }
@@ -5273,6 +5602,7 @@ LoweredFunction lowerToLLVM(Module& source, llvm::Module& dest,
     bool anyVoluntary = false;
     // 手続きは相互再帰し得るので、先に全関数の宣言を作ってから本体を
     // lower する（call が前方の関数を参照しても解決できる）。
+    shared.module = &source;
     std::vector<std::pair<Module::Function*, llvm::Function*>> order;
     for (auto& f : source.functions()) {
         std::vector<llvm::Type*> argTypes;
@@ -5289,6 +5619,10 @@ LoweredFunction lowerToLLVM(Module& source, llvm::Module& dest,
         llvm::Function* fn =
             llvm::Function::Create(ft, llvm::GlobalValue::ExternalLinkage,
                                    f.name, dest);
+        // デバッグ: proc の LLVM インラインを止める（融合/A/B 計測用）。
+        if (f.name != entryName &&
+            std::getenv("XYO_MLIR_PNOINLINE"))
+            fn->addFnAttr(llvm::Attribute::NoInline);
         if (!f.body) continue;
         if (f.name == entryName) entryFn = fn;
         order.push_back({&f, fn});
@@ -5392,6 +5726,18 @@ LoweredFunction lowerToLLVM(Module& source, llvm::Module& dest,
         if (mf->name == entryName) {
             out.ok = true;
             out.fn = fn;
+        }
+    }
+    // 並列 append ループのワーカー本体関数を埋める（全スロット index が
+    // 確定してから emit する。pf 関数はエントリ側の varslot_init を
+    // 共有する）。
+    {
+        Lowerer pl{dest, lc, shared};
+        pl.emitPendingParFors();
+        if (!pl.error.empty()) {
+            out.error = std::move(pl.error);
+            out.ok = false;
+            return out;
         }
     }
     // スロット初期化は entry 関数の先頭で 1 回だけ（手続き関数は

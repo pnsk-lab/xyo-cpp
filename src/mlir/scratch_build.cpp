@@ -20,6 +20,7 @@
 #include "../core/cast.hpp"
 #include "../core/sstr.hpp"
 #include "../core/value.hpp"
+#include "../jit/parfor.hpp"
 #include "../model/blocks.hpp"
 
 namespace xyo::mlir {
@@ -134,6 +135,9 @@ private:
     int branchDepth_ = 0;
     /// 手続きが呼出しグラフ上で循環するかのメモ化（vkey → 0/1）。
     std::unordered_map<std::string, int> cyclicCache_;
+    /// par-for ワーカー本体の emit 中は空でない。カウンタ変数 id を
+    /// 保持し、data_variable 読み出しを xyo.pfctr へ差し替える。
+    std::string pfCounterId_;
     std::string error_;
 
     bool fail(const std::string& why) {
@@ -436,6 +440,10 @@ Value ScriptBuilder::emitReporter(Builder& b, const xyo::Block& blk) {
     if (op == "data_variable") {
         const xyo::BlockField* f = findField(blk, "VARIABLE", "VARIABLE");
         if (!f) return {};
+        // par-for ワーカー内のカウンタ読み出しは反復ローカルの
+        // xyo.pfctr（実変数ではない。legacy の varOverride 相当）。
+        if (pfCounterId_ == f->id)
+            return b.create("xyo.pfctr", {}, {Type::value()})->result(0);
         return b.getVar(f->id, fieldName(*f));
     }
     if (isArgumentReporter(op)) {
@@ -1051,6 +1059,100 @@ bool ScriptBuilder::emitStatement(Builder& b, const xyo::Block& blk) {
             count = emitInputValue(b, blk, "TIMES");
             if (failed()) return false;
             operands.push_back(count);
+        }
+        // 並列 append ループ（par-for）。「反復カウンタ + 各リストへ
+        // 1 個ずつ append」の warp repeat をワーカー分割へ委譲する。
+        // 成功なら xyo.parfor.try が真を返して逐次ループをスキップ、
+        // 失敗（小さい反復・非数値・上限越え等）なら else の通常
+        // xyo.repeat へ落ちる — 意味論は逐次と完全一致。
+        if (repeat && inWarp_) {
+            const xyo::BlockInput* pfSub = findInput(blk, "SUBSTACK");
+            static const bool parForOn = [] {
+                const char* e = std::getenv("XYO_PARFOR");
+                return !e || e[0] != '0';
+            }();
+            std::string why;
+            auto planOpt =
+                (parForOn && pfSub && !pfSub->block.empty())
+                    ? jit::analyzeParFor(blocks_, &blk, &why)
+                    : std::optional<jit::ParForPlan>{};
+            if (planOpt) {
+                jit::ParForPlan& plan = *planOpt;
+                // lists = "id\x1fname\x1eid\x1fname..."
+                std::string listsAttr;
+                for (const xyo::BlockField* lf : plan.lists) {
+                    if (!listsAttr.empty()) listsAttr.push_back('\x1e');
+                    listsAttr += lf->id;
+                    listsAttr.push_back('\x1e');
+                    listsAttr += fieldName(*lf);
+                }
+                Op* tryOp = b.create(
+                    "xyo.parfor.try", {count}, {Type::boolean()},
+                    {{"counter", Attr::str(plan.counterField->id)},
+                     {"cname", Attr::str(fieldName(*plan.counterField))},
+                     {"delta", Attr::real(plan.delta)},
+                     {"lists", Attr::str(listsAttr)}});
+                Region* pfR = tryOp->addRegion();
+                Block* pfBody = pfR->addBlock();
+                Builder pfb(m_);
+                pfb.setBlock(pfBody);
+                // ITEM 式だけを emit する（カウンタの change は
+                // arg で渡され、変数へは書かない）。
+                pfCounterId_ = plan.counterField->id;
+                for (const xyo::Block* cb = plan.bodyHead; cb;
+                     cb = cb->next.empty() ? nullptr
+                                           : blocks_.getBlock(cb->next)) {
+                    if (cb->opcode != "data_addtolist") continue;
+                    const xyo::BlockField* lf =
+                        cb->fields.find("LIST") != cb->fields.end()
+                            ? &cb->fields.at("LIST") : nullptr;
+                    if (!lf) return fail("parfor append without LIST");
+                    int64_t slot = -1;
+                    for (size_t k = 0; k < plan.lists.size(); ++k)
+                        if (plan.lists[k] == lf) {
+                            slot = static_cast<int64_t>(k);
+                            break;
+                        }
+                    if (slot < 0) return fail("parfor list not in plan");
+                    Value item = emitInputValue(pfb, *cb, "ITEM");
+                    if (failed()) return false;
+                    pfb.create("xyo.pfwrite", {item}, {},
+                               {{"slot", Attr::integer(slot)}});
+                }
+                pfCounterId_.clear();
+                pfb.createTerminator("xyo.yield", {});
+                Op* ifOp = b.create("xyo.if", {tryOp->result(0)}, {});
+                Region* tr = ifOp->addRegion();
+                {
+                    Block* tb = tr->addBlock();
+                    Builder hb(m_);
+                    hb.setBlock(tb);
+                    hb.createTerminator("xyo.yield", {});
+                }
+                Region* er = ifOp->addRegion();
+                {
+                    Block* eb = er->addBlock();
+                    Builder ebb(m_);
+                    ebb.setBlock(eb);
+                    // 並列化に失敗したときの逐次 repeat（普通の経路）。
+                    Op* seq = ebb.create("xyo.repeat", {count}, {},
+                                         std::move(attrs));
+                    Region* seqR = seq->addRegion();
+                    Block* seqBody = seqR->addBlock();
+                    Builder sb2(m_);
+                    sb2.setBlock(seqBody);
+                    if (!emitSubstack(sb2, blk, "SUBSTACK")) return false;
+                    if (inWarp_)
+                        sb2.createTerminator(
+                            "xyo.loop_yield", {},
+                            {{"warp", Attr::integer(1)}});
+                    else
+                        sb2.createTerminator("xyo.loop_yield", {});
+                    sb2.createTerminator("xyo.yield", {});
+                    ebb.createTerminator("xyo.yield", {});
+                }
+                return true;
+            }
         }
         // 空本体の warp repeat は既存 JIT と同じ専用ヘルパで回す（呼出しも
         // 代入も無いので、本体を回す代わりに C 側のタイトループで数える）。
