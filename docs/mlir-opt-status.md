@@ -926,3 +926,18 @@ verify 落ち → スクリプト全体が fallback。
 4. **float ループ一般**（mandel 0.32x、round 0.47x）：heal/影/yield の削減。
 5. **list_replace の suite 低下**（1.22→0.84x）：要再測定で切り分け
    （micro では headers 中立を確認済みのため揺動の可能性大）。
+
+## Round 253: headers-off の確定（r253）
+
+### 経緯
+
+r248（headers default-on 前）→ r251/r252 で list_replace 1.23→0.84x、
+list_read 1.05→0.88x と低下。`XYO_MLIR_LISTHDR=0` の A/B（NOLHDR）で
+headers-off がほぼ全面改善（replace 0.85→1.19x、他 5〜10% 改善）の
+ため、既定を opt-in に戻した（`XYO_MLIR_LISTHDR=1` で有効化）。
+
+### 確定状態（r253、legacy 比、hotspot）
+
+- geomean 2.24x。list_replace 1.16x、list_read 0.96x、
+  list_search 9.73x、collatz 0.88x に回復。
+- `XYO_JIT_MEGA=1 xyo-tests` 0 FAIL、fallback 0 件。
