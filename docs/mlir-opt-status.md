@@ -855,3 +855,41 @@ verify 落ち → スクリプト全体が fallback。
   algo_primes 0.55→0.50x（要調査）、list_read 0.88x、
   list_replace 0.84x（r248 の 0.97/1.22x から後退 — 揺動か要確認）。
 - geomean 2.14x。
+
+## Round 248-251: まとめ（現状）
+
+### 確定した改善（いずれもテストで担保）
+
+- 範囲外リスト読みの inline 化（OOB→""/0.0）+ 数値文字列 fast path。
+- `exactIntOperand` の正準形整数文字列許容（`change i by 1` 典型形）。
+- if 条件 narrowing（wrap カウンタ）+ widening の条件キャップジャンプ。
+- `int_exact_ok` の文字列誤却下修正（guard/box 全滅バグ）。
+- `mod.f` の実行時整数 fast path（UREM32）。
+- 偶数証明による `div(V,2)` の整数化（collatz の n/2）+ Clone 伝搬修正。
+- リストヘッダのレジスタ運搬を既定化（warp のみ、replace 共有可）。
+
+### スイート地勢（r251、legacy 比、hotspot）
+
+- Lists: read 0.88x、replace 0.84x、append 1.11x、insdel 1.09x、search 0.98x。
+- Algos: sort 0.72x、sieve 0.58x、matmul 0.65x、fib 0.45x、ack 0.48x、
+  primes 0.50x、collatz 0.82x（0.22x から改善）。
+- Apps: life 0.46x、brainfuck 0.20x、raycast 0.61x、projection 0.97x、
+  ast 0.29x。
+- Math: mandel 0.32x、round 0.50x、letter 0.32x、nbody 0.53x、
+  trig 0.77x、expsqrt 0.42x。
+- geomean 2.1x（定数畳み込み系の極端値を含む）。
+- `XYO_JIT_MEGA=1 xyo-tests` 0 FAIL、`xcheck.py` 45/45、
+  numeric promotion 1514 checks 0 FAIL、fallback 0 件。
+
+### 残る構造的ギャップ（次の一手候補）
+
+- 再帰手続き呼び出し（fib/ack 0.45x）：`xyo_proc_push_ex` 経由の
+  fiber 管理が反復ごとに載る。MLIR-004 のコルーチン化と連携。
+- 可変除数の剰余・除算（primes 0.50x の一部）: mod32 は入れたが、
+  除数がループ運搬の i32 のとき `mod.i` への完全移行が残る。
+- while 版 box（collatz の n 等の unbounded 変数）: per-iter inrange +
+  float redo への継続切り替えは未実装（現状は guard のみ）。
+  `runBoxWhile` の雛形はあるが、cond 側の inrange 強制と bail 継続が
+  未接続。
+- 非 warp ループの spill/reload 削減、文字列 reporter の inline 化
+  （letter 0.32x）、三角関数系の libm 呼び出し境界。
