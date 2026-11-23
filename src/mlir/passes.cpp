@@ -714,6 +714,14 @@ struct Promoter {
     // mod op -> 整数化の方針。-1: srem+補正、-2: urem、
     // 0 以上: sub+select をその回数だけ繰り返す（被除数 < (k+1)*m 証明済み）。
     std::unordered_map<Op*, int> modSubK;
+    // 分岐で証明された偶数性（`if (mod(V,2)==0)` の真側）。V が偶数
+    // なら `div(V,2)` は正確で整数化できる。分岐内だけ有効なスコープ
+    // 付き集合で、setvar で解除する。div op 自体の精密区間は
+    // divRanges_（永続）に記録し、書換え時の intOkOf からも引く。
+    // op が分岐内にしか存在しないため、分岐依存の区間でも健全。
+    std::unordered_set<std::string> evenVars_;
+    // IntVal は後方定義のため pair で持つ（{lo,hi}）。
+    std::unordered_map<Op*, std::pair<int64_t, int64_t>> divRanges_;
     // 入口ガード版プロモーション（変数単位整数化＋入口検査）。
     // entry 非定数の変数にガード範囲を与えた解析が成功したときだけ使う。
     // ガード範囲: |v| ≤ 2^20 の正確な整数（int_exact_ok が検査）。
@@ -1192,6 +1200,14 @@ struct Promoter {
         std::unordered_map<Op*, IntVal>& memo) {
         auto mit = memo.find(v.op);
         if (v.op && mit != memo.end()) return mit->second;
+        // 分岐依存の精密区間（div の偶数証明）。op が分岐内にしかない
+        // ため、記録時の区間がそのまま有効。
+        if (v.op) {
+            auto dit = divRanges_.find(v.op);
+            if (dit != divRanges_.end())
+                return intRange(dit->second.first, dit->second.second,
+                                true);
+        }
         IntVal r = evalIntUnmemo(v, iv, memo);
         if (v.op && r.ok) intProvenOps.insert(v.op);
         return r;
@@ -1268,11 +1284,47 @@ struct Promoter {
                             a.tainted || b.tainted);
         }
         if (n == "xyo.div") {
-            // 除算は整数値ではない（5/2 = 2.5）。切り捨て表現に落とせるのは
-            // 切り捨てをそのまま使う文脈（リスト索引の強制など）だけで、
-            // 変数/リストへ書く値や mathop の入力には使えない。整数昇格の
-            // 対象からは外す（回帰: trig の atan(i/100)）。
-            return intUnknown(false);
+            // 除算は原則として整数値ではない（5/2 = 2.5）。
+            // ただし除数が定数 2 で被除数が偶数証明済みなら正確
+            // （collatz の n/2）。偶数性は `if (mod(V,2)==0)` の真側で
+            // evenVars_ に記録される。trig の atan(i/100) のように
+            // 証明が無いものは従来どおり対象外。
+            if (op->operands.size() != 2) return intUnknown(false);
+            int64_t dd = 0;
+            if (!intConstValue(op->operands[1], &dd) || dd != 2)
+                return intUnknown(false);
+            const Value& num = op->operands[0];
+            int64_t lo = 0, hi = 0;
+            bool tainted = false;
+            if (num.op && num.op->name == "xyo.getvar") {
+                std::string id(num.op->attrStr("id"));
+                auto it = iv.find(id);
+                if (it == iv.end() || !evenVars_.count(id))
+                    return intUnknown(false);
+                lo = it->second.first;
+                hi = it->second.second;
+                tainted = true;
+            } else {
+                int64_t c = 0;
+                if (!intConstValue(num, &c) || (c & 1) != 0)
+                    return intUnknown(false);
+                lo = hi = c;
+            }
+            // 偶数 ÷ 2 は正確。ceil/floor で区間を狭める
+            // （境界が奇数でも外側へ丸めるので健全）。
+            auto ceilDiv2 = [](int64_t x) -> int64_t {
+                return x >= 0 ? (x + 1) / 2 : x / 2;
+            };
+            auto floorDiv2 = [](int64_t x) -> int64_t {
+                return x >= 0 ? x / 2 : (x - 1) / 2;
+            };
+            int64_t nlo = ceilDiv2(lo), nhi = floorDiv2(hi);
+            if (nlo > nhi) return intUnknown(false);
+            if (nlo < INT32_MIN || nhi > INT32_MAX)
+                return intUnknown(false);
+            IntVal r = intRange(nlo, nhi, tainted);
+            divRanges_[op] = {nlo, nhi};
+            return r;
         }
         if (n == "xyo.mod") {
             if (op->operands.size() != 2)
@@ -1774,6 +1826,8 @@ struct Promoter {
         // 判定に混ざらないようにする）。
         intProvenOps.clear();
         modSubK.clear();
+        evenVars_.clear();
+        divRanges_.clear();
         for (auto& [id, c] : cands) c.intGuarded = false;
         if (m.intEligibleVars.empty()) {
             intTrace("no eligible vars (%s)", std::string());
@@ -2004,9 +2058,94 @@ struct Promoter {
             // if の条件式から (pred, var側, 定数側, 極性) を取り出す。
             // bnot/not は極性反転して辿る。成功時は assumeConstBound で
             // 分岐側の区間を絞る。
+            // `eq(mod(V,K),0)` 形から V の K 倍数性を取り出す
+            // （K==2 なら偶数）。box.f/to_num を透過し、両順序に対応。
+            // 成功時は真側の評価用に evenVars_ へ登録する。
+            std::function<bool(Op*, bool)> assumeEven =
+                [&](Op* condOp, bool condTrue) -> bool {
+                if (!condOp) return false;
+                const std::string& n = condOp->name;
+                int pred = -1;
+                std::vector<Value> ops;
+                if (n == "xyo.eq") {
+                    pred = 4;
+                    ops = condOp->operands;
+                } else if ((n == "xyo.cmp.i" || n == "xyo.cmp.f" ||
+                            n == "xyo.cmp.guarded") &&
+                           condOp->attrInt("pred", -1) == 4) {
+                    pred = 4;
+                    if (n == "xyo.cmp.guarded" &&
+                        condOp->operands.size() == 4)
+                        ops = {condOp->operands[2],
+                               condOp->operands[3]};
+                    else if (condOp->operands.size() >= 2)
+                        ops = {condOp->operands[0],
+                               condOp->operands[1]};
+                    else
+                        return false;
+                } else {
+                    return false;
+                }
+                if (ops.size() != 2 || !condTrue) return false;
+                // mod 側と 0 側を特定する。
+                const Value* modV = nullptr;
+                const Value* zeroV = nullptr;
+                auto isZeroConst = [&](const Value& v) -> bool {
+                    int64_t z = 0;
+                    if (intConstValue(v, &z) && z == 0) return true;
+                    if (v.op && v.op->name == "xyo.const.f64") {
+                        const Attr* a = v.op->attr("d");
+                        return a && a->isDouble() && a->d == 0.0;
+                    }
+                    return false;
+                };
+                auto asMod = [&](const Value& v) -> Op* {
+                    Op* o = v.op;
+                    if (!o) return nullptr;
+                    if ((o->name == "xyo.box.f" ||
+                         o->name == "xyo.to_num") &&
+                        !o->operands.empty())
+                        o = o->operands[0].op;
+                    if (!o) return nullptr;
+                    if (o->name != "xyo.mod" && o->name != "xyo.mod.i" &&
+                        o->name != "xyo.mod.f")
+                        return nullptr;
+                    if (o->operands.size() != 2) return nullptr;
+                    int64_t kk = 0;
+                    if (!intConstValue(o->operands[1], &kk) || kk == 0)
+                        return nullptr;
+                    // 偶数性だけを追う（K==2）。一般の K は div 側が
+                    // 対応していない。
+                    if (kk != 2 && kk != -2) return nullptr;
+                    return o;
+                };
+                Op* mo = nullptr;
+                if (isZeroConst(ops[1])) {
+                    mo = asMod(ops[0]);
+                } else if (isZeroConst(ops[0])) {
+                    mo = asMod(ops[1]);
+                }
+                if (!mo || mo->operands.empty()) return false;
+                // 被除数が整数候補の getvar なら偶数とみなす（非 NaN は
+                // 整数証明の帰結として不動点の健全性で担保）。
+                Op* base = mo->operands[0].op;
+                if (!base || base->name != "xyo.getvar") return false;
+                std::string id(base->attrStr("id"));
+                if (!active.count(id)) return false;
+                evenVars_.insert(id);
+                if (intDebug()) {
+                    std::fprintf(stderr, "[mlir-int] even %s\n",
+                                 id.c_str());
+                }
+                return true;
+            };
             std::function<void(Op*, bool, IvMap&)> assumeBranch =
                 [&](Op* condOp, bool condTrue, IvMap& m) {
                     if (!condOp) return;
+                    // 偶数性の記録（真側のみ）。区間の絞り込みとは独立。
+                    if (condOp->name != "xyo.bnot" &&
+                        condOp->name != "xyo.not")
+                        assumeEven(condOp, condTrue);
                     const std::string& n = condOp->name;
                     if (n == "xyo.bnot" || n == "xyo.not") {
                         if (!condOp->operands.empty() &&
@@ -2133,6 +2272,10 @@ struct Promoter {
                         if (!active.count(id) || op->operands.empty())
                             continue;
                         IntVal r = evalIntValue(op->operands[0], iv, memo);
+                        // 右辺の評価後に偶数性は失われる（3n+1 は反転）。
+                        // 右辺自体の評価（div の被除数など）には
+                        // 分岐の仮定が有効でなければならない。
+                        evenVars_.erase(id);
                         // 証明できない書き込み = その変数だけ整数化を諦める。
                         // 加えて、オペランドが「必ず数値 Value を返す」証明
                         // が無い書き込みも落とす — int 輸送は store を
@@ -2141,6 +2284,17 @@ struct Promoter {
                         // 表現が変わり interp とずれる（found: truthRun）。
                         if (!r.ok || r.lo < INT32_MIN || r.hi > INT32_MAX ||
                             !exactIntOperand(op->operands[0], iv)) {
+                            if (intDebug()) {
+                                const char* on =
+                                    op->operands[0].op
+                                        ? op->operands[0].op->name.c_str()
+                                        : "(null)";
+                                std::fprintf(stderr,
+                                    "[mlir-int] drop %s ok=%d range=[%lld,%lld] exact=%d op=%s\n",
+                                    id.c_str(), int(r.ok),
+                                    (long long)r.lo, (long long)r.hi,
+                                    int(exactIntOperand(op->operands[0], iv)), on);
+                            }
                             active.erase(id);
                             iv.erase(id);
                             changed = true;
@@ -2152,6 +2306,7 @@ struct Promoter {
                     if (op->name == "xyo.if") {
                         if (op->regions.size() != 2) return false;
                         const IvMap pre = iv;
+                        const auto preEven = evenVars_;
                         memo.clear();
                         if (!op->operands.empty() && op->operands[0].op)
                             assumeBranch(op->operands[0].op,
@@ -2159,11 +2314,13 @@ struct Promoter {
                         if (!evalBlock(*op->region(0)->entry())) return false;
                         const IvMap thenIv = iv;
                         iv = pre;
+                        evenVars_ = preEven;
                         memo.clear();
                         if (!op->operands.empty() && op->operands[0].op)
                             assumeBranch(op->operands[0].op,
                                          /*condTrue=*/false, iv);
                         if (!evalBlock(*op->region(1)->entry())) return false;
+                        evenVars_ = preEven;
                         for (auto& [id, v] : iv) {
                             auto it = thenIv.find(id);
                             if (it == thenIv.end()) continue;
@@ -2351,8 +2508,25 @@ struct Promoter {
             if (relaxClean_) {
                 // ボックス版: ループ内の書き込みだけ整数式であればよい。
                 // 入口は int_exact_ok、各反復の頭は inrange、yield 後は
-                // reload 検証が守る。
+                // reload 検証が守る。div は intExprProvable に入らないが、
+                // 偶数証明で整数化できたもの（divRanges_ 記録済み）は許す。
+                bool badWrite = false;
                 if (insideNonLiteral[id] != 0) {
+                    walkIntBody(body, [&](Op* op) {
+                        if (badWrite || op->name != "xyo.setvar" ||
+                            op->operands.empty())
+                            return;
+                        if (std::string(op->attrStr("id")) != id) return;
+                        if (intExprProvable(op->operands[0], active))
+                            return;
+                        Op* wop = op->operands[0].op;
+                        if (wop && wop->name == "xyo.div" &&
+                            divRanges_.count(wop))
+                            return;
+                        badWrite = true;
+                    });
+                }
+                if (badWrite) {
                     intTrace("box: non-literal write in body: %s", id);
                     active.erase(id);
                 }
@@ -2450,6 +2624,14 @@ struct Promoter {
             return n == "xyo.add" || n == "xyo.sub" || n == "xyo.mul" ||
                    n == "xyo.mod" || n == "xyo.div";
         };
+        // div の精密区間を優先（intProvenOps は全域を返すため、
+        // 下流のオーバーフロー判定が落ちることがある）。
+        if (v.op) {
+            auto dit = divRanges_.find(v.op);
+            if (dit != divRanges_.end())
+                return intRange(dit->second.first, dit->second.second,
+                                true);
+        }
         if (v.op && intProvenOps.count(v.op) && intNamed(v.op->name) &&
             v.op->name != "xyo.list.item" &&
             v.op->name != "xyo.list.item.i")
@@ -2977,13 +3159,17 @@ struct Promoter {
                 n == "xyo.mathop") {
                 if (intLoop &&
                     (n == "xyo.add" || n == "xyo.sub" || n == "xyo.mul" ||
-                     n == "xyo.mod") &&
+                     n == "xyo.mod" || n == "xyo.div") &&
                     op->operands.size() == 2 && intOkOf(op->operands[0]).ok &&
                     intOkOf(op->operands[1]).ok &&
                     !op->resultTypes.empty() && intOkOf(op->result(0)).ok &&
                     (n != "xyo.mod" || [&] {
                         int64_t mm = 0;
                         return intConstValue(op->operands[1], &mm) && mm > 0;
+                    }()) &&
+                    (n != "xyo.div" || [&] {
+                        int64_t dd = 0;
+                        return intConstValue(op->operands[1], &dd) && dd > 0;
                     }())) {
                     // 整数ループの純整数演算は in-place で i64 化する。
                     // 後続の iOf がそのまま拾える。
