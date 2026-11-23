@@ -2788,20 +2788,85 @@ void Lowerer::emitOp(Op& op) {
                 signedZero = b.CreateSelect(
                     isNegZeroIn, a, signedZero);
                 r0 = b.CreateSelect(r0IsZero, signedZero, r0);
+            } else if (true) {
+                // 非 2 冪除数: 両辺が実行時に [0/1, 2^31] の整数なら
+                // UREM32 で処理し、fmod libcall を避ける（legacy の
+                // mod32.fast と同じ判定）。NaN・非整数・0/負の除数・
+                // 範囲外は slow（fmod＋符号補正）へ。
+                // 両辺とも正なので結果は非負で補正は不要。
+                BasicBlock* fastBB =
+                    BasicBlock::Create(lc, "mod.intfast", fn);
+                BasicBlock* slowBB =
+                    BasicBlock::Create(lc, "mod.slow", fn);
+                BasicBlock* joinBB =
+                    BasicBlock::Create(lc, "mod.join", fn);
+                auto isIntVal = [&](LValue* x) {
+                    LValue* t = b.CreateUnaryIntrinsic(
+                        llvm::Intrinsic::trunc, x);
+                    return b.CreateAnd(
+                        b.CreateFCmpORD(x, x),
+                        b.CreateFCmpOEQ(t, x));
+                };
+                LValue* aOk = b.CreateAnd(
+                    b.CreateAnd(
+                        b.CreateFCmpOGT(
+                            a, llvm::ConstantFP::get(f64(), 0.0)),
+                        b.CreateFCmpOLE(
+                            a, llvm::ConstantFP::get(f64(), 2147483647.0))),
+                    isIntVal(a));
+                LValue* bOk = b.CreateAnd(
+                    b.CreateAnd(
+                        b.CreateFCmpOGE(
+                            c, llvm::ConstantFP::get(f64(), 1.0)),
+                        b.CreateFCmpOLE(
+                            c, llvm::ConstantFP::get(f64(), 2147483647.0))),
+                    isIntVal(c));
+                b.CreateCondBr(b.CreateAnd(aOk, bOk), fastBB, slowBB,
+                               llvm::MDNode::get(lc, {
+                                   llvm::MDString::get(lc, "branch_weights"),
+                                   llvm::ConstantAsMetadata::get(
+                                       llvm::ConstantInt::get(i64(), 63)),
+                                   llvm::ConstantAsMetadata::get(
+                                       llvm::ConstantInt::get(i64(), 1))}));
+                b.SetInsertPoint(fastBB);
+                LValue* ai = b.CreateFPToUI(a, i32());
+                LValue* bi = b.CreateFPToUI(c, i32());
+                LValue* fastR = b.CreateUIToFP(
+                    b.CreateURem(ai, bi), f64());
+                BasicBlock* fastEnd = b.GetInsertBlock();
+                b.CreateBr(joinBB);
+                b.SetInsertPoint(slowBB);
+                LValue* r0s = b.CreateFRem(a, c);
+                LValue* qs = b.CreateFDiv(r0s, c);
+                LValue* negs = b.CreateFCmpOLT(
+                    qs, llvm::ConstantFP::get(f64(), 0.0));
+                LValue* slowR = b.CreateSelect(
+                    negs, b.CreateFAdd(r0s, c), r0s);
+                BasicBlock* slowEnd = b.GetInsertBlock();
+                b.CreateBr(joinBB);
+                b.SetInsertPoint(joinBB);
+                auto* phi = b.CreatePHI(f64(), 2);
+                phi->addIncoming(fastR, fastEnd);
+                phi->addIncoming(slowR, slowEnd);
+                r = phi;
             } else {
                 r0 = b.CreateFRem(a, c);
             }
-            // 補正の符号判定 r0/c も、2 の冪の定数除数なら乗算で足りる。
-            // 上と同じく 1/cc が表現できない場合（最小 denormal）は除算。
-            LValue* q = (isPow2(cc) && cc != 0.0 &&
-                         std::isfinite(1.0 / cc))
-                            ? b.CreateFMul(r0,
-                                           llvm::ConstantFP::get(f64(),
-                                                                 1.0 / cc))
-                            : b.CreateFDiv(r0, c);
-            LValue* neg = b.CreateFCmpOLT(q,
-                                          llvm::ConstantFP::get(f64(), 0.0));
-            r = b.CreateSelect(neg, b.CreateFAdd(r0, c), r0);
+            if (r0) {
+                // 補正の符号判定 r0/c も、2 の冪の定数除数なら乗算で足りる。
+                // 上と同じく 1/cc が表現できない場合（最小 denormal）は
+                // 除算。int fast path（r0 なし）は両辺正で補正不要。
+                LValue* q = (isPow2(cc) && cc != 0.0 &&
+                             std::isfinite(1.0 / cc))
+                                ? b.CreateFMul(r0,
+                                               llvm::ConstantFP::get(f64(),
+                                                                     1.0 /
+                                                                         cc))
+                                : b.CreateFDiv(r0, c);
+                LValue* neg = b.CreateFCmpOLT(
+                    q, llvm::ConstantFP::get(f64(), 0.0));
+                r = b.CreateSelect(neg, b.CreateFAdd(r0, c), r0);
+            }
         }
         vals[k0] = r;
         return;
