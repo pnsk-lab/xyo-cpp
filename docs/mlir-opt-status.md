@@ -941,3 +941,27 @@ headers-off がほぼ全面改善（replace 0.85→1.19x、他 5〜10% 改善）
 - geomean 2.24x。list_replace 1.16x、list_read 0.96x、
   list_search 9.73x、collatz 0.88x に回復。
 - `XYO_JIT_MEGA=1 xyo-tests` 0 FAIL、fallback 0 件。
+
+## Round 254: 数値リテラル比較の inline 化（fib 1.05x）
+
+### 発見
+
+fib/ack が 0.45〜0.50x で停滞。再帰呼び出しの `xyo.lt(n, 2)` が毎回
+`xyo_lt` helper 呼び出しになっていた。原因：Scratch の数値リテラル
+shadow は生文字列（`s:"2"` = SStr*）なので、実行時タグ検査を必ず
+失敗し、fast/slow ダイヤモンドが LLVM に畳まれて直接 call になる。
+
+### 変更（`lower_llvm.cpp`）
+
+`xyo.lt/gt/eq` の lowering で、const オペランドが数値（または数値
+文字列）ならコンパイル時に f64 化し、その側のタグ検査を省く。
+fast 側は定数 f64 を直接使い、slow は helper へ。素の数値定数同士は
+畳む（文字列は bits 一致/文字列比較があり得るので runtime に残す）。
+
+### 効果（r254、legacy 比、hotspot）
+
+- algo_ack 0.50→0.85x、**algo_fib 0.49→1.05x（逆転）**、
+  matmul 0.72→0.76x、primes 0.54→0.58x、sort 0.71→0.76x、
+  life 0.50→0.58x、raycast 0.67→0.71x、list_read 0.96→1.01x、
+  list_replace 1.16→1.22x、collatz 0.88→0.92x。
+- geomean 2.24→2.40x。`XYO_JIT_MEGA=1` 0 FAIL 維持。
