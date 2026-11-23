@@ -897,9 +897,13 @@ namespace {
 /// のため mem2reg でレジスタに乗り、反復ごとの 3 連鎖ロードが消える。
 /// yield 後の読み直しは実ハンドオフ時のみ。
 bool listHeaderOptIn() {
+    // 既定 off（XYO_MLIR_LISTHDR=1 で on）。ヘッダ運搬は理論上
+    // 反復ごとの 3 連鎖ロードを消すが、実測では preheader/reload の
+    // 追加コードとレジスタ圧でむしろ遅くなるケースが多い
+    // （suite A/B: off で list_replace 0.85→1.19x 他ほぼ全面改善）。
     static const bool on = [] {
         const char* e = std::getenv("XYO_MLIR_LISTHDR");
-        return !(e && e[0] == '0');
+        return e && e[0] == '1';
     }();
     return on;
 }
