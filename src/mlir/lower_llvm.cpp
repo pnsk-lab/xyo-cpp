@@ -2788,7 +2788,7 @@ void Lowerer::emitOp(Op& op) {
                 signedZero = b.CreateSelect(
                     isNegZeroIn, a, signedZero);
                 r0 = b.CreateSelect(r0IsZero, signedZero, r0);
-            } else if (true) {
+            } else {
                 // 非 2 冪除数: 両辺が実行時に [0/1, 2^31] の整数なら
                 // UREM32 で処理し、fmod libcall を避ける（legacy の
                 // mod32.fast と同じ判定）。NaN・非整数・0/負の除数・
@@ -2849,8 +2849,6 @@ void Lowerer::emitOp(Op& op) {
                 phi->addIncoming(fastR, fastEnd);
                 phi->addIncoming(slowR, slowEnd);
                 r = phi;
-            } else {
-                r0 = b.CreateFRem(a, c);
             }
             if (r0) {
                 // 補正の符号判定 r0/c も、2 の冪の定数除数なら乗算で足りる。
