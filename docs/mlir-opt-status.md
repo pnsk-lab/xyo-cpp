@@ -822,3 +822,36 @@ verify 落ち → スクリプト全体が fallback。
   suite list_read が 0.2x）は fallback の典型症状。
 - r249/r250 の数値は legacy 測定であり、最適化効果の評価には
   使えない。r251（修正後）で取り直す。
+
+
+## Round 249/250/251: ガード全滅バグと even-div の確定
+
+### 発見（r249/r250 の異常）
+
+r249（even-div 導入）で geomean が 2.27x→1.08x に崩れ、全カーネルが
+一様に ~0.95x になった。`XYO_MLIR_TRACE=1` で確認するとメイン
+スクリプトが `verifier failed ... operand is empty for xyo.yield`
+で fallback し、legacy 実行になっていた。
+
+### 原因
+
+`divRanges_` の Clone 先への伝搬コードのブレース崩れ
+（`modSubK` のループ内にネストし、`modSubK` が空のとき伝搬自体が
+実行されない）。未伝搬の div に対して `intOkOf` が偽を返し、
+`setvar` 側の `iOf` が空を返し、yield が空オペランドになって
+verify 落ち → スクリプト全体が fallback。
+
+### 修正
+
+- 伝搬ループのブレース修正（4 箇所）。
+- `iOf` に div サポートを追加（divRanges_ 参照時のみ i32 化。
+  証明なし div は通さない）。
+- verifier に親 op 連鎖の表示を追加（`ctx: <xyo.if> <xyo.while> ...`）。
+
+### 効果（r251、クリーン再測定）
+
+- fallback 0 件に復帰、極端値も復活（folding は無事）。
+- **math_collatz 0.22→0.82x**（even-div が効いた）、
+  algo_primes 0.55→0.50x（要調査）、list_read 0.88x、
+  list_replace 0.84x（r248 の 0.97/1.22x から後退 — 揺動か要確認）。
+- geomean 2.14x。
