@@ -112,6 +112,20 @@ struct Lowerer {
         llvm::BasicBlock* block = nullptr;
     };
     std::map<Key, NumShadowEntry> numShadow_;
+    /// 同一 BB・同一「書き込み epoch」内での getvar 共有（legacy の
+    /// readNumberMemos に相当）。bits と to_num 済み数値を変数ポインタ
+    /// ごとに 1 回だけ生成し、同じ直線区間の後続 getvar で再利用する。
+    /// 変数を書き得る op（setvar/call/yield/for_each/matpow 等）は
+    /// memoEpoch_ を進めて全域を無効化し、setvar は対象キーも消す。
+    struct VarMemoEntry {
+        llvm::BasicBlock* bb = nullptr;
+        uint32_t epoch = 0;
+        LValue* bits = nullptr;
+        LValue* num = nullptr;
+    };
+    std::unordered_map<LValue*, VarMemoEntry> varMemo_;
+    uint32_t memoEpoch_ = 1;
+    void memoInvalidateAll() { ++memoEpoch_; }
     /// スレッドの fiber は 1 回の実行中ずっと同じ。
     LValue* fiberCache_ = nullptr;
     /// xyo_list_limit（i32 の外部グローバル）。関数をまたいで 1 個。
@@ -1624,6 +1638,21 @@ LValue* Lowerer::numberShadow(const Value& v) {
             numShadow_[key] = NumShadowEntry{d, b.GetInsertBlock()};
             return d;
         }
+        // 同一 BB・同 epoch の別 getvar で既に to_num 済みなら再利用
+        // （legacy readNumberMemos。ループ内キャッシュが効かない
+        // observable スコープでの連続変数読みに効く）。
+        if (v.op->name == "xyo.getvar") {
+            LValue* var = slotVariable(*v.op, false);
+            if (var) {
+                auto& me = varMemo_[var];
+                if (me.bb == b.GetInsertBlock() &&
+                    me.epoch == memoEpoch_ && me.num) {
+                    numShadow_[key] =
+                        NumShadowEntry{me.num, b.GetInsertBlock()};
+                    return me.num;
+                }
+            }
+        }
     }
     // from_int（i32 範囲の正確な整数）は sitofp だけで数値になる。
     // タグ検査の分岐を出さない。
@@ -1753,6 +1782,16 @@ LValue* Lowerer::numberShadow(const Value& v) {
     }
     LValue* phi = emitToNumInline(bits);
     numShadow_[key] = NumShadowEntry{phi, b.GetInsertBlock()};
+    if (v.op && v.op->name == "xyo.getvar") {
+        LValue* var = slotVariable(*v.op, false);
+        if (var) {
+            auto& me = varMemo_[var];
+            me.bb = b.GetInsertBlock();
+            me.epoch = memoEpoch_;
+            if (!me.bits) me.bits = bits;
+            me.num = phi;
+        }
+    }
     return phi;
 }
 
@@ -3369,6 +3408,17 @@ void Lowerer::emitCompat(Op& op, bool asValue) {
 
 void Lowerer::emitOp(Op& op) {
     const std::string& n = op.name;
+    // 変数値を書き得る op は varMemo の epoch を進めて全域を無効化する
+    // （setvar 自身はキー単位で消す。call は callee が任意の変数を書く、
+    // yield 系は他スクリプトが走って書き得る、for_each はループ変数を
+    // helper 経由で書く）。
+    if (n == "xyo.call" || n == "xyo.warp_yield" ||
+        n == "xyo.loop_yield" || n == "xyo.for_each" ||
+        n == "xyo.matpow.try" || n == "xyo.wait" ||
+        n == "xyo.parfor.try" ||
+        n == "xyo.bcastwait" || n == "xyo.yield") {
+        memoInvalidateAll();
+    }
     Key k0{&op, 0, false};
     auto box = [&](LValue* x) {
         return b.CreateCall(callee("xyo_num", {f64()}, i64()), {x});
@@ -4514,9 +4564,19 @@ void Lowerer::emitOp(Op& op) {
     }
     if (n == "xyo.getvar") {
         LValue* var = slotVariable(op, false);
-        vals[k0] = b.CreateLoad(
+        auto& me = varMemo_[var];
+        if (me.bb == b.GetInsertBlock() && me.epoch == memoEpoch_ &&
+            me.bits) {
+            vals[k0] = me.bits;
+            return;
+        }
+        me.bb = b.GetInsertBlock();
+        me.epoch = memoEpoch_;
+        me.bits = b.CreateLoad(
             i64(), b.CreateConstGEP1_32(i8(), var,
                                         uint32_t(offsetof(Variable, value))));
+        me.num = nullptr;
+        vals[k0] = me.bits;
         return;
     }
     if (n == "xyo.setvar") {
@@ -4524,6 +4584,7 @@ void Lowerer::emitOp(Op& op) {
         b.CreateStore(value(op.operands[0]),
                       b.CreateConstGEP1_32(i8(), var,
                                            uint32_t(offsetof(Variable, value))));
+        varMemo_.erase(var);
         return;
     }
     if (n == "xyo.list.ptr") {
