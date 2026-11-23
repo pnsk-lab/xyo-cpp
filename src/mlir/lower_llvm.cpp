@@ -3322,8 +3322,86 @@ void Lowerer::emitOp(Op& op) {
     if (n == "xyo.lt" || n == "xyo.gt" || n == "xyo.eq") {
         const char* sym = n == "xyo.lt" ? "xyo_lt"
                         : n == "xyo.gt" ? "xyo_gt" : "xyo_eq";
+        // const の数値文字列（Scratch の数値リテラル shadow）は実行時
+        // タグ検査を必ず失敗する（SStr* ポインタのため）。数値演算では
+        // to_num と同じ値になるので、コンパイル時に数値化して plain
+        // double として扱う（fib の `n < 2` 等が毎回 helper になっていた）。
+        auto constNum = [&](const Value& v, double* out) -> bool {
+            if (!v.op) return false;
+            if (v.op->name == "xyo.const.f64") {
+                const Attr* a = v.op->attr("d");
+                if (!a || !a->isDouble()) return false;
+                *out = a->d;
+                return true;
+            }
+            if (v.op->name != "xyo.const") return false;
+            const Attr* at = v.op->attr("bits");
+            if (!at || !at->isInt()) return false;
+            const xyo::Value cv{static_cast<uint64_t>(at->i)};
+            if (cv.isNumber()) {
+                *out = cv.asNumberUnchecked();
+                return true;
+            }
+            if (!cv.isString()) return false;
+            SStr* str = cv.asStrPtr();
+            if (!str) return false;
+            // 数値として読めなければ数値演算でもない（呼ばない）。
+            uint32_t st = str->loadNumState();
+            if (st == 0) {
+                (void)cast::parseNumberStringUncached(str);
+                st = str->loadNumState();
+            }
+            if (st != 1 && st != 4) return false;
+            *out = str->loadNumCache();
+            return true;
+        };
         LValue* a = value(op.operands[0]);
         LValue* c = value(op.operands[1]);
+        double da = 0.0, dc = 0.0;
+        const bool aConst = constNum(op.operands[0], &da);
+        const bool cConst = constNum(op.operands[1], &dc);
+        // 両辺とも素の数値定数（NaN 除外）なら畳む。文字列定数は
+        // bits 一致や文字列比較があり得るので runtime に残す。
+        if (aConst && cConst && !std::isnan(da) && !std::isnan(dc)) {
+            // 素の double 同士か確認（文字列由来は畳まない）。
+            bool aPlain = false, cPlain = false;
+            if (op.operands[0].op) {
+                const Attr* at = op.operands[0].op->name == "xyo.const.f64"
+                    ? op.operands[0].op->attr("d")
+                    : op.operands[0].op->attr("bits");
+                if (at) {
+                    if (op.operands[0].op->name == "xyo.const.f64")
+                        aPlain = true;
+                    else {
+                        const xyo::Value cv{
+                            static_cast<uint64_t>(at->i)};
+                        aPlain = cv.isNumber();
+                    }
+                }
+            }
+            if (op.operands[1].op) {
+                const Attr* at = op.operands[1].op->name == "xyo.const.f64"
+                    ? op.operands[1].op->attr("d")
+                    : op.operands[1].op->attr("bits");
+                if (at) {
+                    if (op.operands[1].op->name == "xyo.const.f64")
+                        cPlain = true;
+                    else {
+                        const xyo::Value cv{
+                            static_cast<uint64_t>(at->i)};
+                        cPlain = cv.isNumber();
+                    }
+                }
+            }
+            if (aPlain && cPlain) {
+                bool r = false;
+                if (n == "xyo.eq") r = (da == dc);
+                else if (n == "xyo.lt") r = (da < dc);
+                else r = (da > dc);
+                vals[k0] = llvm::ConstantInt::get(b.getInt1Ty(), r ? 1 : 0);
+                return;
+            }
+        }
         // 両辺が「素の double」（符号付きで kNan 未満）なら helper の数値
         // 経路と厳密に同じ結果になるので、呼び出しを fcmp に置き換える。
         //   xyo_lt/xyo_gt = cast::compare = 両方数値なら数値比較
@@ -3339,8 +3417,13 @@ void Lowerer::emitOp(Op& op) {
             BasicBlock* fast = BasicBlock::Create(lc, "cmp.fast", fn);
             BasicBlock* slow = BasicBlock::Create(lc, "cmp.slow", fn);
             BasicBlock* join = BasicBlock::Create(lc, "cmp.join", fn);
-            LValue* both = b.CreateAnd(b.CreateICmpSLT(a, limit),
-                                       b.CreateICmpSLT(c, limit));
+            // 定数側が数値（数値文字列含む）なら tag 検査不要。
+            // var 側だけ検査すれば fast/slow が決まる。
+            LValue* aOk = aConst ? llvm::ConstantInt::get(b.getInt1Ty(), 1)
+                                 : b.CreateICmpSLT(a, limit);
+            LValue* cOk = cConst ? llvm::ConstantInt::get(b.getInt1Ty(), 1)
+                                 : b.CreateICmpSLT(c, limit);
+            LValue* both = b.CreateAnd(aOk, cOk);
             b.CreateCondBr(both, fast, slow, llvm::MDNode::get(lc, {
                 llvm::MDString::get(lc, "branch_weights"),
                 llvm::ConstantAsMetadata::get(
@@ -3348,8 +3431,10 @@ void Lowerer::emitOp(Op& op) {
                 llvm::ConstantAsMetadata::get(
                     llvm::ConstantInt::get(i64(), 1))}));
             b.SetInsertPoint(fast);
-            LValue* fa = b.CreateBitCast(a, f64());
-            LValue* fc = b.CreateBitCast(c, f64());
+            LValue* fa = aConst ? llvm::ConstantFP::get(f64(), da)
+                                : b.CreateBitCast(a, f64());
+            LValue* fc = cConst ? llvm::ConstantFP::get(f64(), dc)
+                                : b.CreateBitCast(c, f64());
             LValue* fr = n == "xyo.eq" ? b.CreateFCmpOEQ(fa, fc)
                       : n == "xyo.lt" ? b.CreateFCmpOLT(fa, fc)
                                       : b.CreateFCmpOGT(fa, fc);
