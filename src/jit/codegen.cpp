@@ -1118,7 +1118,9 @@ struct Codegen {
         // the scope's quantum allocas live to re-seed them.
         if (!layqFixed() && !curYieldQuantum) return;
         layqApplyBodyClass(bodyMayAllocate);
-        yieldStack.back().qmaxVal = curYieldQMaxVal;
+        // The scope record's qmaxVal holds the OUTER scope's saved cap —
+        // do not write the retargeted value back into it; the member
+        // updated by layqApplyBodyClass is the live cap for this scope.
         emitLayqEntryInit();
     }
     /// Once-per-quantum update at the top of a warp poll. Returns the
@@ -1186,6 +1188,19 @@ struct Codegen {
         yieldStack.push_back({curYieldCnt, curYieldWarp, curYieldSourceLoop,
                               curYieldRemainingF64, curYieldRemainingI32});
         YieldScope& top = yieldStack.back();
+        // The pushed record saves the OUTER scope's LAYQ state. These are
+        // function-local allocas: without saving them here the ended
+        // scope's alloca would stay live in curYieldQuantum and leak into
+        // sibling code — a silent wrong-quantum read in the same function
+        // and an LLVM verifier error when the stale alloca is referenced
+        // while emitting a different function (pending procedures,
+        // par-for bodies). Top level saves nullptr/defaults, so quantum
+        // sites outside any loop scope correctly fall back to the ctx
+        // field again.
+        top.quantum = curYieldQuantum;
+        top.qmask = curYieldQMask;
+        top.qmaxVal = curYieldQMaxVal;
+        top.qpinned = curYieldQPinned;
         curYieldSourceLoop = sourceLoop;
         curYieldRemainingF64 = nullptr;
         curYieldRemainingI32 = nullptr;
@@ -1205,13 +1220,12 @@ struct Codegen {
         layqPollEpoch = nullptr;
         if (!layqOff()) {
             layqApplyBodyClass(bodyMayAllocate);
-            top.qmaxVal = curYieldQMaxVal;
-            // Save the outer quantum for the nested-scope restore on exit.
+            // Save the outer ctx quantum for the scope-exit restore.
             top.savedCtxQuantum = b.CreateLoad(
                 i64t, b.CreateConstGEP1_32(i8t, ctxArg, kYieldQuantumOff));
             if (!layqFixed()) {
-                top.quantum = curYieldQuantum = entryAlloca(i64t, 1, "qnt");
-                top.qmask = curYieldQMask = entryAlloca(i64t, 1, "qmask");
+                curYieldQuantum = entryAlloca(i64t, 1, "qnt");
+                curYieldQMask = entryAlloca(i64t, 1, "qmask");
             }
             emitLayqEntryInit();
         }
@@ -1235,6 +1249,7 @@ struct Codegen {
         curYieldQuantum = s.quantum;
         curYieldQMask = s.qmask;
         curYieldQMaxVal = s.qmaxVal;
+        curYieldQPinned = s.qpinned;
         layqPollEpoch = nullptr;
     }
     // Only active while lowering a proven self-append-only warp repeat.
@@ -2264,10 +2279,16 @@ struct Codegen {
         // LAYQ (adaptive/fixed modes only): per-loop poll quantum state.
         // quantum/qmask are mem2reg-promoted (register in the hot loop);
         // qmaxVal is the C++-side body-class cap immediate.
+        // Outer scope's LAYQ state, saved on push and restored by
+        // endLoopYieldScope (NOT this scope's own allocas — see
+        // beginLoopYieldScope).
         llvm::AllocaInst* quantum = nullptr;
         llvm::AllocaInst* qmask = nullptr;
+        // This scope's own entry snapshot of ctx.yieldQuantum, stored back
+        // to the ctx field at scope end.
         llvm::Value* savedCtxQuantum = nullptr;
         uint64_t qmaxVal = 64;
+        uint64_t qpinned = 64;
     };
     std::vector<YieldScope> yieldStack;
     llvm::AllocaInst* curYieldCnt = nullptr;
@@ -11496,6 +11517,20 @@ struct Codegen {
             auto savedProcArgs = curProcArgs;
             auto savedKnown = knownNum;
             const bool savedInProc = inProc;
+            // The par-for body is a separate LLVM function: no yield-scope
+            // state from the caller may leak into its emission.
+            auto* savedYCnt = curYieldCnt;
+            auto* savedYWarp = curYieldWarp;
+            auto* savedYQuantum = curYieldQuantum;
+            auto* savedYQMask = curYieldQMask;
+            const uint64_t savedYQMax = curYieldQMaxVal;
+            const uint64_t savedYPinned = curYieldQPinned;
+            curYieldCnt = nullptr;
+            curYieldWarp = nullptr;
+            curYieldQuantum = nullptr;
+            curYieldQMask = nullptr;
+            curYieldQMaxVal = 64;
+            curYieldQPinned = 64;
             fn = pp.f;
             exitBB = nullptr;
             argIndex.clear();
@@ -11527,6 +11562,12 @@ struct Codegen {
             curProcArgs = std::move(savedProcArgs);
             knownNum = std::move(savedKnown);
             inProc = savedInProc;
+            curYieldCnt = savedYCnt;
+            curYieldWarp = savedYWarp;
+            curYieldQuantum = savedYQuantum;
+            curYieldQMask = savedYQMask;
+            curYieldQMaxVal = savedYQMax;
+            curYieldQPinned = savedYPinned;
         }
     }
 
@@ -11535,8 +11576,25 @@ struct Codegen {
             PendingProc pp = std::move(pendingProcs.back());
             pendingProcs.pop_back();
             Function* savedFn = fn;
+            llvm::Value* savedCtx = ctxArg;
             auto savedArgs = argIndex;
             auto savedProcArgs = curProcArgs;
+            auto savedKnown = knownNum;
+            const bool savedInProc = inProc;
+            // A procedure body is a separate LLVM function: no yield-scope
+            // state from the caller may leak into its emission.
+            auto* savedYCnt = curYieldCnt;
+            auto* savedYWarp = curYieldWarp;
+            auto* savedYQuantum = curYieldQuantum;
+            auto* savedYQMask = curYieldQMask;
+            const uint64_t savedYQMax = curYieldQMaxVal;
+            const uint64_t savedYPinned = curYieldQPinned;
+            curYieldCnt = nullptr;
+            curYieldWarp = nullptr;
+            curYieldQuantum = nullptr;
+            curYieldQMask = nullptr;
+            curYieldQMaxVal = 64;
+            curYieldQPinned = 64;
             fn = pp.f;
             exitBB = nullptr;
             argIndex.clear();
@@ -11574,10 +11632,18 @@ struct Codegen {
                 b.CreateRetVoid();
             }
             fn = savedFn;
+            ctxArg = savedCtx;
             argIndex = std::move(savedArgs);
             curProcArgs = std::move(savedProcArgs);
-            inProc = false;
+            knownNum = std::move(savedKnown);
+            inProc = savedInProc;
             curFnWarp = savedFnWarp;
+            curYieldCnt = savedYCnt;
+            curYieldWarp = savedYWarp;
+            curYieldQuantum = savedYQuantum;
+            curYieldQMask = savedYQMask;
+            curYieldQMaxVal = savedYQMax;
+            curYieldQPinned = savedYPinned;
             if (fail) return;
         }
     }
