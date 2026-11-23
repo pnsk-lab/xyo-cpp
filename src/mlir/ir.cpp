@@ -92,14 +92,15 @@ bool isReadOnly(std::string_view name) {
 
 bool isRegionOp(std::string_view name) {
     return name == "xyo.if" || name == "xyo.while" || name == "xyo.repeat" ||
-           name == "xyo.forever" || name == "func.func";
+           name == "xyo.forever" || name == "xyo.parfor.try" ||
+           name == "func.func";
 }
 
 size_t regionCount(std::string_view name) {
     if (name == "xyo.if" || name == "xyo.while") return 2;
     if (name == "xyo.repeat" || name == "xyo.forever" ||
         name == "xyo.all_at_once" || name == "xyo.for_each" ||
-        name == "xyo.wait_until" ||
+        name == "xyo.wait_until" || name == "xyo.parfor.try" ||
         name == "func.func")
         return 1;
     return 0;
