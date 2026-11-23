@@ -4059,15 +4059,27 @@ int xyo::editorMainQt(const char* path, bool danger) {
 
     // ネストイベントループ（ランチャーの app.exec() 内でも機能する）
     QEventLoop loop;
-    bool closed = false;
-    QObject::connect(&view, &QQuickWindow::closing, &loop,
-                     [&]() { closed = true; loop.quit(); });
+    // QQuickWindow::closing の引数 QQuickCloseEvent は Qt 6.4 の public
+    // ヘッダに無い（private のみ）ため、signal/slot の文字列接続にする。
+    // 型名を引かないので qmetatype の不完全型エラーを回避できる。
+    // visibleChanged も拾い、ウィンドウが閉じ/隠れたら quit する。
+    const QMetaObject* vmo = view.metaObject();
+    const QMetaObject* lmo = loop.metaObject();
+    const int quitIdx = lmo->indexOfSlot("quit()");
+    if (vmo && quitIdx >= 0) {
+        int sidx = vmo->indexOfSignal("closing(QQuickCloseEvent*)");
+        if (sidx >= 0)
+            QMetaObject::connect(&view, sidx, &loop, quitIdx);
+        sidx = vmo->indexOfSignal("visibleChanged(bool)");
+        if (sidx >= 0)
+            QMetaObject::connect(&view, sidx, &loop, quitIdx);
+    }
     if (std::getenv("XYO_EDIT_DEBUG"))
         std::fprintf(stderr, "[edqt] entering loop, vis=%d\n",
                      (int)view.isVisible());
     // ランチャー経由だと Qt が残留 Quit を処理して exec() が vis=1 の
     // まま早抜けする場合がある。ウィンドウが生きている限り再入する。
-    while (!closed && view.isVisible())
+    while (view.isVisible())
         loop.exec();
     if (std::getenv("XYO_EDIT_DEBUG"))
         std::fprintf(stderr, "[edqt] loop done, vis=%d\n",
