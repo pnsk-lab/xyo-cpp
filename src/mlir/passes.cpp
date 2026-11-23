@@ -848,6 +848,23 @@ struct Promoter {
                 push(b, out, t);
                 return t->result(0);
             }
+            if ((n == "xyo.div" || n == "xyo.div.i") &&
+                v.op->operands.size() == 2 &&
+                divRanges_.count(v.op) != 0) {
+                // 偶数証明済みの div。arith 書換えが先に .i 化していれば
+                // 上（.i 集合）で拾う。ここに来るのは書換えが飛ばした
+                // 場合で、i32 で運ぶ。証明なしの div は通さない
+                // （不健全な i32 化になる）。
+                int64_t dd = 0;
+                if (!intConstValue(v.op->operands[1], &dd) || dd <= 0)
+                    return Value{};
+                Value av = iOf(v.op->operands[0], b, out);
+                Value cv = iOf(v.op->operands[1], b, out);
+                if (!av || !cv) return Value{};
+                Op* d = make("xyo.div.i", {av, cv}, {Type::i32()});
+                push(b, out, d);
+                return d->result(0);
+            }
             int64_t c = 0;
             if (intConstValue(v, &c)) {
                 Op* k = make("xyo.const.i", {}, {Type::i32()},
@@ -2112,8 +2129,15 @@ struct Promoter {
                         return nullptr;
                     if (o->operands.size() != 2) return nullptr;
                     int64_t kk = 0;
-                    if (!intConstValue(o->operands[1], &kk) || kk == 0)
+                    const Value& dv = o->operands[1];
+                    if (dv.op && dv.op->name == "xyo.const.i") {
+                        const Attr* a = dv.op->attr("v");
+                        if (!a || !a->isInt()) return nullptr;
+                        kk = a->i;
+                        if (kk == 0) return nullptr;
+                    } else if (!intConstValue(dv, &kk) || kk == 0) {
                         return nullptr;
+                    }
                     // 偶数性だけを追う（K==2）。一般の K は div 側が
                     // 対応していない。
                     if (kk != 2 && kk != -2) return nullptr;
@@ -2284,17 +2308,6 @@ struct Promoter {
                         // 表現が変わり interp とずれる（found: truthRun）。
                         if (!r.ok || r.lo < INT32_MIN || r.hi > INT32_MAX ||
                             !exactIntOperand(op->operands[0], iv)) {
-                            if (intDebug()) {
-                                const char* on =
-                                    op->operands[0].op
-                                        ? op->operands[0].op->name.c_str()
-                                        : "(null)";
-                                std::fprintf(stderr,
-                                    "[mlir-int] drop %s ok=%d range=[%lld,%lld] exact=%d op=%s\n",
-                                    id.c_str(), int(r.ok),
-                                    (long long)r.lo, (long long)r.hi,
-                                    int(exactIntOperand(op->operands[0], iv)), on);
-                            }
                             active.erase(id);
                             iv.erase(id);
                             changed = true;
@@ -3807,6 +3820,10 @@ struct Promoter {
         for (auto& [o, k] : modSubK) {
             auto f = cl.opMap.find(o);
             if (f != cl.opMap.end()) pt.modSubK[f->second] = k;
+        for (auto& [o, r] : divRanges_) {
+            auto f = cl.opMap.find(o);
+            if (f != cl.opMap.end()) pt.divRanges_[f->second] = r;
+        }
         }
         for (Op* o : intProvenOps) {
             auto f = cl.opMap.find(o);
@@ -4309,6 +4326,10 @@ struct Promoter {
         for (auto& [o, k] : modSubK) {
             auto f = cl.opMap.find(o);
             if (f != cl.opMap.end()) pt.modSubK[f->second] = k;
+        for (auto& [o, r] : divRanges_) {
+            auto f = cl.opMap.find(o);
+            if (f != cl.opMap.end()) pt.divRanges_[f->second] = r;
+        }
         }
         for (Op* o : intProvenOps) {
             auto f = cl.opMap.find(o);
@@ -4453,6 +4474,10 @@ struct Promoter {
         for (auto& [o, k] : modSubK) {
             auto f = cl.opMap.find(o);
             if (f != cl.opMap.end()) pi.modSubK[f->second] = k;
+        for (auto& [o, r] : divRanges_) {
+            auto f = cl.opMap.find(o);
+            if (f != cl.opMap.end()) pi.divRanges_[f->second] = r;
+        }
         }
         for (Op* o : intProvenOps) {
             auto f = cl.opMap.find(o);
@@ -4793,6 +4818,10 @@ struct Promoter {
         for (auto& [o, k] : modSubK) {
             auto f = cl.opMap.find(o);
             if (f != cl.opMap.end()) pi.modSubK[f->second] = k;
+        for (auto& [o, r] : divRanges_) {
+            auto f = cl.opMap.find(o);
+            if (f != cl.opMap.end()) pi.divRanges_[f->second] = r;
+        }
         }
         for (Op* o : intProvenOps) {
             auto f = cl.opMap.find(o);

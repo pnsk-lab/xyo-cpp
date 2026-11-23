@@ -720,3 +720,78 @@ AND していたため、正準形の整数文字列（`"0"` 等）の entry が
   `algo_primes` 33k→13k（box-int が逆効果 — 要調査）、
   `list_read` は不変（box-int も float も同速＝int が走っていないか、
   int 自体が遅い）。
+
+## Round 246: 実行時整数 mod fast path（UREM32）
+
+### 動機
+
+`XYO_MLIR_BOX=0` との A/B で、`math_collatz` が box ありで 2.3 倍
+速い（box-int が効いている）のに対し、`algo_primes` は box ありで
+2.6 倍遅いことが分かった。後者は可変除数の `mod`（`k_i mod k_j`）
+が原因で、float のままだと毎反復 `fmod` libcall になる。
+legacy は mod32 fast path（範囲＋整数性の実行時検査 → UREM32）
+を持つ。
+
+### 変更（`lower_llvm.cpp`）
+
+`xyo.mod.f` の非 2 冪除数経路に、両辺が実行時に
+`0 < a <= 2^31` かつ `1 <= b <= 2^31` かつ整数なら UREM32 で処理する
+fast path を追加（`branch_weights` 63:1）。NaN・非整数・0/負除数・
+範囲外は従来の `fmod`＋符号補正へ。両辺正なので補正は不要。
+
+### 効果
+
+- algo_primes 0.45→0.58x、list_read 0.97→1.05x（legacy 超え継続）、
+  life 0.45→0.50x。geomean は横ばい（2.27x）。
+- `XYO_JIT_MEGA=1 xyo-tests` 0 FAIL。
+
+## Round 247: `int_exact_ok` の文字列誤却下（ガード全滅バグ）
+
+### 発見
+
+`int_exact_ok` の lowering が最終段で `isNum`（素の double 判定）を
+AND していたため、正準形整数文字列の entry が全て偽になり、
+guard/box が常に float 側へ落ちていた。コメント（「文字列も通す」）
+と実装の矛盾。スイートの大半のループ entry は文字列定数のため、
+int 昇格全体が不発だった。
+
+### 変更（`lower_llvm.cpp`）
+
+最終の AND から `isNum` を除去（`f` は既に `to_num` で数値化済み）。
+
+### 効果（r247 スイート）
+
+- **list_read 0.21→0.97x、list_replace 0.37→1.22x**、
+  algo_primes 0.21→0.45x、algo_matmul 0.65→0.74x、
+  math_round 0.46→0.54x、math_expsqrt 0.33→0.44x、
+  str_letter 0.26→0.34x、app_projection 0.91→0.97x。
+- math_collatz は不動（0.22x）— 別経路の問題。
+
+## Round 248: 偶数性による整数除算（collatz の n/2）
+
+### 動機
+
+collatz の内側 while は `if (n mod 2 == 0) n = n/2 else n = 3n+1`。
+`n` は unbounded（`3n+1` で発散）のため区間証明ができず float の
+ままだった。legacy は実行時 int パスを持つ。
+
+### 変更（`passes.cpp`）
+
+- `assumeBranch` に `eq(mod(V,K),0)` 形の検出を追加し、真側の評価
+  中だけ `evenVars_` に V を記録（K==2 のみ、setvar で解除、
+  分岐の前後で保存/復元）。
+- `evalIntUnmemo` に `xyo.div`（除数 const 2・被除数 even）の
+  ケースを追加。精密な半分区間を返し `divRanges_` に記録
+  （分岐内 op のため分岐依存区間で健全）。
+- `intOkOf` で `divRanges_` を優先参照。arith 書換えゲートに
+  `div`（正の定数除数）を追加し `div.i` へ（lowering は既存）。
+- box の `relaxClean` 判定で、divRanges_ 記録済みの div 書き込みを
+  許容（`intExprProvable` は静的なため div を含められず、frontend
+  との計数一致を崩さないよう動的側だけ緩和）。
+
+### 効果
+
+- collatz_nest_50 の while が `int loop: 2 vars` に
+ （acc + n。従来は acc のみ）。
+- `XYO_JIT_MEGA=1 xyo-tests` 0 FAIL、`xcheck` 45/45、
+  numeric promotion 1514 checks 0 FAIL。
