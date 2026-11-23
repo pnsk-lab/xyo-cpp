@@ -517,3 +517,30 @@ app_life +0.5% / app_brainfuck +3.3% / app_raycast +3.2% / app_ast +4.1% /
 algo_sort +4.1% / algo_matmul +5.0% / algo_primes +4.4% / algo_ack +3.5% /
 list_read +7.1% / list_insdel +15.9% / str_cast +5.0% / math_expsqrt -2.7%。
 回帰は 1 件のみで、他は微増。
+
+### 次の一手（Round 241 で特定した最有力リード）
+
+スイート IR の yield 形を legacy と数えると差がはっきり出る
+（`performance.sb3`、post-opt IR の出現数）:
+
+| | `xyo_yield_fast` | `xyo_warp_yield_due` | `xyo_loop_yield` |
+|---|---|---|---|
+| legacy | 202 | **214** | **0** |
+| MLIR | 244 | **58** | **357** |
+
+- legacy は warp ループを**全数**「`warp_due` で問い合わせ → 真のときだけ
+  spill+yield」で lowering する。
+- MLIR は `emitBatchedRepeat` が適用できたループ（58 箇所）だけがその形で、
+  残り 357 箇所は `xyo_loop_yield` を直接呼ぶ形（`emitWarpLoopYield`）に
+  落ちている。`emitBatchedRepeat` の安全条件（本体内に入れ子ループ・
+  手続き呼出し・待機系を許さない）が、まさに app_*/algo_primes/sieve の
+  二重ループ＋手続き呼出しに当たる。
+- したがって次ラウンドの本命は「**バッチが使えない warp ループでも、
+  spill を稀分岐側へ出す**」— `emitWarpLoopYield` を
+  「`xyo_warp_yield_due` で問い合わせ → 真のときだけ spill + `xyo_yield`
+  + reload」に置き換える（legacy と同形）。現在の形は 64 反復ごとに
+  `xyo_loop_yield` を呼び、その呼出しが yield し得るため運搬値を
+  呼出し境界で spill せざるを得ない。
+  正しさの条件（yield 後に他スレッドが同じ変数を書く可能性）を
+  `recomputeHoisted` と同じ枠組みで満たす必要があり、
+  `d`/`b` 運搬の reload 契約とセットで設計する。
