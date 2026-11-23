@@ -3200,6 +3200,16 @@ void Lowerer::emitOp(Op& op) {
             const std::string& n = v.op->name;
             if (n == "xyo.from_int" || n == "xyo.to_int") return true;
             if (n == "xyo.box.f") return true;
+            // numeric/intvalued リストからの読みは素の double が確定
+            // （frontend が全書き込みを数値と証明）。タグ検査不要。
+            if ((n == "xyo.list.item" || n == "xyo.list.item.i") &&
+                !v.op->operands.empty() && v.op->operands[0].op &&
+                v.op->operands[0].op->name == "xyo.list.ptr") {
+                Op* ptr = v.op->operands[0].op;
+                if (ptr->attrInt("numeric", 0) != 0 ||
+                    ptr->attrInt("intvalued", 0) != 0)
+                    return true;
+            }
             if (n == "xyo.const") {
                 const Attr* a = v.op->attr("bits");
                 if (!a || !a->isInt()) return false;
