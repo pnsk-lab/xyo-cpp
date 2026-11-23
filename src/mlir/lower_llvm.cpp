@@ -439,6 +439,9 @@ struct Lowerer {
         llvm::BasicBlock* preheader = nullptr;
         std::unordered_set<Op*> bodyOps;
         std::unordered_set<std::string> mutatedLists;
+    /// 構造変化（伸縮）のあるリスト。replace のみは含まない
+    /// （ヘッダ共有可）。
+    std::unordered_set<std::string> structMutatedLists;
         bool observable = false;
         std::vector<ListHeader> headers;
     };
@@ -880,6 +883,12 @@ bool listMutator(const std::string& n) {
            n == "xyo.list.insert" || n == "xyo.list.delete" ||
            n == "xyo.list.deleteall" || n == "xyo.list.replace.i";
 }
+/// 構造を変えるミューテータ（伸縮・再配置し得る）。replace は値だけを
+/// 書き換え、SList*・len・items は不変なのでヘッダ共有できる。
+bool structuralMutator(const std::string& n) {
+    return n == "xyo.list.add" || n == "xyo.list.insert" ||
+           n == "xyo.list.delete" || n == "xyo.list.deleteall";
+}
 }  // namespace
 
 namespace {
@@ -907,6 +916,11 @@ void Lowerer::pushLoopScope(Block& body, bool warp) {
                 o->operands[0].op->name == "xyo.list.ptr")
                 sc.mutatedLists.insert(
                     std::string(o->operands[0].op->attrStr("id")));
+            if (structuralMutator(o->name) && !o->operands.empty() &&
+                o->operands[0].op &&
+                o->operands[0].op->name == "xyo.list.ptr")
+                sc.structMutatedLists.insert(
+                    std::string(o->operands[0].op->attrStr("id")));
             if (hoistBarrier(o->name)) sc.observable = true;
             for (auto& r : o->regions)
                 if (r)
@@ -932,7 +946,8 @@ void Lowerer::pushLoopScope(Block& body, bool warp) {
             Op* p = o->operands[0].op;
             if (p->name != "xyo.list.ptr") continue;
             std::string id(p->attrStr("id"));
-            if (sc.mutatedLists.count(id)) continue;
+            // replace のみのループは len/items が不変なので共有する。
+            if (sc.structMutatedLists.count(id)) continue;
             used[id] = std::string(p->attrStr("name"));
         }
         for (auto& [id, name] : used) {
@@ -4264,10 +4279,8 @@ void Lowerer::emitOp(Op& op) {
         b.CreateStore(b.CreateAdd(len, llvm::ConstantInt::get(i32(), 1)),
                       b.CreateConstGEP1_32(
                           i8(), list, uint32_t(offsetof(SList, len))));
-        b.CreateStore(llvm::ConstantInt::get(i8(), 1),
-                      b.CreateConstGEP1_32(
-                          i8(), list, uint32_t(offsetof(SList, monitorDirty))));
-        // numericOnly は単調（一度 false になったら false のまま）。
+        // SList::monitorDirty は読み手が存在しないため fast path では書かない
+        //（helper 経路が設定する）。numericOnly は単調なので維持する。
         LValue* oldN = b.CreateLoad(
             i8(), b.CreateConstGEP1_32(
                       i8(), list, uint32_t(offsetof(SList, numericOnly))));
@@ -4334,9 +4347,7 @@ void Lowerer::emitOp(Op& op) {
             ptr(), b.CreateConstGEP1_32(
                        i8(), list, uint32_t(offsetof(SList, items))));
         b.CreateStore(item, b.CreateGEP(i64(), items, i0));
-        b.CreateStore(llvm::ConstantInt::get(i8(), 1),
-                      b.CreateConstGEP1_32(
-                          i8(), list, uint32_t(offsetof(SList, monitorDirty))));
+        // SList::monitorDirty は読み手が存在しないため fast path では書かない。
         LValue* oldN = b.CreateLoad(
             i8(), b.CreateConstGEP1_32(
                       i8(), list, uint32_t(offsetof(SList, numericOnly))));
