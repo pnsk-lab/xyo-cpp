@@ -354,6 +354,8 @@ struct Lowerer {
         const uint32_t idx = slotFor(id, name, isList);
         // entry の先頭でロードする（スロット初期化は lowering の最後に
         // さらに手前へ挿入されるので、必ず init の後になる）。
+        // 注: !invariant.load は不採用 — sha256 で効かず bubblesort が
+        // LLVM の remat 化で 39→46ms へ悪化した（実測で撤回）。
         llvm::BasicBlock& fentry = fn->getEntryBlock();
         IRBuilder<> ib(&fentry, fentry.begin());
         LValue* arr = ib.CreateLoad(
@@ -469,6 +471,9 @@ struct Lowerer {
     std::vector<LoopScope> loopScopes_;
     /// getvar op → 数値キャッシュ alloca（アクティブなスコープの和）。
     std::unordered_map<const Op*, llvm::AllocaInst*> loopNumCache_;
+    /// xyo.arg op → 数値キャッシュ alloca（proc 引数は呼出し中不変 —
+    /// 関数エントリで 1 回だけ to_num して使い回す）。
+    std::unordered_map<const Op*, llvm::AllocaInst*> argNumCache_;
     void popLoopScope() {
         for (const NumCacheEntry& e : loopScopes_.back().numCache)
             loopNumCache_.erase(e.gv);
@@ -1471,11 +1476,16 @@ LValue* Lowerer::numberShadow(const Value& v) {
     // to_num(getvar/arg) で、その変数がループ内で書かれないときは
     // preheader で 1 回だけ求めたキャッシュ値を使う（legacy の昇格
     // 数値影に相当。yield 後は recomputeHoisted が読み直す）。
-    if (v.op && (v.op->name == "xyo.getvar" || v.op->name == "xyo.arg") &&
-        !loopNumCache_.empty()) {
+    if (v.op && (v.op->name == "xyo.getvar" || v.op->name == "xyo.arg")) {
+        llvm::AllocaInst* cs = nullptr;
         auto cit = loopNumCache_.find(v.op);
-        if (cit != loopNumCache_.end()) {
-            LValue* d = b.CreateLoad(f64(), cit->second);
+        if (cit != loopNumCache_.end()) cs = cit->second;
+        else {
+            auto ait = argNumCache_.find(v.op);
+            if (ait != argNumCache_.end()) cs = ait->second;
+        }
+        if (cs) {
+            LValue* d = b.CreateLoad(f64(), cs);
             numShadow_[key] = NumShadowEntry{d, b.GetInsertBlock()};
             return d;
         }
@@ -5305,6 +5315,37 @@ LoweredFunction lowerToLLVM(Module& source, llvm::Module& dest,
         // entry block の第 0 引数は ctx。
         l.vals[keyOf(mf->body->args[0])] = fn->getArg(0);
         l.b.SetInsertPoint(entry);
+        BasicBlock* bodyStart = entry;
+        // proc 引数の to_num は呼出し中不変 — index ごとに 1 回だけ
+        // 求めて使い回す（legacy の引数数値影。各使用点で fast/slow
+        // チェーンを繰り返すと sha256 の p9 が 2.7 倍遅かった）。
+        {
+            std::unordered_map<uint32_t, llvm::AllocaInst*> byIndex;
+            std::function<void(Block&)> scan = [&](Block& blk) {
+                for (Op* o : blk.ops) {
+                    if (o->name == "xyo.arg") {
+                        const uint32_t idx = static_cast<uint32_t>(
+                            o->attrInt("index"));
+                        llvm::AllocaInst*& slot = byIndex[idx];
+                        if (!slot) {
+                            slot = l.entryAlloca(l.f64(), "anc.d");
+                            l.b.CreateStore(
+                                l.emitToNumInline(
+                                    fn->getArg(l.argBase + idx)),
+                                slot);
+                        }
+                        l.argNumCache_.emplace(o, slot);
+                    }
+                    for (auto& r : o->regions)
+                        if (r)
+                            for (auto& rcb : r->blocks) scan(*rcb);
+                }
+            };
+            scan(*mf->body);
+            // emitToNumInline は挿入点を直列の condbr→join へ伸ばす。
+            // 最後の join（未終端）を本体の開始ブロックとして渡す。
+            bodyStart = l.b.GetInsertBlock();
+        }
         // warp 手続きは呼出し中 isWarp=1 を保証する。呼出し元の値を
         // 保存し、return で戻す（既存 codegen と同じ契約）。
         llvm::Value* savedWarp = nullptr;
@@ -5314,7 +5355,7 @@ LoweredFunction lowerToLLVM(Module& source, llvm::Module& dest,
             l.b.CreateStore(llvm::ConstantInt::get(l.i32(), 1),
                             l.ctxField(uint32_t(offsetof(JitCtx, isWarp))));
         }
-        l.lowerBlock(*mf->body, entry);
+        l.lowerBlock(*mf->body, bodyStart);
         if (!l.error.empty()) {
             // 途中まで lowering した module は不完全（本体の無い手続き関数が
             // 残る）ので、必ず失敗として扱う。
