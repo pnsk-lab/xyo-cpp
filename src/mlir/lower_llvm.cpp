@@ -3360,6 +3360,7 @@ void Lowerer::emitOp(Op& op) {
         double da = 0.0, dc = 0.0;
         const bool aConst = constNum(op.operands[0], &da);
         const bool cConst = constNum(op.operands[1], &dc);
+
         // 両辺とも素の数値定数（NaN 除外）なら畳む。文字列定数は
         // bits 一致や文字列比較があり得るので runtime に残す。
         if (aConst && cConst && !std::isnan(da) && !std::isnan(dc)) {
