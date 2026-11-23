@@ -795,3 +795,30 @@ collatz の内側 while は `if (n mod 2 == 0) n = n/2 else n = 3n+1`。
  （acc + n。従来は acc のみ）。
 - `XYO_JIT_MEGA=1 xyo-tests` 0 FAIL、`xcheck` 45/45、
   numeric promotion 1514 checks 0 FAIL。
+
+## Round 249/250: フォールバック事故と even-div の検証
+
+### 事故
+
+evenness 導入後の r249/r250 で geomean が 2.27x→1.08x→1.08x に
+落ち、全カーネルが一様に ~0.95x になった。`XYO_MLIR_TRACE` で
+確認すると、メインスクリプト（~Mv、6040 ops）が
+`verifier failed after passes (operand is empty for xyo.yield)` で
+fallback し、legacy 実行になっていた。
+
+### 原因
+
+`divRanges_` の Clone 先への伝搬コードのブレース崩れ
+（`modSubK` のループ内にネストし、`modSubK` が空のとき伝搬自体が
+実行されない＋変数シャドウ）。未伝搬の div は `intOkOf` で落ち、
+`setvar` 側の `iOf` が空を返し、yield が空オペランドになって
+verify 落ち → スクリプト全体が fallback。
+
+### 教訓
+
+- スイート全面が一様に ~1.0x になったら fallback を疑い、
+  `XYO_MLIR_TRACE=1` で `fallback` 行を確認する。
+- ミニベンチとスイートの乖離（micro_read は parity なのに
+  suite list_read が 0.2x）は fallback の典型症状。
+- r249/r250 の数値は legacy 測定であり、最適化効果の評価には
+  使えない。r251（修正後）で取り直す。
