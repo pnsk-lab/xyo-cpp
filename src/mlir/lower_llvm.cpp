@@ -918,7 +918,8 @@ struct Lowerer {
     /// f64 入力の Scratch mod: 両辺が正の i32 整数なら UREM32、
     /// それ以外は fmod+符号補正。|c| が 2 の冪定数なら c*trunc(x/c)
     /// 置き換え（除数定数は呼び出し側が hasDiv/dc で渡す）。
-    LValue* emitModF64(LValue* a, LValue* c, bool hasDiv, double dc);
+    LValue* emitModF64(LValue* a, LValue* c, bool hasDiv, double dc,
+                       bool noIntPath = false);
     /// 動的除数の mod の共有 slow 側。モジュールに 1 個だけ作る
     /// noinline/cold の f64(f64,f64) — ±2^53 内の非零整数なら i64
     /// SREM+符号補正、それ以外は fmod+符号補正（legacy
@@ -975,8 +976,71 @@ bool isPow2(double d);
 /// 正の i32 整数のとき UREM32（fmod libcall を避ける）、どちらも
 /// 外れるときだけ frem+fdiv+select の符号補正を使う。
 LValue* Lowerer::emitModF64(LValue* a, LValue* c, bool hasDiv,
-                            double dc) {
+                            double dc, bool noIntPath) {
     LValue* r = nullptr;
+    // 除数が正の i32 整数定数で、a が i32 範囲の整数なら
+    // trunc(a) を整数として除算する（legacy の mod.c32.* 相当）。
+    // sha256 の `x mod 256` 連打で、fmod チェーンより fptosi+and が
+    // 数倍速い。a が整数でない/範囲外なら通常経路へ落ちる。
+    // fptosi は範囲外入力で poison を返すため、範囲検査を先に行う。
+    const bool cInt = !noIntPath && hasDiv && std::isfinite(dc) &&
+                      dc >= 1.0 && dc <= 2147483647.0 &&
+                      std::floor(dc) == dc;
+    if (cInt) {
+        BasicBlock* intBB = BasicBlock::Create(lc, "mod.c32", fn);
+        BasicBlock* otherBB = BasicBlock::Create(lc, "mod.c32.other", fn);
+        BasicBlock* joinBB = BasicBlock::Create(lc, "mod.c32.done", fn);
+        LValue* t = b.CreateUnaryIntrinsic(llvm::Intrinsic::trunc, a);
+        LValue* isInt = b.CreateFCmpOEQ(t, a);
+        LValue* inRange = b.CreateFCmpOLE(
+            b.CreateUnaryIntrinsic(llvm::Intrinsic::fabs, a),
+            llvm::ConstantFP::get(f64(), 2147483647.0));
+        b.CreateCondBr(b.CreateAnd(isInt, inRange), intBB, otherBB,
+                       llvm::MDNode::get(lc, {
+                           llvm::MDString::get(lc, "branch_weights"),
+                           llvm::ConstantAsMetadata::get(
+                               llvm::ConstantInt::get(i64(), 48)),
+                           llvm::ConstantAsMetadata::get(
+                               llvm::ConstantInt::get(i64(), 16))}));
+        b.SetInsertPoint(intBB);
+        LValue* ai = b.CreateFPToSI(a, i32());
+        LValue* bi = llvm::ConstantInt::get(i32(), uint32_t(int64_t(dc)));
+        LValue* rem = b.CreateSRem(ai, bi);
+        LValue* intR;
+        const int64_t dcI = int64_t(dc);
+        if ((dcI & (dcI - 1)) == 0 && dcI > 0) {
+            // 2 冪の除数は and で閉じる（Scratch mod は非負結果）。
+            intR = b.CreateUIToFP(
+                b.CreateAnd(rem, llvm::ConstantInt::get(
+                                     i32(), uint32_t(dcI - 1))),
+                f64());
+        } else {
+            // 非 2 冪: Scratch mod は除数の符号へ寄せる（ここでは正）。
+            LValue* rr = rem;
+            LValue* fix = b.CreateSelect(
+                b.CreateICmpSLT(rr, llvm::ConstantInt::get(i32(), 0)),
+                b.CreateAdd(rr, bi), rr);
+            intR = b.CreateSIToFP(fix, f64());
+        }
+        // a が c の負の倍数（-256 mod 256 等）や -0.0 のとき、Scratch は
+        // -0.0 を返す。srem の -0/0 区別は f64 に戻すと消えるため、
+        // rem==0 だけ a の符号のゼロを返す。
+        intR = b.CreateSelect(
+            b.CreateICmpEQ(rem, llvm::ConstantInt::get(i32(), 0)),
+            b.CreateBinaryIntrinsic(llvm::Intrinsic::copysign, llvm::ConstantFP::get(f64(), 0.0), a),
+            intR);
+        BasicBlock* intEnd = b.GetInsertBlock();
+        b.CreateBr(joinBB);
+        b.SetInsertPoint(otherBB);
+        LValue* other = emitModF64(a, c, hasDiv, dc, /*noIntPath=*/true);
+        BasicBlock* otherEnd = b.GetInsertBlock();
+        b.CreateBr(joinBB);
+        b.SetInsertPoint(joinBB);
+        auto* phi = b.CreatePHI(f64(), 2);
+        phi->addIncoming(intR, intEnd);
+        phi->addIncoming(other, otherEnd);
+        return phi;
+    }
     if (hasDiv && isPow2(dc) && std::fabs(dc) >= 1.0) {
         LValue* q = b.CreateFMul(
             a, llvm::ConstantFP::get(f64(), 1.0 / dc));
