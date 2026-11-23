@@ -544,3 +544,61 @@ list_read +7.1% / list_insdel +15.9% / str_cast +5.0% / math_expsqrt -2.7%。
   正しさの条件（yield 後に他スレッドが同じ変数を書く可能性）を
   `recomputeHoisted` と同じ枠組みで満たす必要があり、
   `d`/`b` 運搬の reload 契約とセットで設計する。
+
+## Round 242: warp yield 検査を sampled clock + 稀分岐ハンドオフへ
+
+### 変更（`lower_llvm.cpp`）
+
+`emitWarpDueCheck(handBB, done, warpKnown)` を新設し、warp 系 yield
+3 箇所を legacy の `emitWarpDeadlineCheck` と同形にした:
+
+- `emitWarpLoopYield`（未昇格 warp ループ）: これまで検査のたびに
+  `xyo_loop_yield`（内部で時計を読む不透明呼出し）と
+  `recomputeHoisted` を**無条件**で実行していた。今は
+  「`isWarp==0` → handoff / `sampledWarpClockUs` があれば
+  アトミック 2 ロード + 期限比較 / なければ `xyo_warp_yield_due`」の
+  形で、**実際に譲るときだけ** `xyo_yield` + `recomputeHoisted` を走る。
+- `emitLoopYield` の非コルーチン warp 枝: 同上。
+- `xyo.warp_yield` の due ブロック: 直接 `xyo_warp_yield_due` を呼んで
+  いたのを `emitWarpDueCheck` へ差し替え（sampled clock の fast path
+  を使える + `isWarp==0` のとき必須 yield を飛ばす隙間も塞ぐ）。
+  `kind=='d'` の box.f 化を due 側から handoff 側へ移した。
+
+### 落とし穴（実測で発見）
+
+`emitWarpDueCheck` が done へ分岐する直前ブロックは `mergeBB` で、
+呼出し元の `dueBB` ではない。**done の PHI incoming は mergeBB を
+指す必要がある** — 最初 dueBB のままにしていて IR verify に落ち、
+MLIR frontend がまるごと legacy へ fallback していた
+（`test_mlir` の "warp procedure compiled through MLIR" が検出した）。
+修正後 `XYO_JIT_MEGA=1` / 非 Mega とも **0 FAIL**。
+
+### 効果
+
+- スイート hotspot（MLIR / legacy）: **algo_sort 0.75→0.83**、
+  algo_sieve 0.61→0.67、algo_matmul 0.55→0.58、app_projection
+  0.78→0.86、list_replace 0.35→0.37、list_read 0.24→0.25、
+  math_round 0.43→0.46、loops_empty 0.93→0.94。回帰なし
+  （app_raycast 0.23→0.21、app_brainfuck 0.23→0.22、app_ast
+  0.33→0.32、algo_ack 0.52→0.51 は ±1〜2% 揺動圏内）。
+- IR 出現数: `xyo_loop_yield` 357→**91**（handoff のみ）、
+  `xyo_warp_yield_due` 58→477（フォールバックブロック分）、
+  atomic ロード 836 箇所 = sampled clock fast path が発火している。
+
+### 残る差（確定した次の一手）
+
+- **「ミニは速い・スイートは遅い」は崩れた**: Round 241 までは隔離
+  ミニで parity、スイートのみ 0.22x だったが、今回の
+  `abl_read_varidx`（変数索引 list read、非昇格）は **MLIR 200ms /
+  legacy 65ms** で隔離でも 3 倍差。残差は**コード生成差**で確定。
+- legacy の内側ループは (1) リスト `items`/`len` をレジスタに保持し
+  反復をまたぐ、（2) 変数スロットを 1 回解決して使い回す、
+  (3) 文字列要素の `numState/numCache` fast path を inline で持つ
+  （タグ==str のとき `bzhi` + `movl 0x10` + `vmovsd 0x8`）、
+  (4) spill は実 yield 時のみ。MLIR は反復ごとに
+  `varSlotData → List → len/items → item` の 3 段ポインタチェイスを
+  行う。**P1「item fast path 抜本」はこの方向（ヘッダの
+  ループ不変ホイスト + 非昇格変数のスロットキャッシュ + 文字列
+  キャッシュ fast path）に限定できる**。`XYO_MLIR_LISTHDR=1`
+  スケッチでは -2〜+2% しか出なかったので、ヘッダだけでなく
+  変数スロット側が支配的と思われる。

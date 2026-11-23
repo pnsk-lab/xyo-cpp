@@ -799,6 +799,21 @@ struct Lowerer {
         return true;
     }
     void emitWarpLoopYield();
+    /// warp ループの「本当に yield が要るか」検査を emit し、
+    /// 要るときは handBB へ、要らなければ done へ分岐する。
+    /// legacy codegen の emitWarpDeadlineCheck と同じ形:
+    ///  - 実行時 isWarp==0 なら無条件で handoff（非 warp 実行は毎反復
+    ///    ではなくこの検査間隔ごとに譲る契約 = xyo_loop_yield と同値）
+    ///  - ctx->sampledWarpClockUs が生きていればアトミック 2 ロード +
+    ///    比較だけ（呼出しゼロ）。watchdog が既に時計を標本化している
+    ///    ため同期ヘルパを呼ぶ必要がない
+    ///  - なければ xyo_warp_yield_due（GC 予算 + isStuck の同期検査）
+    /// warpKnown は「呼び出し側が既に isWarp!=0 を確認済み」のとき
+    /// 先頭の検査を省く。
+    /// 戻り値は「譲らない」側で done へ分岐する直前の基本ブロック
+    ///（done の PHI incoming は due 元のブロックではなくこちらを使う）。
+    BasicBlock* emitWarpDueCheck(BasicBlock* handBB, BasicBlock* done,
+                                 bool warpKnown);
     /// warp 本体の「値をすべて定数ステップで更新するだけ」の判定結果。
     struct ChunkInfo {
         std::map<uint32_t, double> steps;
@@ -1249,6 +1264,81 @@ llvm::AllocaInst* Lowerer::yieldCounter() {
     return yieldCnt_;
 }
 
+llvm::BasicBlock* Lowerer::emitWarpDueCheck(BasicBlock* handBB,
+                                            BasicBlock* done,
+                                            bool warpKnown) {
+    static const bool sharedWarpClock = [] {
+        const char* env = std::getenv("XYO_JIT_WARP_CLOCK");
+        return !env || env[0] != '0';
+    }();
+    BasicBlock* chkBB = BasicBlock::Create(lc, "wyield.chk", fn);
+    if (!warpKnown) {
+        LValue* warp = b.CreateLoad(
+            i32(), ctxField(uint32_t(offsetof(JitCtx, isWarp))));
+        b.CreateCondBr(b.CreateICmpEQ(warp, llvm::ConstantInt::get(i32(), 0)),
+                       handBB, chkBB);
+    } else {
+        b.CreateBr(chkBB);
+    }
+    b.SetInsertPoint(chkBB);
+    llvm::Value* should = nullptr;
+    BasicBlock* mergeBB = BasicBlock::Create(lc, "wyield.merge", fn);
+    if (sharedWarpClock) {
+        // legacy の sampled warp clock: 呼出しを挟まずアトミックを 2 つ
+        // 読んで期限と比較する。ポインタが無ければ同期ヘルパへ退く。
+        llvm::Value* clockField = b.CreateConstGEP1_32(
+            i8(), ctx, uint32_t(offsetof(JitCtx, sampledWarpClockUs)));
+        llvm::Value* clockPtr = b.CreateLoad(ptr(), clockField);
+        BasicBlock* sampled = BasicBlock::Create(lc, "wyield.sampled", fn);
+        BasicBlock* fallback = BasicBlock::Create(lc, "wyield.fallback", fn);
+        b.CreateCondBr(
+            b.CreateICmpNE(clockPtr,
+                           llvm::ConstantPointerNull::get(ptr())),
+            sampled, fallback, llvm::MDNode::get(lc, {
+                llvm::MDString::get(lc, "branch_weights"),
+                llvm::ConstantAsMetadata::get(
+                    llvm::ConstantInt::get(i64(), 1000)),
+                llvm::ConstantAsMetadata::get(
+                    llvm::ConstantInt::get(i64(), 1))}));
+
+        b.SetInsertPoint(sampled);
+        auto* timeUs = b.CreateLoad(i64(), clockPtr);
+        timeUs->setAtomic(llvm::AtomicOrdering::Monotonic);
+        llvm::Value* deadlineField = b.CreateConstGEP1_32(
+            i8(), ctx, uint32_t(offsetof(JitCtx, sampledWarpDeadlineUs)));
+        llvm::Value* deadlinePtr = b.CreateLoad(ptr(), deadlineField);
+        auto* deadlineUs = b.CreateLoad(i64(), deadlinePtr);
+        deadlineUs->setAtomic(llvm::AtomicOrdering::Monotonic);
+        llvm::Value* expired = b.CreateICmpSGT(timeUs, deadlineUs);
+        b.CreateBr(mergeBB);
+
+        b.SetInsertPoint(fallback);
+        LValue* due = b.CreateCall(
+            callee("xyo_warp_yield_due", {ptr()}, i32()), {ctx});
+        llvm::Value* oldExpired =
+            b.CreateICmpNE(due, llvm::ConstantInt::get(i32(), 0));
+        b.CreateBr(mergeBB);
+
+        b.SetInsertPoint(mergeBB);
+        auto* joined = b.CreatePHI(b.getInt1Ty(), 2);
+        joined->addIncoming(expired, sampled);
+        joined->addIncoming(oldExpired, fallback);
+        should = joined;
+    } else {
+        LValue* due = b.CreateCall(
+            callee("xyo_warp_yield_due", {ptr()}, i32()), {ctx});
+        should = b.CreateICmpNE(due, llvm::ConstantInt::get(i32(), 0));
+        b.CreateBr(mergeBB);
+        b.SetInsertPoint(mergeBB);
+    }
+    b.CreateCondBr(should, handBB, done, llvm::MDNode::get(lc, {
+        llvm::MDString::get(lc, "branch_weights"),
+        llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i64(), 1)),
+        llvm::ConstantAsMetadata::get(
+            llvm::ConstantInt::get(i64(), 100000))}));
+    return mergeBB;
+}
+
 void Lowerer::emitWarpLoopYield() {
     mayYield = true;
     llvm::AllocaInst* cnt = yieldCounter();
@@ -1256,13 +1346,20 @@ void Lowerer::emitWarpLoopYield() {
                             llvm::ConstantInt::get(i64(), 1));
     b.CreateStore(n, cnt);
     BasicBlock* dueBB = BasicBlock::Create(lc, "wyield.due", fn);
+    BasicBlock* handBB = BasicBlock::Create(lc, "wyield.hand", fn);
     BasicBlock* done = BasicBlock::Create(lc, "wyield.done", fn);
     LValue* due = b.CreateICmpEQ(
         b.CreateAnd(n, llvm::ConstantInt::get(i64(), 63)),
         llvm::ConstantInt::get(i64(), 0));
     b.CreateCondBr(due, dueBB, done);
     b.SetInsertPoint(dueBB);
-    b.CreateCall(callee("xyo_loop_yield", {ptr()}, b.getVoidTy()), {ctx});
+    // 64 反復ごとの検査は legacy と同じく「期限超過か」を見るだけにし、
+    // 実際に譲るときだけ yield + hoist 再評価を行う。以前は検査のたびに
+    // xyo_loop_yield（内部で時計を読む不透明呼出し）と recomputeHoisted
+    // を無条件で走らせていた。
+    emitWarpDueCheck(handBB, done, /*warpKnown=*/false);
+    b.SetInsertPoint(handBB);
+    b.CreateCall(callee("xyo_yield", {ptr()}, b.getVoidTy()), {ctx});
     recomputeHoisted();
     b.CreateBr(done);
     b.SetInsertPoint(done);
@@ -1453,7 +1550,12 @@ void Lowerer::emitLoopYield() {
         llvm::ConstantInt::get(i64(), 0));
     b.CreateCondBr(due, dueBB, done);
     b.SetInsertPoint(dueBB);
-    b.CreateCall(callee("xyo_loop_yield", {ptr()}, b.getVoidTy()), {ctx});
+    // warp 枝: legacy と同じく期限超過かだけを見て、実際に譲るときだけ
+    // yield + hoist 再評価（isWarp!=0 済みなので先頭検査は省略）。
+    BasicBlock* handBB = BasicBlock::Create(lc, "yield.hand", fn);
+    emitWarpDueCheck(handBB, done, /*warpKnown=*/true);
+    b.SetInsertPoint(handBB);
+    b.CreateCall(callee("xyo_yield", {ptr()}, b.getVoidTy()), {ctx});
     recomputeHoisted();
     b.CreateBr(done);
     b.SetInsertPoint(done);
@@ -3330,6 +3432,15 @@ void Lowerer::emitOp(Op& op) {
             ids.push_back(id);
             names.push_back(name);
         }
+        // 実際にスケジューラへ譲る場合だけ spill/reload する
+        //（譲らない限りレジスタのまま回り、メモリ往復も to_num も
+        // 発生しない）。検査自体は sampled warp clock（アトミック
+        // 2 ロード）か xyo_warp_yield_due。
+        // ハンドオフ時は slots が最新になる（GC ルートとしても正しい）。
+        BasicBlock* handBB = BasicBlock::Create(lc, "wyield.handoff", fn);
+        BasicBlock* noHandBB =
+            emitWarpDueCheck(handBB, done, /*warpKnown=*/false);
+        b.SetInsertPoint(handBB);
         // 数値のみの変数は実際に譲る 1 回だけ box.f でビットを作る。
         for (size_t i = 0; i < namePairs.size(); ++i) {
             if (kind[i] != 'd') continue;
@@ -3338,17 +3449,6 @@ void Lowerer::emitOp(Op& op) {
                 llvm::ConstantInt::get(i64(), kNumBitsLimit),
                 b.CreateBitCast(preD[i], i64()));
         }
-        // 実際にスケジューラへ譲る場合だけ spill/reload する
-        //（xyo_warp_yield_due が GC 予算・stuck を見る。譲らない限り
-        // レジスタのまま回り、メモリ往復も to_num も発生しない）。
-        // ハンドオフ時は slots が最新になる（GC ルートとしても正しい）。
-        BasicBlock* handBB = BasicBlock::Create(lc, "wyield.handoff", fn);
-        LValue* should = b.CreateCall(
-            callee("xyo_warp_yield_due", {ptr()}, i32()), {ctx});
-        b.CreateCondBr(b.CreateICmpNE(should,
-                                       llvm::ConstantInt::get(i32(), 0)),
-                       handBB, done);
-        b.SetInsertPoint(handBB);
         std::vector<LValue*> reloadedBits =
             spillAndYieldBits(ids, names, preBits);
         std::vector<LValue*> reloadedD(namePairs.size(), nullptr);
@@ -3406,7 +3506,7 @@ void Lowerer::emitOp(Op& op) {
             if (kind[i] == 'i') {
                 auto* iPhi = b.CreatePHI(intTys[i], 3);
                 iPhi->addIncoming(inVals[i], pre);
-                iPhi->addIncoming(inVals[i], dueBB);
+                iPhi->addIncoming(inVals[i], noHandBB);
                 iPhi->addIncoming(reloadedI[i], handEnd);
                 vals[keyOf(op.result(ri++))] = iPhi;
                 continue;
@@ -3414,19 +3514,19 @@ void Lowerer::emitOp(Op& op) {
             if (kind[i] == 'd') {
                 auto* dPhi = b.CreatePHI(f64(), 3);
                 dPhi->addIncoming(preD[i], pre);
-                dPhi->addIncoming(preD[i], dueBB);
+                dPhi->addIncoming(preD[i], noHandBB);
                 dPhi->addIncoming(reloadedD[i], handEnd);
                 vals[keyOf(op.result(ri++))] = dPhi;
                 continue;
             }
             auto* bitsPhi = b.CreatePHI(i64(), 3);
             bitsPhi->addIncoming(preBits[i], pre);
-            bitsPhi->addIncoming(preBits[i], dueBB);
+            bitsPhi->addIncoming(preBits[i], noHandBB);
             bitsPhi->addIncoming(reloadedBits[i], handEnd);
             vals[keyOf(op.result(ri++))] = bitsPhi;
             auto* dPhi = b.CreatePHI(f64(), 3);
             dPhi->addIncoming(preD[i], pre);
-            dPhi->addIncoming(preD[i], dueBB);
+            dPhi->addIncoming(preD[i], noHandBB);
             dPhi->addIncoming(reloadedD[i], handEnd);
             vals[keyOf(op.result(ri++))] = dPhi;
         }
