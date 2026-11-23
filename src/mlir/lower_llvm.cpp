@@ -448,6 +448,13 @@ struct Lowerer {
         LValue* itemsPhi = nullptr;
         LValue* lenPhi = nullptr;
     };
+    /// to_num(getvar) のループ不変キャッシュ（ループ内で書かれない
+    /// 変数）。preheader と yield 後の読み直しでだけ to_num する。
+    struct NumCacheEntry {
+        Op* gv = nullptr;              // xyo.getvar op
+        LValue* var = nullptr;         // Variable*
+        llvm::AllocaInst* slot = nullptr;  // f64 キャッシュ
+    };
     struct LoopScope {
         llvm::BasicBlock* preheader = nullptr;
         std::unordered_set<Op*> bodyOps;
@@ -457,8 +464,16 @@ struct Lowerer {
     std::unordered_set<std::string> structMutatedLists;
         bool observable = false;
         std::vector<ListHeader> headers;
+        std::vector<NumCacheEntry> numCache;
     };
     std::vector<LoopScope> loopScopes_;
+    /// getvar op → 数値キャッシュ alloca（アクティブなスコープの和）。
+    std::unordered_map<const Op*, llvm::AllocaInst*> loopNumCache_;
+    void popLoopScope() {
+        for (const NumCacheEntry& e : loopScopes_.back().numCache)
+            loopNumCache_.erase(e.gv);
+        loopScopes_.pop_back();
+    }
     ListHeader* findListHeader(const std::string& id);
     /// リストポインタをロードする（ループ不変ヘッダがあればキャッシュから）。
     LValue* listPtrFor(Op& op, LValue* var, ListHeader** out);
@@ -480,6 +495,9 @@ struct Lowerer {
     std::vector<LValue*> emitWarpCheck(Op* wy,
                                        const std::vector<LValue*>& cur);
     LValue* numberShadow(const Value& v);
+    /// i64 bits → f64 の inline toNum fast/slow（numberShadow 末尾と
+    /// numCache 初期化で共用。挿入位置に fast/slow/join を生成する）。
+    LValue* emitToNumInline(LValue* bits);
     /// 値 bits が「数値化キャッシュを持つ SStr」なら inline で数値を
     /// 読む（legacy と同形: タグ==0x7FF9 → numState(acquire)!=0 →
     /// state==2 ? 0 : numCache）。strBits は SStr* を指す生ビット。
@@ -1210,6 +1228,75 @@ void Lowerer::pushLoopScope(Block& body, bool warp, Block* extra) {
             sc.headers.push_back(h);
         }
     }
+    // to_num(getvar) のループ不変キャッシュ。warp ループの 64 反復
+    // バッチ中は同じ変数値を再変換しない（legacy の数値影に相当）。
+    // ループ内で書かれる変数は対象外。xyo.call・wait 系を含むスコープは
+    // observable で落ちる（hoistBarrier で変数スロットへの任意書き込み
+    // を防ぐ）。yield 後は recomputeHoisted が読み直すので、他
+    // スクリプトからの書き換えも legacy と同じ周期で反映される。
+    static const bool noNumCache = [] {
+        const char* e = std::getenv("XYO_MLIR_NONUMCACHE");
+        return e && e[0] == '1';
+    }();
+    if (warp && !sc.observable && !noNumCache) {
+        std::unordered_set<std::string> written;
+        std::unordered_set<Op*> toNumIns;
+        for (Op* o : sc.bodyOps) {
+            if (o->name == "xyo.setvar" && !o->attrStr("id").empty())
+                written.insert(std::string(o->attrStr("id")));
+            // 昇格変数は yield 点でメモリを往復する（間の getvar は
+            // 古い値を読み得る）のでキャッシュ対象から外す。
+            if (o->name == "xyo.warp_yield" ||
+                o->name == "xyo.loop_yield") {
+                const std::string vlist(o->attrStr("vars"));
+                size_t pos = 0;
+                while (pos < vlist.size()) {
+                    const size_t e = vlist.find('\x1e', pos);
+                    const std::string ent =
+                        vlist.substr(pos, e == std::string::npos
+                                              ? std::string::npos
+                                              : e - pos);
+                    const size_t sep = ent.find('\x1f');
+                    if (sep != std::string::npos && sep > 0)
+                        written.insert(ent.substr(0, sep));
+                    if (e == std::string::npos) break;
+                    pos = e + 1;
+                }
+            }
+            if ((o->name == "xyo.to_num" || o->name == "xyo.to_num.d") &&
+                !o->operands.empty())
+                toNumIns.insert(o->operands[0].op);
+        }
+        for (Op* o : sc.bodyOps) {
+            if (!toNumIns.count(o) || loopNumCache_.count(o)) continue;
+            LValue* bits = nullptr;
+            LValue* var = nullptr;
+            if (o->name == "xyo.getvar") {
+                const std::string id(o->attrStr("id"));
+                if (written.count(id)) continue;
+                var = slotVariable(id, std::string(o->attrStr("name")),
+                                   false);
+                if (!error.empty()) break;
+                bits = b.CreateLoad(
+                    i64(),
+                    b.CreateConstGEP1_32(
+                        i8(), var, uint32_t(offsetof(Variable, value))));
+            } else if (o->name == "xyo.arg") {
+                // proc 引数は呼出し間で不変 — キャッシュ後は読み直し不要。
+                bits = fn->getArg(argBase +
+                                  static_cast<uint32_t>(o->attrInt("index")));
+            } else {
+                continue;
+            }
+            NumCacheEntry e;
+            e.gv = o;
+            e.var = var;
+            e.slot = entryAlloca(f64(), "lnc.d");
+            b.CreateStore(emitToNumInline(bits), e.slot);
+            sc.numCache.push_back(e);
+            loopNumCache_.emplace(o, e.slot);
+        }
+    }
     loopScopes_.push_back(std::move(sc));
 }
 
@@ -1261,8 +1348,17 @@ void Lowerer::readListHeader(const ListHeader& h) {
 
 void Lowerer::recomputeHoisted() {
     // リストヘッダは他スレッドが伸縮し得るので yield のたびに読み直す。
-    for (LoopScope& sc : loopScopes_)
+    for (LoopScope& sc : loopScopes_) {
         for (const ListHeader& h : sc.headers) readListHeader(h);
+        for (const NumCacheEntry& e : sc.numCache) {
+            if (!e.var) continue;  // xyo.arg: 不変なので読み直し不要
+            LValue* bits = b.CreateLoad(
+                i64(), b.CreateConstGEP1_32(
+                           i8(), e.var,
+                           uint32_t(offsetof(Variable, value))));
+            b.CreateStore(emitToNumInline(bits), e.slot);
+        }
+    }
     for (HoistEntry& e : hoistStack_) {
         if (!e.op || !e.var) continue;
         std::vector<LValue*> args{ctx, e.var};
@@ -1372,6 +1468,18 @@ LValue* Lowerer::numberShadow(const Value& v) {
     auto it = numShadow_.find(key);
     if (it != numShadow_.end() && it->second.block == b.GetInsertBlock())
         return it->second.value;
+    // to_num(getvar/arg) で、その変数がループ内で書かれないときは
+    // preheader で 1 回だけ求めたキャッシュ値を使う（legacy の昇格
+    // 数値影に相当。yield 後は recomputeHoisted が読み直す）。
+    if (v.op && (v.op->name == "xyo.getvar" || v.op->name == "xyo.arg") &&
+        !loopNumCache_.empty()) {
+        auto cit = loopNumCache_.find(v.op);
+        if (cit != loopNumCache_.end()) {
+            LValue* d = b.CreateLoad(f64(), cit->second);
+            numShadow_[key] = NumShadowEntry{d, b.GetInsertBlock()};
+            return d;
+        }
+    }
     // from_int（i32 範囲の正確な整数）は sitofp だけで数値になる。
     // タグ検査の分岐を出さない。
     if (v.op && v.op->name == "xyo.from_int" && !v.op->operands.empty()) {
@@ -1498,6 +1606,12 @@ LValue* Lowerer::numberShadow(const Value& v) {
         numShadow_[key] = NumShadowEntry{slow, b.GetInsertBlock()};
         return slow;
     }
+    LValue* phi = emitToNumInline(bits);
+    numShadow_[key] = NumShadowEntry{phi, b.GetInsertBlock()};
+    return phi;
+}
+
+LValue* Lowerer::emitToNumInline(LValue* bits) {
     LValue* limit = llvm::ConstantInt::get(i64(), kNumBitsLimit);
     // toNumberImmediate と同じ: 素の double はそのまま（NaN は 0）、
     // それ以外は ヒープ文字列だけ parse が必要 → runtime helper。
@@ -1524,9 +1638,9 @@ LValue* Lowerer::numberShadow(const Value& v) {
     auto* phi = b.CreatePHI(f64(), 2);
     phi->addIncoming(nonNan, fastEnd);
     phi->addIncoming(s, slowEnd);
-    numShadow_[key] = NumShadowEntry{phi, b.GetInsertBlock()};
     return phi;
 }
+
 
 llvm::AllocaInst* Lowerer::yieldCounter() {
     if (yieldCnt_) return yieldCnt_;
@@ -1962,9 +2076,9 @@ void Lowerer::emitWhile(Op& op) {
     // ループ不変なリスト読みの巻き上げ用スコープ。cond+body 両方を見る。
     pushLoopScope(*body, op.attrInt("warp") != 0, before);
     struct ScopeGuard {
-        std::vector<LoopScope>& v;
-        ~ScopeGuard() { v.pop_back(); }
-    } scopeGuard{loopScopes_};
+        Lowerer* self;
+        ~ScopeGuard() { self->popLoopScope(); }
+    } scopeGuard{this};
     BasicBlock* pre = b.GetInsertBlock();
     BasicBlock* condBB = BasicBlock::Create(lc, "while.cond", fn);
     BasicBlock* bodyBB = BasicBlock::Create(lc, "while.body", fn);
@@ -2430,7 +2544,8 @@ bool Lowerer::emitBatchedRepeat(Op& op, LValue* remaining, Block* body,
     b.SetInsertPoint(batchHead->getTerminator());
     std::vector<LValue*> headIn(phis.begin(), phis.end());
     for (size_t i = 0; i < body->args.size(); ++i)
-        if (isPairCarry(*body, i)) headIn[i] = healOnce(phis[i]);
+        if (body->args[i].type == Type::f64())
+            headIn[i] = healOnce(phis[i]);
     b.SetInsertPoint(innerHead);
     auto* batchPhi = b.CreatePHI(i64(), 2);
     batchPhi->addIncoming(usedI, batchHead);
@@ -2440,8 +2555,12 @@ bool Lowerer::emitBatchedRepeat(Op& op, LValue* remaining, Block* body,
         phi->addIncoming(headIn[i], batchHead);
         innerPhis.push_back(phi);
         vals[keyOf(body->args[i])] = phi;
-        // 以降の読みは heal 不要（'b' の影はここで非 NaN が保証される）。
-        if (isPairCarry(*body, i)) markArgNonNaN(body->args[i]);
+        // 以降の読みは heal 不要（バックエッジで正規化するので非 NaN が
+        // 保証される）。'b' ペアだけでなく 'd' 単体運搬も対象にする —
+        // 読み側の ord+select がループキャリー鎖に乗ると実測 1.6 倍遅い
+        // （abl_read_varidx: fadd→ord→sel→phi の 7cy vs legacy 3cy）。
+        if (body->args[i].type == Type::f64())
+            markArgNonNaN(body->args[i]);
     }    LValue* go2 = b.CreateICmpSGE(batchPhi,
                                   llvm::ConstantInt::get(i64(), 1));
     b.CreateCondBr(go2, innerBody, after);
@@ -2464,7 +2583,7 @@ bool Lowerer::emitBatchedRepeat(Op& op, LValue* remaining, Block* body,
     // バックエッジは書き込み側で正規化する（分岐は予測されるので
     // ループキャリーの依存連鎖から vcmpord+blend が消える）。
     for (size_t i = 0; i < innerPhis.size(); ++i)
-        if (i < nextSeq.size() && isPairCarry(*body, i))
+        if (i < nextSeq.size() && body->args[i].type == Type::f64())
             nextSeq[i] = healCarryOnWrite(nextSeq[i]);
     LValue* batchNext =
         b.CreateSub(batchPhi, llvm::ConstantInt::get(i64(), 1));
@@ -2572,9 +2691,9 @@ void Lowerer::emitRepeat(Op& op) {
     // ループ不変なリスト読みの巻き上げ用スコープ。
     pushLoopScope(*body, op.attrInt("warp") != 0);
     struct ScopeGuard {
-        std::vector<LoopScope>& v;
-        ~ScopeGuard() { v.pop_back(); }
-    } scopeGuard{loopScopes_};
+        Lowerer* self;
+        ~ScopeGuard() { self->popLoopScope(); }
+    } scopeGuard{this};
     // 定数回数はコンパイル時に数値化する（実行時 to_num 呼び出しの削減）。
     // 文字列定数も xyo_to_num と同一のヘルパで畳み込む（pinner が保持）。
     LValue* remaining = nullptr;
