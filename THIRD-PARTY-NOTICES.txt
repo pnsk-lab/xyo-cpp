@@ -20,7 +20,10 @@ linked into the xyo executable, so you may replace them with a compatible
 version of Qt at any time (for example via your package manager, Homebrew,
 or the official Qt installer). The corresponding Qt source code is
 available from https://code.qt.io/ and from the same distribution channels
-that provided the libraries.
+that provided the libraries. Linux releases bundle the Qt (and SDL2/
+librsvg/etc.) shared libraries under lib/ next to the executable (found
+via $ORIGIN rpath); deleting lib/ makes xyo use the system libraries
+instead, and you may substitute your own builds there.
 
 Other bundled dependencies
 --------------------------

@@ -34,7 +34,8 @@ jobs:
             -DXYO_LLVM_MODE=llvm-config \
             -DLLVM_CONFIG="/usr/lib/llvm-${LLVM_STATIC}/bin/llvm-config" \
             -DXYO_SDL2=ON -DXYO_REQUIRE_SDL2=ON -DXYO_FULL_BUILD=ON \
-            -DXYO_STATIC_LLVM=ON
+            -DXYO_STATIC_LLVM=ON \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=TRUE "-DCMAKE_INSTALL_RPATH=$ORIGIN/lib"
           cmake --build build -j"$(nproc)"
           echo "--- libLLVM に依存していないこと ---"
           readelf -d build/xyo | grep -c "libLLVM" | grep -q "^0$"
@@ -58,14 +59,19 @@ jobs:
           build/xyo aot examples/play_demo.sb3 --obj build/aot-portability/play.o
           qemu-x86_64 -cpu qemu64 build/xyo run examples/play_demo.sb3 --aot build/aot-portability/play.o --frames 30
 
-      - name: Package
+      - name: Package (bundle Qt/SDL2/rsvg .so for Qt-less hosts)
         run: |
-          mkdir -p dist/pkg
+          mkdir -p dist/pkg dist/pkg/lib
           cp build/xyo dist/pkg/
           cp LICENSE THIRD-PARTY-NOTICES.txt dist/pkg/
           cp RUNNING.md dist/pkg/RUNNING.txt
+          bash tools/ci/bundle_linux_libs.sh build/xyo dist/pkg/lib
+          echo "--- rpath points at bundled lib ---"
+          readelf -d dist/pkg/xyo | grep -E "RUNPATH|RPATH"
+          echo "--- Qt resolves to bundled lib (not system) ---"
+          LD_LIBRARY_PATH= ldd dist/pkg/xyo | grep libQt6Core
           tar -C dist/pkg -czf dist/xyo-linux-x86_64.tar.gz \
-            xyo LICENSE THIRD-PARTY-NOTICES.txt RUNNING.txt
+            xyo lib LICENSE THIRD-PARTY-NOTICES.txt RUNNING.txt
           ls -lh dist
 
       - name: Upload artifact
