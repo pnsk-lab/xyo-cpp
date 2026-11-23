@@ -1332,7 +1332,16 @@ struct Promoter {
         if (n == "xyo.const") {
             uint64_t bits = 0;
             if (!constBits(op, &bits)) return false;
-            return isNumericBits(bits);
+            if (isNumericBits(bits)) return true;
+            // 正準形の整数文字列（s:"1" 等）も可。Scratch の数値
+            // リテラル shadow は生文字列のまま const になるため、
+            // `change i by 1` の典型形がここで落ちていた。
+            // intLiteralBits が toString での往復を保証しているため、
+            // i32 経由で数値化して格納しても観測可能な表現は変わらない
+            // （格納側は const なら rawBits、読みは to_int で同一）。
+            // 非正準形（" 1"・"1.0"・""）は従来どおり不可。
+            int64_t dummy = 0;
+            return intLiteralBits(bits, &dummy);
         }
         if (n == "xyo.const.f64") return true;
         if (n == "xyo.getvar") {
@@ -1863,6 +1872,10 @@ struct Promoter {
         });
         thresholds.insert(INT32_MAX);
         std::unordered_map<std::string, int> growth;
+        // if 条件から得た変数ごとの上界候補（wrap カウンタ用）。
+        // widening の発火時に閾値の代わりにここへジャンプする。
+        // 不正な候補は union で戻り、収束判定が健全性を保証する。
+        std::unordered_map<std::string, int64_t> narrowCapHi;
         const int64_t trips = tripBound();
         bool converged = false;
         for (int round = 0; round < 64; ++round) {
@@ -1879,6 +1892,240 @@ struct Promoter {
             // setvar は上書き（REPLACE）。中間値は head に入れない。
             // if は両分岐を評価して区間を union する（条件付き書き込みを
             // 片側の値で狭めると不健全になる）。
+            // if 条件による区間の絞り込み（wrap カウンタ用）。
+            // `if (i > 1000) i = 1` の形は反復回数によらず i を有界に
+            // 保つが、単なる union では else 側が際限なく広がる。条件が
+            // 「整数候補 V と定数 C の比較」であれば、各分岐の評価前に
+            // V の区間を条件の含意で交差させる（到達不能な分岐の絞り込み
+            // は union で吸収されるため安全側に倒れる）。
+            // condTrue: 条件が真の分岐を評価中か。V が active の整数候補
+            // であること（実行時は必ず整数＝NaN なし）が前提。
+            std::function<bool(const Value&, int, int64_t, bool, IvMap&,
+                               int)>
+                assumeConstBound = [&](const Value& x, int pred, int64_t c,
+                                      bool condTrue, IvMap& m,
+                                      int depth) -> bool {
+                if (depth > 8) return false;
+                if (x.op) {
+                    const std::string& xn = x.op->name;
+                    // to_num / box.f は値の恒等写像として辿る。
+                    if ((xn == "xyo.to_num" || xn == "xyo.box.f") &&
+                        !x.op->operands.empty())
+                        return assumeConstBound(x.op->operands[0], pred, c,
+                                                condTrue, m, depth + 1);
+                    if (xn == "xyo.getvar") {
+                        std::string id(x.op->attrStr("id"));
+                        if (!active.count(id)) return false;
+                        auto it = m.find(id);
+                        if (it == m.end()) return false;
+                        int64_t lo = it->second.first;
+                        int64_t hi = it->second.second;
+                        // 仮定の上界（head 非依存）。widening のジャンプ先
+                        // 候補にする。有効性は不動点の収束判定が保証する
+                        // （外れ値は union で戻り、収束しなければ従来の
+                        // 閾値ジャンプへフォールバックする）。
+                        const int64_t INF = INT64_MAX;
+                        int64_t capHi = INF;
+                        // pred: 0=LT 1=GT 2=LE 3=GE 4=EQ（NE は非凸で不可）。
+                        if (pred == 0) {
+                            if (condTrue) {
+                                hi = std::min(hi, c - 1);
+                                capHi = c - 1;
+                            } else
+                                lo = std::max(lo, c);
+                        } else if (pred == 1) {
+                            if (condTrue)
+                                lo = std::max(lo, c + 1);
+                            else {
+                                hi = std::min(hi, c);
+                                capHi = c;
+                            }
+                        } else if (pred == 2) {
+                            if (condTrue) {
+                                hi = std::min(hi, c);
+                                capHi = c;
+                            } else
+                                lo = std::max(lo, c + 1);
+                        } else if (pred == 3) {
+                            if (condTrue)
+                                lo = std::max(lo, c);
+                            else {
+                                hi = std::min(hi, c - 1);
+                                capHi = c - 1;
+                            }
+                        } else if (pred == 4) {
+                            if (!condTrue) return false;
+                            lo = hi = c;
+                            capHi = c;
+                        } else {
+                            return false;
+                        }
+                        // 空にすると到達不能分岐。union 側の過近似を保つ
+                        // ため絞らない（精度は落ちるが健全）。
+                        if (lo > hi) return false;
+                        // i32 を溢れる絞り込みは落下判定に任せる（ここでは
+                        // 現状維持＝過近似）。
+                        if (lo < INT32_MIN || hi > INT32_MAX) return false;
+                        it->second = {lo, hi};
+                        if (capHi != INF) {
+                            auto nc = narrowCapHi.find(id);
+                            if (nc == narrowCapHi.end())
+                                narrowCapHi[id] = capHi;
+                            else if (capHi < nc->second)
+                                nc->second = capHi;
+                        }
+                        return true;
+                    }
+                    // add/sub(定数) は逆向きに辿る（(i+1)>1000 → i>999）。
+                    if ((xn == "xyo.add" || xn == "xyo.sub" ||
+                         xn == "xyo.add.i" || xn == "xyo.sub.i") &&
+                        x.op->operands.size() == 2) {
+                        int64_t k = 0;
+                        const Value* base = nullptr;
+                        if (intConstValue(x.op->operands[1], &k)) {
+                            base = &x.op->operands[0];
+                        } else if ((xn == "xyo.add" || xn == "xyo.add.i") &&
+                                   intConstValue(x.op->operands[0], &k)) {
+                            base = &x.op->operands[1];
+                        } else {
+                            return false;
+                        }
+                        const bool isSub =
+                            xn == "xyo.sub" || xn == "xyo.sub.i";
+                        __int128 nc = isSub ? (__int128)c + k
+                                            : (__int128)c - k;
+                        if (nc < INT32_MIN || nc > INT32_MAX) return false;
+                        return assumeConstBound(*base, pred, (int64_t)nc,
+                                                condTrue, m, depth + 1);
+                    }
+                }
+                return false;
+            };
+            // if の条件式から (pred, var側, 定数側, 極性) を取り出す。
+            // bnot/not は極性反転して辿る。成功時は assumeConstBound で
+            // 分岐側の区間を絞る。
+            std::function<void(Op*, bool, IvMap&)> assumeBranch =
+                [&](Op* condOp, bool condTrue, IvMap& m) {
+                    if (!condOp) return;
+                    const std::string& n = condOp->name;
+                    if (n == "xyo.bnot" || n == "xyo.not") {
+                        if (!condOp->operands.empty() &&
+                            condOp->operands[0].op)
+                            assumeBranch(condOp->operands[0].op, !condTrue,
+                                         m);
+                        return;
+                    }
+                    int pred = -1;
+                    std::vector<Value> ops;
+                    if (n == "xyo.cmp.i" || n == "xyo.cmp.f" ||
+                        n == "xyo.cmp.guarded") {
+                        pred = (int)condOp->attrInt("pred", -1);
+                        // cmp.guarded は (bits, bits, f64, f64)。f64 側は
+                        // const.f64 との比較、bits 側は const との比較で
+                        // 取り出す（どちらか片方で足りる）。
+                        if (n == "xyo.cmp.guarded" &&
+                            condOp->operands.size() == 4) {
+                            const Value& ad = condOp->operands[2];
+                            const Value& cd = condOp->operands[3];
+                            int64_t cf = 0;
+                            auto asInt = [&](const Value& v,
+                                             int64_t* o) -> bool {
+                                if (!v.op) return false;
+                                if (v.op->name == "xyo.const.f64") {
+                                    const Attr* a = v.op->attr("d");
+                                    if (!a || !a->isDouble()) return false;
+                                    double d = a->d;
+                                    if (!(d >= -2147483648.0 &&
+                                          d <= 2147483647.0))
+                                        return false;
+                                    // 整数値でなければ絞れない。
+                                    if (std::trunc(d) != d) return false;
+                                    *o = (int64_t)d;
+                                    return true;
+                                }
+                                return intConstValue(v, o);
+                            };
+                            if (asInt(cd, &cf)) {
+                                assumeConstBound(ad, pred, cf, condTrue, m,
+                                                0);
+                                return;
+                            }
+                            if (asInt(ad, &cf)) {
+                                // 左右反転: pred を反対向きに読み替える。
+                                int rp = pred;
+                                if (pred == 0) rp = 2;
+                                else if (pred == 1) rp = 3;
+                                else if (pred == 2) rp = 0;
+                                else if (pred == 3) rp = 1;
+                                assumeConstBound(cd, rp, cf, condTrue, m,
+                                                0);
+                                return;
+                            }
+                        }
+                        if (condOp->operands.size() >= 2)
+                            ops = {condOp->operands[0],
+                                   condOp->operands[1]};
+                        else
+                            return;
+                    } else if (n == "xyo.lt" || n == "xyo.gt" ||
+                               n == "xyo.eq") {
+                        pred = n == "xyo.lt" ? 0 : n == "xyo.gt" ? 1 : 4;
+                        ops = condOp->operands;
+                    } else {
+                        return;
+                    }
+                    if (ops.size() != 2 || pred < 0 || pred > 4) return;
+                    int64_t c = 0;
+                    // f64 定数は整数値のときだけ使う（cmp.f の定数側）。
+                    auto constInt = [&](const Value& v,
+                                        int64_t* o) -> bool {
+                        if (!v.op) return false;
+                        if (v.op->name == "xyo.const.f64") {
+                            const Attr* a = v.op->attr("d");
+                            if (!a || !a->isDouble()) return false;
+                            double d = a->d;
+                            if (!(d >= -2147483648.0 && d <= 2147483647.0))
+                                return false;
+                            // cmp.f の定数は [<|>|<=|>=] をそのまま整数に
+                            // 読める必要がある。非整数は絞らない。
+                            // LT/GT: X<C ⟺ X<=ceil(C)-1、X>C ⟺ X>=floor(C)+1。
+                            // LE/GE: X<=C ⟺ X<=floor(C)、X>=C ⟺ X>=ceil(C)。
+                            double bnd = d;
+                            if (n == "xyo.cmp.f" || n == "xyo.cmp.guarded") {
+                                if (pred == 0 || pred == 1) {
+                                    bnd = pred == 0 ? std::ceil(d) - 1
+                                                    : std::floor(d) + 1;
+                                    // 変換後は LE/GE として扱う。
+                                    pred = pred == 0 ? 2 : 3;
+                                } else {
+                                    bnd = pred == 2 ? std::floor(d)
+                                                    : std::ceil(d);
+                                }
+                                if (!(bnd >= -2147483648.0 &&
+                                      bnd <= 2147483647.0))
+                                    return false;
+                            } else if (std::trunc(d) != d) {
+                                return false;
+                            }
+                            *o = (int64_t)bnd;
+                            return true;
+                        }
+                        return intConstValue(v, o);
+                    };
+                    if (constInt(ops[1], &c)) {
+                        assumeConstBound(ops[0], pred, c, condTrue, m, 0);
+                        return;
+                    }
+                    if (constInt(ops[0], &c)) {
+                        int rp = pred;
+                        if (pred == 0) rp = 2;
+                        else if (pred == 1) rp = 3;
+                        else if (pred == 2) rp = 0;
+                        else if (pred == 3) rp = 1;
+                        assumeConstBound(ops[1], rp, c, condTrue, m, 0);
+                        return;
+                    }
+                };
             std::function<bool(Block&)> evalBlock = [&](Block& blk) -> bool {
                 for (Op* op : blk.ops) {
                     if (op->name == "xyo.setvar") {
@@ -1906,10 +2153,16 @@ struct Promoter {
                         if (op->regions.size() != 2) return false;
                         const IvMap pre = iv;
                         memo.clear();
+                        if (!op->operands.empty() && op->operands[0].op)
+                            assumeBranch(op->operands[0].op,
+                                         /*condTrue=*/true, iv);
                         if (!evalBlock(*op->region(0)->entry())) return false;
                         const IvMap thenIv = iv;
                         iv = pre;
                         memo.clear();
+                        if (!op->operands.empty() && op->operands[0].op)
+                            assumeBranch(op->operands[0].op,
+                                         /*condTrue=*/false, iv);
                         if (!evalBlock(*op->region(1)->entry())) return false;
                         for (auto& [id, v] : iv) {
                             auto it = thenIv.find(id);
@@ -1979,7 +2232,18 @@ struct Promoter {
                         for (int64_t th : thresholds) {
                             if (th >= hi && th < t) t = th;
                         }
+                        // 条件キャップが現在値を覆うなら閾値より手前へ
+                        // ジャンプする（wrap カウンタの早期収束）。
+                        // 覆わない場合は消費して従来の閾値へ。
+                        auto nc = narrowCapHi.find(id);
+                        if (nc != narrowCapHi.end()) {
+                            if (nc->second >= hi &&
+                                nc->second < t)
+                                t = nc->second;
+                            narrowCapHi.erase(nc);
+                        }
                         hi = t;
+                        growth[id] = 0;
                     }
                 } else {
                     growth[id] = 0;

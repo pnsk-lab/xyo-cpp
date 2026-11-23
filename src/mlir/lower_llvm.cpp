@@ -22,6 +22,7 @@
 #include <llvm/IR/Instructions.h>
 
 #include "../core/cast.hpp"
+#include "../core/sstr.hpp"
 #include "../core/value.hpp"
 #include "../jit/jit.hpp"
 #include "../model/blocks.hpp"  // utf8ToU16
@@ -463,6 +464,13 @@ struct Lowerer {
     std::vector<LValue*> emitWarpCheck(Op* wy,
                                        const std::vector<LValue*>& cur);
     LValue* numberShadow(const Value& v);
+    /// 値 bits が「数値化キャッシュを持つ SStr」なら inline で数値を
+    /// 読む（legacy と同形: タグ==0x7FF9 → numState(acquire)!=0 →
+    /// state==2 ? 0 : numCache）。strBits は SStr* を指す生ビット。
+    /// 非文字列・state==0 は missBB へ流す。fastEndOut に値確定ブロックを
+    /// 返す（join 側 PHI の incoming 元）。
+    LValue* numericStringFast(LValue* bits, BasicBlock* missBB,
+                              BasicBlock* joinBB, BasicBlock** fastEndOut);
     /// !xyo.f64 オペランドの読み取り。生 NaN は toNumber 一致で 0 に
     /// 変換する（.f 演算子チェインでも数値境界の意味論を守る）。
     /// boxed な !xyo.value を f64 にする（既に f64 なら NaN 正規化だけ）。
@@ -3776,7 +3784,8 @@ void Lowerer::emitOp(Op& op) {
                   b.CreateICmpSLE(idx, len))
             : b.CreateICmpULT(
                   b.CreateSub(idx, llvm::ConstantInt::get(i32(), 1)), len);
-        b.CreateCondBr(ok, fast, slow, llvm::MDNode::get(lc, {
+        BasicBlock* oob = BasicBlock::Create(lc, "lii.oob", fn);
+        b.CreateCondBr(ok, fast, oob, llvm::MDNode::get(lc, {
             llvm::MDString::get(lc, "branch_weights"),
             llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i64(), 63)),
             llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i64(), 1))}));
@@ -3792,6 +3801,9 @@ void Lowerer::emitOp(Op& op) {
         LValue* item = b.CreateLoad(i64(), b.CreateGEP(i64(), items, off));
         BasicBlock* fastEnd = b.GetInsertBlock();
         b.CreateBr(join);
+        b.SetInsertPoint(oob);
+        BasicBlock* oobEnd = b.GetInsertBlock();
+        b.CreateBr(join);
         b.SetInsertPoint(slow);
         LValue* idxBits = b.CreateBitCast(b.CreateSIToFP(idx, f64()), i64());
         LValue* slowVal = b.CreateCall(
@@ -3800,8 +3812,10 @@ void Lowerer::emitOp(Op& op) {
         BasicBlock* slowEnd = b.GetInsertBlock();
         b.CreateBr(join);
         b.SetInsertPoint(join);
-        auto* phi = b.CreatePHI(i64(), 2);
+        auto* phi = b.CreatePHI(i64(), 3);
         phi->addIncoming(item, fastEnd);
+        phi->addIncoming(llvm::ConstantInt::get(i64(), val::kEmptyStr),
+                         oobEnd);
         phi->addIncoming(slowVal, slowEnd);
         vals[k0] = phi;
         return;
@@ -3814,9 +3828,10 @@ void Lowerer::emitOp(Op& op) {
         LValue* list = listPtrFor(op, var, &lh);
         BasicBlock* chk1 = BasicBlock::Create(lc, "lin.chk1", fn);
         BasicBlock* fast = BasicBlock::Create(lc, "lin.fast", fn);
+        BasicBlock* oob = BasicBlock::Create(lc, "lin.oob", fn);
         BasicBlock* slow = BasicBlock::Create(lc, "lin.slow", fn);
         BasicBlock* join = BasicBlock::Create(lc, "lin.join", fn);
-        b.CreateCondBr(b.CreateIsNull(list), slow, chk1,
+        b.CreateCondBr(b.CreateIsNull(list), oob, chk1,
                        llvm::MDNode::get(lc, {
                            llvm::MDString::get(lc, "branch_weights"),
                            llvm::ConstantAsMetadata::get(
@@ -3846,7 +3861,8 @@ void Lowerer::emitOp(Op& op) {
                   b.CreateICmpSLE(idx, len))
             : b.CreateICmpULT(
                   b.CreateSub(idx, llvm::ConstantInt::get(i32(), 1)), len);
-        b.CreateCondBr(ok, fast, slow, llvm::MDNode::get(lc, {
+        // 範囲外は helper を呼ばず 0.0（to_num("")=0 と同値）。
+        b.CreateCondBr(ok, fast, oob, llvm::MDNode::get(lc, {
             llvm::MDString::get(lc, "branch_weights"),
             llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i64(), 63)),
             llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i64(), 1))}));
@@ -3863,12 +3879,13 @@ void Lowerer::emitOp(Op& op) {
         // numeric/intvalued フラグは「プロジェクト内の書き込みが全て数値」
         // という静的証明に過ぎず、ホスト（テストの SList::push 等）が実行
         // の合間に文字列を挿入し得る。タグを見ずに bitcast するとポインタ
-        // を浮動小数と誤読するので、plain double だけを fast に通し、
-        // それ以外は slow（xyo_list_item + xyo_to_num）へ落とす。
+        // を浮動小数と誤読するので、plain double は fast、タグ付きは
+        // numericStringFast（SSr 数値キャッシュ）を試みてから slow へ。
         BasicBlock* fastNum = BasicBlock::Create(lc, "lin.fastnum", fn);
+        BasicBlock* tagBB = BasicBlock::Create(lc, "lin.tag", fn);
         b.CreateCondBr(b.CreateICmpSLT(
                            item, llvm::ConstantInt::get(i64(), kNumBitsLimit)),
-                       fastNum, slow);
+                       fastNum, tagBB);
         b.SetInsertPoint(fastNum);
         LValue* fv = b.CreateBitCast(item, f64());
         // 整数値リスト（intvalued=1）は NaN を含まないことが静的に証明
@@ -3888,6 +3905,13 @@ void Lowerer::emitOp(Op& op) {
                                               fv);
         BasicBlock* fastEnd = b.GetInsertBlock();
         b.CreateBr(join);
+        b.SetInsertPoint(tagBB);
+        BasicBlock* strEnd = nullptr;
+        LValue* strVal =
+            numericStringFast(item, slow, join, &strEnd);
+        b.SetInsertPoint(oob);
+        BasicBlock* oobEnd = b.GetInsertBlock();
+        b.CreateBr(join);
         b.SetInsertPoint(slow);
         LValue* idxBits = b.CreateBitCast(b.CreateSIToFP(idx, f64()), i64());
         LValue* raw = b.CreateCall(
@@ -3897,8 +3921,10 @@ void Lowerer::emitOp(Op& op) {
         BasicBlock* slowEnd = b.GetInsertBlock();
         b.CreateBr(join);
         b.SetInsertPoint(join);
-        auto* phi = b.CreatePHI(f64(), 2);
+        auto* phi = b.CreatePHI(f64(), 4);
         phi->addIncoming(fd, fastEnd);
+        phi->addIncoming(strVal, strEnd);
+        phi->addIncoming(llvm::ConstantFP::get(f64(), 0.0), oobEnd);
         phi->addIncoming(sd, slowEnd);
         vals[k0] = phi;
         return;
@@ -3920,8 +3946,9 @@ void Lowerer::emitOp(Op& op) {
         // 実測 2.3 倍遅かった（定数索引のリスト読み）。
         BasicBlock* fastNum = BasicBlock::Create(lc, "lnv.fastnum", fn);
         BasicBlock* join = BasicBlock::Create(lc, "lnv.join", fn);
+        BasicBlock* oob = BasicBlock::Create(lc, "lnv.oob", fn);
         BasicBlock* slow = BasicBlock::Create(lc, "lnv.slow", fn);
-        b.CreateCondBr(b.CreateIsNull(list), slow, chk1,
+        b.CreateCondBr(b.CreateIsNull(list), oob, chk1,
                        llvm::MDNode::get(lc, {
                            llvm::MDString::get(lc, "branch_weights"),
                            llvm::ConstantAsMetadata::get(
@@ -3940,12 +3967,13 @@ void Lowerer::emitOp(Op& op) {
         // 整数化範囲検査（legacy と同形）: off = cvttsd2si(f)-1 を
         // (uint64)off < len で判定。toListIndexD は floor + [1,len] だが、
         // 正の有限値で floor==trunc、負/範囲外/NaN/タグ値は cvtt の結果が
-        // unsigned で len を超えて必ず slow へ落ちるため等価。
+        // unsigned で len を超えて必ず oob へ落ちるため等価。
         // f64 の 3 比較 + floor + AND 列が cvtt+sub+ult の 3 命令になる。
         LValue* i0 = b.CreateSub(b.CreateFPToSI(f, i64()),
                                  llvm::ConstantInt::get(i64(), 1));
         LValue* ok = b.CreateICmpULT(i0, b.CreateZExt(len, i64()));
-        b.CreateCondBr(ok, fast, slow, llvm::MDNode::get(lc, {
+        // 範囲外は helper を呼ばず 0.0（to_num("")=0 と同値）。
+        b.CreateCondBr(ok, fast, oob, llvm::MDNode::get(lc, {
             llvm::MDString::get(lc, "branch_weights"),
             llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i64(), 63)),
             llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i64(), 1))}));
@@ -3959,9 +3987,12 @@ void Lowerer::emitOp(Op& op) {
         LValue* item = b.CreateLoad(i64(), b.CreateGEP(i64(), items, i0));
         // item.num.i と同じ理由（ホストがプロジェクト外から非数値を挿入
         // し得る）で、要素のタグを確認してから bitcast する。
+        // タグ付き要素は numericStringFast（SStr 数値キャッシュ）で
+        // inline 化を試み、外れたら slow へ。
+        BasicBlock* tagBB = BasicBlock::Create(lc, "lnv.tag", fn);
         b.CreateCondBr(b.CreateICmpSLT(
                            item, llvm::ConstantInt::get(i64(), kNumBitsLimit)),
-                       fastNum, slow);
+                       fastNum, tagBB);
         b.SetInsertPoint(fastNum);
         LValue* fv = b.CreateBitCast(item, f64());
         // 整数値リスト（intvalued=1）は NaN を含まないことが静的に証明
@@ -3982,6 +4013,13 @@ void Lowerer::emitOp(Op& op) {
                                           fv);
         BasicBlock* fastEnd = b.GetInsertBlock();
         b.CreateBr(join);
+        b.SetInsertPoint(tagBB);
+        BasicBlock* strEnd = nullptr;
+        LValue* strVal =
+            numericStringFast(item, slow, join, &strEnd);
+        b.SetInsertPoint(oob);
+        BasicBlock* oobEnd = b.GetInsertBlock();
+        b.CreateBr(join);
         b.SetInsertPoint(slow);
         LValue* raw = b.CreateCall(
             callee("xyo_list_item", {ptr(), ptr(), i64()}, i64()),
@@ -3990,8 +4028,10 @@ void Lowerer::emitOp(Op& op) {
         BasicBlock* slowEnd = b.GetInsertBlock();
         b.CreateBr(join);
         b.SetInsertPoint(join);
-        auto* phi = b.CreatePHI(f64(), 2);
+        auto* phi = b.CreatePHI(f64(), 4);
         phi->addIncoming(fd, fastEnd);
+        phi->addIncoming(strVal, strEnd);
+        phi->addIncoming(llvm::ConstantFP::get(f64(), 0.0), oobEnd);
         phi->addIncoming(sd, slowEnd);
         vals[k0] = phi;
         return;
@@ -4624,6 +4664,45 @@ void Lowerer::emitOp(Op& op) {
     if (n == "xyo.yield" || n == "xyo.condition" || n == "func.return")
         return;
     error = "unsupported op: " + n;
+}
+
+llvm::Value* Lowerer::numericStringFast(LValue* bits, BasicBlock* missBB,
+                                        BasicBlock* joinBB,
+                                        BasicBlock** fastEndOut) {
+    // legacy が data_itemoflist / emitToNumF64 で生成する形:
+    //   bits>>48 == 0x7FF9 (タグ付き SStr) → numState(acquire) != 0 →
+    //   numState==2 ? 0.0 : numCache。
+    // 非文字列・state==0 は missBB へ。数値が確定したら fastEndOut の
+    // ブロックから joinBB へ。
+    LValue* tag = b.CreateLShr(bits, llvm::ConstantInt::get(i64(), 48));
+    BasicBlock* strBB = BasicBlock::Create(lc, "lns.str", fn);
+    BasicBlock* stateBB = BasicBlock::Create(lc, "lns.state", fn);
+    b.CreateCondBr(b.CreateICmpEQ(tag, llvm::ConstantInt::get(i64(), 0x7FF9)),
+                   strBB, missBB);
+    b.SetInsertPoint(strBB);
+    LValue* str = b.CreateIntToPtr(
+        b.CreateAnd(bits, llvm::ConstantInt::get(i64(), val::kPtrMask)),
+        ptr());
+    auto* state = b.CreateLoad(
+        i32(), b.CreateConstGEP1_32(i8(), str,
+                                    uint32_t(offsetof(SStr, numState))));
+    state->setAtomic(llvm::AtomicOrdering::Acquire);
+    b.CreateCondBr(b.CreateICmpEQ(state, llvm::ConstantInt::get(i32(), 0)),
+                   missBB, stateBB);
+    b.SetInsertPoint(stateBB);
+    auto* cache = b.CreateLoad(
+        f64(), b.CreateConstGEP1_32(i8(), str,
+                                    uint32_t(offsetof(SStr, numCache))));
+    cache->setAtomic(llvm::AtomicOrdering::Monotonic);
+    // state==2 は NaN（"abc" 等）→ 0.0。それ以外はキャッシュ値
+    // （state==3 は比較で非数値扱いだが to_num としては 0、
+    // state==4 は Infinity — numCache が正しい値を持つ）。
+    LValue* d = b.CreateSelect(
+        b.CreateICmpEQ(state, llvm::ConstantInt::get(i32(), 2)),
+        llvm::ConstantFP::get(f64(), 0.0), cache);
+    *fastEndOut = b.GetInsertBlock();
+    b.CreateBr(joinBB);
+    return d;
 }
 
 void Lowerer::lowerBlock(Block& blk, BasicBlock* bb) {
