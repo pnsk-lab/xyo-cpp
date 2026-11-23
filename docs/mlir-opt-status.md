@@ -965,3 +965,20 @@ fast 側は定数 f64 を直接使い、slow は helper へ。素の数値定数
   life 0.50→0.58x、raycast 0.67→0.71x、list_read 0.96→1.01x、
   list_replace 1.16→1.22x、collatz 0.88→0.92x。
 - geomean 2.24→2.40x。`XYO_JIT_MEGA=1` 0 FAIL 維持。
+
+## Round 254-255: 数値リテラル比較の inline 化と numeric リスト fast path
+
+### 変更
+
+- `xyo.lt/gt/eq` で const 数値（数値文字列含む）をコンパイル時に f64 化し、
+  その側のタグ検査を省略。fast 側は定数 f64 を直接使い、slow は helper。
+  素の数値定数同士は畳む（fib 0.49→1.05x、ack 0.50→0.85x）。
+- `numeric`/`intvalued` リストからの `list.item` を plain-double とみなし、
+  `cmp.guarded` のタグ検査を省略（sieve 0.65→0.69x 等）。
+
+### 確定状態（r255、legacy 比、hotspot、geomean 2.44x）
+
+- Lists: read 0.96x、replace 1.17x、append 1.03x、insdel 1.16x、
+  search 9.87x。
+- Algos: sort 0.76x、sieve 0.69x、matmul 0.76x、fib 1.04x、
+  ack 0.85x、primes 0.58x、collatz 0.92x。
