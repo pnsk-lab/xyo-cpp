@@ -158,6 +158,56 @@ struct Folder {
 
     bool foldOp(Block& b, size_t i, Op* op) {
         const std::string& n = op->name;
+        // xyo.int_exact_ok(xyo.const) / (xyo.const.f64) はコンパイル時に
+        // 確定できる。lower_llvm と同じ条件（素の非 -0.0 double・整数・
+        // nonneg 時は [0,2^20]、それ以外は |v|<=2^20）で畳む。
+        // 特にトリップ数の文字列リテラル（"10000" 等）は false と畳まれ、
+        // int 昇格ループ全体が dead になるのを防ぐ。
+        if (n == "xyo.int_exact_ok" && op->operands.size() == 1 &&
+            op->operands[0].op) {
+            Op* src = op->operands[0].op;
+            uint64_t bits = 0;
+            bool have = false;
+            if (src->name == "xyo.const" && constBits(src, &bits))
+                have = true;
+            else if (src->name == "xyo.const.f64") {
+                double d = 0;
+                if (constF64(src, &d)) {
+                    std::memcpy(&bits, &d, sizeof(bits));
+                    have = true;
+                }
+            }
+            if (have) {
+                // lowerer と同じく to_num 基準: 数値化できる文字列
+                // ("0" 等) も正確な整数なら昇格対象になる。
+                const double d =
+                    xyo::Value{bits}.isNumber()
+                        ? xyo::Value{bits}.asNumberUnchecked()
+                        : xyo_to_num(bits);
+                uint64_t dbits = 0;
+                std::memcpy(&dbits, &d, sizeof(dbits));
+                static constexpr double kBound = 1048576.0;  // 2^20
+                const bool nonNeg = op->attrInt("nonneg", 0) != 0;
+                const bool notNegZero =
+                    dbits != 0x8000000000000000ULL;
+                const bool inRange =
+                    nonNeg ? (d >= 0.0 && d <= kBound)
+                           : (std::fabs(d) <= kBound);
+                const bool isInt = std::trunc(d) == d;
+                const bool ok = d == d && notNegZero && inRange && isInt;
+                // boolean 定数（raw 0/1）。int_exact_ok の結果は常に
+                // and/if の i1 経路に載るので !xyo.value ボックスには
+                // しない（lowerer の bool 正規化が i1 化する）。
+                Value c = makeConstant(
+                    m, Type::boolean(), "xyo.const",
+                    {{"bits", Attr::integer(ok ? 1 : 0)}});
+                insertBefore(m, b, i, c.op);
+                replaceAllUses(m, op, 0, c);
+                eraseFromBlock(b, op);
+                ++folded;
+                return true;
+            }
+        }
         // 数値定数だけを対象にする（文字列/GC パスには触れない）。
         auto boxedNum = [&](size_t k, double* out) {
             if (k >= op->operands.size()) return false;
@@ -1265,6 +1315,56 @@ struct Promoter {
         return intUnknown(t);
     }
 
+    /// `setvar` のオペランドが「必ず数値 Value を生成する」か。int 輸送は
+    /// store を num(int) にするので、整数として読めるが数値でない値
+    /// （正準形の整数文字列、bool、文字を返し得る op）を書き込むと表現が
+    /// interp とずれる。ここで保守的に拒否した変数は 'b' 運搬（生 bits
+    /// 保持）に落ちるため意味は壊れない。
+    bool exactIntOperand(
+        const Value& v,
+        const std::unordered_map<std::string, std::pair<int64_t, int64_t>>&
+            iv,
+        int depth = 0) const {
+        // block 引数（'b' 運搬の生 bits）は文字列を持ち得るので不可。
+        if (!v.op || depth > 8) return false;
+        Op* op = v.op;
+        const std::string& n = op->name;
+        if (n == "xyo.const") {
+            uint64_t bits = 0;
+            if (!constBits(op, &bits)) return false;
+            return isNumericBits(bits);
+        }
+        if (n == "xyo.const.f64") return true;
+        if (n == "xyo.getvar") {
+            // 整数候補（i32 運搬 = 常に数値）だけ。他の変数は文字列を
+            // 持ち得る。entry の const は値ではなく型を見るので除外。
+            return iv.count(std::string(op->attrStr("id"))) != 0;
+        }
+        // .i 系・from_int・to_int は常に数値 Value。
+        if (n == "xyo.from_int" ||
+            (n.size() > 2 && n.compare(n.size() - 2, 2, ".i") == 0 &&
+             n != "xyo.list.item.i" && n != "xyo.list.itemnum.i"))
+            return true;
+        // 四則・mod・round・from_num・from_bool は常に数値を返す。
+        if (n == "xyo.add" || n == "xyo.sub" || n == "xyo.mul" ||
+            n == "xyo.div" || n == "xyo.mod" || n == "xyo.round" ||
+            n == "xyo.from_num" || n == "xyo.boolval" ||
+            n == "xyo.mathop" || n == "xyo.list.len" ||
+            n == "xyo.list.itemnum" || n == "xyo.strlen" ||
+            n == "xyo.num_ok") {
+            for (const Value& u : op->operands)
+                if (u.type == Type::value() &&
+                    !exactIntOperand(u, iv, depth + 1))
+                    return false;
+            return true;
+        }
+        // select/if の両分岐が数値確定なら数値。
+        if (n == "xyo.select" && op->operands.size() == 3)
+            return exactIntOperand(op->operands[1], iv, depth + 1) &&
+                   exactIntOperand(op->operands[2], iv, depth + 1);
+        return false;
+    }
+
     /// 本体（+ 入れ子 if）を走査する共有ヘルパー。
     template <typename F> void walkIntBody(Block& b, F&& fn, int depth = 0) {
         if (depth > 8) return;
@@ -1787,7 +1887,13 @@ struct Promoter {
                             continue;
                         IntVal r = evalIntValue(op->operands[0], iv, memo);
                         // 証明できない書き込み = その変数だけ整数化を諦める。
-                        if (!r.ok || r.lo < INT32_MIN || r.hi > INT32_MAX) {
+                        // 加えて、オペランドが「必ず数値 Value を返す」証明
+                        // が無い書き込みも落とす — int 輸送は store を
+                        // from_int（num）にするので、整数として読める文字列
+                        // （item of list が s:"0" を返す等）を書き込むと
+                        // 表現が変わり interp とずれる（found: truthRun）。
+                        if (!r.ok || r.lo < INT32_MIN || r.hi > INT32_MAX ||
+                            !exactIntOperand(op->operands[0], iv)) {
                             active.erase(id);
                             iv.erase(id);
                             changed = true;
@@ -2710,8 +2816,19 @@ struct Promoter {
                         // のみで運搬が float の変数は iOf が空を返すため、
                         // その場合は bits 影へ（未変換だと getvar が残り、
                         // verifier 落ちでスクリプト全体が fallback する）。
-                        Value iv2 = intOkOf(ops[2]).ok ? iOf(ops[2], b, out)
-                                                       : Value{};
+                        // intOkOf は正準形整数"文字列"リテラル（s:"1"）も
+                        // int と評価するが、from_int にすると格納 bits が
+                        // num(1) に変わり interp と型がずれる。const 等は
+                        // 生 bits をそのまま書き、本当に i32 由来の値だけ
+                        // from_int にする。
+                        bool rawBits = false;
+                        if (ops[2].op &&
+                            (ops[2].op->name == "xyo.const" ||
+                             ops[2].op->name == "xyo.const.f64"))
+                            rawBits = true;
+                        Value iv2 = !rawBits && intOkOf(ops[2]).ok
+                                        ? iOf(ops[2], b, out)
+                                        : Value{};
                         if (iv2) {
                             Op* fx = make("xyo.from_int", {iv2},
                                           {Type::value()});
@@ -3034,6 +3151,19 @@ struct Promoter {
         for (const std::string& id : order) {
             LoopCandidate& c = cands[id];
             c.initBits = gv.at(id);
+            if (kindOf(id) == 'd') {
+                // f64 だけを運ぶ。bits は必要時に box.f で作る。
+                loop->operands.push_back(dv.at(id));
+                loop->resultTypes.push_back(Type::f64());
+                Value ad;
+                ad.block = &body;
+                ad.argIndex = static_cast<uint32_t>(body.args.size());
+                ad.type = Type::f64();
+                body.args.push_back(ad);
+                c.bits = {};
+                c.d = ad;
+                continue;
+            }
             loop->operands.push_back(gv.at(id));
             loop->resultTypes.push_back(Type::value());
             loop->operands.push_back(dv.at(id));
@@ -3073,6 +3203,18 @@ struct Promoter {
                 continue;
             }
             c.initBits = gv.at(id);
+            if (kindOf(id) == 'd') {
+                loop->operands.push_back(dv.at(id));
+                loop->resultTypes.push_back(Type::f64());
+                Value ad;
+                ad.block = &body;
+                ad.argIndex = static_cast<uint32_t>(body.args.size());
+                ad.type = Type::f64();
+                body.args.push_back(ad);
+                c.bits = {};
+                c.d = ad;
+                continue;
+            }
             loop->operands.push_back(gv.at(id));
             loop->resultTypes.push_back(Type::value());
             loop->operands.push_back(dv.at(id));
@@ -3157,6 +3299,10 @@ struct Promoter {
             guardVal = a->result(0);
         }
         // (3) xyo.if の殻を作る。結果は (bits,f64)×変数で両分岐統一。
+        // この経路の if は (bits,f64) ペアを前提に書き戻すので、f64 運搬の
+        // 変数はここではペア運搬へ降格する（意味論は不変）。
+        for (const std::string& id : order)
+            if (kindOf(id) == 'd') kinds_[id] = 'b';
         std::vector<Type> ifResults;
         for (size_t i = 0; i < order.size(); ++i) {
             ifResults.push_back(Type::value());
@@ -3373,12 +3519,13 @@ struct Promoter {
                 }
             }
         }
-        planKinds(/*allowD=*/false);
+        planKinds(/*allowD=*/true);
         if (!nestedOps_.empty()) {
             // 入れ子ループの spill は bits を使う。d-only 運搬（bits を
-            // 持たない）では渡せないので、この形は昇格しない。
+            // 持たない）では渡せないので、該当変数だけペア運搬へ降格する
+            // （昇格自体は維持する）。
             for (const std::string& id : order)
-                if (kindOf(id) == 'd') return;
+                if (kindOf(id) == 'd') kinds_[id] = 'b';
         }
         if (useGuard) {
             if (runGuarded()) return;
@@ -3434,6 +3581,18 @@ struct Promoter {
                                   static_cast<ptrdiff_t>(loopIndex), t);
             ++loopIndex;
             c.initBits = g->result(0);
+            if (kindOf(id) == 'd') {
+                loop->operands.push_back(t->result(0));
+                loop->resultTypes.push_back(Type::f64());
+                Value ad0;
+                ad0.block = &body;
+                ad0.argIndex = static_cast<uint32_t>(body.args.size());
+                ad0.type = Type::f64();
+                body.args.push_back(ad0);
+                c.bits = {};
+                c.d = ad0;
+                continue;
+            }
             c.bits = g->result(0);
             c.d = t->result(0);
             loop->operands.push_back(g->result(0));
@@ -3838,6 +3997,8 @@ struct Promoter {
         pi.warpLoop = warpLoop;
         pi.intLoop = true;
         pi.boxLoop_ = true;
+        // while の複製パスは (bits,f64) ペア前提の writeback なので
+        // f64 運搬は使わない（kinds は pt/pe が決める）。
         pi.planKinds(false);
         for (auto& [o, k] : modSubK) {
             auto f = cl.opMap.find(o);
@@ -4105,6 +4266,25 @@ struct Promoter {
         }
         // trip ガード（整数・非負・2^20 以下）。
         // int_exact_ok はビット列を取る（to_num した f64 ではない）。
+        // trip が文字列リテラル（"10000" 等の文字列ボックス）の場合、
+        // int_exact_ok は false と畳まれ int ループ全体が死ぬ。
+        // repeat は入力を to_num するので数値 const へ正規化してよい。
+        if (tripVal.op) {
+            uint64_t tb = 0;
+            if (constBitsOf(tripVal.op, &tb) && !isNumericBits(tb)) {
+                Op* tc = make("xyo.const", {}, {Type::value()},
+                              {{"bits", Attr::integer(
+                                            static_cast<int64_t>(
+                                                xyo::Value::numCanonical(
+                                                    xyo_to_num(tb)).bits))}});
+                tc->parent = &parent;
+                parent.ops.insert(parent.ops.begin() +
+                                      static_cast<ptrdiff_t>(loopIndex),
+                                  tc);
+                ++loopIndex;
+                tripVal = tc->result(0);
+            }
+        }
         Op* tripOk = make("xyo.int_exact_ok", {tripVal},
                           {Type::boolean()},
                           {{"nonneg", Attr::integer(1)}});
@@ -4159,7 +4339,7 @@ struct Promoter {
         pi.warpLoop = warpLoop;
         pi.intLoop = true;
         pi.boxLoop_ = true;
-        pi.planKinds(false);
+        pi.planKinds(true);
         for (auto& [o, k] : modSubK) {
             auto f = cl.opMap.find(o);
             if (f != cl.opMap.end()) pi.modSubK[f->second] = k;
@@ -4169,6 +4349,74 @@ struct Promoter {
             if (f != cl.opMap.end()) pi.intProvenOps.insert(f->second);
         }
         pi.wireInt(gv, dv, tv);
+        Block* intBody = intLoop->region(0)->entry();
+        Op* origYield = intBody->lastOp();
+        // bail 不要証明: trip が定数で、全 int 変数の反復全体の区間が
+        // [0, 2^20] に収まるなら guardian if と bail フラグは発火しない。
+        // その場合はフラグ運搬と毎反復の if を丸ごと省く。
+        bool noBail = false;
+        {
+            double tc = 0;
+            const int64_t tb =
+                constNumValue(tripVal, &tc) ? repeatTripCount(tc) : -1;
+            if (tb >= 0) {
+                std::unordered_map<std::string,
+                                   std::pair<int64_t, int64_t>> iv;
+                for (auto& [i2, c2] : cands)
+                    if (c2.isInt) iv[i2] = {c2.intLo, c2.intHi};
+                noBail = true;
+                for (const std::string& id : order) {
+                    const LoopCandidate& c = cands[id];
+                    if (!c.isInt) continue;
+                    // 入口が実行時検査（intGuarded）の変数は入口区間を
+                    // 静かに持たないので消去対象外。
+                    if (c.intGuarded) {
+                        noBail = false;
+                        break;
+                    }
+                    int64_t blo = 0, bhi = 0;
+                    if (!repeatBoundOf(id, tb, iv, &blo, &bhi) ||
+                        blo < 0 || bhi > kGuardBound) {
+                        noBail = false;
+                        break;
+                    }
+                }
+            }
+        }
+        // 入口シャドウを保存（else 分岐用）。
+        struct Shadow3 {
+            Value bits, d, iv;
+        };
+        std::map<std::string, Shadow3> entrySh;
+        for (auto& [id, c] : pi.cands)
+            entrySh[id] = {c.bits, c.d, c.iv};
+        if (noBail) {
+            // guardian 無し: 本体をそのまま int 運搬で書き換え、
+            // 終端 yield は変数値をそのまま運ぶ。
+            pi.rewriteBlock(*intBody);
+            std::vector<Value> outs;
+            for (const std::string& id : order) {
+                LoopCandidate& c = pi.cands[id];
+                if (c.isInt)
+                    outs.push_back(c.iv);
+                else if (pi.kindOf(id) == 'd')
+                    outs.push_back(c.d);
+                else {
+                    outs.push_back(c.bits);
+                    outs.push_back(c.d);
+                }
+            }
+            Op* y = pi.make("xyo.yield", std::move(outs), {});
+            auto it = std::find(intBody->ops.begin(), intBody->ops.end(),
+                                origYield);
+            if (it != intBody->ops.end()) {
+                y->parent = intBody;
+                *it = y;
+            } else {
+                y->parent = intBody;
+                intBody->ops.push_back(y);
+            }
+        } else {
         // bail フラグの iter arg を追加（i32、初期値 0）。
         Op* flagInit = pi.make("xyo.const.i", {}, {Type::i32()},
                                {{"v", Attr::integer(0)}});
@@ -4183,19 +4431,11 @@ struct Promoter {
         }
         intLoop->operands.push_back(flagInit->result(0));
         intLoop->resultTypes.push_back(Type::i32());
-        Block* intBody = intLoop->region(0)->entry();
         Value flagArg;
         flagArg.block = intBody;
         flagArg.argIndex = static_cast<uint32_t>(intBody->args.size());
         flagArg.type = Type::i32();
         intBody->args.push_back(flagArg);
-        // 入口シャドウを保存（else 分岐用）。
-        struct Shadow3 {
-            Value bits, d, iv;
-        };
-        std::map<std::string, Shadow3> entrySh;
-        for (auto& [id, c] : pi.cands)
-            entrySh[id] = {c.bits, c.d, c.iv};
         // ガーディアン if(!bailed){本体} を作り、本体 ops を then へ移す。
         Op* grd = pi.make("xyo.if", {}, {});
         grd->parent = intBody;
@@ -4205,7 +4445,6 @@ struct Promoter {
         Region* gElseR = grd->addRegion();
         Block* gElseB = gElseR->addBlock();
         // 終端 yield を除く本体 ops を then へ移動する。
-        Op* origYield = intBody->lastOp();
         std::vector<Op*> moveOps;
         for (auto it = intBody->ops.begin(); it != intBody->ops.end();
              ++it) {
@@ -4345,11 +4584,20 @@ struct Promoter {
                 intBody->ops.push_back(y);
             }
         }
+        }  // !noBail
         // (3) then 分岐の終端: int ループ結果をそのまま yield。
+        // noBail では int ループが flag を持たないので末尾に 0 を足す。
         {
             std::vector<Value> outs;
             for (size_t i = 0; i < intLoop->resultTypes.size(); ++i)
                 outs.push_back(intLoop->result(i));
+            if (noBail) {
+                Op* z = pi.make("xyo.const.i", {}, {Type::i32()},
+                                {{"v", Attr::integer(0)}});
+                z->parent = thenB;
+                thenB->ops.push_back(z);
+                outs.push_back(z->result(0));
+            }
             Op* y = pi.make("xyo.yield", std::move(outs), {});
             y->parent = thenB;
             thenB->ops.push_back(y);
@@ -4437,7 +4685,7 @@ struct Promoter {
         for (auto& [id, c] : pf.cands) c.isInt = false;
         pf.order = order;
         pf.warpLoop = warpLoop;
-        pf.planKinds(false);
+        pf.planKinds(true);
         // bail 時は元の入口値で最初からやり直す（継続ではない）。
         // gv/dv はガード前の SSA 値なので int ループの spill に汚染されない。
         pf.wireFloat(gv, dv);
@@ -4508,7 +4756,15 @@ struct Promoter {
                                   {Type::value()});
                     bx->parent = fElseB;
                     fElseB->ops.push_back(bx);
-                    wv = bx->result(0);
+                    // 0 回反復では f64 影ではなく元の実体を書く
+                    // （文字列リテラルの型を失わない）。
+                    Op* sel = make("xyo.select",
+                                   {wbRan->result(0), bx->result(0),
+                                    gv.at(id)},
+                                   {Type::value()});
+                    sel->parent = fElseB;
+                    fElseB->ops.push_back(sel);
+                    wv = sel->result(0);
                     ++roff;
                 } else {
                     wv = intVals[roff];
@@ -4568,6 +4824,14 @@ struct Promoter {
                     commit.push_back(fx);
                     resBits = fx->result(0);
                     ++roff;
+                } else if (kindOf(c.id) == 'd') {
+                    // f64 運搬の変数は結果を box して Value に戻す。
+                    Op* bx = m.create("xyo.box.f", {resOp->result(roff)},
+                                       {Type::value()});
+                    bx->parent = &parent;
+                    commit.push_back(bx);
+                    resBits = bx->result(0);
+                    ++roff;
                 } else {
                     resBits = resOp->result(roff);
                     roff += 2;
@@ -4584,9 +4848,20 @@ struct Promoter {
                 commit.push_back(sel);
                 commit.push_back(st);
             }
+            // resOp の実位置の直後へ挿入する。loopIndex はガード版では
+            // ifOp 挿入のたびに進んでいるため +1 では resOp を 1 つ
+            // 飛び越えてしまい、func.return の後に commit が置かれて
+            // 「terminator is not the last op」で検証失敗していた。
+            size_t resIndex = loopIndex;
+            for (size_t ri = 0; ri < parent.ops.size(); ++ri) {
+                if (parent.ops[ri] == resOp) {
+                    resIndex = ri;
+                    break;
+                }
+            }
             for (size_t i = 0; i < commit.size(); ++i)
                 parent.ops.insert(parent.ops.begin() +
-                                      static_cast<ptrdiff_t>(loopIndex + 1 + i),
+                                      static_cast<ptrdiff_t>(resIndex + 1 + i),
                                   commit[i]);
         }
     }
@@ -5687,6 +5962,11 @@ uint64_t foldConstantRepeatLoops(Module& m) {
 /// `to_num(list.item.i(ptr, idx))` が数値リストの読みなら、数値として直接
 /// 読む `xyo.list.item.num.i` に融合する（タグ検査を消し、読みを 1 回にする）。
 uint64_t fuseNumericListToNum(Module& m) {
+    static const bool off = [] {
+        const char* e = std::getenv("XYO_MLIR_NOFUSENUM");
+        return e && e[0] == '1';
+    }();
+    if (off) return 0;
     std::unordered_map<Op*, int> uses;
     std::function<void(Block&)> countUses = [&](Block& b) {
         for (Op* op : b.ops) {

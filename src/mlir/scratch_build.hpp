@@ -10,6 +10,7 @@
 #include <string>
 
 #include "ir.hpp"
+#include "core/value.hpp"
 
 namespace xyo {
 
@@ -21,18 +22,32 @@ struct BuildOutcome {
     bool ok = false;
     std::string reason;   // フォールバック理由（診断用）
     bool hasLoop = false;
+    /// 内部で yield する helper（compat・glide・sayforsecs 等）を使った。
+    /// これがあるとスタックレス・コルーチン化はできない。
+    bool internalYield = false;
+};
+
+/// ビルド時のオプション。
+struct BuildOptions {
+    /// スタックレス・コルーチン化を前提とした IR を作る
+    /// （ループ yield を予算判定なしの直接 yield にする等）。
+    bool coroMode = false;
 };
 
 /// 文字列リテラルを GC ルートへ固定するコールバック（boxed bits を返す）。
 /// SStr は GC 管理なので、生成コードへ埋め込む前に JitPinned へ登録する。
-using StringPinner = std::function<uint64_t(const std::u16string&)>;
+/// 既存の Value をそのまま返すことで、shadow が保持する SStr への
+/// **ポインタ同一性**が保たれる（テストは stored.bits == shadow bits を
+/// 要求する。新規 SStr に変換すると破れる）。
+using StringPinner = std::function<uint64_t(const xyo::Value&)>;
 
 /// `topId` のハットから下を `module` の関数 `entryName` へ変換する。
 BuildOutcome buildScriptFromBlocks(Module& module, Blocks& blocks,
                                    const std::string& topId,
                                    const std::string& entryName,
                                    const StringPinner& pin = {},
-                                   std::map<std::string, std::string>* procNames = nullptr);
+                                   std::map<std::string, std::string>* procNames = nullptr,
+                                   const BuildOptions* options = nullptr);
 
 } // namespace mlir
 } // namespace xyo

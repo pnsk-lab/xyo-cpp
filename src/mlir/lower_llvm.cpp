@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <map>
 #include <set>
@@ -20,6 +21,7 @@
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instructions.h>
 
+#include "../core/cast.hpp"
 #include "../core/value.hpp"
 #include "../jit/jit.hpp"
 #include "../model/blocks.hpp"  // utf8ToU16
@@ -66,8 +68,20 @@ struct Shared {
     std::map<std::string, uint32_t> slotIndex;
     std::vector<Slot> slotDefs;
     std::map<std::string, llvm::Constant*> globals;
+    /// compat 層 / clone 系ヘルパを emit した関数を含むモジュールは
+    /// 呼出し側スレッドの affinity が要る（既存 codegen の mainThread
+    /// マークと同じ規則）。entry 以外の手続き関数でも伝播する。
+    bool mainThread = false;
 };
 
+/// xyo.const.f64 の定数値。
+bool constF64Of(const Value& v, double* out) {
+    if (!v.op || v.op->name != "xyo.const.f64") return false;
+    const Attr* a = v.op->attr("d");
+    if (!a || !a->isDouble()) return false;
+    *out = a->d;
+    return true;
+}
 struct Lowerer {
     Lowerer(llvm::Module& module, llvm::LLVMContext& context, Shared& shared_)
         : mod(module), lc(context), b(context), shared(shared_) {}
@@ -114,6 +128,54 @@ struct Lowerer {
     std::string error;
     bool mayYield = false;
     bool voluntaryYield = false;
+    /// スタックレス・コルーチン化（stackless::lower）が受理できる形で
+    /// emit する。ループ yield は予算判定なしの直接 yield、待機系は
+    /// begin/poll 形、内部で yield する helper は使わない。
+    bool coroMode_ = false;
+    /// この lowering 対象の関数が warp 手続きか（warp 内 yield を
+    /// 協調点として !xyo.coop 印付けするために使う）。
+    bool mfWarp_ = false;
+    /// yielder: コルーチン化前提なので毎反復の直接 yield で良い。
+    void emitCoroYield() {
+        mayYield = true;
+        voluntaryYield = true;
+        if (!fiberCache_) {
+            llvm::BasicBlock& fentry = fn->getEntryBlock();
+            IRBuilder<> ib(&fentry, fentry.begin());
+            fiberCache_ = ib.CreateLoad(
+                ptr(), ib.CreateConstGEP1_32(
+                           i8(), ctx, uint32_t(offsetof(JitCtx, fiber))));
+        }
+        b.CreateCall(callee("xyo_yield_fast", {ptr()}, b.getVoidTy()),
+                     {fiberCache_});
+    }
+    /// コルーチン化前提の blocking helper 展開。扱えたら true。
+    bool emitCoroBlockingDirect(std::string_view sym, Op& op);
+    /// begin 済みの非同期処理が終わるまで poll するループ
+    /// （legacy codegen の emitStepLoop と同じ形）。
+    void emitCoroStepLoop(const char* stepSym) {
+        mayYield = true;
+        voluntaryYield = true;
+        BasicBlock* head = BasicBlock::Create(lc, "step.head", fn);
+        BasicBlock* checkOne = BasicBlock::Create(lc, "step.chk", fn);
+        BasicBlock* yieldBB = BasicBlock::Create(lc, "step.yield", fn);
+        BasicBlock* busyBB = BasicBlock::Create(lc, "step.busy", fn);
+        BasicBlock* done = BasicBlock::Create(lc, "step.done", fn);
+        b.CreateBr(head);
+        b.SetInsertPoint(head);
+        LValue* r = b.CreateCall(callee(stepSym, {ptr()}, i32()), {ctx});
+        b.CreateCondBr(
+            b.CreateICmpEQ(r, llvm::ConstantInt::get(i32(), 0)), done, checkOne);
+        b.SetInsertPoint(checkOne);
+        b.CreateCondBr(
+            b.CreateICmpEQ(r, llvm::ConstantInt::get(i32(), 1)), yieldBB, busyBB);
+        b.SetInsertPoint(yieldBB);
+        emitCoroYield();
+        b.CreateBr(head);
+        b.SetInsertPoint(busyBB);
+        b.CreateBr(head);
+        b.SetInsertPoint(done);
+    }
 
     llvm::BasicBlock* retBlock() {
         if (!retBB_) retBB_ = llvm::BasicBlock::Create(lc, "fn.ret", fn);
@@ -143,6 +205,21 @@ struct Lowerer {
     llvm::FunctionCallee callee(const char* name,
                                 std::vector<llvm::Type*> args,
                                 llvm::Type* ret) {
+        // 既存 codegen と同じ caller-affinity 規則: compat ヘルパは
+        // 実行キャッシュや拡張プリミティブへ触れるので worker で
+        // 走らせず、clone 生成/削除はスケジューラ/Target 配列を
+        // 書き換えるので mainThread 固定にする。
+        if (std::string_view(name).starts_with("xyo_rt_"))
+            shared.mainThread = true;
+        static const bool cloneSerialHint = [] {
+            const char* v = std::getenv("XYO_CLONE_SERIAL_CODEGEN");
+            return !v || v[0] != '0';
+        }();
+        if (cloneSerialHint &&
+            (std::string_view(name) == "xyo_ctl_createclone" ||
+             std::string_view(name) == "xyo_ctl_deleteclone" ||
+             std::string_view(name) == "xyo_ctl_deleteclone_begin"))
+            shared.mainThread = true;
         return mod.getOrInsertFunction(
             name, llvm::FunctionType::get(ret, args, false));
     }
@@ -197,7 +274,34 @@ struct Lowerer {
                     (v.op ? v.op->name : std::string("(blockarg)"));
             return llvm::ConstantInt::get(i64(), 0);
         }
-        return it->second;
+        LValue* lv = it->second;
+        // 昇格済みの f64 値（xyo.list.item.num 等）が !xyo.value 期待の
+        // オペランドに流れてきた場合は箱に戻す。生の store double は
+        // NaN 正規化（canonical kNan）をスキップし、i64 ビット列として
+        // 扱う箇所では `icmp slt double, i64` の不正 IR になる
+        // （IPSCCP クラッシュの実績あり）。xyo.box.f と同じ形で
+        // NaN は canonical 化する。
+        if (lv && lv->getType() == f64() && v.type == Type::value()) {
+            lv = b.CreateSelect(
+                b.CreateFCmpUNO(lv, lv),
+                llvm::ConstantInt::get(
+                    i64(), static_cast<int64_t>(val::kNan)),
+                b.CreateBitCast(lv, i64()));
+        }
+        // !xyo.bool 期待のオペランドに i64（定数畳み込みが作った
+        // Value ボックスの kTrue/kFalse、または boolean 定数の raw 0/1）
+        // が流れてきた場合は i1 に畳む。false と見なすのは 0 と
+        // ボックス済み kFalse だけ — ボックス kTrue(0x7FF8...2) と
+        // raw 1 の両 convention を正しく扱う。
+        if (lv && lv->getType() == i64() && v.type == Type::boolean()) {
+            LValue* nz =
+                b.CreateICmpNE(lv, llvm::ConstantInt::get(i64(), 0));
+            LValue* nf = b.CreateICmpNE(
+                lv, llvm::ConstantInt::get(
+                        i64(), static_cast<int64_t>(val::kFalse)));
+            lv = b.CreateAnd(nz, nf);
+        }
+        return lv;
     }
 
     // --- 変数スロット -----------------------------------------------
@@ -324,6 +428,11 @@ struct Lowerer {
         llvm::AllocaInst* lpSlot = nullptr;
         llvm::AllocaInst* itemsSlot = nullptr;
         llvm::AllocaInst* lenSlot = nullptr;
+        // rep.batch の外側ループで運ぶ SSA 値（バッチ境界でのみ更新）。
+        // 設定されているときはスロットよりこちらを優先する。
+        LValue* lpPhi = nullptr;
+        LValue* itemsPhi = nullptr;
+        LValue* lenPhi = nullptr;
     };
     struct LoopScope {
         llvm::BasicBlock* preheader = nullptr;
@@ -354,6 +463,300 @@ struct Lowerer {
     std::vector<LValue*> emitWarpCheck(Op* wy,
                                        const std::vector<LValue*>& cur);
     LValue* numberShadow(const Value& v);
+    /// !xyo.f64 オペランドの読み取り。生 NaN は toNumber 一致で 0 に
+    /// 変換する（.f 演算子チェインでも数値境界の意味論を守る）。
+    /// boxed な !xyo.value を f64 にする（既に f64 なら NaN 正規化だけ）。
+    ///
+    /// lowering が既に NaN 正規化済み（または非 NaN と判明）の f64
+    /// だけ再検査を省く。.f 演算子・ループ運搬 arg は生 NaN を持ち得る
+    /// （inf-inf 等 → interp は to_num で 0 に直すので store するまで
+    /// shadow は NaN まま）。
+    LValue* f64Operand(const Value& v) {
+        LValue* d = value(v);
+        if (!d || d->getType() == f64()) {
+            if (!d) return d;
+            if (v.op) {
+                const std::string& pn = v.op->name;
+                if (pn == "xyo.to_num" || pn == "xyo.const.f64")
+                    return d;  // lowering が uno 正規化（または定数）済み
+            }
+            // numFacts で非 NaN が確実なら heal を省略する。
+            // 特にループ運搬の 'd' 影は入口で正規化済みのとき本体では
+            // 再評価する必要がなく、ループキャリー連鎖から ord+sel が消える。
+            if (numFacts(v) & 1) return d;
+            return b.CreateSelect(b.CreateFCmpUNO(d, d),
+                                  llvm::ConstantFP::get(f64(), 0.0), d);
+        }
+        // ボックス値を数値へ。定数はコンパイル時に畳む。
+        if (v.op && v.op->name == "xyo.const") {
+            const Attr* a = v.op->attr("bits");
+            if (a && a->isInt()) {
+                const uint64_t cb = static_cast<uint64_t>(a->i);
+                if (cb < static_cast<uint64_t>(val::kNan))
+                    return llvm::ConstantFP::get(
+                        f64(), xyo::Value{cb}.asNumberUnchecked());
+                return llvm::ConstantFP::get(f64(), xyo_to_num(cb));
+            }
+        }
+        LValue* num =
+            b.CreateCall(callee("xyo_to_num", {i64()}, f64()), {d});
+        return b.CreateSelect(b.CreateFCmpUNO(num, num),
+                              llvm::ConstantFP::get(f64(), 0.0), num);
+    }
+    /// リスト索引の生 f64。`xyo.box.f` producer は昇格変数の数値影なので
+    /// bits 化（box + NaN 正規化）→ bitcast の往復を省いてオペランドを
+    /// 直接使う。cvttsd2si は NaN に INT64_MIN を返すので範囲判定は同値。
+    /// bits が必要な呼び出し側は自分で value() する（slow 経路のみに
+    /// 置けば fast 側の box も消える）。
+    LValue* indexF(const Value& v) {
+        if (v.op && v.op->name == "xyo.box.f" && !v.op->operands.empty())
+            return value(v.op->operands[0]);
+        // 定数は bitcast ではなく to_num で畳む。文字列定数の bits は
+        // タグ付きポインタで、bitcast→cvtt が巨大値に畳まれると
+        // icmp ult が常に false に fold され fast path が消えて
+        // slow 専用ループになる（実測で item 定数索引が 2.4×遅かった）。
+        if (v.op && v.op->name == "xyo.const") {
+            const Attr* a = v.op->attr("bits");
+            if (a && a->isInt()) {
+                const uint64_t cb = static_cast<uint64_t>(a->i);
+                if (cb < static_cast<uint64_t>(val::kNan))
+                    return llvm::ConstantFP::get(
+                        f64(), xyo::Value{cb}.asNumberUnchecked());
+                return llvm::ConstantFP::get(f64(), xyo_to_num(cb));
+            }
+        }
+        return b.CreateBitCast(value(v), f64());
+    }
+    /// slow 経路（helper 呼出し）用の bits。`xyo.box.f` producer は
+    /// op 本体を参照せず f64 から等価な箱化をここで emit する — これで
+    /// hot 経路の `value()` 参照が無くなり、無条件に emit された box.f
+    /// の命令列が LLVM DCE で消える。
+    LValue* slowBits(const Value& v) {
+        if (v.op && v.op->name == "xyo.box.f" && !v.op->operands.empty()) {
+            LValue* d = value(v.op->operands[0]);
+            return b.CreateSelect(
+                b.CreateFCmpUNO(d, d),
+                llvm::ConstantInt::get(
+                    i64(), static_cast<int64_t>(val::kNan)),
+                b.CreateBitCast(d, i64()));
+        }
+        return value(v);
+    }
+
+    // ---- f64 の値属性（non-NaN / finite）推論 ---------------------------
+    // sel(uno(d),0,d) / box.f の canonical 化を静的に省く軽量解析。
+    // ループ運搬の block argument は自分の更新値を経由して循環するので
+    // 最大不動点として解く:
+    //   (1) そのブロックの全 arg を楽観の 3 で初期化
+    //   (2) arg の incoming（entry 値 + yield バックエッジ値）を
+    //       evalFacts で評価して min を取る（arg は仮定値を返すだけで
+    //       循環は即停止）。値は下がるのみなので 6 回で必ず安定する。
+    // evalFacts は arg 以外を（非 arg の）再帰で普通に評価する。
+    std::map<Key, int> numFactsArg_;        // block arg: 仮定 or 確定
+    std::map<Key, char> numFactsSettled_;   // arg が確定済みか
+    std::map<Key, const std::vector<const Value*>*> loopArgIns_;
+    std::deque<std::vector<const Value*>> numFactsInsStore_;
+
+    int evalFacts(const Value& v) {
+        if (v.type != Type::f64()) return 0;
+        if (!v.op) {
+            // block arg: 仮定値（未解決なら楽観 3）。
+            auto it = numFactsArg_.find(keyOf(v));
+            if (it != numFactsArg_.end()) return it->second;
+            return 3;
+        }
+        const Op& o = *v.op;
+        const std::string& n = o.name;
+        if (n == "xyo.const.f64") {
+            const Attr* a = o.attr("d");
+            const double dv = a ? a->asDouble(0.0) : 0.0;
+            return dv != dv ? 0 : (std::isfinite(dv) ? 3 : 1);
+        }
+        if (n == "xyo.to_num" || n == "xyo.to_num.d") return 1;
+        if (n == "xyo.list.item.num" || n == "xyo.list.item.num.i")
+            return 1;  // タグ検査済み bitcast または to_num — 常に非 NaN
+        if (n == "xyo.list.len" || n == "xyo.list.len.i") return 3;
+        if (n == "xyo.add.f" || n == "xyo.sub.f") {
+            const int a0 = evalFacts(o.operands[0]);
+            const int c0 = evalFacts(o.operands[1]);
+            if (((a0 & 1) && (c0 & 2)) || ((a0 & 2) && (c0 & 1)))
+                return ((a0 & 2) && (c0 & 2)) ? 3 : 1;
+            return 0;
+        }
+        if (n == "xyo.mul.f") {
+            return (evalFacts(o.operands[0]) & 2) &&
+                   (evalFacts(o.operands[1]) & 2) ? 3 : 0;
+        }
+        if (n == "xyo.div.f" || n == "xyo.mod.f") {
+            const int a0 = evalFacts(o.operands[0]);
+            const int c0 = evalFacts(o.operands[1]);
+            if ((a0 & 2) && (c0 & 2)) {
+                double cc = 0.0;
+                if (constF64Of(o.operands[1], &cc) && cc != 0.0)
+                    return n == "xyo.div.f" ? 3 : 1;
+            }
+            return 0;
+        }
+        if (n == "xyo.round.f" || n == "xyo.mathop.f")
+            return evalFacts(o.operands[0]);
+        if (n == "xyo.select" && o.operands.size() >= 3)
+            return evalFacts(o.operands[1]) & evalFacts(o.operands[2]);
+        if (n == "xyo.if") {
+            int r = 3;
+            for (auto& reg : o.regions) {
+                if (!reg) continue;
+                for (auto& blk : reg->blocks) {
+                    Op* t = blk->lastOp();
+                    if (!t || t->name != "xyo.yield") continue;
+                    if (v.index < t->operands.size())
+                        r &= evalFacts(t->operands[v.index]);
+                    else
+                        r = 0;
+                }
+            }
+            return r;
+        }
+        if ((n == "xyo.warp_yield" || n == "xyo.loop_yield") &&
+            v.index < o.operands.size())
+            return evalFacts(o.operands[v.index]);
+        if (n == "xyo.repeat" || n == "xyo.while" ||
+            n == "xyo.repeat_until") {
+            // ネストしたループの結果はその body arg の確定値（未解決
+            // ならこの solve 経路では 0 — 保守的）。
+            for (auto& rr : o.regions)
+                if (rr && !rr->blocks.empty() &&
+                    !rr->blocks[0]->args.empty()) {
+                    Block* bd = rr->entry();
+                    if (bd && v.index < bd->args.size()) {
+                        Value a;
+                        a.block = bd;
+                        a.argIndex = v.index;
+                        a.type = bd->args[v.index].type;
+                        return numFacts(a);
+                    }
+                    break;
+                }
+            return 0;
+        }
+        return 0;
+    }
+
+    /// arg の確定属性。未登録なら対象ループの arg 群を不動点で解く。
+    int numFactsBlockArg(const Value& v) {
+        const Key k = keyOf(v);
+        auto it = numFactsArg_.find(k);
+        if (it != numFactsArg_.end() && numFactsSettled_.count(k))
+            return it->second;
+        auto ins = loopArgIns_.find(k);
+        if (ins == loopArgIns_.end()) {
+            numFactsArg_[k] = 0;
+            numFactsSettled_[k] = 1;
+            return 0;
+        }
+        // 同一ブロックの f64 arg をまとめて不動点で解く。
+        std::vector<const Value*> sibArgs;
+        if (v.block) {
+            for (const Value& a : v.block->args)
+                if (a.type == Type::f64() && loopArgIns_.count(keyOf(a)))
+                    sibArgs.push_back(&a);
+        }
+        if (sibArgs.empty()) {
+            numFactsArg_[k] = 0;
+            numFactsSettled_[k] = 1;
+            return 0;
+        }
+        for (const Value* a : sibArgs) {
+            const Key ak = keyOf(*a);
+            if (!numFactsSettled_.count(ak))
+                numFactsArg_[ak] = 3;  // 楽観シード
+        }
+        // arg の incoming は arg ごと（entry 値 + その arg の yield 値）。
+        for (int iter = 0; iter < 6; ++iter) {
+            bool changed = false;
+            for (const Value* a : sibArgs) {
+                const Key ak = keyOf(*a);
+                // 確定済み（markArgNonNaN で非 NaN を保証した値など）は
+                // 不動点の対象外。ここで上書きすると書き込み側で正規化
+                // した意味が消え、読み側の heal が復活する。
+                if (numFactsSettled_.count(ak)) continue;
+                int next = 3;
+                for (const Value* in : *loopArgIns_[ak])
+                    next &= evalFacts(*in);
+                if (next < numFactsArg_[ak]) {
+                    numFactsArg_[ak] = next;
+                    changed = true;
+                }
+            }
+            if (!changed) break;
+        }
+        for (const Value* a : sibArgs)
+            if (!numFactsSettled_.count(keyOf(*a)))
+                numFactsSettled_[keyOf(*a)] = 1;
+        if (std::getenv("XYO_MLIR_NUMDBG"))
+            std::fprintf(stderr, "[numfacts] arg #%u -> %d\n",
+                         v.argIndex, numFactsArg_[k]);
+        return numFactsArg_[k];
+    }
+
+    int numFacts(const Value& v) {
+        if (!v.op) return numFactsBlockArg(v);
+        return evalFacts(v);
+    }
+
+    /// ループ運搬の f64 引数を「非 NaN と確定」として登録する
+    /// （書き込み側で正規化した場合だけ呼ぶ）。
+    void markArgNonNaN(const Value& a) {
+        numFactsArg_[keyOf(a)] = 1;
+        numFactsSettled_[keyOf(a)] = 1;
+    }
+
+    /// ループ運搬値の NaN 正規化を**書き込み側**で行う。
+    ///
+    /// 読み側で `select(uno(d), 0, d)` すると vcmpordsd(4cy) + blend(1) +
+    /// vaddsd(4) がループキャリーの依存連鎖になり、リスト読みのループが
+    /// legacy の 2.7 倍遅かった（実測 5.2ns/反復 vs 1.9ns）。稀な NaN だけ
+    /// 別ブロックへ分岐させれば、連鎖は fadd(4cy) だけで済む（legacy と
+    /// 同じ形 — `vucomisd; jp` は予測でほぼ無料）。
+    ///
+    /// 正規化値は 0.0 でよい: 影が NaN なら対応する bits は box.f が
+    /// 作った正準 NaN で、to_num(正準 NaN) = 0 だから。
+    LValue* healCarryOnWrite(LValue* raw) {
+        if (!raw || raw->getType() != f64()) return raw;
+        BasicBlock* cur = b.GetInsertBlock();
+        BasicBlock* fix = BasicBlock::Create(lc, "carry.fix", fn);
+        BasicBlock* cont = BasicBlock::Create(lc, "carry.next", fn);
+        b.CreateCondBr(
+            b.CreateFCmpUNO(raw, raw), fix, cont,
+            llvm::MDNode::get(lc, {
+                llvm::MDString::get(lc, "branch_weights"),
+                llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i64(), 1)),
+                llvm::ConstantAsMetadata::get(
+                    llvm::ConstantInt::get(i64(), 4095))}));
+        b.SetInsertPoint(fix);
+        b.CreateBr(cont);
+        b.SetInsertPoint(cont);
+        auto* p = b.CreatePHI(f64(), 2);
+        p->addIncoming(raw, cur);
+        p->addIncoming(llvm::ConstantFP::get(f64(), 0.0), fix);
+        return p;
+    }
+
+    /// ループ外・バッチ境界用の安価な正規化（select 1 個）。
+    LValue* healOnce(LValue* v) {
+        if (!v || v->getType() != f64()) return v;
+        return b.CreateSelect(b.CreateFCmpUNO(v, v),
+                              llvm::ConstantFP::get(f64(), 0.0), v);
+    }
+
+    /// body 引数 i が「(bits, f64) ペア運搬の f64 側」か（kinds='b'）。
+    /// 'b' は value → f64 の順に 2 引数、'd' は f64 単独、'i' は整数単独。
+    /// 'b' なら bits は box.f 由来で常に正準なので、影だけ書き込み側で
+    /// 正規化してよい。
+    static bool isPairCarry(const Block& body, size_t i) {
+        return i > 0 && i < body.args.size() &&
+               body.args[i].type == Type::f64() &&
+               body.args[i - 1].type == Type::value();
+    }
     /// 整数ループの reload 用: 素の double ビットなら直接 fptosi、
     /// 正準形の整数文字列などは to_num 経由（呼び出し側が整数値を保証）。
     /// to_num 呼び出しは低速側にだけ残る。
@@ -442,6 +845,9 @@ bool hoistBarrier(const std::string& n) {
         "xyo.list.length", "xyo.list.contains", "xyo.list.contents",
         "xyo.list.add", "xyo.list.replace", "xyo.list.insert",
         "xyo.list.delete", "xyo.list.deleteall",
+        // 昇格/融合で作られる変種（.num は f64 読み、.i は i32 索引）。
+        "xyo.list.item.i", "xyo.list.item.num", "xyo.list.item.num.i",
+        "xyo.list.replace.i",
     };
     return kSafe.count(n) == 0;
 }
@@ -449,7 +855,7 @@ bool hoistBarrier(const std::string& n) {
 bool listMutator(const std::string& n) {
     return n == "xyo.list.add" || n == "xyo.list.replace" ||
            n == "xyo.list.insert" || n == "xyo.list.delete" ||
-           n == "xyo.list.deleteall";
+           n == "xyo.list.deleteall" || n == "xyo.list.replace.i";
 }
 }  // namespace
 
@@ -491,6 +897,7 @@ void Lowerer::pushLoopScope(Block& body) {
         for (Op* o : sc.bodyOps) {
             const std::string& n = o->name;
             if (n != "xyo.list.item" && n != "xyo.list.item.i" &&
+                n != "xyo.list.item.num" && n != "xyo.list.item.num.i" &&
                 n != "xyo.list.replace" && n != "xyo.list.replace.i" &&
                 n != "xyo.list.length")
                 continue;
@@ -543,7 +950,9 @@ LValue* Lowerer::listPtrFor(Op& op, LValue* var, ListHeader** out) {
         const std::string id(op.operands[0].op->attrStr("id"));
         *out = findListHeader(id);
     }
-    if (*out) return b.CreateLoad(ptr(), (*out)->lpSlot);
+    if (*out)
+        return (*out)->lpPhi ? (*out)->lpPhi
+                             : b.CreateLoad(ptr(), (*out)->lpSlot);
     return b.CreateLoad(ptr(), b.CreateConstGEP1_32(
                                   i8(), var, uint32_t(offsetof(Variable, list))));
 }
@@ -703,8 +1112,13 @@ LValue* Lowerer::numberShadow(const Value& v) {
             return d;
         }
     }
-    // 常に数値と証明できた変数はタグ検査なしで数値化できる。
-    if (shared.numericVars && v.op && v.op->name == "xyo.getvar" &&
+    // 常に数値と証明できた変数でもタグ検査は省けない。numericVars の
+    // 証明は「プロジェクト内の全書き込みが数値を生成する」だけで、
+    // 実行の合間にホスト（テスト/モニタ/未コンパイル経路）から直接
+    // Variable.value を文字列・真偽値に書き換えられる — そうすると
+    // bitcast がポインタビットを浮動小数と誤読し 0 になる（found:
+    // nan codegen input>=19 の全失敗）。分岐 1 個を残して正しくする。
+    if (false && shared.numericVars && v.op && v.op->name == "xyo.getvar" &&
         shared.numericVars->count(std::string(v.op->attrStr("id")))) {
         LValue* bits = value(v);
         if (!bits) {
@@ -718,12 +1132,31 @@ LValue* Lowerer::numberShadow(const Value& v) {
         return nonNan;
     }
     // f64 値（昇格後の影・畳み込んだ定数）はそのまま使う。
-    // NaN もそのまま通す（Value 経路の to_num と同一値になる）。
+    // ただし NaN は toNumber に揃えて 0 に変換する。Value 経路では
+    // box→canonical kNan→to_num=0 となるため、生 NaN を伝播させると
+    // `sqrt(-1)+7` が 7 ではなく NaN になる（数値 NaN を 0 に正規化
+    // するのはタグ域の Value だけではなく非正準 NaN も同様 — 既存の
+    // fast path と同じ `uno→0` 変換を使う）。
     if (v.type == Type::f64()) {
         LValue* d = value(v);
         if (!d) {
             error = "numberShadow: operand has no lowered value";
             return nullptr;
+        }
+        // f64Operand と同じく、lowering が正規化済みの値だけ再検査を
+        // 省く（.f 演算子・ループ arg は NaN を持ち得る）。
+        bool clean = false;
+        if (v.op) {
+            const std::string& pn = v.op->name;
+            clean = pn == "xyo.to_num" || pn == "xyo.const.f64";
+        }
+        // 非 NaN が証明できた値（書き込み側で正規化済みのループ運搬値など）
+        // は再検査しない。ループキャリーに vcmpord+blend(5cy) が乗ると
+        // リスト読みループが実測 2 倍遅くなる。
+        if (!clean && (numFacts(v) & 1)) clean = true;
+        if (!clean) {
+            d = b.CreateSelect(b.CreateFCmpUNO(d, d),
+                               llvm::ConstantFP::get(f64(), 0.0), d);
         }
         numShadow_[key] = NumShadowEntry{d, b.GetInsertBlock()};
         return d;
@@ -749,6 +1182,20 @@ LValue* Lowerer::numberShadow(const Value& v) {
     if (!bits) {
         error = "numberShadow: operand has no lowered value";
         return nullptr;
+    }
+    // オペランド型が !xyo.value でも、実際の lowering 結果が f64（
+    // xyo.list.item.num 等の昇格済み数値）の場合がある。i64 ビット列
+    // として扱うと `icmp slt double, i64` のような不正 IR を生成して
+    // 後段の LLVM パス（IPSCCP）を落とすため、f64 として扱い、上と
+    // 同じ `uno→0` の NaN 正規化だけを適用する。
+    if (bits->getType() == f64()) {
+        LValue* d = (numFacts(v) & 1)
+                        ? static_cast<LValue*>(bits)
+                        : static_cast<LValue*>(b.CreateSelect(
+                              b.CreateFCmpUNO(bits, bits),
+                              llvm::ConstantFP::get(f64(), 0.0), bits));
+        numShadow_[key] = NumShadowEntry{d, b.GetInsertBlock()};
+        return d;
     }
     static const bool noNumFast = [] {
         const char* e = std::getenv("XYO_MLIR_NONUMFAST");
@@ -822,14 +1269,6 @@ void Lowerer::emitWarpLoopYield() {
 }
 
 namespace {
-/// xyo.const.f64 の定数値。
-bool constF64Of(const Value& v, double* out) {
-    if (!v.op || v.op->name != "xyo.const.f64") return false;
-    const Attr* a = v.op->attr("d");
-    if (!a || !a->isDouble()) return false;
-    *out = a->d;
-    return true;
-}
 /// 0 でも非有限でもない 2 の冪か。
 bool isPow2(double d) {
     if (!(d == d) || !std::isfinite(d) || d == 0.0) return false;
@@ -838,11 +1277,147 @@ bool isPow2(double d) {
 }
 }  // namespace
 
+bool Lowerer::emitCoroBlockingDirect(std::string_view sym, Op& op) {
+    auto arg = [&](size_t i) {
+        return i < op.operands.size() ? value(op.operands[i])
+                                      : static_cast<LValue*>(nullptr);
+    };
+    auto callVoid = [&](const char* name, std::vector<llvm::Type*> sig,
+                        std::vector<llvm::Value*> args) {
+        b.CreateCall(callee(name, std::move(sig), b.getVoidTy()), args);
+    };
+    // glide: begin → step poll。
+    if (sym == "xyo_mot_glidexy") {
+        callVoid("xyo_mot_glidebegin_xy", {ptr(), i64(), i64(), i64()},
+                 {ctx, arg(0), arg(1), arg(2)});
+        emitCoroStepLoop("xyo_mot_glidestep");
+        return true;
+    }
+    if (sym == "xyo_mot_glideto") {
+        callVoid("xyo_mot_glidebegin_to", {ptr(), i64(), i64()},
+                 {ctx, arg(0), arg(1)});
+        emitCoroStepLoop("xyo_mot_glidestep");
+        return true;
+    }
+    if (sym == "xyo_looks_switchbackdropwait") {
+        callVoid("xyo_looks_backdropbegin", {ptr(), i64()}, {ctx, arg(0)});
+        emitCoroStepLoop("xyo_looks_backdropstep");
+        return true;
+    }
+    // 「begin して 1 回 yield」で足りるもの。
+    if (sym == "xyo_looks_saysecs" || sym == "xyo_looks_thinksecs") {
+        callVoid(sym == "xyo_looks_saysecs" ? "xyo_looks_saybegin"
+                                            : "xyo_looks_thinkbegin",
+                 {ptr(), i64(), i64()}, {ctx, arg(0), arg(1)});
+        emitCoroYield();
+        return true;
+    }
+    if (sym == "xyo_sns_askwait") {
+        callVoid("xyo_sns_askbegin", {ptr(), i64()}, {ctx, arg(0)});
+        emitCoroYield();
+        return true;
+    }
+    if (sym == "xyo_snd_playwait") {
+        callVoid("xyo_snd_playbegin", {ptr(), i64()}, {ctx, arg(0)});
+        emitCoroYield();
+        return true;
+    }
+    // sound の effect/volume: legacy は *_begin の戻り値が非 0 のときだけ
+    // yield する（warp 中の連続設定で無駄に譲らないため）。
+    if (sym == "xyo_snd_seteffect" || sym == "xyo_snd_changeeffect" ||
+        sym == "xyo_snd_setvolume" || sym == "xyo_snd_changevolume") {
+        const char* begin = sym == "xyo_snd_seteffect"
+                                ? "xyo_snd_seteffect_begin"
+                            : sym == "xyo_snd_changeeffect"
+                                ? "xyo_snd_changeeffect_begin"
+                            : sym == "xyo_snd_setvolume"
+                                ? "xyo_snd_setvolume_begin"
+                                : "xyo_snd_changevolume_begin";
+        LValue* r = b.CreateCall(callee(begin, {ptr(), i64()}, i32()),
+                                 {ctx, arg(0)});
+        BasicBlock* yieldBB = BasicBlock::Create(lc, "snd.yield", fn);
+        BasicBlock* cont = BasicBlock::Create(lc, "snd.cont", fn);
+        b.CreateCondBr(
+            b.CreateICmpNE(r, llvm::ConstantInt::get(i32(), 0)),
+            yieldBB, cont);
+        b.SetInsertPoint(yieldBB);
+        emitCoroYield();
+        b.CreateBr(cont);
+        b.SetInsertPoint(cont);
+        return true;
+    }
+    return false;
+}
+
 void Lowerer::emitLoopYield() {
-    // 既存 codegen と同じ: カウンタを進め、非 warp は毎回、warp は 64 回に
     // 1 回スケジューラへ譲る。xyo_loop_yield は warp 時の stuck 判定込み。
     // チャンク展開の途中コピーでは検査しない（最後のコピーが代表する）。
     if (suppressWarpYield_) return;
+    // コルーチン化前提では予算判定を自前で持つ — legacy codegen の
+    // stacklessNormalLoop と同じ形。非 warp は毎反復、warp は 64 反復に
+    // 1 回だけ watchdog/GC 予算を見て、真なら直接 yield する
+    // （xyo_loop_yield はコルーチン化で拒否されるので使わない）。
+    if (coroMode_) {
+        mayYield = true;
+        // warp 手続き内の停止点は watchdog/GC 予算の協調点だけ —
+        // 意味論 yield には数えない（legacy の fnSemanticYield /
+        // cooperativeOnly と同じ扱いで同期バッチへ残す）。
+        if (!mfWarp_) voluntaryYield = true;
+        llvm::AllocaInst* counter = yieldCounter();
+        LValue* n = b.CreateAdd(
+            b.CreateLoad(i64(), counter),
+            llvm::ConstantInt::get(i64(), warpChunkStep_));
+        b.CreateStore(n, counter);
+        if (!fiberCache_) {
+            llvm::BasicBlock& fentry = fn->getEntryBlock();
+            IRBuilder<> ib(&fentry, fentry.begin());
+            fiberCache_ = ib.CreateLoad(
+                ptr(), ib.CreateConstGEP1_32(
+                           i8(), ctx, uint32_t(offsetof(JitCtx, fiber))));
+        }
+        LValue* warp = b.CreateLoad(
+            i32(), ctxField(uint32_t(offsetof(JitCtx, isWarp))));
+        BasicBlock* normal = BasicBlock::Create(lc, "yield.normal", fn);
+        BasicBlock* warpBB = BasicBlock::Create(lc, "yield.warp", fn);
+        BasicBlock* dueBB = BasicBlock::Create(lc, "yield.due", fn);
+        BasicBlock* yieldBB = BasicBlock::Create(lc, "yield.susp", fn);
+        BasicBlock* done = BasicBlock::Create(lc, "yield.done", fn);
+        b.CreateCondBr(b.CreateICmpEQ(warp, llvm::ConstantInt::get(i32(), 0)),
+                       normal, warpBB);
+        b.SetInsertPoint(normal);
+        // warp 手続き内のループでは isWarp が常に 1 なので、この枝は
+        // 静的に unreachable。それでも coro の停止点として置く
+        // （legacy も同じ形で、両方の停止点を xyo_yield* 呼出しにする）。
+        b.CreateCall(callee("xyo_yield_fast", {ptr()}, b.getVoidTy()),
+                     {fiberCache_});
+        b.CreateBr(done);
+        b.SetInsertPoint(warpBB);
+        LValue* sampled = b.CreateICmpEQ(
+            b.CreateAnd(n, llvm::ConstantInt::get(i64(), 63)),
+            llvm::ConstantInt::get(i64(), 0));
+        b.CreateCondBr(sampled, dueBB, done);
+        b.SetInsertPoint(dueBB);
+        LValue* due = b.CreateCall(
+            callee("xyo_warp_yield_due", {ptr()}, i32()), {ctx});
+        b.CreateCondBr(
+            b.CreateICmpNE(due, llvm::ConstantInt::get(i32(), 0)),
+            yieldBB, done);
+        b.SetInsertPoint(yieldBB);
+        {
+            // warp 定義内ではこの yield は watchdog/GC 予算の協調点だけ
+            // （意味論的な停止点ではない）。legacy の callCooperativeYield
+            // と同じく !xyo.coop を付け、stackless::lowerRecursive が
+            // coro.suspend にしないよう印を付ける。それ以外（非 warp の
+            // 手続きや entry）の warp 枝は意味論 yield として残す。
+            auto* call = b.CreateCall(
+                callee("xyo_yield", {ptr()}, b.getVoidTy()), {ctx});
+            if (mfWarp_)
+                call->setMetadata("xyo.coop", llvm::MDNode::get(lc, {}));
+        }
+        b.CreateBr(done);
+        b.SetInsertPoint(done);
+        return;
+    }
     mayYield = true;
     voluntaryYield = true;
     // カウンタは関数エントリの alloca（epilogue で ctx へ書き戻す）。
@@ -1025,6 +1600,21 @@ void Lowerer::emitWhile(Op& op) {
     std::vector<LValue*> initVals;
     for (size_t i = 0; i < before->args.size() && i < op.operands.size(); ++i)
         initVals.push_back(value(op.operands[i]));
+    // numFacts 用: cond 側 arg の incoming = {entry, body の yield 値}。
+    {
+        Op* bodyTerm = body->lastOp();
+        if (bodyTerm && bodyTerm->name == "xyo.yield") {
+            for (size_t i = 0; i < before->args.size(); ++i) {
+                if (before->args[i].type != Type::f64()) continue;
+                auto& vec = numFactsInsStore_.emplace_back();
+                if (i < op.operands.size())
+                    vec.push_back(&op.operands[i]);
+                if (i < bodyTerm->operands.size())
+                    vec.push_back(&bodyTerm->operands[i]);
+                loopArgIns_[keyOf(before->args[i])] = &vec;
+            }
+        }
+    }
     b.CreateBr(condBB);
     for (size_t i = 0; i < condPhis.size() && i < initVals.size(); ++i)
         condPhis[i]->addIncoming(initVals[i], pre);
@@ -1368,15 +1958,70 @@ bool Lowerer::emitBatchedRepeat(Op& op, LValue* remaining, Block* body,
     BasicBlock* innerBody = BasicBlock::Create(lc, "rep.batch.body", fn);
     BasicBlock* after = BasicBlock::Create(lc, "rep.batch.after", fn);
     BasicBlock* exitBB = BasicBlock::Create(lc, "rep.batch.end", fn);
+
+    // リストヘッダを外側ループの phi として運ぶ（バッチ内では不変、
+    // バッチ境界の yield 後に読み直す）。バッチ内のリスト読みが
+    // lp→len→items の 3 段ロードではなくレジスタだけになる。
+    // `pre` ではヘッダの初期値を読む（null なら null/0 を phi の初期値に）。
+    std::vector<ListHeader*> phiHeaders;
+    if (!loopScopes_.empty()) {
+        for (ListHeader& h : loopScopes_.back().headers)
+            phiHeaders.push_back(&h);
+    }
+    std::vector<LValue*> hdrLpInit, hdrItInit, hdrLnInit;
+    for (ListHeader* h : phiHeaders) {
+        LValue* lp0 = b.CreateLoad(
+            ptr(), b.CreateConstGEP1_32(
+                       i8(), h->var, uint32_t(offsetof(Variable, list))));
+        BasicBlock* iniNull = b.GetInsertBlock();
+        BasicBlock* iniHave = BasicBlock::Create(lc, "lst.inihave", fn);
+        BasicBlock* iniDone = BasicBlock::Create(lc, "lst.inidone", fn);
+        b.CreateCondBr(b.CreateIsNull(lp0), iniDone, iniHave);
+        b.SetInsertPoint(iniHave);
+        LValue* it0 = b.CreateLoad(
+            ptr(), b.CreateConstGEP1_32(
+                       i8(), lp0, uint32_t(offsetof(SList, items))));
+        LValue* ln0 = b.CreateLoad(
+            i32(), b.CreateConstGEP1_32(
+                       i8(), lp0, uint32_t(offsetof(SList, len))));
+        b.CreateBr(iniDone);
+        b.SetInsertPoint(iniDone);
+        auto* lpI = b.CreatePHI(ptr(), 2);
+        lpI->addIncoming(lp0, iniHave);
+        lpI->addIncoming(llvm::ConstantPointerNull::get(ptr()), iniNull);
+        auto* itI = b.CreatePHI(ptr(), 2);
+        itI->addIncoming(it0, iniHave);
+        itI->addIncoming(llvm::ConstantPointerNull::get(ptr()), iniNull);
+        auto* lnI = b.CreatePHI(i32(), 2);
+        lnI->addIncoming(ln0, iniHave);
+        lnI->addIncoming(llvm::ConstantInt::get(i32(), 0), iniNull);
+        hdrLpInit.push_back(lpI);
+        hdrItInit.push_back(itI);
+        hdrLnInit.push_back(lnI);
+    }
+    BasicBlock* preEnd = b.GetInsertBlock();
     b.CreateBr(head);
 
     b.SetInsertPoint(head);
     auto* remainPhi = b.CreatePHI(f64(), 2);
-    remainPhi->addIncoming(remaining, pre);
+    remainPhi->addIncoming(remaining, preEnd);
+    // ヘッダ phi（preEnd から初期値、afterEnd からリロード値）。
+    for (size_t hi = 0; hi < phiHeaders.size(); ++hi) {
+        ListHeader* h = phiHeaders[hi];
+        auto* lpP = b.CreatePHI(ptr(), 2);
+        lpP->addIncoming(hdrLpInit[hi], preEnd);
+        auto* itP = b.CreatePHI(ptr(), 2);
+        itP->addIncoming(hdrItInit[hi], preEnd);
+        auto* lnP = b.CreatePHI(i32(), 2);
+        lnP->addIncoming(hdrLnInit[hi], preEnd);
+        h->lpPhi = lpP;
+        h->itemsPhi = itP;
+        h->lenPhi = lnP;
+    }
     std::vector<llvm::PHINode*> phis;
     for (size_t i = 0; i < body->args.size(); ++i) {
         auto* phi = b.CreatePHI(ty(body->args[i].type), 2);
-        if (i < initVals.size()) phi->addIncoming(initVals[i], pre);
+        if (i < initVals.size()) phi->addIncoming(initVals[i], preEnd);
         phis.push_back(phi);
     }
     LValue* go = b.CreateFCmpOGE(remainPhi,
@@ -1388,20 +2033,32 @@ bool Lowerer::emitBatchedRepeat(Op& op, LValue* remaining, Block* body,
     LValue* used = b.CreateSelect(
         b.CreateFCmpOGE(remainPhi, llvm::ConstantFP::get(f64(), 64.5)),
         llvm::ConstantFP::get(f64(), 64.0), remainPhi);
+    // バッチ内の残り反復数は整数カウンタで回す。f64 だと XMM を 1 本
+    // 占有し、fadd(4cy)+ucomisd がループキャリーになる。実行回数は
+    // floor(used+0.5) で従来の batchPhi>=0.5 判定と同値。
+    LValue* usedI = b.CreateFPToSI(
+        b.CreateFAdd(used, llvm::ConstantFP::get(f64(), 0.5)), i64());
     b.CreateBr(innerHead);
 
+    // ペア運搬の f64 影は「バッチ入場時に一度だけ」正規化する
+    // （バッチ内は書き込み側で正規化するので、ここは端数の 1 回だけ）。
+    b.SetInsertPoint(batchHead->getTerminator());
+    std::vector<LValue*> headIn(phis.begin(), phis.end());
+    for (size_t i = 0; i < body->args.size(); ++i)
+        if (isPairCarry(*body, i)) headIn[i] = healOnce(phis[i]);
     b.SetInsertPoint(innerHead);
-    auto* batchPhi = b.CreatePHI(f64(), 2);
-    batchPhi->addIncoming(used, batchHead);
+    auto* batchPhi = b.CreatePHI(i64(), 2);
+    batchPhi->addIncoming(usedI, batchHead);
     std::vector<llvm::PHINode*> innerPhis;
     for (size_t i = 0; i < body->args.size(); ++i) {
         auto* phi = b.CreatePHI(ty(body->args[i].type), 2);
-        phi->addIncoming(phis[i], batchHead);
+        phi->addIncoming(headIn[i], batchHead);
         innerPhis.push_back(phi);
         vals[keyOf(body->args[i])] = phi;
-    }
-    LValue* go2 = b.CreateFCmpOGE(batchPhi,
-                                  llvm::ConstantFP::get(f64(), 0.5));
+        // 以降の読みは heal 不要（'b' の影はここで非 NaN が保証される）。
+        if (isPairCarry(*body, i)) markArgNonNaN(body->args[i]);
+    }    LValue* go2 = b.CreateICmpSGE(batchPhi,
+                                  llvm::ConstantInt::get(i64(), 1));
     b.CreateCondBr(go2, innerBody, after);
 
     b.SetInsertPoint(innerBody);
@@ -1419,8 +2076,13 @@ bool Lowerer::emitBatchedRepeat(Op& op, LValue* remaining, Block* body,
     }
     std::vector<LValue*> nextSeq;
     for (const Value& v : term->operands) nextSeq.push_back(value(v));
+    // バックエッジは書き込み側で正規化する（分岐は予測されるので
+    // ループキャリーの依存連鎖から vcmpord+blend が消える）。
+    for (size_t i = 0; i < innerPhis.size(); ++i)
+        if (i < nextSeq.size() && isPairCarry(*body, i))
+            nextSeq[i] = healCarryOnWrite(nextSeq[i]);
     LValue* batchNext =
-        b.CreateFSub(batchPhi, llvm::ConstantFP::get(f64(), 1.0));
+        b.CreateSub(batchPhi, llvm::ConstantInt::get(i64(), 1));
     BasicBlock* innerEnd = b.GetInsertBlock();
     b.CreateBr(innerHead);
     batchPhi->addIncoming(batchNext, innerEnd);
@@ -1433,10 +2095,9 @@ bool Lowerer::emitBatchedRepeat(Op& op, LValue* remaining, Block* body,
                      innerPhis.size(), body->args.size());
     b.SetInsertPoint(after);
     std::vector<LValue*> cur(innerPhis.begin(), innerPhis.end());
-    // カウンタは i64。バッチで実際に実行する反復数は端数込みで
-    // floor(used+0.5)（本体は batchPhi>=0.5 の間だけ回る）。
-    warpStepOverride_ = b.CreateFPToSI(
-        b.CreateFAdd(used, llvm::ConstantFP::get(f64(), 0.5)), i64());
+    // バッチで実際に実行した反復数（端数込み）。内側カウンタと同じ
+    // floor(used+0.5) を共有する。
+    warpStepOverride_ = usedI;
     std::vector<LValue*> checked = emitWarpCheck(wy, cur);
     warpStepOverride_ = nullptr;
     if (!error.empty()) return true;
@@ -1449,6 +2110,41 @@ bool Lowerer::emitBatchedRepeat(Op& op, LValue* remaining, Block* body,
         else
             outerNext[i] = llvm::UndefValue::get(ty(body->args[i].type));
     }
+    // バッチ境界でリストヘッダを読み直す（yield 中に他スレッドが
+    // 伸縮させ得るため）。バッチごとの数命令なので、手渡し無しでも
+    // 無条件に読み直す。
+    std::vector<LValue*> hdrLpNew, hdrItNew, hdrLnNew;
+    for (size_t hi = 0; hi < phiHeaders.size(); ++hi) {
+        ListHeader* h = phiHeaders[hi];
+        LValue* lpN = b.CreateLoad(
+            ptr(), b.CreateConstGEP1_32(
+                       i8(), h->var, uint32_t(offsetof(Variable, list))));
+        BasicBlock* relNull = b.GetInsertBlock();
+        BasicBlock* relHave = BasicBlock::Create(lc, "lst.relhave", fn);
+        BasicBlock* relDone = BasicBlock::Create(lc, "lst.reldone", fn);
+        b.CreateCondBr(b.CreateIsNull(lpN), relDone, relHave);
+        b.SetInsertPoint(relHave);
+        LValue* itN = b.CreateLoad(
+            ptr(), b.CreateConstGEP1_32(
+                       i8(), lpN, uint32_t(offsetof(SList, items))));
+        LValue* lnN = b.CreateLoad(
+            i32(), b.CreateConstGEP1_32(
+                       i8(), lpN, uint32_t(offsetof(SList, len))));
+        b.CreateBr(relDone);
+        b.SetInsertPoint(relDone);
+        auto* lpP = b.CreatePHI(ptr(), 2);
+        lpP->addIncoming(lpN, relHave);
+        lpP->addIncoming(llvm::ConstantPointerNull::get(ptr()), relNull);
+        auto* itP = b.CreatePHI(ptr(), 2);
+        itP->addIncoming(itN, relHave);
+        itP->addIncoming(llvm::ConstantPointerNull::get(ptr()), relNull);
+        auto* lnP = b.CreatePHI(i32(), 2);
+        lnP->addIncoming(lnN, relHave);
+        lnP->addIncoming(llvm::ConstantInt::get(i32(), 0), relNull);
+        hdrLpNew.push_back(lpP);
+        hdrItNew.push_back(itP);
+        hdrLnNew.push_back(lnP);
+    }
     BasicBlock* afterEnd = b.GetInsertBlock();
     // 終端 br を出す前に残り回数の減算を発行する（後から作ると
     // 終端命令の後ろに命令が付いて壊れた IR になる）。
@@ -1457,6 +2153,15 @@ bool Lowerer::emitBatchedRepeat(Op& op, LValue* remaining, Block* body,
     remainPhi->addIncoming(nextRemain, afterEnd);
     for (size_t i = 0; i < phis.size(); ++i)
         phis[i]->addIncoming(outerNext[i], afterEnd);
+    for (size_t hi = 0; hi < phiHeaders.size(); ++hi) {
+        ListHeader* h = phiHeaders[hi];
+        static_cast<llvm::PHINode*>(h->lpPhi)->addIncoming(hdrLpNew[hi],
+                                                         afterEnd);
+        static_cast<llvm::PHINode*>(h->itemsPhi)->addIncoming(hdrItNew[hi],
+                                                            afterEnd);
+        static_cast<llvm::PHINode*>(h->lenPhi)->addIncoming(hdrLnNew[hi],
+                                                           afterEnd);
+    }
 
     b.SetInsertPoint(exitBB);
     for (size_t i = 0; i < op.resultTypes.size(); ++i) {
@@ -1504,6 +2209,22 @@ void Lowerer::emitRepeat(Op& op) {
         if (!error.empty()) {
             error += " (repeat init operand " + std::to_string(i) + ")";
             return;
+        }
+    }
+    // numFacts 解析用: 各 f64 block arg の incoming（entry 値 + body の
+    // yield バックエッジ値）を登録する。arg → {init, back} の 2 要素。
+    {
+        Op* term = body->lastOp();
+        if (term && term->name == "xyo.yield") {
+            for (size_t i = 0; i < body->args.size(); ++i) {
+                if (body->args[i].type != Type::f64()) continue;
+                auto& vec = numFactsInsStore_.emplace_back();
+                if (i + 1 < op.operands.size())
+                    vec.push_back(&op.operands[i + 1]);
+                if (i < term->operands.size())
+                    vec.push_back(&term->operands[i]);
+                loopArgIns_[keyOf(body->args[i])] = &vec;
+            }
         }
     }
     // warp ループで本体が小さいなら 64 反復チャンクに展開する。
@@ -1641,7 +2362,9 @@ void Lowerer::emitWaitUntil(Op& op) {
         error = "malformed xyo.wait_until";
         return;
     }
-    const bool event = op.attrInt("event") != 0;
+    // コルーチン化前提では event 依存最適化（xyo_wait_event_yield 内部で
+    // Fiber を譲る）を使わない — 停止点は明示的な xyo_yield だけにする。
+    const bool event = !coroMode_ && op.attrInt("event") != 0;
     const uint64_t site = static_cast<uint64_t>(op.attrInt("site"));
     mayYield = true;
     voluntaryYield = true;
@@ -1705,7 +2428,12 @@ void Lowerer::emitForEach(Op& op) {
     b.CreateBr(head);
     b.SetInsertPoint(head);
     LValue* i = b.CreateLoad(i64(), idx);
-    LValue* go = b.CreateFCmpOLE(b.CreateSIToFP(i, f64()), n);
+    // interp は「index を増やしてから index < VALUE」で回すので、
+    // 端数の上限は床ではなく「i-1 < n」— 3.5 は 4 回回る（i=4 で
+    // 3 < 3.5）。i <= n だと端数で 1 回足りなくなる。
+    LValue* go = b.CreateFCmpOLT(
+        b.CreateFSub(b.CreateSIToFP(i, f64()),
+                     llvm::ConstantFP::get(f64(), 1.0)), n);
     b.CreateCondBr(go, bodyBB, doneBB);
     b.SetInsertPoint(bodyBB);
     b.CreateCall(callee("xyo_var_set", {ptr(), ptr(), ptr(), i64()},
@@ -1724,16 +2452,17 @@ void Lowerer::emitForEach(Op& op) {
 
 void Lowerer::emitStop(Op& op) {
     const std::string kind(op.attrStr("kind"));
-    if (kind == "all") {
-        b.CreateCall(callee("xyo_stop_all_begin", {ptr()}, b.getVoidTy()),
-                     {ctx});
+    if (kind == "all" || kind == "script") {
+        b.CreateCall(
+            callee(kind == "all" ? "xyo_stop_all_begin"
+                                 : "xyo_stop_script_begin",
+                   {ptr()}, b.getVoidTy()),
+            {ctx});
         b.CreateBr(retBlock());
-        return;
-    }
-    if (kind == "script") {
-        b.CreateCall(callee("xyo_stop_script_begin", {ptr()}, b.getVoidTy()),
-                     {ctx});
-        b.CreateBr(retBlock());
+        // builder が鎖を切る（terminated_）ため後続 op は原則無いが、
+        // 終端 xyo.yield と region 側の br が残る。終端済みブロックへ
+        // それ以上命令を足さないよう未接続の dead ブロックへ移す。
+        b.SetInsertPoint(BasicBlock::Create(lc, "stop.dead", fn));
         return;
     }
     // clone の削除は条件付き（この clone だけ消える）。
@@ -1897,16 +2626,20 @@ void Lowerer::emitOp(Op& op) {
     }
     if (n == "xyo.add.f" || n == "xyo.sub.f" || n == "xyo.mul.f" ||
         n == "xyo.div.f" || n == "xyo.mod.f") {
-        LValue* a = value(op.operands[0]);
-        LValue* c = value(op.operands[1]);
+        LValue* a = f64Operand(op.operands[0]);
+        LValue* c = f64Operand(op.operands[1]);
         LValue* r = nullptr;
         if (n == "xyo.add.f") r = b.CreateFAdd(a, c);
         else if (n == "xyo.sub.f") r = b.CreateFSub(a, c);
         else if (n == "xyo.mul.f") r = b.CreateFMul(a, c);
         else if (n == "xyo.div.f") {
             // 2 の冪の定数除数は乗算に置き換える（IEEE で厳密に同じ）。
+            // ただし逆数が表現できない場合は除算のまま — cc = 2^-1074
+            // のような最小 denormal は 1/cc が +inf になり、x*inf で
+            // 0 が NaN・有限値が ±inf になる（found: x/'5e-324'）。
             double cc = 0.0;
-            if (!constF64Of(op.operands[1], &cc) || !isPow2(cc))
+            if (!constF64Of(op.operands[1], &cc) || !isPow2(cc) ||
+                !std::isfinite(1.0 / cc))
                 r = b.CreateFDiv(a, c);
             else
                 r = b.CreateFMul(a, llvm::ConstantFP::get(f64(), 1.0 / cc));
@@ -1925,17 +2658,29 @@ void Lowerer::emitOp(Op& op) {
                 LValue* t =
                     b.CreateUnaryIntrinsic(llvm::Intrinsic::trunc, q);
                 r0 = b.CreateFSub(a, b.CreateFMul(c, t));
-                // -0.0 の保持: (-0) - c*trunc((-0)/c) は +0 になるが、
-                // fmod(-0, c) は -0。入力が -0 のときだけ入力を返す。
-                LValue* isNegZero = b.CreateICmpEQ(
+                // fmod(n,c) は r==0 のとき符号を n に合わせる
+                // （cutform では n - c*trunc(n/c) が必ず +0 になる）。
+                // -0.0 の入力だけでなく n が c の整数倍のときも
+                // 必要: fmod(-3, 1) = -0 だが -3 - 1*trunc(-3) = +0。
+                LValue* r0IsZero = b.CreateFCmpOEQ(
+                    r0, llvm::ConstantFP::get(f64(), 0.0));
+                LValue* signedZero = b.CreateSelect(
+                    b.CreateFCmpOLT(a, llvm::ConstantFP::get(f64(), 0.0)),
+                    llvm::ConstantFP::get(f64(), -0.0),
+                    llvm::ConstantFP::get(f64(), 0.0));
+                LValue* isNegZeroIn = b.CreateICmpEQ(
                     b.CreateBitCast(a, i64()),
                     llvm::ConstantInt::get(i64(), 0x8000000000000000ULL));
-                r0 = b.CreateSelect(isNegZero, a, r0);
+                signedZero = b.CreateSelect(
+                    isNegZeroIn, a, signedZero);
+                r0 = b.CreateSelect(r0IsZero, signedZero, r0);
             } else {
                 r0 = b.CreateFRem(a, c);
             }
             // 補正の符号判定 r0/c も、2 の冪の定数除数なら乗算で足りる。
-            LValue* q = (isPow2(cc) && cc != 0.0)
+            // 上と同じく 1/cc が表現できない場合（最小 denormal）は除算。
+            LValue* q = (isPow2(cc) && cc != 0.0 &&
+                         std::isfinite(1.0 / cc))
                             ? b.CreateFMul(r0,
                                            llvm::ConstantFP::get(f64(),
                                                                  1.0 / cc))
@@ -1970,14 +2715,24 @@ void Lowerer::emitOp(Op& op) {
         }
         static constexpr double kBound = 1048576.0;  // 2^20
         const bool nonNeg = op.attrInt("nonneg", 0) != 0;
-        LValue* f = b.CreateBitCast(bits, f64());
         LValue* isNum = b.CreateICmpSLT(
             bits, llvm::ConstantInt::get(i64(), kNumBitsLimit));
+        // 非数値（数値化できる文字列 "0" 等）も to_num が正確な整数を
+        // 返すなら昇格可 — legacy の induction 輸送と同じ判定。
+        // repeat/change ループの初期値が文字列リテラルでも int 化する。
+        LValue* numF = b.CreateCall(callee("xyo_to_num", {i64()}, f64()),
+                                    {bits});
+        LValue* f = b.CreateSelect(
+            isNum, b.CreateBitCast(bits, f64()), numF);
         LValue* ordered = b.CreateFCmpORD(f, f);
         // -0.0 は整数だが i32 輸送で +0 になるため除外する
         // （1/-0 == -Infinity と 1/+0 == +Infinity の区別のため）。
-        LValue* nonZero = b.CreateFCmpONE(
-            f, llvm::ConstantFP::get(f64(), 0.0));
+        // fcmp ではなくビット判定: +0.0 を除くと k_i=0 始まりのループが
+        // 入口ガードで全滅し int 昇格が死ぬ。
+        LValue* nonZero = b.CreateICmpNE(
+            b.CreateBitCast(f, i64()),
+            llvm::ConstantInt::get(
+                i64(), std::numeric_limits<int64_t>::min()));
         LValue* inRange;
         if (nonNeg) {
             inRange = b.CreateAnd(
@@ -1997,6 +2752,12 @@ void Lowerer::emitOp(Op& op) {
     }
     if (n == "xyo.box.f") {
         LValue* d = value(op.operands[0]);
+        // non-NaN が証明できる f64 影は canonical 化を省略して bitcast
+        // のみ（ループ運搬の heal 済み 'd' で ord+cmov が消える）。
+        if (numFacts(op.operands[0]) & 1) {
+            vals[k0] = b.CreateBitCast(d, i64());
+            return;
+        }
         vals[k0] = b.CreateSelect(b.CreateFCmpUNO(d, d),
                                   llvm::ConstantInt::get(i64(), kNumBitsLimit),
                                   b.CreateBitCast(d, i64()));
@@ -2140,13 +2901,23 @@ void Lowerer::emitOp(Op& op) {
             return;
         }
         llvm::Type* dt = op.resultTypes.empty() ? i64() : ty(op.resultTypes[0]);
+        // !xyo.f64 期待でない値が f64 降格されて来た場合は直接変換
+        // （numberShadow と同じく toNumber 境界なので NaN→0 相当の
+        // 素直な fptosi でよい: f64 NaN は Value 経路なら to_num=0）。
+        if (bits->getType() == f64()) {
+            LValue* z = b.CreateSelect(
+                b.CreateFCmpUNO(bits, bits),
+                llvm::ConstantFP::get(f64(), 0.0), bits);
+            vals[k0] = b.CreateFPToSI(z, dt);
+            return;
+        }
         vals[k0] = toIntChecked(bits, dt);
         return;
     }
     if (n == "xyo.cmp.f") {
         const int64_t pred = op.attrInt("pred");
-        LValue* a = value(op.operands[0]);
-        LValue* c = value(op.operands[1]);
+        LValue* a = f64Operand(op.operands[0]);
+        LValue* c = f64Operand(op.operands[1]);
         static const llvm::CmpInst::Predicate kPreds[] = {
             llvm::CmpInst::FCMP_OLT, llvm::CmpInst::FCMP_OGT,
             llvm::CmpInst::FCMP_OLE, llvm::CmpInst::FCMP_OGE,
@@ -2218,8 +2989,6 @@ void Lowerer::emitOp(Op& op) {
             error = "xyo.cmp.guarded: unsupported predicate";
             return;
         }
-        LValue* abits = value(op.operands[0]);
-        LValue* bbits = value(op.operands[1]);
         LValue* af = value(op.operands[2]);
         LValue* bf = value(op.operands[3]);
         LValue* limit = llvm::ConstantInt::get(i64(), kNumBitsLimit);
@@ -2234,7 +3003,22 @@ void Lowerer::emitOp(Op& op) {
             if (n == "xyo.const") {
                 const Attr* a = v.op->attr("bits");
                 if (!a || !a->isInt()) return false;
-                return xyo::Value{static_cast<uint64_t>(a->i)}.isNumber();
+                const uint64_t cb = static_cast<uint64_t>(a->i);
+                const xyo::Value cv{cb};
+                if (cv.isNumber()) return true;
+                // numericCompareOperand と同じ判定で数値文字列定数
+                // （numState 1=数値, 4=Infinity リテラル）だけ畳む。
+                // "false" や空白文字列は to_num しても 0 になるが
+                // 比較では文字列扱いなので fast に乗せられない。
+                if (!cv.isString()) return false;
+                SStr* cs = cv.asStrPtr();
+                if (!cs) return false;
+                uint32_t st = cs->loadNumState();
+                if (st == 0) {
+                    (void)cast::parseNumberStringUncached(cs);
+                    st = cs->loadNumState();
+                }
+                return st == 1 || st == 4;
             }
             return false;
         };
@@ -2243,6 +3027,21 @@ void Lowerer::emitOp(Op& op) {
                 return llvm::ConstantInt::get(b.getInt1Ty(), 1);
             return b.CreateAnd(b.CreateICmpSLT(value(bits), limit),
                                b.CreateFCmpORD(f, f));
+        };
+        // 片側が数値文字列の定数（"1000" 等）のとき、静的には
+        // 「素の double」と言えず側判定が落ちて slow の xyo_* 呼出しが
+        // 毎反復走る。文字列が数値として読めて、かつ相手が確定数値なら
+        // 数値比較で合流できる（Scratch では両側が数値化可能なら
+        // 数値比較 — 定数側は to_num で読めることを確認済み）。
+        auto constNumericStr = [&](const Value& v) -> bool {
+            if (!v.op || v.op->name != "xyo.const") return false;
+            const Attr* a = v.op->attr("bits");
+            if (!a || !a->isInt()) return false;
+            const uint64_t cb = static_cast<uint64_t>(a->i);
+            const xyo::Value cv{cb};
+            if (cv.isNumber()) return true;
+            if (!cv.isString()) return false;
+            return !std::isnan(xyo_to_num(cb));
         };
         LValue* ok = b.CreateAnd(sideOk(op.operands[0], af),
                                  sideOk(op.operands[1], bf));
@@ -2258,6 +3057,10 @@ void Lowerer::emitOp(Op& op) {
         BasicBlock* fastEnd = b.GetInsertBlock();
         b.CreateBr(join);
         b.SetInsertPoint(slow);
+        // bits は slow 経路でだけ materialize する（box.f producer を
+        // fast 側で作らない）。
+        LValue* abits = slowBits(op.operands[0]);
+        LValue* bbits = slowBits(op.operands[1]);
         LValue* sr = b.CreateICmpNE(
             b.CreateCall(callee(sym, {i64(), i64()}, i32()), {abits, bbits}),
             llvm::ConstantInt::get(i32(), 0));
@@ -2684,7 +3487,7 @@ void Lowerer::emitOp(Op& op) {
         //   -0.5 <= x < 0   -> -0
         //   x == 0          -> x（符号保持）
         LValue* x = n == "xyo.round" ? numberShadow(op.operands[0])
-                                     : value(op.operands[0]);
+                                     : f64Operand(op.operands[0]);
         if (!x) {
             error = "xyo.round: operand not lowered";
             return;
@@ -2717,7 +3520,7 @@ void Lowerer::emitOp(Op& op) {
         };
         const int64_t fn = op.attrInt("op");
         LValue* x = n == "xyo.mathop" ? numberShadow(op.operands[0])
-                                      : value(op.operands[0]);
+                                      : f64Operand(op.operands[0]);
         if (!x) {
             error = "xyo.mathop: operand not lowered";
             return;
@@ -2855,10 +3658,11 @@ void Lowerer::emitOp(Op& op) {
             b.SetInsertPoint(chk2);
         }
         LValue* len =
-            lh ? b.CreateLoad(i32(), lh->lenSlot)
-               : b.CreateLoad(i32(), b.CreateConstGEP1_32(
-                                        i8(), list,
-                                        uint32_t(offsetof(SList, len))));
+            lh && lh->lenPhi ? lh->lenPhi
+            : lh ? b.CreateLoad(i32(), lh->lenSlot)
+                 : b.CreateLoad(i32(), b.CreateConstGEP1_32(
+                                          i8(), list,
+                                          uint32_t(offsetof(SList, len))));
         // [1,len] の両側判定を符号なし 1 命令に畳む: (uint)(idx-1) < (uint)len。
         // idx<1 なら idx-1 は wrap して巨大値になり、idx>len なら idx-1>=len。
         // XYO_MLIR_NOULEITEM=1 で旧形式（SGE+SLE+AND）に戻す（A/B 用）。
@@ -2878,10 +3682,11 @@ void Lowerer::emitOp(Op& op) {
             llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i64(), 1))}));
         b.SetInsertPoint(fast);
         LValue* items =
-            lh ? b.CreateLoad(ptr(), lh->itemsSlot)
-               : b.CreateLoad(ptr(), b.CreateConstGEP1_32(
-                                        i8(), list,
-                                        uint32_t(offsetof(SList, items))));
+            lh && lh->itemsPhi ? lh->itemsPhi
+            : lh ? b.CreateLoad(ptr(), lh->itemsSlot)
+                 : b.CreateLoad(ptr(), b.CreateConstGEP1_32(
+                                          i8(), list,
+                                          uint32_t(offsetof(SList, items))));
         LValue* off = b.CreateSub(b.CreateSExt(idx, i64()),
                                   llvm::ConstantInt::get(i64(), 1));
         LValue* item = b.CreateLoad(i64(), b.CreateGEP(i64(), items, off));
@@ -2923,10 +3728,11 @@ void Lowerer::emitOp(Op& op) {
         b.CreateBr(chk2);
         b.SetInsertPoint(chk2);
         LValue* len =
-            lh ? b.CreateLoad(i32(), lh->lenSlot)
-               : b.CreateLoad(i32(), b.CreateConstGEP1_32(
-                                        i8(), list,
-                                        uint32_t(offsetof(SList, len))));
+            lh && lh->lenPhi ? lh->lenPhi
+            : lh ? b.CreateLoad(i32(), lh->lenSlot)
+                 : b.CreateLoad(i32(), b.CreateConstGEP1_32(
+                                          i8(), list,
+                                          uint32_t(offsetof(SList, len))));
         // [1,len] の両側判定を符号なし 1 命令に畳む: (uint)(idx-1) < (uint)len。
         // idx<1 なら idx-1 は wrap して巨大値になり、idx>len なら idx-1>=len。
         // XYO_MLIR_NOULEITEM=1 で旧形式（SGE+SLE+AND）に戻す（A/B 用）。
@@ -2946,13 +3752,24 @@ void Lowerer::emitOp(Op& op) {
             llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i64(), 1))}));
         b.SetInsertPoint(fast);
         LValue* items =
-            lh ? b.CreateLoad(ptr(), lh->itemsSlot)
-               : b.CreateLoad(ptr(), b.CreateConstGEP1_32(
-                                        i8(), list,
-                                        uint32_t(offsetof(SList, items))));
+            lh && lh->itemsPhi ? lh->itemsPhi
+            : lh ? b.CreateLoad(ptr(), lh->itemsSlot)
+                 : b.CreateLoad(ptr(), b.CreateConstGEP1_32(
+                                          i8(), list,
+                                          uint32_t(offsetof(SList, items))));
         LValue* off = b.CreateSub(b.CreateSExt(idx, i64()),
                                   llvm::ConstantInt::get(i64(), 1));
         LValue* item = b.CreateLoad(i64(), b.CreateGEP(i64(), items, off));
+        // numeric/intvalued フラグは「プロジェクト内の書き込みが全て数値」
+        // という静的証明に過ぎず、ホスト（テストの SList::push 等）が実行
+        // の合間に文字列を挿入し得る。タグを見ずに bitcast するとポインタ
+        // を浮動小数と誤読するので、plain double だけを fast に通し、
+        // それ以外は slow（xyo_list_item + xyo_to_num）へ落とす。
+        BasicBlock* fastNum = BasicBlock::Create(lc, "lin.fastnum", fn);
+        b.CreateCondBr(b.CreateICmpSLT(
+                           item, llvm::ConstantInt::get(i64(), kNumBitsLimit)),
+                       fastNum, slow);
+        b.SetInsertPoint(fastNum);
         LValue* fv = b.CreateBitCast(item, f64());
         // 整数値リスト（intvalued=1）は NaN を含まないことが静的に証明
         // されているので NaN→0 正規化を省く。XYO_MLIR_NOINTVAL=1 で無効化。
@@ -2990,14 +3807,20 @@ void Lowerer::emitOp(Op& op) {
         // 数値リストの読み（Value 索引）。範囲/整数検査は item と同一で、
         // 値はタグ検査なしで数値化する。
         LValue* var = value(op.operands[0]);
-        LValue* idxBits = value(op.operands[1]);
+        // box.f 昇格値なら bits 化をスキップし slow でだけ materialize する。
+        LValue* f = indexF(op.operands[1]);
         ListHeader* lh = nullptr;
         LValue* list = listPtrFor(op, var, &lh);
         BasicBlock* chk1 = BasicBlock::Create(lc, "lnv.chk1", fn);
         BasicBlock* chk2 = BasicBlock::Create(lc, "lnv.chk2", fn);
         BasicBlock* fast = BasicBlock::Create(lc, "lnv.fast", fn);
-        BasicBlock* slow = BasicBlock::Create(lc, "lnv.slow", fn);
+        // ホットな並び (fast → fastNum → join) を連続させ、slow は最後に
+        // 置く。slow を fast と fastNum の間に挟むと fast 経路が無条件 jmp
+        // で飛び越す形になり、ループ本体が 2 キャッシュラインに跨がって
+        // 実測 2.3 倍遅かった（定数索引のリスト読み）。
+        BasicBlock* fastNum = BasicBlock::Create(lc, "lnv.fastnum", fn);
         BasicBlock* join = BasicBlock::Create(lc, "lnv.join", fn);
+        BasicBlock* slow = BasicBlock::Create(lc, "lnv.slow", fn);
         b.CreateCondBr(b.CreateIsNull(list), slow, chk1,
                        llvm::MDNode::get(lc, {
                            llvm::MDString::get(lc, "branch_weights"),
@@ -3009,35 +3832,37 @@ void Lowerer::emitOp(Op& op) {
         b.CreateBr(chk2);
         b.SetInsertPoint(chk2);
         LValue* len =
-            lh ? b.CreateLoad(i32(), lh->lenSlot)
-               : b.CreateLoad(i32(), b.CreateConstGEP1_32(
-                                        i8(), list,
-                                        uint32_t(offsetof(SList, len))));
-        LValue* f = b.CreateBitCast(idxBits, f64());
-        LValue* plain = b.CreateAnd(
-            b.CreateICmpSLT(idxBits,
-                            llvm::ConstantInt::get(i64(), kNumBitsLimit)),
-            b.CreateFCmpORD(f, f));
-        LValue* lenF = b.CreateUIToFP(len, f64());
-        LValue* inRange = b.CreateAnd(
-            b.CreateFCmpOGE(f, llvm::ConstantFP::get(f64(), 1.0)),
-            b.CreateFCmpOLE(f, lenF));
-        LValue* integral = b.CreateFCmpOEQ(
-            f, b.CreateUnaryIntrinsic(llvm::Intrinsic::floor, f));
-        LValue* ok = b.CreateAnd(plain, b.CreateAnd(inRange, integral));
+            lh && lh->lenPhi ? lh->lenPhi
+            : lh ? b.CreateLoad(i32(), lh->lenSlot)
+                 : b.CreateLoad(i32(), b.CreateConstGEP1_32(
+                                          i8(), list,
+                                          uint32_t(offsetof(SList, len))));
+        // 整数化範囲検査（legacy と同形）: off = cvttsd2si(f)-1 を
+        // (uint64)off < len で判定。toListIndexD は floor + [1,len] だが、
+        // 正の有限値で floor==trunc、負/範囲外/NaN/タグ値は cvtt の結果が
+        // unsigned で len を超えて必ず slow へ落ちるため等価。
+        // f64 の 3 比較 + floor + AND 列が cvtt+sub+ult の 3 命令になる。
+        LValue* i0 = b.CreateSub(b.CreateFPToSI(f, i64()),
+                                 llvm::ConstantInt::get(i64(), 1));
+        LValue* ok = b.CreateICmpULT(i0, b.CreateZExt(len, i64()));
         b.CreateCondBr(ok, fast, slow, llvm::MDNode::get(lc, {
             llvm::MDString::get(lc, "branch_weights"),
             llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i64(), 63)),
             llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i64(), 1))}));
         b.SetInsertPoint(fast);
         LValue* items =
-            lh ? b.CreateLoad(ptr(), lh->itemsSlot)
-               : b.CreateLoad(ptr(), b.CreateConstGEP1_32(
-                                        i8(), list,
-                                        uint32_t(offsetof(SList, items))));
-        LValue* i0 = b.CreateSub(b.CreateFPToSI(f, i64()),
-                                 llvm::ConstantInt::get(i64(), 1));
+            lh && lh->itemsPhi ? lh->itemsPhi
+            : lh ? b.CreateLoad(ptr(), lh->itemsSlot)
+                 : b.CreateLoad(ptr(), b.CreateConstGEP1_32(
+                                          i8(), list,
+                                          uint32_t(offsetof(SList, items))));
         LValue* item = b.CreateLoad(i64(), b.CreateGEP(i64(), items, i0));
+        // item.num.i と同じ理由（ホストがプロジェクト外から非数値を挿入
+        // し得る）で、要素のタグを確認してから bitcast する。
+        b.CreateCondBr(b.CreateICmpSLT(
+                           item, llvm::ConstantInt::get(i64(), kNumBitsLimit)),
+                       fastNum, slow);
+        b.SetInsertPoint(fastNum);
         LValue* fv = b.CreateBitCast(item, f64());
         // 整数値リスト（intvalued=1）は NaN を含まないことが静的に証明
         // されているので NaN→0 正規化を省く（item.num.i と同様）。
@@ -3060,7 +3885,7 @@ void Lowerer::emitOp(Op& op) {
         b.SetInsertPoint(slow);
         LValue* raw = b.CreateCall(
             callee("xyo_list_item", {ptr(), ptr(), i64()}, i64()),
-            {ctx, var, idxBits});
+            {ctx, var, slowBits(op.operands[1])});
         LValue* sd = b.CreateCall(callee("xyo_to_num", {i64()}, f64()), {raw});
         BasicBlock* slowEnd = b.GetInsertBlock();
         b.CreateBr(join);
@@ -3108,10 +3933,11 @@ void Lowerer::emitOp(Op& op) {
             b.SetInsertPoint(chk2);
         }
         LValue* len =
-            lh ? b.CreateLoad(i32(), lh->lenSlot)
-               : b.CreateLoad(i32(), b.CreateConstGEP1_32(
-                                        i8(), list,
-                                        uint32_t(offsetof(SList, len))));
+            lh && lh->lenPhi ? lh->lenPhi
+            : lh ? b.CreateLoad(i32(), lh->lenSlot)
+                 : b.CreateLoad(i32(), b.CreateConstGEP1_32(
+                                          i8(), list,
+                                          uint32_t(offsetof(SList, len))));
         // [1,len] の両側判定を符号なし 1 命令に畳む: (uint)(idx-1) < (uint)len。
         // idx<1 なら idx-1 は wrap して巨大値になり、idx>len なら idx-1>=len。
         // XYO_MLIR_NOULEITEM=1 で旧形式（SGE+SLE+AND）に戻す（A/B 用）。
@@ -3131,10 +3957,11 @@ void Lowerer::emitOp(Op& op) {
             llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i64(), 1))}));
         b.SetInsertPoint(fast);
         LValue* items =
-            lh ? b.CreateLoad(ptr(), lh->itemsSlot)
-               : b.CreateLoad(ptr(), b.CreateConstGEP1_32(
-                                        i8(), list,
-                                        uint32_t(offsetof(SList, items))));
+            lh && lh->itemsPhi ? lh->itemsPhi
+            : lh ? b.CreateLoad(ptr(), lh->itemsSlot)
+                 : b.CreateLoad(ptr(), b.CreateConstGEP1_32(
+                                          i8(), list,
+                                          uint32_t(offsetof(SList, items))));
         LValue* off = b.CreateSub(b.CreateSExt(idx, i64()),
                                   llvm::ConstantInt::get(i64(), 1));
         b.CreateStore(item, b.CreateGEP(i64(), items, off));
@@ -3254,7 +4081,8 @@ void Lowerer::emitOp(Op& op) {
     if (n == "xyo.list.replace") {
         // legacy と同じ: idx が 1..len の整数なら items[idx-1] を直接書く。
         LValue* var = value(op.operands[0]);
-        LValue* idxBits = value(op.operands[1]);
+        // box.f 昇格値なら bits 化をスキップ（slow でだけ materialize）。
+        LValue* f = indexF(op.operands[1]);
         LValue* item = value(op.operands[2]);
         LValue* list = b.CreateLoad(
             ptr(), b.CreateConstGEP1_32(
@@ -3282,18 +4110,10 @@ void Lowerer::emitOp(Op& op) {
         LValue* len = b.CreateLoad(
             i32(), b.CreateConstGEP1_32(
                        i8(), list, uint32_t(offsetof(SList, len))));
-        LValue* f = b.CreateBitCast(idxBits, f64());
-        LValue* plain = b.CreateAnd(
-            b.CreateICmpSLT(idxBits,
-                            llvm::ConstantInt::get(i64(), kNumBitsLimit)),
-            b.CreateFCmpORD(f, f));
-        LValue* lenF = b.CreateUIToFP(len, f64());
-        LValue* inRange = b.CreateAnd(
-            b.CreateFCmpOGE(f, llvm::ConstantFP::get(f64(), 1.0)),
-            b.CreateFCmpOLE(f, lenF));
-        LValue* integral = b.CreateFCmpOEQ(
-            f, b.CreateUnaryIntrinsic(llvm::Intrinsic::floor, f));
-        LValue* ok = b.CreateAnd(plain, b.CreateAnd(inRange, integral));
+        // 索引の判定: item と同じく off = cvttsd2si(f)-1 < len の整数化。
+        LValue* i0 = b.CreateSub(b.CreateFPToSI(f, i64()),
+                                 llvm::ConstantInt::get(i64(), 1));
+        LValue* ok = b.CreateICmpULT(i0, b.CreateZExt(len, i64()));
         b.CreateCondBr(ok, fast, slow, llvm::MDNode::get(lc, {
             llvm::MDString::get(lc, "branch_weights"),
             llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i64(), 63)),
@@ -3302,11 +4122,7 @@ void Lowerer::emitOp(Op& op) {
         LValue* items = b.CreateLoad(
             ptr(), b.CreateConstGEP1_32(
                        i8(), list, uint32_t(offsetof(SList, items))));
-        LValue* i = b.CreateFPToSI(f, i64());
-        b.CreateStore(item,
-                      b.CreateGEP(i64(), items,
-                                  b.CreateSub(i, llvm::ConstantInt::get(
-                                                     i64(), 1))));
+        b.CreateStore(item, b.CreateGEP(i64(), items, i0));
         b.CreateStore(llvm::ConstantInt::get(i8(), 1),
                       b.CreateConstGEP1_32(
                           i8(), list, uint32_t(offsetof(SList, monitorDirty))));
@@ -3325,7 +4141,7 @@ void Lowerer::emitOp(Op& op) {
         b.SetInsertPoint(slow);
         b.CreateCall(callee("xyo_list_replace", {ptr(), ptr(), i64(), i64()},
                             b.getVoidTy()),
-                     {ctx, var, idxBits, item});
+                     {ctx, var, slowBits(op.operands[1]), item});
         BasicBlock* slowEnd = b.GetInsertBlock();
         b.CreateBr(join);
         b.SetInsertPoint(join);
@@ -3364,6 +4180,57 @@ void Lowerer::emitOp(Op& op) {
         }
         const bool reporterCallee = op.attrInt("ret") != 0;
         const bool wantsValue = !op.resultTypes.empty();
+        // 呼出しグラフが循環する callee（builder が rec=1 を付けた）:
+        // legacy の rewriteRecursivePush と同じ形
+        //   r = xyo_proc_push_ex(ctx, bid, bc, defwarp, code, depth, 1, 1)
+        //   if (r && xyo_recursion_yield_due(ctx)) xyo_yield(ctx)
+        //   call; xyo_proc_pop(ctx)
+        // で非 warp の再帰呼出しが譲る（interpreter との parity）。
+        // 明示 yield は stackless::lowerRecursive がそのまま
+        // コルーチンの停止点として使える。
+        const bool framed = op.attrInt("rec") != 0;
+        if (framed) {
+            mayYield = true;
+            if (!mfWarp_) voluntaryYield = true;
+            const void* bc = reinterpret_cast<const void*>(
+                static_cast<uintptr_t>(op.attrInt("bc")));
+            LValue* rec = b.CreateCall(
+                callee("xyo_proc_push_ex",
+                       {ptr(), ptr(), ptr(), i32(), ptr(), i32(), i32(),
+                        i32()},
+                       i32()),
+                {ctx, idPtr(std::string(op.attrStr("bid"))),
+                 llvm::ConstantExpr::getIntToPtr(
+                     llvm::ConstantInt::get(
+                         i64(), reinterpret_cast<uintptr_t>(bc)),
+                     ptr()),
+                 llvm::ConstantInt::get(i32(), op.attrInt("defwarp")),
+                 idPtr(std::string(op.attrStr("code"))),
+                 llvm::ConstantInt::get(i32(), op.attrInt("depth")),
+                 llvm::ConstantInt::get(i32(), 1),
+                 llvm::ConstantInt::get(i32(), 1)});
+            LValue* due = b.CreateCall(
+                callee("xyo_recursion_yield_due", {ptr()}, i32()), {ctx});
+            LValue* need = b.CreateICmpNE(
+                b.CreateAnd(rec, due), llvm::ConstantInt::get(i32(), 0));
+            BasicBlock* yieldBB = BasicBlock::Create(lc, "rec.yield", fn);
+            BasicBlock* callBB = BasicBlock::Create(lc, "rec.call", fn);
+            b.CreateCondBr(need, yieldBB, callBB);
+            b.SetInsertPoint(yieldBB);
+            {
+                // warp 手続き内では runtime の isWarp が常に 1 で
+                // due 判定が必ず偽 — 実行上は no-op の協調点。
+                // legacy の callCooperativeYield と同じく !xyo.coop
+                // を付け、コルーチンの停止点にしない。
+                auto* call = b.CreateCall(
+                    callee("xyo_yield", {ptr()}, b.getVoidTy()), {ctx});
+                if (mfWarp_)
+                    call->setMetadata("xyo.coop",
+                                      llvm::MDNode::get(lc, {}));
+            }
+            b.CreateBr(callBB);
+            b.SetInsertPoint(callBB);
+        }
         std::vector<LValue*> args;
         llvm::AllocaInst* outSlot = nullptr;
         args.push_back(ctx);
@@ -3375,6 +4242,9 @@ void Lowerer::emitOp(Op& op) {
         }
         for (const Value& v : op.operands) args.push_back(value(v));
         b.CreateCall(target, args);
+        if (framed)
+            b.CreateCall(callee("xyo_proc_pop", {ptr()}, b.getVoidTy()),
+                         {ctx});
         // 手続き内の stop all / stop this script / delete this clone は
         // callee 側の xyo_*_begin が c->stopped を立てる。legacy codegen
         // の emitStoppedUnwind と同じく、呼出し後に検査してスクリプト
@@ -3413,6 +4283,9 @@ void Lowerer::emitOp(Op& op) {
         b.CreateBr(done);
         b.SetInsertPoint(done);
         b.CreateBr(retBlock());
+        // 終端済みブロックへ以後の op/region 終端 br を足さないよう
+        // dead ブロックへ挿入点を移す（call.stop と同じ形）。
+        b.SetInsertPoint(BasicBlock::Create(lc, "ret.dead", fn));
         return;
     }
     if (n == "xyo.snd.volume") {
@@ -3425,6 +4298,75 @@ void Lowerer::emitOp(Op& op) {
                                                    : "xyo_snd_changevolume";
         b.CreateCall(callee(sym, {ptr(), i64()}, b.getVoidTy()),
                      {ctx, value(op.operands[0])});
+        return;
+    }
+    if (n == "xyo.pen.setsize") {
+        // 既存 codegen と同じ helper — 呼出し回数カウンタ
+        // （xyo_pen_size_calls）の計上もここで行われる。
+        b.CreateCall(callee("xyo_pen_setsize", {ptr(), i64()}, b.getVoidTy()),
+                     {ctx, value(op.operands[0])});
+        return;
+    }
+    if (n == "xyo.direct" || n == "xyo.direct.get") {
+        // build 側の directMap と同じ契約: sym 名のランタイム helper に
+        // (ctx, 入力値..., フィールド値...) をそのまま渡す。
+        const std::string sym(op.attrStr("sym"));
+        if (sym.empty()) {
+            error = "xyo.direct: missing sym";
+            return;
+        }
+        if (op.attrInt("yields") != 0) {
+            mayYield = true;
+            voluntaryYield = true;
+        }
+        // コルーチン化前提では、内部で Fiber を yield する blocking helper
+        // を begin/poll 形へ展開する（stackless::lower は
+        // xyo_mot_glidexy / xyo_looks_saysecs 等を「内部 yield」として拒否）。
+        if (coroMode_ && op.attrInt("yields") != 0) {
+            if (emitCoroBlockingDirect(sym, op)) return;
+        }
+        std::vector<llvm::Type*> sig{ptr()};
+        std::vector<LValue*> args{ctx};
+        for (const Value& v : op.operands) {
+            sig.push_back(i64());
+            args.push_back(value(v));
+        }
+        LValue* r = b.CreateCall(
+            callee(sym.c_str(), sig,
+                   n == "xyo.direct" ? b.getVoidTy() : i64()),
+            args);
+        if (n == "xyo.direct.get") vals[k0] = r;
+        return;
+    }
+    if (n == "xyo.monitor") {
+        // モニタ表示切替（legacy の xyo_var_monitor と同じ helper）。
+        const std::string id(op.attrStr("id"));
+        b.CreateCall(
+            callee("xyo_var_monitor", {ptr(), ptr(), i32()}, b.getVoidTy()),
+            {ctx, idPtr(id),
+             llvm::ConstantInt::get(i32(), op.attrInt("vis"))});
+        return;
+    }
+    if (n == "xyo.wait") {
+        // legacy codegen と同じ waitBegin → poll/yield ループ。
+        mayYield = true;
+        voluntaryYield = true;
+        b.CreateCall(callee("xyo_wait_begin", {ptr(), f64()}, b.getVoidTy()),
+                     {ctx, f64Operand(op.operands[0])});
+        BasicBlock* head = BasicBlock::Create(lc, "wait.head", fn);
+        BasicBlock* yieldBB = BasicBlock::Create(lc, "wait.yield", fn);
+        BasicBlock* doneBB = BasicBlock::Create(lc, "wait.done", fn);
+        b.CreateBr(head);
+        b.SetInsertPoint(head);
+        LValue* more = b.CreateCall(
+            callee("xyo_wait_poll", {ptr()}, i32()), {ctx});
+        b.CreateCondBr(
+            b.CreateICmpNE(more, llvm::ConstantInt::get(i32(), 0)),
+            yieldBB, doneBB);
+        b.SetInsertPoint(yieldBB);
+        b.CreateCall(callee("xyo_yield", {ptr()}, b.getVoidTy()), {ctx});
+        b.CreateBr(head);
+        b.SetInsertPoint(doneBB);
         return;
     }
     if (n == "xyo.days2000" || n == "xyo.timer") {
@@ -3448,6 +4390,13 @@ void Lowerer::emitOp(Op& op) {
     if (n == "xyo.for_each") { emitForEach(op); return; }
     if (n == "xyo.stop") { emitStop(op); return; }
     if (n == "xyo.wait_until") { emitWaitUntil(op); return; }
+    if (n == "xyo.list.contents") {
+        // legacy の data_listcontents と同じ helper（Variable* を受ける）。
+        vals[k0] = b.CreateCall(
+            callee("xyo_list_contents", {ptr(), ptr()}, i64()),
+            {ctx, value(op.operands[0])});
+        return;
+    }
     if (n == "xyo.list.length") {
         LValue* var = value(op.operands[0]);
         LValue* list = b.CreateLoad(
@@ -3484,7 +4433,8 @@ void Lowerer::emitOp(Op& op) {
         // 直接読み: SList が JIT 直アクセス可（extra == nullptr）で、索引が
         // 1..len の整数のときだけ items[idx-1] を読む。それ以外は helper。
         LValue* var = value(op.operands[0]);
-        LValue* idxBits = value(op.operands[1]);
+        // box.f 昇格値なら bits 化をスキップ（slow でだけ materialize）。
+        LValue* f = indexF(op.operands[1]);
         LValue* list = b.CreateLoad(
             ptr(), b.CreateConstGEP1_32(
                        i8(), var, uint32_t(offsetof(Variable, list))));
@@ -3516,19 +4466,11 @@ void Lowerer::emitOp(Op& op) {
         LValue* len = b.CreateLoad(
             i32(), b.CreateConstGEP1_32(
                        i8(), list, uint32_t(offsetof(SList, len))));
-        // 索引の判定: 素の非 NaN double で 1..len の整数。
-        LValue* f = b.CreateBitCast(idxBits, f64());
-        LValue* plain = b.CreateAnd(
-            b.CreateICmpSLT(idxBits,
-                            llvm::ConstantInt::get(i64(), kNumBitsLimit)),
-            b.CreateFCmpORD(f, f));
-        LValue* lenF = b.CreateUIToFP(len, f64());
-        LValue* inRange = b.CreateAnd(
-            b.CreateFCmpOGE(f, llvm::ConstantFP::get(f64(), 1.0)),
-            b.CreateFCmpOLE(f, lenF));
-        LValue* integral = b.CreateFCmpOEQ(f, b.CreateUnaryIntrinsic(
-                                                  llvm::Intrinsic::floor, f));
-        LValue* ok = b.CreateAnd(plain, b.CreateAnd(inRange, integral));
+        // 索引の判定: item.num と同じく off = cvttsd2si(f)-1 < len の
+        // 整数化（等価性は同じ）。3 比較 + floor が cvtt+sub+ult になる。
+        LValue* i0 = b.CreateSub(b.CreateFPToSI(f, i64()),
+                                 llvm::ConstantInt::get(i64(), 1));
+        LValue* ok = b.CreateICmpULT(i0, b.CreateZExt(len, i64()));
         b.CreateCondBr(ok, fast, slow, llvm::MDNode::get(lc, {
             llvm::MDString::get(lc, "branch_weights"),
             llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i64(), 63)),
@@ -3537,17 +4479,14 @@ void Lowerer::emitOp(Op& op) {
         LValue* items = b.CreateLoad(
             ptr(), b.CreateConstGEP1_32(
                        i8(), list, uint32_t(offsetof(SList, items))));
-        LValue* i = b.CreateFPToSI(f, i64());
-        LValue* p0 = b.CreateGEP(
-            i64(), items,
-            b.CreateSub(i, llvm::ConstantInt::get(i64(), 1)));
-        LValue* item = b.CreateLoad(i64(), p0);
+        LValue* item = b.CreateLoad(i64(),
+                                    b.CreateGEP(i64(), items, i0));
         BasicBlock* fastEnd = b.GetInsertBlock();
         b.CreateBr(join);
         b.SetInsertPoint(slow);
         LValue* slowVal = b.CreateCall(
             callee("xyo_list_item", {ptr(), ptr(), i64()}, i64()),
-            {ctx, var, idxBits});
+            {ctx, var, slowBits(op.operands[1])});
         BasicBlock* slowEnd = b.GetInsertBlock();
         b.CreateBr(join);
         b.SetInsertPoint(join);
@@ -3603,7 +4542,7 @@ void Lowerer::lowerBlock(Block& blk, BasicBlock* bb) {
 
 LoweredFunction lowerToLLVM(Module& source, llvm::Module& dest,
                             llvm::LLVMContext& lc,
-                            const std::string& entryName) {
+                            const std::string& entryName, bool coroMode) {
     LoweredFunction out;
     Shared shared;
     shared.numericVars = &source.numericVars;
@@ -3637,6 +4576,14 @@ LoweredFunction lowerToLLVM(Module& source, llvm::Module& dest,
         BasicBlock* entry = BasicBlock::Create(lc, "entry", fn);
         Lowerer l{dest, lc, shared};
         l.fn = fn;
+        // コルーチン化前提はスクリプトの全関数へ適用する。手続き関数は
+        // 融合で entry へ畳まれるか、再帰グラフなら
+        // stackless::lowerRecursive が各手続きをコルーチン化する
+        // （xyo_loop_yield を残すと internal yield として拒否されるため、
+        // 手続き側も同じ形にする。lower 失敗時も明示 yield の形は
+        // Fiber 上で意味論が同じ）。
+        l.coroMode_ = coroMode;
+        l.mfWarp_ = mf->warp();
         l.ctx = fn->getArg(0);
         if (mf->op && mf->op->attrInt("ret") != 0) l.argBase = 2;
         if (mf->body->args.empty()) {
@@ -3704,6 +4651,7 @@ LoweredFunction lowerToLLVM(Module& source, llvm::Module& dest,
     }
     out.mayYield = anyYield;
     out.voluntaryYield = anyVoluntary;
+    out.mainThread = shared.mainThread;
     if (std::getenv("XYO_MLIR_FNTRACE"))
         std::fprintf(stderr, "[mlir-total] anyYield=%d ok=%d\n",
                      anyYield ? 1 : 0, out.ok ? 1 : 0);

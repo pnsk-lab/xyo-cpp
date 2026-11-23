@@ -409,3 +409,111 @@ legacy 29,385 ms → MLIR 29,964 ms（+2%）〜 31,906 ms（+9%）。
 計算主体（流体シム）は ticks +32%、レンダラ主体は数 % 遅い。
 **レンダラ接続時の既定を従来に戻したい場合は
 `play`/`gui` だけ `isEnabled()` で renderer を見て false にする**のが次の調整点。
+
+## Round 240: MLIR-005（再帰コルーチン化 + fallback ゼロ）後の再測定
+
+- **hotspot スイート交互 A/B（同一バイナリ、runs=1×3 交互、中央値）**:
+  全 47 ベンチ幾何平均 **1.78x**（R239 の 1.72x と同水準 = 誤差内）。
+  fib 0.50x / ack 0.50x / sort 0.34x / read 0.16x / collatz 0.08x が従来どおり
+  の弱点で、今回の仕事による変動ではない。チェックサム差は
+  `sched_*`（時間依存）のみ。
+- **なぜ動かないか**: ScratchBench の headless variant は
+  `XYO_JIT_MODE=hotspot` を明示するため Mega プリセットが外れる
+  （`Mega requires the Eager LLVM tier`）。今回の再帰コルーチン化と
+  0-fallback 化は Mega/eager 経路の機構であり、hotspot の数値には
+  影響しない — 正確性と `xyo run` 既定経路の拡張が目的の変更。
+- **Mega 直接測定（`XYO_JIT_MEGA=1`、eager、同一 sb3）**: MLIR vs legacy =
+  **2.98x 幾何平均**（hotspot の 1.78x を上回る）。定数ループ畳み込み系が
+  Mega 融合でさらに伸びる（loops_empty 242x、str_join 408x）。
+  fib/ack は warp 再帰（`procSafeRecursive` でフレーム自体を emit しない
+  plain 呼出し＋sync batch 参加）なので 0.5x 据え置き — コルーチン化は
+  非 warp 再帰向けの機構。
+- **微修正**: `xyo.call` の `rec` attr 付与は `coroMode_`（コルーチン候補）
+  のときだけに限定。コルーチンにならないスクリプトでは push_ex/pop
+  フレームは純粋なオーバーヘッドなので（hotspot では `coroCandidate` が
+  `generalEnabled`/`enabled` に連動するため実質 no-op だが、非候補の
+  Fiber 経路でもフレームを emit しない形に揃えた）。
+
+## Round 241: ループ運搬の NaN 正規化とリスト読み（numFacts 解析）
+
+### 実装したもの
+
+1. **`numFacts` 解析（f64 の non-NaN / finite を最大不動点で求める）**
+   `lower_llvm.cpp`。`const.f64` / `to_num` / `add.f,sub.f` / `mul.f` /
+   `div.f,mod.f` / `mathop.f` / `select` / `if` / `warp_yield` /
+   ループ運搬 block argument を評価し、bit0=non-NaN・bit1=finite を返す。
+   ループ運搬は「そのブロックの f64 arg を楽観 3 で種付けし、incoming を
+   再評価して下げるだけ」の 6 反復不動点（単調なので必ず収束）。
+   非 NaN が証明できた値は `f64Operand` / `numberShadow` の
+   `select(uno(d),0,d)` を省く。
+   **注意**: 不動点が既に確定済みの arg（`markArgNonNaN` で保証した値）を
+   上書きしないこと。姉妹 arg の求解が確定値を 0 に落とし、heal が復活
+   するバグを実測で踏んだ（下記の「効かなかった」の一因）。
+
+2. **書き込み側 NaN 正規化（`healCarryOnWrite`）**
+   読み側 `select(uno)` は `vcmpordsd(4cy)+blend(1)+vaddsd(4)` がループ
+   キャリーの依存連鎖になる。バックエッジで `vucomisd; jp` の稀分岐に
+   出し、正規化値は 0.0（影が NaN なら bits は box.f の正準 NaN で
+   `to_num(正準 NaN)=0`）に置き換える。legacy と同じ形。
+   `kinds="b"`（bits が box.f 由来で常に正準）の f64 側だけに適用。
+
+3. **`indexF` の定数畳み込み**
+   リスト索引が `xyo.const` のとき bitcast ではなく `to_num` で
+   コンパイル時評価する。文字列定数（"1"）の bits はタグ付きポインタで、
+   `bitcast→cvttsd2si` が INT64_MAX に fold され `icmp ult` が常に偽 →
+   fast path ごと消えて 2 命令しかない slow ループになっていた。
+
+4. **`xyo.list.item.num` のブロック順**（fast → fastNum → join → slow）
+
+5. **`XYO_MLIR_NOFUSENUM`**（`fuseNumericListToNum` を止める A/B ゲート）
+
+### 効いたもの（同一 sb3・`--fps 0`・プロジェクト内 `times` 計測）
+
+| ミニ | legacy | MLIR 前 | MLIR 後 |
+|------|--------|---------|---------|
+| `micro_loop`（`change i by 1` 50M） | 29 | **111** | **32（= 1.1x、ほぼ parity）** |
+| `abl_acc_const`（`sum += 7` 50M） | 29 | 32 | 32 |
+| `abl_read_const`（`sum += item 1 of L`、NOFUSENUM） | 90 | 282 | 121 |
+
+`change i by 1` の 3.4 倍差は「ループ運搬の非 NaN 証明」が無く、
+毎反復 `vcmpord+blend` がキャリーに乗っていたことが原因だった。修正後は
+legacy と同等（32 vs 29 ms）。
+
+### 効かなかったもの（すべて実測で棄却）
+
+- **リストヘッダの巻き上げ**（`XYO_MLIR_LISTHDR=1`）: 依存ロード 4 本が
+  消えて内側ループが 5 命令になっても **-0〜2%** のみ。リスト読みの
+  コストはロード連鎖ではない。
+- **読み側 heal の削除**: 0%。
+- **読み側 heal を書き込み側へ移動**: 定数索引で ±0%、変数索引で悪化。
+- **バッチ yield**（`XYO_MLIR_NOBATCH=1`）: スイートで -2〜8%。
+- **変数昇格の無効化**（`XYO_MLIR_NOPROMOTE=1`）: スイートで -20〜36%。
+- **`list.item.num` への fusion**（`to_num(list.item)` → `.num`）:
+  定数索引のミニでは 2.3 倍**速い**が、変数索引のミニとスイート
+  （`list_read` 138K→128K）では**遅い**。既定は fusion 有効のまま。
+
+### 決定的な観測: スイート差はコード生成の差ではない
+
+- スイートは **1 スクリプト 5,649 op / 49 ループ / promoted=174** を
+  **1 関数**として emit（`xyo-jit: compiled ~Mv 211.6ms`、legacy は 2668.7ms）。
+  fallback は 0 件（`XYO_MLIR_TRACE=1` で確認）。
+- 生成コードは MLIR の方が**小さい**（`.text` 242,666 B vs legacy 541,726 B）
+  → I-cache 圧力説は棄却。
+- 上記の全トグル（heal / ロード巻き上げ / バッチ / 昇格 / fusion）が
+  スイートの app_*/algo_*/list_* を **±数% しか動かさない**一方、
+  同じコードの隔離ミニでは 2〜3 倍動く。
+- したがって Round 240 の P3（「ミニ parity・スイート 0.22x、原因は
+  文脈」）は維持され、**P1「item fast path 抜本」をコード生成側の
+  書き換えで解決する見込みは薄い**。ただし切り分けは進んだ:
+  ループ本体の命令列・ロード連鎖・yield・昇格・コードサイズの
+  いずれも主因ではない。
+- 残る最有力は **ネストループの昇格漏れ**（P2、`scanBlock` の region
+  打ち切り）。スイートで `int=10` / `loops=49` しか整数昇格が発火して
+  おらず、app_*/algo_primes/sieve はすべて二重ループである点と整合する。
+
+### スイート実測（Round 241 前 → 後、同一バイナリ差し替え前後での比較）
+
+app_life +0.5% / app_brainfuck +3.3% / app_raycast +3.2% / app_ast +4.1% /
+algo_sort +4.1% / algo_matmul +5.0% / algo_primes +4.4% / algo_ack +3.5% /
+list_read +7.1% / list_insdel +15.9% / str_cast +5.0% / math_expsqrt -2.7%。
+回帰は 1 件のみで、他は微増。

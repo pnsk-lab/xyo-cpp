@@ -30,6 +30,7 @@
 #include "../core/cast.hpp"
 #include "../jit/aot_emit.hpp"
 #include "../jit/jit.hpp"
+#include "../jit/stackless_coro_lower.hpp"
 #include "../core/sstr.hpp"
 #include "../model/blocks.hpp"
 #include "ir.hpp"
@@ -143,8 +144,10 @@ bool blockIntExpr(const Blocks& tb, const xyo::Block* b,
 /// 常に数値（素の double）を生成する式か（ブロック木の再帰）。
 /// 算術/比較系の演算子は Scratch では常に数値（NaN 含む）を返すので、
 /// オペランドの型は問わない。変数読みは集合に含まれるときだけ数値。
+/// 数値要素リストの item 参照・リスト長・リスト内位置も数値。
 bool blockNumericExpr(const Blocks& tb, const xyo::Block* b,
                       const std::unordered_set<std::string>& vars,
+                      const std::unordered_set<std::string>& lists,
                       int depth = 0) {
     if (!b || depth > 8) return false;
     const std::string& op = b->opcode;
@@ -168,6 +171,15 @@ bool blockNumericExpr(const Blocks& tb, const xyo::Block* b,
         auto it = b->fields.find("VARIABLE");
         return it != b->fields.end() && vars.count(it->second.id) != 0;
     }
+    // data_itemoflist は numericLists に入っていても数値確定ではない:
+    // 証明は「スクリプト内の書き込みが全て数値」だが、ホスト（テスト・
+    // モニタ・未コンパイル経路）が実行の合間に文字列を挿入し得る。
+    // 'd' 昇格変数の box.f は必ず数値 bits を作るため、文字列を読んだ
+    // 値の比較が lexical 比較を失う（numeric promotion テストで検出）。
+    if (op == "data_lengthoflist")
+        return true;
+    if (op == "data_itemnumoflist")
+        return true;
     return false;
 }
 
@@ -215,7 +227,7 @@ void computeNumericTypes(Runtime& runtime, Target* target, Blocks* blocks,
                     if (!vars.count(it->second.id)) continue;
                     const xyo::Block* vin =
                         resolveInputBlock(tb, blk, "VALUE");
-                    if (!blockNumericExpr(tb, vin, vars)) badVars.insert(it->second.id);
+                    if (!blockNumericExpr(tb, vin, vars, lists)) badVars.insert(it->second.id);
                     continue;
                 }
                 if (op == "data_addtolist" || op == "data_insertatlist" ||
@@ -226,7 +238,7 @@ void computeNumericTypes(Runtime& runtime, Target* target, Blocks* blocks,
                     if (!lists.count(it->second.id)) continue;
                     const xyo::Block* vin =
                         resolveInputBlock(tb, blk, "ITEM");
-                    if (!blockNumericExpr(tb, vin, vars))
+                    if (!blockNumericExpr(tb, vin, vars, lists))
                         badLists.insert(it->second.id);
                     continue;
                 }
@@ -605,14 +617,37 @@ bool tryEmitScript(llvm::Module& mod, llvm::LLVMContext& lc,
     // 内の外書きを許す条件に使う（broadcast/clone 等は多重起動し得る）。
     m.singleSpawn = top && top->opcode == "event_whenflagclicked";
     computeIntEligibility(runtime, target, blocks, m);
-    const StringPinner pin = [&](const std::u16string& text) -> uint64_t {
-        SStr* s = SStr::create(text);
-        pinned.strings.push_back(s);
-        return xyo::Value::string(s).bits;
+    const StringPinner pin = [&](const xyo::Value& lit) -> uint64_t {
+        // 既存の SStr を pin してポインタ同一性を保つ。非文字列 Value が
+        // 渡った場合はビット列をそのまま返す（呼出し側が文字列のみ渡す
+        // 前提だが、防御としてそのまま返しておく）。
+        if (lit.isString()) {
+            SStr* s = lit.asStrPtr();
+            if (s) {
+                pinned.strings.push_back(s);
+                return lit.bits;
+            }
+            return lit.bits; // kEmptyStr はポインタ不要のシングルトン
+        }
+        return lit.bits;
     };
+    // スタックレス・コルーチン化の候補なら、backend の stackless::lower が
+    // 受理できる IR 形状で emit する（legacy codegen の
+    // stacklessNormalLoop と同じ判断）。判定は backend と同じ条件に揃える。
+    static const bool blockCounting = [] {
+        const char* e = std::getenv("XYO_BLOCK_COUNT");
+        return e && e[0] == '1';
+    }();
+    const bool coroCandidate =
+        top && !blockCounting && !std::getenv("XYO_JIT_CALLFRAME") &&
+        !std::getenv("XYO_PROF") &&
+        (stackless::eligible(*blocks, *top) ||
+         stackless::generalCandidate(*blocks, *top));
+    BuildOptions buildOpts;
+    buildOpts.coroMode = coroCandidate;
     std::map<std::string, std::string> procNames;
     const BuildOutcome built = buildScriptFromBlocks(
-        m, *blocks, topBlockId, entryName, pin, &procNames);
+        m, *blocks, topBlockId, entryName, pin, &procNames, &buildOpts);
     if (!built.ok) {
         g_fallback.fetch_add(1, std::memory_order_relaxed);
         trace("fallback %s: %s", scriptLabel(topBlockId, top).c_str(),
@@ -663,7 +698,8 @@ bool tryEmitScript(llvm::Module& mod, llvm::LLVMContext& lc,
         }
     }
 
-    const LoweredFunction lowered = lowerToLLVM(m, mod, lc, entryName);
+    const LoweredFunction lowered =
+        lowerToLLVM(m, mod, lc, entryName, coroCandidate);
     if (!lowered.ok || !lowered.fn || !lowered.error.empty()) {
         g_fallback.fetch_add(1, std::memory_order_relaxed);
         trace("fallback %s: lowering failed (%s)", topBlockId.c_str(),
@@ -682,16 +718,33 @@ bool tryEmitScript(llvm::Module& mod, llvm::LLVMContext& lc,
     }
     // 生成した IR が壊れていたら関数ごと取り下げる（モジュールには
     // 触れていないので、既存 codegen が同じ名前で作り直せる）。
-    std::string verifyError;
+    // 手続き関数も検査する — entry だけだと callee 側の不正 IR
+    // （typed な icmp/to_num(double) 等）が残り、JIT の O2 パイプライン
+    // （IPSCCP 等）内でクラッシュした実績がある。
     {
-        llvm::raw_string_ostream os(verifyError);
-        if (llvm::verifyFunction(*lowered.fn, &os)) {
+        std::vector<llvm::Function*> toCheck{lowered.fn};
+        for (const auto& [vkey, fname] : procNames)
+            if (llvm::Function* f = mod.getFunction(fname))
+                toCheck.push_back(f);
+        std::string verifyError;
+        llvm::Function* bad = nullptr;
+        {
+            llvm::raw_string_ostream os(verifyError);
+            for (llvm::Function* f : toCheck)
+                if (llvm::verifyFunction(*f, &os)) { bad = f; break; }
+        }
+        if (bad) {
             if (std::getenv("XYO_MLIR_LLVM_ERR"))
-                lowered.fn->print(llvm::errs());
-            lowered.fn->eraseFromParent();
+                bad->print(llvm::errs());
+            // 名前は erase の前に控える — eraseFromParent() 後は
+            // llvm::Value::getName() が解放済みメモリを読む。
+            const std::string badName = bad->getName().str();
+            for (llvm::Function* f : toCheck)
+                if (f->getParent()) f->eraseFromParent();
             g_fallback.fetch_add(1, std::memory_order_relaxed);
-            trace("fallback %s: invalid LLVM function (%s)",
-                  topBlockId.c_str(), os.str().c_str());
+            trace("fallback %s: invalid LLVM function %s (%s)",
+                  topBlockId.c_str(), badName.c_str(),
+                  verifyError.c_str());
             return false;
         }
     }
@@ -704,7 +757,9 @@ bool tryEmitScript(llvm::Module& mod, llvm::LLVMContext& lc,
         pendingFnNames.push_back(fname);
     }
     out.entry = nullptr;  // JIT アドレス解決後に埋める（既存経路と同じ）
-    out.mainThread = false;
+    // compat/clone 系ヘルパを emit した場合は既存 codegen と同じく
+    // caller スレッド affinity を要求する（worker で走らせない）。
+    out.mainThread = lowered.mainThread;
     out.mayYield = lowered.mayYield;
     // 予算 watchdog だけで譲る（warp ループのみ）なら、legacy と同じく
     // 「協調的 yield のみ」として同期バッチに参加できる。
