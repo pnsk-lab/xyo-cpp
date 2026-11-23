@@ -1,31 +1,21 @@
-# Docker / bench での Qt 依存について（調査メモ）
+# Docker / bench での Qt 依存について
 
-## 現象
+## 解決済み（2026-11-23）
 
-scratch-bench (docker) で xyo-cpp の全 variant が exit 127 で失敗：
+`xyo-linux-x86_64.tar.gz` に Qt/SDL2/rsvg 等の `.so` を `lib/` として同梱し、
+rpath `$ORIGIN/lib` で参照するようにした（`release.yml` + `bundle_linux_libs.sh`）。
+Qt の無い docker でも動的バイナリがそのまま起動する。
+LGPL 対応として `lib/` 置換可能である旨を `THIRD-PARTY-NOTICES.txt` に明記。
 
-```
-xyo: error while loading shared libraries: libQt6Quick.so.6: cannot open shared object file
-```
+## 背景
 
-## 原因
+動的リンク release は Qt6 Quick にリンクしているが、bench の docker には
+Qt が無く、`libQt6Quick.so.6: cannot open shared object file` (exit 127) で
+`main()` 前に loader が失敗していた。`xyo run/test` は Qt を使わないが
+`DT_NEEDED` で要求されるため。
 
-`xyo-linux-x86_64.tar.gz`（動的リンク release）は Qt6 Quick に動的リンク
-している（LGPL のため。release.yml で明示）。Qt の無い環境では
-`main()` 前に loader が失敗する。`xyo run/test` は Qt を使わないが、
-`DT_NEEDED` で要求されるため起動できない。xyo-cpp のコード不良ではない。
+## 代替案（残る選択肢）
 
-## 対策
-
-### bench/docker 側（推奨）
-
-`xyo-linux-x86_64-static.tar.gz` を使う。`XYO_STATIC=ON` でビルドされ
-`readelf -d` の `NEEDED` が 0（完全静的）。headless の run/test/aot に
-必要十分。`src/runtimes/xyo.ts` の `archiveName` を static に変えるか、
-docker image に Qt6 を入れる（重いので static 推奨）。
-
-### xyo-cpp 側
-
-- `cmake -DXYO_QT=OFF` で Qt なしビルド可（`xyo gui` はスタブ）。
-- release は dynamic（desktop 向け、Qt あり）と static（container 向け、
-  Qt なし）の両方を出している。使い分けを明記する。
+- `xyo-linux-x86_64-static.tar.gz`（完全静的、依存ゼロ）。headless 専用なら
+  こちらでも可。
+- `cmake -DXYO_QT=OFF` で Qt なしビルド（`xyo gui` はスタブ）。
