@@ -893,3 +893,36 @@ verify 落ち → スクリプト全体が fallback。
   未接続。
 - 非 warp ループの spill/reload 削減、文字列 reporter の inline 化
   （letter 0.32x）、三角関数系の libm 呼び出し境界。
+
+## Round 252: クリーン再測定と現状確定
+
+### r249/r250/r251/r252 の整理
+
+- r249/r250 は `divRanges_` 伝搬バグによる全面 fallback（legacy 実行）
+  のため無効。`XYO_MLIR_TRACE=1` で `fallback` 行を確認すること。
+- r251（修正後）で復帰を確認：fallback 0 件、極端値（folding）維持、
+  collatz 0.22→0.82x。
+- r252（クリーン再実行、並行ビルドなし）で確定：geomean 2.1x。
+  r251 からの差は環境揺動（±5〜10%）の範囲内。
+
+### 確定状態（r252、legacy 比、hotspot）
+
+- Lists: read 0.90x、replace 0.85x、append 0.93x、insdel 1.01x、
+  search 8.61x（MLIR が大幅に高速）。
+- Algos: sort 0.69x、sieve 0.56x、matmul 0.65x、fib 0.45x、
+  ack 0.48x、primes 0.50x、collatz 0.82x。
+- Apps: life 0.46x、brainfuck 0.20x、raycast 0.61x、
+  projection 0.85x、ast 0.29x。
+- 検証: `XYO_JIT_MEGA=1 xyo-tests` 0 FAIL、`xcheck.py` 45/45、
+  fallback 0 件。
+
+### 残課題（優先度順）
+
+1. **再帰呼び出し**（fib/ack 0.45x）：`xyo_proc_push_ex` 経路。
+   MLIR-004 のコルーチン化と連携して直接呼び出し化。
+2. **while 版 box**（collatz の n 等の unbounded 変数）：
+   per-iter inrange + float 継続。`runBoxWhile` の雛形あり。
+3. **文字列 op**（letter 0.32x）：`letter_of` の helper 呼び出し。
+4. **float ループ一般**（mandel 0.32x、round 0.47x）：heal/影/yield の削減。
+5. **list_replace の suite 低下**（1.22→0.84x）：要再測定で切り分け
+   （micro では headers 中立を確認済みのため揺動の可能性大）。
