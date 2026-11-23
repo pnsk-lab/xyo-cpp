@@ -412,6 +412,9 @@ struct LoopCandidate {
 bool promotableLeaf(const std::string& n) {
     static const std::unordered_set<std::string> kOk = {
         "xyo.const",   "xyo.const.f64", "xyo.getvar",  "xyo.setvar",
+        // 手続き引数の読み（pure — 呼出し時確定の値を fn arg から読む
+        // だけ）。昇格の対象にも spill 対象にもならない葉。
+        "xyo.arg",
         "xyo.add",     "xyo.sub",       "xyo.mul",     "xyo.div",
         "xyo.mod",     "xyo.round",     "xyo.mathop",  "xyo.to_num",
         "xyo.from_num", "xyo.boolval",  "xyo.lt",      "xyo.gt",
@@ -724,8 +727,9 @@ struct Promoter {
     std::unordered_map<Op*, std::pair<int64_t, int64_t>> divRanges_;
     // 入口ガード版プロモーション（変数単位整数化＋入口検査）。
     // entry 非定数の変数にガード範囲を与えた解析が成功したときだけ使う。
-    // ガード範囲: |v| ≤ 2^20 の正確な整数（int_exact_ok が検査）。
-    static constexpr int64_t kGuardBound = 1048576;
+    // ガード範囲: |v| ≤ 2^30 の正確な整数（int_exact_ok が検査）。
+    // i32 表現域に十分な余裕を残す（中間値の add.i は区間証明で守る）。
+    static constexpr int64_t kGuardBound = 1073741824;
     // ガード版の解析中に参照する entry 範囲（nullptr なら通常解析）。
     const std::map<std::string, std::pair<int64_t, int64_t>>*
         guardEntries_ = nullptr;
@@ -1672,11 +1676,20 @@ struct Promoter {
     /// repeat の定数回数 C から、その変数の head 区間の上界を求める。
     /// 本体の書き込みが「定数代入」または「自分自身 + 定数」だけで、
     /// 入れ子ループ内に書き込みが無いときだけ計算する。
-    bool repeatBoundOf(const std::string& id, int64_t trips,
-                        const std::unordered_map<std::string,
-                                                 std::pair<int64_t, int64_t>>&
-                            iv,
-                        int64_t* lo, int64_t* hi) {
+    /// 変数 id の 1 反復あたりの変化量を「定数代入範囲 [cmin,cmax] と
+    /// 正側・負側の増分合計 pos/neg」に分解する。repeatBoundOf と
+    /// runBoxRepeat の実行時 prefix 計算の共通部品。
+    struct DeltaSums {
+        bool ok = false;
+        int64_t cmin = INT64_MAX;
+        int64_t cmax = INT64_MIN;
+        int64_t pos = 0;  // clamp 済み（|delta| > 2^40 は飽和）
+        int64_t neg = 0;
+    };
+    bool repeatDeltaSumsOf(const std::string& id,
+                           const std::unordered_map<
+                               std::string, std::pair<int64_t, int64_t>>& iv,
+                           DeltaSums* out) {
         bool sawWrite = false;
         bool ok = true;
         int64_t cmin = INT64_MAX, cmax = INT64_MIN;
@@ -1775,6 +1788,29 @@ struct Promoter {
         };
         walk(body, 0);
         if (!ok || !sawWrite) return false;
+        // i32 算術に乗せるため飽和させる。
+        auto clamp128 = [](__int128 x) -> int64_t {
+            if (x > (1LL << 40)) return (1LL << 40);
+            if (x < -(1LL << 40)) return -(1LL << 40);
+            return (int64_t)x;
+        };
+        out->ok = true;
+        out->cmin = cmin;
+        out->cmax = cmax;
+        out->pos = clamp128(pos);
+        out->neg = clamp128(neg);
+        return true;
+    }
+
+    bool repeatBoundOf(const std::string& id, int64_t trips,
+                        const std::unordered_map<std::string,
+                                                 std::pair<int64_t, int64_t>>&
+                            iv,
+                        int64_t* lo, int64_t* hi) {
+        DeltaSums ds;
+        if (!repeatDeltaSumsOf(id, iv, &ds)) return false;
+        const int64_t cmin = ds.cmin, cmax = ds.cmax;
+        const __int128 pos = ds.pos, neg = ds.neg;
         const LoopCandidate& lc = cands.at(id);
         int64_t baseLo = lc.intEntry;
         int64_t baseHi = lc.intEntry;
@@ -3470,6 +3506,12 @@ struct Promoter {
         }
         cands = std::move(scanTmp.cands);
         if (cands.empty()) return;
+        // 昇格前の入れ子ループは spill/reload 対象として採用する（repeat
+        // 経路と同じ）。忘れると isNestedOp が効かず、入れ子が書いた値を
+        // ループ先頭の古い SSA のまま参照して壊れる（quicksort の
+        // パーティションで実際にソート破壊を確認）。
+        nestedOps_ = std::move(scanTmp.nestedOps);
+        nestedWrites_ = std::move(scanTmp.nestedWrites);
         for (auto& [id, c] : cands) order.push_back(id);
         // while 系ループも warp 手続き内なら静的 warp（フロントが印を付ける）。
         // 印が無い/非 warp は従来どおり毎反復 spill する。
@@ -3477,7 +3519,7 @@ struct Promoter {
         intLoop = analyzeIntLoop();
         // entry 非定数で落ちた場合は入口ガード版を試す。
         bool useGuard = false;
-        if (!intLoop && guardEnabled()) {
+        if (!intLoop && guardEnabled() && nestedOps_.empty()) {
             scanIntConsts();
             std::map<std::string, std::pair<int64_t, int64_t>> guardMap;
             for (auto& [id, c] : cands) {
@@ -3501,12 +3543,19 @@ struct Promoter {
                 useGuard = intLoop;
             }
             // ループ条件でボックスを強制する版（途中脱出）。collatz の
-            // 3n+1 のように区間が発散する本体は、条件側で 0..2^20 を
+            // 3n+1 のように区間が発散する本体は、条件側で 0..2^30 を
             // 強制すれば i32 で閉じる。範囲外は直後の float ループが
             // 引き継ぐので意味論は不変。
-            if (!intLoop && !guardMap.empty() && boxEnabled() &&
-                loop->name == "xyo.while") {
-                for (auto& [id, v] : guardMap) boxMap[id] = {0, kGuardBound};
+            // 定数 entry の変数も対象にする（repeat 版と同様。bubblesort
+            // の j のように「入口は定数だが条件上界が静的に読めない」
+            // カウンタが head 区間で発散して落ちるのを防ぐ — 条件折込の
+            // v <= 2^30 が出口を保証する）。
+            if (!intLoop && boxEnabled() &&
+                loop->name == "xyo.while" && nestedOps_.empty()) {
+                for (auto& [id, c] : cands) {
+                    if (!m.intEligibleVars.count(id)) continue;
+                    boxMap[id] = {0, kGuardBound};
+                }
                 if (analyzeIntLoop(&boxMap, /*clampToBox=*/true,
                                    /*relaxClean=*/true)) {
                     guardEntries_ = nullptr;
@@ -3525,6 +3574,12 @@ struct Promoter {
             if (runGuardedWhile()) return;
             intLoop = false;
             planKinds(/*allowD=*/true);
+        }
+        if (!nestedOps_.empty()) {
+            // repeat 経路と同じく、入れ子 spill は bits が要るので
+            // d-only 運搬をペア運搬へ降格する。
+            for (const std::string& id : order)
+                if (kindOf(id) == 'd') kinds_[id] = 'b';
         }
         for (const std::string& id : order) {
             LoopCandidate& c = cands[id];
@@ -4949,6 +5004,41 @@ struct Promoter {
                 }
             }
         }
+        // 実行時 prefix: 全 int 変数の 1 反復あたりの増分区間が取れたら、
+        // 入口で「[0, 2^20] を逸脱しない最大回数 Tsafe」を計算し、int
+        // ループの trip を min(trip, Tsafe) に絞る。こうすれば範囲外
+        // にならないので毎反復の bail 検査と flag 運搬が要らない。
+        // Tsafe < trip なら残りは従来通り float で全反復やり直す。
+        // 変数の増分が読めない（複雑な式/ネストループ内の書き込み）
+        // ときは従来の bail 構造へフォールバックする。
+        bool usePrefix = false;
+        Value tripIV, prefixV;
+        std::vector<DeltaSums> dss;
+        if (!noBail) {
+            std::unordered_map<std::string,
+                               std::pair<int64_t, int64_t>> iv0;
+            for (auto& [i2, c2] : cands)
+                if (c2.isInt) iv0[i2] = {c2.intLo, c2.intHi};
+            bool okAll = true;
+            for (const std::string& id : order) {
+                const LoopCandidate& c = cands[id];
+                if (!c.isInt) continue;
+                DeltaSums ds;
+                if (!repeatDeltaSumsOf(id, iv0, &ds)) {
+                    okAll = false;
+                    break;
+                }
+                // 定数代入（set）が保証範囲を飛ぶと prefix 計算が
+                // 意味をなさないので bail 経路へ回す。
+                if (ds.cmin != INT64_MAX &&
+                    (ds.cmin < 0 || ds.cmax > kGuardBound)) {
+                    okAll = false;
+                    break;
+                }
+                dss.push_back(ds);
+            }
+            if (okAll && !dss.empty()) usePrefix = true;
+        }
         // 入口シャドウを保存（else 分岐用）。
         struct Shadow3 {
             Value bits, d, iv;
@@ -4956,7 +5046,99 @@ struct Promoter {
         std::map<std::string, Shadow3> entrySh;
         for (auto& [id, c] : pi.cands)
             entrySh[id] = {c.bits, c.d, c.iv};
-        if (noBail) {
+        if (noBail || usePrefix) {
+            // prefix 版: Tsafe を入口（then 側・intLoop 直前）で計算し、
+            // ループの trip を min(trip, Tsafe) に差し替える
+            // （prefix は必ず trip 以下なので全反復が保証範囲内）。
+            if (usePrefix) {
+                auto ipos = std::find(thenB->ops.begin(),
+                                      thenB->ops.end(), intLoop);
+                auto emitT = [&](const std::string& n,
+                                 std::vector<Value> ops, Type ty,
+                                 std::map<std::string, Attr> at = {}) {
+                    Op* o = pi.make(n, std::move(ops), {ty}, at);
+                    o->parent = thenB;
+                    ipos = thenB->ops.insert(ipos, o) + 1;
+                    return o->result(0);
+                };
+                auto mkI32 = [&](int64_t x) {
+                    return emitT("xyo.const.i", {}, Type::i32(),
+                                 {{"v", Attr::integer(x)}});
+                };
+                auto cmpI = [&](const Value& a, const Value& b,
+                                int64_t pred) {
+                    return emitT("xyo.cmp.i", {a, b}, Type::boolean(),
+                                 {{"pred", Attr::integer(pred)}});
+                };
+                auto clampNonNeg = [&](const Value& v) {
+                    Value z = mkI32(0);
+                    Value ge = cmpI(v, z, 5);  // SGE
+                    return emitT("xyo.select", {ge, v, z}, Type::i32());
+                };
+                tripIV = emitT("xyo.to_int", {tripVal}, Type::i32());
+                Value ts;
+                bool have = false;
+                size_t di = 0;
+                for (const std::string& id : order) {
+                    const LoopCandidate& c = cands[id];
+                    if (!c.isInt) continue;
+                    const DeltaSums& ds = dss[di++];
+                    int64_t v0c = c.intEntry;
+                    Value v0 = c.intGuarded ? tv.at(id) : Value{};
+                    auto minInto = [&](const Value& t) {
+                        if (!have) {
+                            ts = t;
+                            have = true;
+                            return;
+                        }
+                        Value lt = cmpI(t, ts, 0);  // SLT
+                        ts = emitT("xyo.select", {lt, t, ts},
+                                   Type::i32());
+                    };
+                    if (ds.pos > 0) {
+                        Value rem;
+                        if (!v0.op) {
+                            rem = mkI32(std::max<int64_t>(
+                                0, kGuardBound - v0c));
+                        } else {
+                            rem = clampNonNeg(
+                                emitT("xyo.sub.i",
+                                      {mkI32(kGuardBound), v0},
+                                      Type::i32()));
+                        }
+                        int64_t p = std::min<int64_t>(ds.pos,
+                                                      kGuardBound);
+                        Value q = emitT("xyo.div.i",
+                                        {rem, mkI32(p)}, Type::i32());
+                        minInto(q);
+                    }
+                    if (ds.neg < 0) {
+                        int64_t nd = std::min<int64_t>(-ds.neg,
+                                                       kGuardBound);
+                        Value q;
+                        if (!v0.op) {
+                            q = mkI32(std::max<int64_t>(0,
+                                                        v0c / nd));
+                        } else {
+                            q = emitT("xyo.div.i",
+                                      {clampNonNeg(v0), mkI32(nd)},
+                                      Type::i32());
+                        }
+                        minInto(q);
+                    }
+                }
+                if (have) {
+                    Value lt = cmpI(ts, tripIV, 0);  // SLT
+                    Value mn = emitT("xyo.select",
+                                     {lt, ts, tripIV}, Type::i32());
+                    prefixV = clampNonNeg(mn);
+                } else {
+                    prefixV = tripIV;
+                }
+                Value ft = emitT("xyo.from_int", {prefixV},
+                                 Type::value());
+                intLoop->operands[0] = ft;
+            }
             // guardian 無し: 本体をそのまま int 運搬で書き換え、
             // 終端 yield は変数値をそのまま運ぶ。
             pi.rewriteBlock(*intBody);
@@ -5163,6 +5345,29 @@ struct Promoter {
                 z->parent = thenB;
                 thenB->ops.push_back(z);
                 outs.push_back(z->result(0));
+            } else if (usePrefix) {
+                // prefix が trip 未満なら残りは float やり直しが要る。
+                Op* c = pi.make("xyo.cmp.i",
+                                {prefixV, tripIV},
+                                {Type::boolean()},
+                                {{"pred", Attr::integer(0)}});
+                c->parent = thenB;
+                thenB->ops.push_back(c);
+                Op* one = pi.make("xyo.const.i", {}, {Type::i32()},
+                                  {{"v", Attr::integer(1)}});
+                one->parent = thenB;
+                thenB->ops.push_back(one);
+                Op* zero = pi.make("xyo.const.i", {}, {Type::i32()},
+                                   {{"v", Attr::integer(0)}});
+                zero->parent = thenB;
+                thenB->ops.push_back(zero);
+                Op* f = pi.make("xyo.select",
+                                {c->result(0), one->result(0),
+                                 zero->result(0)},
+                                {Type::i32()});
+                f->parent = thenB;
+                thenB->ops.push_back(f);
+                outs.push_back(f->result(0));
             }
             Op* y = pi.make("xyo.yield", std::move(outs), {});
             y->parent = thenB;
@@ -6713,20 +6918,21 @@ uint64_t promoteNumericArith(Module& m) {
                 out.resize(mark);
             }
             // ボックス比較の両辺が数値化できる場合はガード付き比較へ
-            // 書き換える。item 読みはここで item.num 化される（単一使用・
-            // 数値リスト）。lowering の cmp.guarded は実行時ガード付きで
-            // fcmp し、外れたら helper へ落ちるため、ホスト挿入の非数値や
-            // NaN でも正しい。while ループ内の item 比較は int ループ昇格の
-            // 対象外で boxed のまま残るため、ここで拾う。
-            // XYO_MLIR_NOCMPGUARD=1 で従来の boxed 比較に戻せる（A/B 用）。
+            // 書き換える（既定 OFF の実験的パス。XYO_MLIR_CMPGUARD=1 で有効化）。
+            // bubble 系ベンチで fixpoint（numericLists）と組み合わせると
+            // 誤コンパイルするため既定では boxed のまま残す。A/B 用の
+            // 旧フラグ XYO_MLIR_NOCMPGUARD=1 も無効化として残す。
             if ((op->name == "xyo.lt" || op->name == "xyo.gt" ||
                  op->name == "xyo.eq") &&
                 op->operands.size() == 2) {
-                static const bool noCmpGuard = [] {
-                    const char* e = std::getenv("XYO_MLIR_NOCMPGUARD");
-                    return e && e[0] == '1';
+                static const bool enableCmpGuard = [] {
+                    if (const char* e = std::getenv("XYO_MLIR_CMPGUARD"))
+                        return e[0] == '1';
+                    if (const char* e = std::getenv("XYO_MLIR_NOCMPGUARD"))
+                        return !(e[0] == '1');
+                    return false;
                 }();
-                if (!noCmpGuard) {
+                if (enableCmpGuard) {
                     Value a, c;
                     const size_t mark = out.size();
                     if (toF64(op->operands[0], &a) &&

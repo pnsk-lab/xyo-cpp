@@ -21,9 +21,11 @@
 #include <unordered_set>
 
 #include <llvm/IR/Function.h>
+#include <llvm/IR/Instructions.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/Transforms/Utils/Cloning.h>
 
 #include "../engine/mega_preset.hpp"
 #include "../engine/runtime.hpp"
@@ -775,6 +777,55 @@ bool tryEmitScript(llvm::Module& mod, llvm::LLVMContext& lc,
                   topBlockId.c_str(), badName.c_str(),
                   verifyError.c_str());
             return false;
+        }
+    }
+
+    // legacy codegen の inlineSmallProcCalls と同じ小手続きインライン。
+    // LLVM のコストモデルは複数呼出しラッパ proc（sha256 の p3..p6 →
+    // p9/p10/p11 の 2 段呼出し）を残すので、しきい値内は強制展開する。
+    // コルーチン化された再帰グラフは呼出し形状が意味論なので触らない。
+    if (!coroCandidate) {
+        static const bool inlineProcs = [] {
+            const char* e = std::getenv("XYO_MLIR_NOINLINE");
+            return !(e && e[0] == '1');
+        }();
+        if (inlineProcs) {
+            unsigned maxInsts = 220;
+            if (const char* lim = std::getenv("XYO_JIT_INLINE_LIMIT"))
+                maxInsts = unsigned(std::strtoul(lim, nullptr, 10));
+            std::unordered_set<llvm::Function*> owned{lowered.fn};
+            for (const auto& [vkey, fname] : procNames)
+                if (llvm::Function* f = mod.getFunction(fname))
+                    owned.insert(f);
+            llvm::InlineFunctionInfo ifi;
+            for (int iter = 0; iter < 8 && maxInsts; ++iter) {
+                bool changed = false;
+                std::vector<llvm::CallBase*> sites;
+                for (llvm::Function* f : owned) {
+                    if (!f || f->empty()) continue;
+                    for (llvm::BasicBlock& bb : *f)
+                        for (llvm::Instruction& ins : bb)
+                            if (auto* cb =
+                                    llvm::dyn_cast<llvm::CallBase>(&ins))
+                                if (llvm::Function* cg =
+                                        cb->getCalledFunction())
+                                    if (cg != f && owned.count(cg))
+                                        sites.push_back(cb);
+                }
+                for (llvm::CallBase* cb : sites) {
+                    llvm::Function* cg = cb->getCalledFunction();
+                    if (!cg || cg->empty()) continue;
+                    unsigned n = 0;
+                    for (llvm::BasicBlock& bb : *cg)
+                        n += unsigned(bb.size());
+                    if (n > maxInsts) continue;
+                    if (llvm::InlineResult ir =
+                            llvm::InlineFunction(*cb, ifi);
+                        ir.isSuccess())
+                        changed = true;
+                }
+                if (!changed) break;
+            }
         }
     }
 

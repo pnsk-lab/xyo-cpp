@@ -221,8 +221,21 @@ struct Lowerer {
              std::string_view(name) == "xyo_ctl_deleteclone" ||
              std::string_view(name) == "xyo_ctl_deleteclone_begin"))
             shared.mainThread = true;
-        return mod.getOrInsertFunction(
+        auto fc = mod.getOrInsertFunction(
             name, llvm::FunctionType::get(ret, args, false));
+        // 純粋な値変換ヘルパは readonly/willreturn として印す。
+        // ループ条件の xyo_to_num(arg) のような不変呼出しを LICM が
+        // ホイストできるようになる（属性が無いと毎反復コールのまま）。
+        std::string_view sv(name);
+        if (sv == "xyo_to_num" || sv == "xyo_truthy") {
+            if (llvm::Function* f =
+                    llvm::cast<llvm::Function>(fc.getCallee())) {
+                f->setDoesNotThrow();
+                f->setWillReturn();
+                f->setOnlyReadsMemory();
+            }
+        }
+        return fc;
     }
 
     llvm::Value* ctxField(uint64_t off) {
@@ -452,7 +465,7 @@ struct Lowerer {
     void readListHeader(const ListHeader& h);
     std::vector<HoistEntry> hoistStack_;
     llvm::AllocaInst* entryAlloca(llvm::Type* t, const char* name);
-    void pushLoopScope(Block& body, bool warp);
+    void pushLoopScope(Block& body, bool warp, Block* extra = nullptr);
     void recomputeHoisted();
     bool tryHoistListRead(Op& op);
     /// チャンク分割された warp repeat の本体を発行する（64 反復 + tail）。
@@ -590,9 +603,20 @@ struct Lowerer {
         if (n == "xyo.add.f" || n == "xyo.sub.f") {
             const int a0 = evalFacts(o.operands[0]);
             const int c0 = evalFacts(o.operands[1]);
+            int r = 0;
             if (((a0 & 1) && (c0 & 2)) || ((a0 & 2) && (c0 & 1)))
-                return ((a0 & 2) && (c0 & 2)) ? 3 : 1;
-            return 0;
+                r = ((a0 & 2) && (c0 & 2)) ? 3 : 1;
+            if (std::getenv("XYO_MLIR_NUMDBG"))
+                std::fprintf(stderr,
+                             "[numfacts-eval] %s l=%s:%d r=%s:%d -> %d\n",
+                             n.c_str(),
+                             o.operands[0].op ? o.operands[0].op->name.c_str()
+                                              : "arg",
+                             a0,
+                             o.operands[1].op ? o.operands[1].op->name.c_str()
+                                              : "arg",
+                             c0, r);
+            return r;
         }
         if (n == "xyo.mul.f") {
             return (evalFacts(o.operands[0]) & 2) &&
@@ -703,9 +727,20 @@ struct Lowerer {
         for (const Value* a : sibArgs)
             if (!numFactsSettled_.count(keyOf(*a)))
                 numFactsSettled_[keyOf(*a)] = 1;
-        if (std::getenv("XYO_MLIR_NUMDBG"))
-            std::fprintf(stderr, "[numfacts] arg #%u -> %d\n",
+        if (std::getenv("XYO_MLIR_NUMDBG")) {
+            std::fprintf(stderr, "[numfacts] %s arg #%u -> %d",
+                         fn ? fn->getName().str().c_str() : "?",
                          v.argIndex, numFactsArg_[k]);
+            for (const Value* a : sibArgs) {
+                std::fprintf(stderr, " | arg%u ins:", a->argIndex);
+                for (const Value* in : *loopArgIns_[keyOf(*a)])
+                    std::fprintf(stderr, " %s:%d",
+                                 in->op ? in->op->name.c_str() : "arg",
+                                 evalFacts(*in));
+                std::fprintf(stderr, " =>%d", numFactsArg_[keyOf(*a)]);
+            }
+            std::fprintf(stderr, "\n");
+        }
         return numFactsArg_[k];
     }
 
@@ -809,6 +844,15 @@ struct Lowerer {
         *out = d;
         return true;
     }
+    /// f64 入力の Scratch mod: 両辺が正の i32 整数なら UREM32、
+    /// それ以外は fmod+符号補正。|c| が 2 の冪定数なら c*trunc(x/c)
+    /// 置き換え（除数定数は呼び出し側が hasDiv/dc で渡す）。
+    LValue* emitModF64(LValue* a, LValue* c, bool hasDiv, double dc);
+    /// 動的除数の mod の共有 slow 側。モジュールに 1 個だけ作る
+    /// noinline/cold の f64(f64,f64) — ±2^53 内の非零整数なら i64
+    /// SREM+符号補正、それ以外は fmod+符号補正（legacy
+    /// modWideVariableFn と同じ）。
+    llvm::Function* modWideVariableFn();
     void emitWarpLoopYield();
     /// warp ループの「本当に yield が要るか」検査を emit し、
     /// 要るときは handBB へ、要らなければ done へ分岐する。
@@ -851,6 +895,155 @@ namespace {
 constexpr int64_t kNumBitsLimit = static_cast<int64_t>(val::kNan);
 }  // namespace
 
+namespace {
+bool isPow2(double d);
+}
+
+/// f64 版の Scratch mod（xyo.mod と xyo.mod.f の共有実装）。
+/// |c| が 2 の冪の定数なら x - c*trunc(x/c)、そうでなければ両辺が
+/// 正の i32 整数のとき UREM32（fmod libcall を避ける）、どちらも
+/// 外れるときだけ frem+fdiv+select の符号補正を使う。
+LValue* Lowerer::emitModF64(LValue* a, LValue* c, bool hasDiv,
+                            double dc) {
+    LValue* r = nullptr;
+    if (hasDiv && isPow2(dc) && std::fabs(dc) >= 1.0) {
+        LValue* q = b.CreateFMul(
+            a, llvm::ConstantFP::get(f64(), 1.0 / dc));
+        LValue* t = b.CreateUnaryIntrinsic(llvm::Intrinsic::trunc, q);
+        LValue* r0 = b.CreateFSub(a, b.CreateFMul(c, t));
+        // fmod(n,c) は r==0 のとき符号を n に合わせる（cutform では
+        // 必ず +0 になるため。-0.0 入力と c の整数倍の両方で必要）。
+        LValue* r0IsZero =
+            b.CreateFCmpOEQ(r0, llvm::ConstantFP::get(f64(), 0.0));
+        LValue* signedZero = b.CreateSelect(
+            b.CreateFCmpOLT(a, llvm::ConstantFP::get(f64(), 0.0)),
+            llvm::ConstantFP::get(f64(), -0.0),
+            llvm::ConstantFP::get(f64(), 0.0));
+        LValue* isNegZeroIn = b.CreateICmpEQ(
+            b.CreateBitCast(a, i64()),
+            llvm::ConstantInt::get(i64(), 0x8000000000000000ULL));
+        signedZero = b.CreateSelect(isNegZeroIn, a, signedZero);
+        r0 = b.CreateSelect(r0IsZero, signedZero, r0);
+        // 補正の符号判定 r0/c も乗算で足りる（1/dc が表現できる場合。
+        // 最小 denormal 等は除算に残す）。
+        LValue* qc = (std::isfinite(1.0 / dc))
+                         ? b.CreateFMul(
+                               r0, llvm::ConstantFP::get(f64(), 1.0 / dc))
+                         : b.CreateFDiv(r0, c);
+        LValue* neg =
+            b.CreateFCmpOLT(qc, llvm::ConstantFP::get(f64(), 0.0));
+        return b.CreateSelect(neg, b.CreateFAdd(r0, c), r0);
+    }
+    // 非 2 冪除数: 呼出し側には「両辺が正の i32 整数 → UREM32」の
+    // fast path だけ残し、それ以外は __xyo_mod_var_wide（noinline/cold）
+    // へ譲る（legacy の emitArithNumeric AOp::Mod と同じ形。sha256 の
+    // mod 2^32 連打で inline 幅広分岐が呼出し側を圧迫していた）。
+    BasicBlock* fastBB = BasicBlock::Create(lc, "mod.intfast", fn);
+    BasicBlock* wideBB = BasicBlock::Create(lc, "mod.wide", fn);
+    BasicBlock* joinBB = BasicBlock::Create(lc, "mod.join", fn);
+    auto isIntVal = [&](LValue* x) {
+        LValue* t = b.CreateUnaryIntrinsic(llvm::Intrinsic::trunc, x);
+        return b.CreateAnd(b.CreateFCmpORD(x, x), b.CreateFCmpOEQ(t, x));
+    };
+    LValue* aOk = b.CreateAnd(
+        b.CreateAnd(
+            b.CreateFCmpOGT(a, llvm::ConstantFP::get(f64(), 0.0)),
+            b.CreateFCmpOLE(a,
+                            llvm::ConstantFP::get(f64(), 2147483647.0))),
+        isIntVal(a));
+    LValue* bOk = b.CreateAnd(
+        b.CreateAnd(
+            b.CreateFCmpOGE(c, llvm::ConstantFP::get(f64(), 1.0)),
+            b.CreateFCmpOLE(c,
+                            llvm::ConstantFP::get(f64(), 2147483647.0))),
+        isIntVal(c));
+    b.CreateCondBr(b.CreateAnd(aOk, bOk), fastBB, wideBB,
+                   llvm::MDNode::get(
+                       lc, {llvm::MDString::get(lc, "branch_weights"),
+                            llvm::ConstantAsMetadata::get(
+                                llvm::ConstantInt::get(i64(), 48)),
+                            llvm::ConstantAsMetadata::get(
+                                llvm::ConstantInt::get(i64(), 16))}));
+    b.SetInsertPoint(fastBB);
+    LValue* ai = b.CreateFPToUI(a, i32());
+    LValue* bi = b.CreateFPToUI(c, i32());
+    LValue* fastR = b.CreateUIToFP(b.CreateURem(ai, bi), f64());
+    BasicBlock* fastEnd = b.GetInsertBlock();
+    b.CreateBr(joinBB);
+    b.SetInsertPoint(wideBB);
+    LValue* wideR =
+        b.CreateCall(modWideVariableFn(), {a, c});
+    BasicBlock* wideEnd = b.GetInsertBlock();
+    b.CreateBr(joinBB);
+    b.SetInsertPoint(joinBB);
+    auto* phi = b.CreatePHI(f64(), 2);
+    phi->addIncoming(fastR, fastEnd);
+    phi->addIncoming(wideR, wideEnd);
+    r = phi;
+    return r;
+}
+
+/// 動的除数 mod の共有 slow 関数（legacy modWideVariableFn 相当）。
+llvm::Function* Lowerer::modWideVariableFn() {
+    constexpr const char* name = "__xyo_mod_var_wide";
+    if (auto* existing = mod.getFunction(name)) return existing;
+    auto* f = llvm::Function::Create(
+        llvm::FunctionType::get(f64(), {f64(), f64()}, false),
+        llvm::GlobalValue::InternalLinkage, name, mod);
+    f->addFnAttr(llvm::Attribute::NoInline);
+    f->addFnAttr(llvm::Attribute::Cold);
+    auto args = f->arg_begin();
+    llvm::Value* fa = &*args++;
+    llvm::Value* fb = &*args;
+    IRBuilder<> ir(lc);
+    auto* entry = BasicBlock::Create(lc, "entry", f);
+    auto* check = BasicBlock::Create(lc, "check", f);
+    auto* integer = BasicBlock::Create(lc, "integer", f);
+    auto* slow = BasicBlock::Create(lc, "float", f);
+    ir.SetInsertPoint(entry);
+    const auto bounded = [&](llvm::Value* v) {
+        return ir.CreateAnd(
+            ir.CreateFCmpOGT(
+                v, llvm::ConstantFP::get(f64(), -4503599627370496.0)),
+            ir.CreateFCmpOLT(
+                v, llvm::ConstantFP::get(f64(), 4503599627370496.0)));
+    };
+    llvm::Value* range = ir.CreateAnd(
+        ir.CreateAnd(bounded(fa), bounded(fb)),
+        ir.CreateAnd(
+            ir.CreateFCmpONE(fa, llvm::ConstantFP::get(f64(), 0.0)),
+            ir.CreateFCmpONE(fb, llvm::ConstantFP::get(f64(), 0.0))));
+    ir.CreateCondBr(range, check, slow);
+    ir.SetInsertPoint(check);
+    llvm::Value* ni = ir.CreateFPToSI(fa, i64());
+    llvm::Value* di = ir.CreateFPToSI(fb, i64());
+    llvm::Value* ints = ir.CreateAnd(
+        ir.CreateFCmpOEQ(ir.CreateSIToFP(ni, f64()), fa),
+        ir.CreateFCmpOEQ(ir.CreateSIToFP(di, f64()), fb));
+    ir.CreateCondBr(ints, integer, slow);
+    ir.SetInsertPoint(integer);
+    llvm::Value* rem = ir.CreateSRem(ni, di);
+    llvm::Value* adjust = ir.CreateAnd(
+        ir.CreateXor(
+            ir.CreateICmpSLT(rem, llvm::ConstantInt::get(i64(), 0)),
+            ir.CreateICmpSLT(di, llvm::ConstantInt::get(i64(), 0))),
+        ir.CreateICmpNE(rem, llvm::ConstantInt::get(i64(), 0)));
+    llvm::Value* wrapped =
+        ir.CreateSelect(adjust, ir.CreateAdd(rem, di), rem);
+    llvm::Value* numeric = ir.CreateSIToFP(wrapped, f64());
+    llvm::Value* negativeZero = ir.CreateAnd(
+        ir.CreateICmpEQ(rem, llvm::ConstantInt::get(i64(), 0)),
+        ir.CreateICmpSLT(ni, llvm::ConstantInt::get(i64(), 0)));
+    ir.CreateRet(ir.CreateSelect(
+        negativeZero, llvm::ConstantFP::get(f64(), -0.0), numeric));
+    ir.SetInsertPoint(slow);
+    llvm::Value* r0 = ir.CreateFRem(fa, fb);
+    llvm::Value* signDiff = ir.CreateFCmpOLT(
+        ir.CreateFDiv(r0, fb), llvm::ConstantFP::get(f64(), 0.0));
+    ir.CreateRet(ir.CreateSelect(signDiff, ir.CreateFAdd(r0, fb), r0));
+    return f;
+}
+
 llvm::AllocaInst* Lowerer::entryAlloca(llvm::Type* t, const char* name) {
     llvm::BasicBlock& entry = fn->getEntryBlock();
     IRBuilder<> ib(&entry, entry.begin());
@@ -889,6 +1082,31 @@ bool structuralMutator(const std::string& n) {
     return n == "xyo.list.add" || n == "xyo.list.insert" ||
            n == "xyo.list.delete" || n == "xyo.list.deleteall";
 }
+}
+
+namespace {
+/// 書き込む Value bits が「必ず数値（素の double または正準 NaN 未満）」
+/// と静的に証明できるか。真なら SList::numericOnly の更新を省いてよい
+/// （数値の書き込みは numericOnly を 1→0 に変えない）。
+bool guaranteedNumericBits(const Value& v) {
+    if (!v.op) return false;
+    const std::string& n = v.op->name;
+    if (n == "xyo.from_int") return true;
+    if (n == "xyo.const") {
+        const Attr* a = v.op->attr("bits");
+        if (a && a->isInt())
+            return static_cast<uint64_t>(a->i) <
+                   static_cast<uint64_t>(kNumBitsLimit);
+        return false;
+    }
+    // 数値証明済みリストの読みは必ず素の double ビット。
+    if ((n == "xyo.list.item" || n == "xyo.list.item.i") &&
+        !v.op->operands.empty() && v.op->operands[0].op &&
+        v.op->operands[0].op->name == "xyo.list.ptr" &&
+        v.op->operands[0].op->attrInt("numeric") != 0)
+        return true;
+    return false;
+}
 }  // namespace
 
 namespace {
@@ -897,41 +1115,47 @@ namespace {
 /// のため mem2reg でレジスタに乗り、反復ごとの 3 連鎖ロードが消える。
 /// yield 後の読み直しは実ハンドオフ時のみ。
 bool listHeaderOptIn() {
-    // 既定 off（XYO_MLIR_LISTHDR=1 で on）。ヘッダ運搬は理論上
-    // 反復ごとの 3 連鎖ロードを消すが、実測では preheader/reload の
-    // 追加コードとレジスタ圧でむしろ遅くなるケースが多い
-    // （suite A/B: off で list_replace 0.85→1.19x 他ほぼ全面改善）。
+    // 既定 on（XYO_MLIR_LISTHDR=0 で off）。書き込み側の item.i/
+    // replace.i が Variable.list/len/items を反復ごとにロードする
+    // ため、書き込みループ（bubblesort の swap 等）では hoist が効く。
+    // 読み専用ループではほぼ中立（i32-1 運搬でロード自体が軽い）。
     static const bool on = [] {
         const char* e = std::getenv("XYO_MLIR_LISTHDR");
-        return e && e[0] == '1';
+        return !e || e[0] != '0';
     }();
     return on;
 }
 }  // namespace
 
-void Lowerer::pushLoopScope(Block& body, bool warp) {
+void Lowerer::pushLoopScope(Block& body, bool warp, Block* extra) {
     LoopScope sc;
     sc.preheader = b.GetInsertBlock();
-    std::function<void(Block&)> walk = [&](Block& blk) {
-        for (Op* o : blk.ops) {
-            sc.bodyOps.insert(o);
-            if (listMutator(o->name) && !o->operands.empty() &&
-                o->operands[0].op &&
-                o->operands[0].op->name == "xyo.list.ptr")
-                sc.mutatedLists.insert(
-                    std::string(o->operands[0].op->attrStr("id")));
-            if (structuralMutator(o->name) && !o->operands.empty() &&
-                o->operands[0].op &&
-                o->operands[0].op->name == "xyo.list.ptr")
-                sc.structMutatedLists.insert(
-                    std::string(o->operands[0].op->attrStr("id")));
-            if (hoistBarrier(o->name)) sc.observable = true;
-            for (auto& r : o->regions)
-                if (r)
-                    for (auto& cb : r->blocks) walk(*cb);
-        }
+    auto walkInto = [&](Block& blk) {
+        std::function<void(Block&)> walk = [&](Block& cb) {
+            for (Op* o : cb.ops) {
+                sc.bodyOps.insert(o);
+                if (listMutator(o->name) && !o->operands.empty() &&
+                    o->operands[0].op &&
+                    o->operands[0].op->name == "xyo.list.ptr")
+                    sc.mutatedLists.insert(
+                        std::string(o->operands[0].op->attrStr("id")));
+                if (structuralMutator(o->name) && !o->operands.empty() &&
+                    o->operands[0].op &&
+                    o->operands[0].op->name == "xyo.list.ptr")
+                    sc.structMutatedLists.insert(
+                        std::string(o->operands[0].op->attrStr("id")));
+                if (hoistBarrier(o->name)) sc.observable = true;
+                for (auto& r : o->regions)
+                    if (r)
+                        for (auto& rcb : r->blocks) walk(*rcb);
+            }
+        };
+        walk(blk);
     };
-    walk(body);
+    walkInto(body);
+    // while の cond 領域もループ内で毎反復評価されるため同じスコープに
+    // 含める（cond でリストを読む/書くケースをヘッダ判定に反映する）。
+    if (extra) walkInto(*extra);
     // 平坦ストレージでは extra が存在せず、リストを伸縮しないループなら
     // items/len は反復中ずっと同じ。前置で読んでおく（yield 後に読み直す）。
     // warp ループに限る: 非 warp は毎反復 yield し、他スクリプトが書き換
@@ -1156,6 +1380,28 @@ LValue* Lowerer::numberShadow(const Value& v) {
             LValue* d = b.CreateSIToFP(iv, f64());
             numShadow_[key] = NumShadowEntry{d, b.GetInsertBlock()};
             return d;
+        }
+    }
+    // 数値リスト（numeric=1 — 全書き込みが数値と証明済み）の
+    // list.item/.i 読みは要素が必ず素の double。タグ検査の分岐を出さず
+    // bitcast + NaN 治療だけにする（bubble/quicksort 系で比較ごとの
+    // fast/slow 分岐 1 個を消す）。item.num 相当の意味論 — 要素が
+    // 文字列などの場合は numeric 証明が成立していないため起きない。
+    // （書き込み証明をすり抜けた文字列は bitcast でゴミ double を読む
+    // が、item.num 自体が同じ挙動なので差分は無い。）
+    if (v.op && (v.op->name == "xyo.list.item" ||
+                 v.op->name == "xyo.list.item.i") &&
+        !v.op->operands.empty() && v.op->operands[0].op &&
+        v.op->operands[0].op->name == "xyo.list.ptr" &&
+        v.op->operands[0].op->attrInt("numeric") != 0) {
+        LValue* bits = value(v);
+        if (bits && bits->getType() == i64()) {
+            LValue* f = b.CreateBitCast(bits, f64());
+            LValue* nonNan = b.CreateSelect(
+                b.CreateFCmpUNO(f, f),
+                llvm::ConstantFP::get(f64(), 0.0), f);
+            numShadow_[key] = NumShadowEntry{nonNan, b.GetInsertBlock()};
+            return nonNan;
         }
     }
     // 常に数値と証明できた変数でもタグ検査は省けない。numericVars の
@@ -1713,6 +1959,12 @@ void Lowerer::emitWhile(Op& op) {
         error = "xyo.while region has no block";
         return;
     }
+    // ループ不変なリスト読みの巻き上げ用スコープ。cond+body 両方を見る。
+    pushLoopScope(*body, op.attrInt("warp") != 0, before);
+    struct ScopeGuard {
+        std::vector<LoopScope>& v;
+        ~ScopeGuard() { v.pop_back(); }
+    } scopeGuard{loopScopes_};
     BasicBlock* pre = b.GetInsertBlock();
     BasicBlock* condBB = BasicBlock::Create(lc, "while.cond", fn);
     BasicBlock* bodyBB = BasicBlock::Create(lc, "while.body", fn);
@@ -2725,16 +2977,21 @@ void Lowerer::emitOp(Op& op) {
         if (n == "xyo.add") r = b.CreateFAdd(fa, fb);
         else if (n == "xyo.sub") r = b.CreateFSub(fa, fb);
         else if (n == "xyo.mul") r = b.CreateFMul(fa, fb);
-        else if (n == "xyo.div") r = b.CreateFDiv(fa, fb);
-        else {
-            // Scratch: rem = fmod(n,m); rem/m < 0 ? rem+m : rem.
-            // NOTE: do NOT simplify to (rem < 0) even for a positive
-            // constant m: a tiny negative rem divided by a huge m rounds
-            // to -0.0, and (-0.0 < 0.0) is false while (rem < 0) is true.
-            LValue* r0 = b.CreateFRem(fa, fb);
-            LValue* neg = b.CreateFCmpOLT(b.CreateFDiv(r0, fb),
-                                          llvm::ConstantFP::get(f64(), 0.0));
-            r = b.CreateSelect(neg, b.CreateFAdd(r0, fb), r0);
+        else if (n == "xyo.div") {
+            // 2 の冪の定数除数は乗算に置き換える（xyo.div.f と同じ）。
+            double cc = 0.0;
+            if (!constF64Of(op.operands[1], &cc) || !isPow2(cc) ||
+                !std::isfinite(1.0 / cc))
+                r = b.CreateFDiv(fa, fb);
+            else
+                r = b.CreateFMul(fa,
+                                 llvm::ConstantFP::get(f64(), 1.0 / cc));
+        } else {
+            // xyo.mod.f と同じ u32 整数 fast path + frem フォールバック
+            // （sha256 の x mod 2^32 連打は fmod libcall が支配的だった）。
+            double cc = 0.0;
+            const bool hasC = finiteConst(op.operands[1], &cc);
+            r = emitModF64(fa, fb, hasC, cc);
         }
         double cd = 0.0;
         const bool cA = finiteConst(op.operands[0], &cd);
@@ -2777,113 +3034,8 @@ void Lowerer::emitOp(Op& op) {
             else
                 r = b.CreateFMul(a, llvm::ConstantFP::get(f64(), 1.0 / cc));
         } else {
-            // Same -0.0 rounding caveat as xyo.mod above: keep rem/m < 0.
-            // |c| が 2 の冪（|c| >= 1）なら fmod の libcall を避けて
-            //   x - c * trunc(x / c)
-            // で厳密に同じ値が出る（1/c はちょうど表現でき、trunc と
-            // 2 の冪の積は丸めが起きない。|c| >= 1 なので x/c は溢れない）。
             double cc = 0.0;
-            LValue* r0 = nullptr;
-            if (constF64Of(op.operands[1], &cc) && isPow2(cc) &&
-                std::fabs(cc) >= 1.0) {
-                LValue* q = b.CreateFMul(
-                    a, llvm::ConstantFP::get(f64(), 1.0 / cc));
-                LValue* t =
-                    b.CreateUnaryIntrinsic(llvm::Intrinsic::trunc, q);
-                r0 = b.CreateFSub(a, b.CreateFMul(c, t));
-                // fmod(n,c) は r==0 のとき符号を n に合わせる
-                // （cutform では n - c*trunc(n/c) が必ず +0 になる）。
-                // -0.0 の入力だけでなく n が c の整数倍のときも
-                // 必要: fmod(-3, 1) = -0 だが -3 - 1*trunc(-3) = +0。
-                LValue* r0IsZero = b.CreateFCmpOEQ(
-                    r0, llvm::ConstantFP::get(f64(), 0.0));
-                LValue* signedZero = b.CreateSelect(
-                    b.CreateFCmpOLT(a, llvm::ConstantFP::get(f64(), 0.0)),
-                    llvm::ConstantFP::get(f64(), -0.0),
-                    llvm::ConstantFP::get(f64(), 0.0));
-                LValue* isNegZeroIn = b.CreateICmpEQ(
-                    b.CreateBitCast(a, i64()),
-                    llvm::ConstantInt::get(i64(), 0x8000000000000000ULL));
-                signedZero = b.CreateSelect(
-                    isNegZeroIn, a, signedZero);
-                r0 = b.CreateSelect(r0IsZero, signedZero, r0);
-            } else {
-                // 非 2 冪除数: 両辺が実行時に [0/1, 2^31] の整数なら
-                // UREM32 で処理し、fmod libcall を避ける（legacy の
-                // mod32.fast と同じ判定）。NaN・非整数・0/負の除数・
-                // 範囲外は slow（fmod＋符号補正）へ。
-                // 両辺とも正なので結果は非負で補正は不要。
-                BasicBlock* fastBB =
-                    BasicBlock::Create(lc, "mod.intfast", fn);
-                BasicBlock* slowBB =
-                    BasicBlock::Create(lc, "mod.slow", fn);
-                BasicBlock* joinBB =
-                    BasicBlock::Create(lc, "mod.join", fn);
-                auto isIntVal = [&](LValue* x) {
-                    LValue* t = b.CreateUnaryIntrinsic(
-                        llvm::Intrinsic::trunc, x);
-                    return b.CreateAnd(
-                        b.CreateFCmpORD(x, x),
-                        b.CreateFCmpOEQ(t, x));
-                };
-                LValue* aOk = b.CreateAnd(
-                    b.CreateAnd(
-                        b.CreateFCmpOGT(
-                            a, llvm::ConstantFP::get(f64(), 0.0)),
-                        b.CreateFCmpOLE(
-                            a, llvm::ConstantFP::get(f64(), 2147483647.0))),
-                    isIntVal(a));
-                LValue* bOk = b.CreateAnd(
-                    b.CreateAnd(
-                        b.CreateFCmpOGE(
-                            c, llvm::ConstantFP::get(f64(), 1.0)),
-                        b.CreateFCmpOLE(
-                            c, llvm::ConstantFP::get(f64(), 2147483647.0))),
-                    isIntVal(c));
-                b.CreateCondBr(b.CreateAnd(aOk, bOk), fastBB, slowBB,
-                               llvm::MDNode::get(lc, {
-                                   llvm::MDString::get(lc, "branch_weights"),
-                                   llvm::ConstantAsMetadata::get(
-                                       llvm::ConstantInt::get(i64(), 63)),
-                                   llvm::ConstantAsMetadata::get(
-                                       llvm::ConstantInt::get(i64(), 1))}));
-                b.SetInsertPoint(fastBB);
-                LValue* ai = b.CreateFPToUI(a, i32());
-                LValue* bi = b.CreateFPToUI(c, i32());
-                LValue* fastR = b.CreateUIToFP(
-                    b.CreateURem(ai, bi), f64());
-                BasicBlock* fastEnd = b.GetInsertBlock();
-                b.CreateBr(joinBB);
-                b.SetInsertPoint(slowBB);
-                LValue* r0s = b.CreateFRem(a, c);
-                LValue* qs = b.CreateFDiv(r0s, c);
-                LValue* negs = b.CreateFCmpOLT(
-                    qs, llvm::ConstantFP::get(f64(), 0.0));
-                LValue* slowR = b.CreateSelect(
-                    negs, b.CreateFAdd(r0s, c), r0s);
-                BasicBlock* slowEnd = b.GetInsertBlock();
-                b.CreateBr(joinBB);
-                b.SetInsertPoint(joinBB);
-                auto* phi = b.CreatePHI(f64(), 2);
-                phi->addIncoming(fastR, fastEnd);
-                phi->addIncoming(slowR, slowEnd);
-                r = phi;
-            }
-            if (r0) {
-                // 補正の符号判定 r0/c も、2 の冪の定数除数なら乗算で足りる。
-                // 上と同じく 1/cc が表現できない場合（最小 denormal）は
-                // 除算。int fast path（r0 なし）は両辺正で補正不要。
-                LValue* q = (isPow2(cc) && cc != 0.0 &&
-                             std::isfinite(1.0 / cc))
-                                ? b.CreateFMul(r0,
-                                               llvm::ConstantFP::get(f64(),
-                                                                     1.0 /
-                                                                         cc))
-                                : b.CreateFDiv(r0, c);
-                LValue* neg = b.CreateFCmpOLT(
-                    q, llvm::ConstantFP::get(f64(), 0.0));
-                r = b.CreateSelect(neg, b.CreateFAdd(r0, c), r0);
-            }
+            r = emitModF64(a, c, constF64Of(op.operands[1], &cc), cc);
         }
         vals[k0] = r;
         return;
@@ -2898,7 +3050,7 @@ void Lowerer::emitOp(Op& op) {
     }
     if (n == "xyo.int_exact_ok") {
         // 入口ガード: Value が正確な整数か（i1）。
-        // nonneg 属性時は 0 <= v <= 2^20、そうでなければ |v| <= 2^20。
+        // nonneg 属性時は 0 <= v <= 2^30、そうでなければ |v| <= 2^30。
         // 成功時は xyo.to_int が正確に i32 を返す。
         if (op.operands.empty()) {
             error = "xyo.int_exact_ok needs 1 operand";
@@ -2909,7 +3061,7 @@ void Lowerer::emitOp(Op& op) {
             error = "xyo.int_exact_ok operand not lowered";
             return;
         }
-        static constexpr double kBound = 1048576.0;  // 2^20
+        static constexpr double kBound = 1073741824.0;  // 2^30
         const bool nonNeg = op.attrInt("nonneg", 0) != 0;
         LValue* isNum = b.CreateICmpSLT(
             bits, llvm::ConstantInt::get(i64(), kNumBitsLimit));
@@ -4158,7 +4310,10 @@ void Lowerer::emitOp(Op& op) {
         LValue* i0 = b.CreateSub(b.CreateFPToSI(f, i64()),
                                  llvm::ConstantInt::get(i64(), 1));
         LValue* ok = b.CreateICmpULT(i0, b.CreateZExt(len, i64()));
-        // 範囲外は helper を呼ばず 0.0（to_num("")=0 と同値）。
+        // 範囲外は helper 経由。0.0 を直接返すとタグ付き索引（文字列
+        // "3"、bool 等）を 0 と誤読する — bitcast→cvttsd2si が非数値
+        // ビットを巨大値/0 にするため fast path の範囲判定を通らず、
+        // slow 側の xyo_list_item が正しく変換する分岐に届かない。
         b.CreateCondBr(ok, fast, oob, llvm::MDNode::get(lc, {
             llvm::MDString::get(lc, "branch_weights"),
             llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i64(), 63)),
@@ -4171,14 +4326,36 @@ void Lowerer::emitOp(Op& op) {
                                           i8(), list,
                                           uint32_t(offsetof(SList, items))));
         LValue* item = b.CreateLoad(i64(), b.CreateGEP(i64(), items, i0));
+        // 索引が数値確定（box.f/from_int の昇格値、または数値 const）なら
+        // OOB は常に to_num("") = 0.0 — helper を呼ばず inline で返す。
+        // タグ付き索引（文字列 "3" 等）は slow の xyo_list_item が正しく
+        // 変換するため従来通り helper へ落とす。
+        bool numIdx = false;
+        if (op.operands.size() >= 2 && op.operands[1].op) {
+            const std::string& on = op.operands[1].op->name;
+            if (on == "xyo.box.f" || on == "xyo.from_int")
+                numIdx = true;
+            else if (on == "xyo.const") {
+                numIdx = static_cast<uint64_t>(
+                             op.operands[1].op->attrInt("bits")) <
+                         static_cast<uint64_t>(val::kNan);
+            }
+        }
         // item.num.i と同じ理由（ホストがプロジェクト外から非数値を挿入
         // し得る）で、要素のタグを確認してから bitcast する。
         // タグ付き要素は numericStringFast（SStr 数値キャッシュ）で
         // inline 化を試み、外れたら slow へ。
         BasicBlock* tagBB = BasicBlock::Create(lc, "lnv.tag", fn);
-        b.CreateCondBr(b.CreateICmpSLT(
-                           item, llvm::ConstantInt::get(i64(), kNumBitsLimit)),
-                       fastNum, tagBB);
+        b.CreateCondBr(
+            b.CreateICmpSLT(item,
+                            llvm::ConstantInt::get(i64(), kNumBitsLimit)),
+            fastNum, tagBB,
+            llvm::MDNode::get(
+                lc, {llvm::MDString::get(lc, "branch_weights"),
+                     llvm::ConstantAsMetadata::get(
+                         llvm::ConstantInt::get(i64(), 63)),
+                     llvm::ConstantAsMetadata::get(
+                         llvm::ConstantInt::get(i64(), 1))}));
         b.SetInsertPoint(fastNum);
         LValue* fv = b.CreateBitCast(item, f64());
         // 整数値リスト（intvalued=1）は NaN を含まないことが静的に証明
@@ -4204,8 +4381,14 @@ void Lowerer::emitOp(Op& op) {
         LValue* strVal =
             numericStringFast(item, slow, join, &strEnd);
         b.SetInsertPoint(oob);
-        BasicBlock* oobEnd = b.GetInsertBlock();
-        b.CreateBr(join);
+        BasicBlock* oobEnd = nullptr;
+        if (numIdx) {
+            // 数値索引の OOB = to_num("") = 0.0。helper 不要。
+            b.CreateBr(join);
+            oobEnd = oob;
+        } else {
+            b.CreateBr(slow);
+        }
         b.SetInsertPoint(slow);
         LValue* raw = b.CreateCall(
             callee("xyo_list_item", {ptr(), ptr(), i64()}, i64()),
@@ -4214,11 +4397,12 @@ void Lowerer::emitOp(Op& op) {
         BasicBlock* slowEnd = b.GetInsertBlock();
         b.CreateBr(join);
         b.SetInsertPoint(join);
-        auto* phi = b.CreatePHI(f64(), 4);
+        auto* phi = b.CreatePHI(f64(), numIdx ? 4 : 3);
         phi->addIncoming(fd, fastEnd);
         phi->addIncoming(strVal, strEnd);
-        phi->addIncoming(llvm::ConstantFP::get(f64(), 0.0), oobEnd);
         phi->addIncoming(sd, slowEnd);
+        if (numIdx)
+            phi->addIncoming(llvm::ConstantFP::get(f64(), 0.0), oobEnd);
         vals[k0] = phi;
         return;
     }
@@ -4291,19 +4475,24 @@ void Lowerer::emitOp(Op& op) {
         LValue* off = b.CreateSub(b.CreateSExt(idx, i64()),
                                   llvm::ConstantInt::get(i64(), 1));
         b.CreateStore(item, b.CreateGEP(i64(), items, off));
-        b.CreateStore(llvm::ConstantInt::get(i8(), 1),
-                      b.CreateConstGEP1_32(
-                          i8(), list, uint32_t(offsetof(SList, monitorDirty))));
-        LValue* oldN = b.CreateLoad(
-            i8(), b.CreateConstGEP1_32(
-                      i8(), list, uint32_t(offsetof(SList, numericOnly))));
-        LValue* isNum = b.CreateZExt(
-            b.CreateICmpSLT(item,
-                            llvm::ConstantInt::get(i64(), kNumBitsLimit)),
-            i8());
-        b.CreateStore(b.CreateAnd(oldN, isNum),
-                      b.CreateConstGEP1_32(
-                          i8(), list, uint32_t(offsetof(SList, numericOnly))));
+        // SList::monitorDirty は読み手が存在しないため fast path では
+        // 書かない（他の replace/add fast path と同じ）。
+        // 書き込み値が数値と証明できるなら numericOnly は変化しない
+        //（読み+比較+AND+store の 4 命令を省く）。
+        if (!guaranteedNumericBits(op.operands[op.operands.size() - 1])) {
+            LValue* oldN = b.CreateLoad(
+                i8(), b.CreateConstGEP1_32(
+                          i8(), list,
+                          uint32_t(offsetof(SList, numericOnly))));
+            LValue* isNum = b.CreateZExt(
+                b.CreateICmpSLT(item,
+                                llvm::ConstantInt::get(i64(), kNumBitsLimit)),
+                i8());
+            b.CreateStore(b.CreateAnd(oldN, isNum),
+                          b.CreateConstGEP1_32(
+                              i8(), list,
+                              uint32_t(offsetof(SList, numericOnly))));
+        }
         BasicBlock* fastEnd = b.GetInsertBlock();
         b.CreateBr(join);
         b.SetInsertPoint(slow);
@@ -4381,16 +4570,22 @@ void Lowerer::emitOp(Op& op) {
                           i8(), list, uint32_t(offsetof(SList, len))));
         // SList::monitorDirty は読み手が存在しないため fast path では書かない
         //（helper 経路が設定する）。numericOnly は単調なので維持する。
-        LValue* oldN = b.CreateLoad(
-            i8(), b.CreateConstGEP1_32(
-                      i8(), list, uint32_t(offsetof(SList, numericOnly))));
-        LValue* isNum = b.CreateZExt(
-            b.CreateICmpSLT(item,
-                            llvm::ConstantInt::get(i64(), kNumBitsLimit)),
-            i8());
-        b.CreateStore(b.CreateAnd(oldN, isNum),
-                      b.CreateConstGEP1_32(
-                          i8(), list, uint32_t(offsetof(SList, numericOnly))));
+        // 書き込み値が数値と証明できるなら numericOnly は変化しない
+        //（読み+比較+AND+store の 4 命令を省く）。
+        if (!guaranteedNumericBits(op.operands[op.operands.size() - 1])) {
+            LValue* oldN = b.CreateLoad(
+                i8(), b.CreateConstGEP1_32(
+                          i8(), list,
+                          uint32_t(offsetof(SList, numericOnly))));
+            LValue* isNum = b.CreateZExt(
+                b.CreateICmpSLT(item,
+                                llvm::ConstantInt::get(i64(), kNumBitsLimit)),
+                i8());
+            b.CreateStore(b.CreateAnd(oldN, isNum),
+                          b.CreateConstGEP1_32(
+                              i8(), list,
+                              uint32_t(offsetof(SList, numericOnly))));
+        }
         BasicBlock* fastEnd = b.GetInsertBlock();
         b.CreateBr(join);
         b.SetInsertPoint(slow);
@@ -4448,16 +4643,22 @@ void Lowerer::emitOp(Op& op) {
                        i8(), list, uint32_t(offsetof(SList, items))));
         b.CreateStore(item, b.CreateGEP(i64(), items, i0));
         // SList::monitorDirty は読み手が存在しないため fast path では書かない。
-        LValue* oldN = b.CreateLoad(
-            i8(), b.CreateConstGEP1_32(
-                      i8(), list, uint32_t(offsetof(SList, numericOnly))));
-        LValue* isNum = b.CreateZExt(
-            b.CreateICmpSLT(item,
-                            llvm::ConstantInt::get(i64(), kNumBitsLimit)),
-            i8());
-        b.CreateStore(b.CreateAnd(oldN, isNum),
-                      b.CreateConstGEP1_32(
-                          i8(), list, uint32_t(offsetof(SList, numericOnly))));
+        // 書き込み値が数値と証明できるなら numericOnly は変化しない
+        //（読み+比較+AND+store の 4 命令を省く）。
+        if (!guaranteedNumericBits(op.operands[op.operands.size() - 1])) {
+            LValue* oldN = b.CreateLoad(
+                i8(), b.CreateConstGEP1_32(
+                          i8(), list,
+                          uint32_t(offsetof(SList, numericOnly))));
+            LValue* isNum = b.CreateZExt(
+                b.CreateICmpSLT(item,
+                                llvm::ConstantInt::get(i64(), kNumBitsLimit)),
+                i8());
+            b.CreateStore(b.CreateAnd(oldN, isNum),
+                          b.CreateConstGEP1_32(
+                              i8(), list,
+                              uint32_t(offsetof(SList, numericOnly))));
+        }
         BasicBlock* fastEnd = b.GetInsertBlock();
         b.CreateBr(join);
         b.SetInsertPoint(slow);
@@ -4735,13 +4936,18 @@ void Lowerer::emitOp(Op& op) {
         LValue* len = b.CreateLoad(
             i32(), b.CreateConstGEP1_32(
                        i8(), list, uint32_t(offsetof(SList, len))));
-        LValue* boxed = box(b.CreateUIToFP(len, f64()));
+        // len は u32 由来で NaN に成り得ない — bitcast で十分
+        // （box() の xyo_num 呼出しを inner loop から外す）。
+        LValue* lenF64 = b.CreateUIToFP(len, f64());
+        LValue* boxed = b.CreateBitCast(lenF64, i64());
         BasicBlock* fastEnd = b.GetInsertBlock();
         b.CreateBr(join);
         b.SetInsertPoint(slow);
         LValue* slowVal = b.CreateCall(
             callee("xyo_list_length", {ptr(), ptr()}, i64()),
             {ctx, var});
+        LValue* slowF64 =
+            b.CreateCall(callee("xyo_to_num", {i64()}, f64()), {slowVal});
         BasicBlock* slowEnd = b.GetInsertBlock();
         b.CreateBr(join);
         b.SetInsertPoint(join);
@@ -4749,6 +4955,11 @@ void Lowerer::emitOp(Op& op) {
         phi->addIncoming(boxed, fastEnd);
         phi->addIncoming(slowVal, slowEnd);
         vals[k0] = phi;
+        // f64 影を join で合流させ、後続の to_num 往復を消す。
+        auto* fphi = b.CreatePHI(f64(), 2);
+        fphi->addIncoming(lenF64, fastEnd);
+        fphi->addIncoming(slowF64, slowEnd);
+        numShadow_[k0] = NumShadowEntry{fphi, join};
         return;
     }
     if (n == "xyo.list.item") {
@@ -4757,9 +4968,8 @@ void Lowerer::emitOp(Op& op) {
         LValue* var = value(op.operands[0]);
         // box.f 昇格値なら bits 化をスキップ（slow でだけ materialize）。
         LValue* f = indexF(op.operands[1]);
-        LValue* list = b.CreateLoad(
-            ptr(), b.CreateConstGEP1_32(
-                       i8(), var, uint32_t(offsetof(Variable, list))));
+        ListHeader* lh = nullptr;
+        LValue* list = listPtrFor(op, var, &lh);
         BasicBlock* pre = b.GetInsertBlock();
         BasicBlock* chk1 = BasicBlock::Create(lc, "li.chk1", fn);
         BasicBlock* chk2 = BasicBlock::Create(lc, "li.chk2", fn);
@@ -4774,7 +4984,9 @@ void Lowerer::emitOp(Op& op) {
                            llvm::ConstantAsMetadata::get(
                                llvm::ConstantInt::get(i64(), 63))}));
         b.SetInsertPoint(chk1);
-        if (!flatListStore_) {
+        // ListHeader があるループは「extra 無しの平坦ストレージ」のとき
+        // だけ作られるので、そのときは extra 検査自体を省ける。
+        if (!flatListStore_ && !lh) {
             LValue* extra = b.CreateLoad(
                 ptr(), b.CreateConstGEP1_32(
                            i8(), list, uint32_t(offsetof(SList, extra))));
@@ -4785,9 +4997,12 @@ void Lowerer::emitOp(Op& op) {
             b.CreateBr(chk2);
             b.SetInsertPoint(chk2);
         }
-        LValue* len = b.CreateLoad(
-            i32(), b.CreateConstGEP1_32(
-                       i8(), list, uint32_t(offsetof(SList, len))));
+        LValue* len =
+            lh && lh->lenPhi ? lh->lenPhi
+            : lh ? b.CreateLoad(i32(), lh->lenSlot)
+                 : b.CreateLoad(i32(), b.CreateConstGEP1_32(
+                                           i8(), list,
+                                           uint32_t(offsetof(SList, len))));
         // 索引の判定: item.num と同じく off = cvttsd2si(f)-1 < len の
         // 整数化（等価性は同じ）。3 比較 + floor が cvtt+sub+ult になる。
         LValue* i0 = b.CreateSub(b.CreateFPToSI(f, i64()),
@@ -4798,9 +5013,12 @@ void Lowerer::emitOp(Op& op) {
             llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i64(), 63)),
             llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i64(), 1))}));
         b.SetInsertPoint(fast);
-        LValue* items = b.CreateLoad(
-            ptr(), b.CreateConstGEP1_32(
-                       i8(), list, uint32_t(offsetof(SList, items))));
+        LValue* items =
+            lh && lh->itemsPhi ? lh->itemsPhi
+            : lh ? b.CreateLoad(ptr(), lh->itemsSlot)
+                 : b.CreateLoad(ptr(), b.CreateConstGEP1_32(
+                                           i8(), list,
+                                           uint32_t(offsetof(SList, items))));
         LValue* item = b.CreateLoad(i64(),
                                     b.CreateGEP(i64(), items, i0));
         BasicBlock* fastEnd = b.GetInsertBlock();
@@ -4859,8 +5077,15 @@ llvm::Value* Lowerer::numericStringFast(LValue* bits, BasicBlock* missBB,
     LValue* tag = b.CreateLShr(bits, llvm::ConstantInt::get(i64(), 48));
     BasicBlock* strBB = BasicBlock::Create(lc, "lns.str", fn);
     BasicBlock* stateBB = BasicBlock::Create(lc, "lns.state", fn);
-    b.CreateCondBr(b.CreateICmpEQ(tag, llvm::ConstantInt::get(i64(), 0x7FF9)),
-                   strBB, missBB);
+    b.CreateCondBr(
+        b.CreateICmpEQ(tag, llvm::ConstantInt::get(i64(), 0x7FF9)), strBB,
+        missBB,
+        llvm::MDNode::get(
+            lc, {llvm::MDString::get(lc, "branch_weights"),
+                 llvm::ConstantAsMetadata::get(
+                     llvm::ConstantInt::get(i64(), 1)),
+                 llvm::ConstantAsMetadata::get(
+                     llvm::ConstantInt::get(i64(), 63))}));
     b.SetInsertPoint(strBB);
     LValue* str = b.CreateIntToPtr(
         b.CreateAnd(bits, llvm::ConstantInt::get(i64(), val::kPtrMask)),
@@ -4869,8 +5094,15 @@ llvm::Value* Lowerer::numericStringFast(LValue* bits, BasicBlock* missBB,
         i32(), b.CreateConstGEP1_32(i8(), str,
                                     uint32_t(offsetof(SStr, numState))));
     state->setAtomic(llvm::AtomicOrdering::Acquire);
-    b.CreateCondBr(b.CreateICmpEQ(state, llvm::ConstantInt::get(i32(), 0)),
-                   missBB, stateBB);
+    b.CreateCondBr(
+        b.CreateICmpEQ(state, llvm::ConstantInt::get(i32(), 0)), missBB,
+        stateBB,
+        llvm::MDNode::get(
+            lc, {llvm::MDString::get(lc, "branch_weights"),
+                 llvm::ConstantAsMetadata::get(
+                     llvm::ConstantInt::get(i64(), 1)),
+                 llvm::ConstantAsMetadata::get(
+                     llvm::ConstantInt::get(i64(), 63))}));
     b.SetInsertPoint(stateBB);
     auto* cache = b.CreateLoad(
         f64(), b.CreateConstGEP1_32(i8(), str,
