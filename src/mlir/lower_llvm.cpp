@@ -449,7 +449,7 @@ struct Lowerer {
     void readListHeader(const ListHeader& h);
     std::vector<HoistEntry> hoistStack_;
     llvm::AllocaInst* entryAlloca(llvm::Type* t, const char* name);
-    void pushLoopScope(Block& body);
+    void pushLoopScope(Block& body, bool warp);
     void recomputeHoisted();
     bool tryHoistListRead(Op& op);
     /// チャンク分割された warp repeat の本体を発行する（64 反復 + tail）。
@@ -883,19 +883,20 @@ bool listMutator(const std::string& n) {
 }  // namespace
 
 namespace {
-/// リストヘッダのキャッシュは既定 off。実測（list_read/replace/search）で
-/// 効果が無く、yield ごとの読み直しがホットループの最適化を妨げる場合が
-/// あったため、A/B 用の opt-in にした。
+/// リストヘッダのキャッシュは既定 on（XYO_MLIR_LISTHDR=0 で off）。
+/// 読み専用ループの Variable.list/len/items を前置で読む。alloca 経由
+/// のため mem2reg でレジスタに乗り、反復ごとの 3 連鎖ロードが消える。
+/// yield 後の読み直しは実ハンドオフ時のみ。
 bool listHeaderOptIn() {
     static const bool on = [] {
         const char* e = std::getenv("XYO_MLIR_LISTHDR");
-        return e && e[0] == '1';
+        return !(e && e[0] == '0');
     }();
     return on;
 }
 }  // namespace
 
-void Lowerer::pushLoopScope(Block& body) {
+void Lowerer::pushLoopScope(Block& body, bool warp) {
     LoopScope sc;
     sc.preheader = b.GetInsertBlock();
     std::function<void(Block&)> walk = [&](Block& blk) {
@@ -915,7 +916,10 @@ void Lowerer::pushLoopScope(Block& body) {
     walk(body);
     // 平坦ストレージでは extra が存在せず、リストを伸縮しないループなら
     // items/len は反復中ずっと同じ。前置で読んでおく（yield 後に読み直す）。
-    if (flatListStore_ && !sc.observable && listHeaderOptIn()) {
+    // warp ループに限る: 非 warp は毎反復 yield し、他スクリプトが書き換
+    // える度に読み直しが必要になってヘッダ化の意味が無いばかりか、読み直
+    // し漏れがあれば古い配列を読む（list read memo の writer 混在ケース）。
+    if (flatListStore_ && warp && !sc.observable && listHeaderOptIn()) {
         std::map<std::string, std::string> used;
         for (Op* o : sc.bodyOps) {
             const std::string& n = o->name;
@@ -2295,7 +2299,7 @@ void Lowerer::emitRepeat(Op& op) {
     }
     LValue* count = value(op.operands[0]);
     // ループ不変なリスト読みの巻き上げ用スコープ。
-    pushLoopScope(*body);
+    pushLoopScope(*body, op.attrInt("warp") != 0);
     struct ScopeGuard {
         std::vector<LoopScope>& v;
         ~ScopeGuard() { v.pop_back(); }
