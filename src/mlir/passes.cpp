@@ -848,6 +848,19 @@ struct Promoter {
                 push(b, out, t);
                 return t->result(0);
             }
+            // int 証明済みの float 演算（round.f 等）は to_int で
+            // i32 化する（box.f 経由で checked 変換。結果が整数と
+            // 証明済みなので正確）。
+            if (v.op->resultTypes.size() == 1 &&
+                v.op->resultTypes[0] == Type::f64() &&
+                divRanges_.count(v.op) != 0) {
+                // f64 値を box して to_int（fast path、呼び出しなし）。
+                Op* bf = make("xyo.box.f", {v}, {Type::value()});
+                push(b, out, bf);
+                Op* ti = make("xyo.to_int", {bf->result(0)}, {Type::i32()});
+                push(b, out, ti);
+                return ti->result(0);
+            }
             if ((n == "xyo.div" || n == "xyo.div.i") &&
                 v.op->operands.size() == 2 &&
                 divRanges_.count(v.op) != 0) {
@@ -1300,6 +1313,61 @@ struct Promoter {
             return intRange((int64_t)lo, (int64_t)hi,
                             a.tainted || b.tainted);
         }
+        if (n == "xyo.round") {
+            // round は有限値を有限の整数値へ写す。入力が NaN になり得ない
+            // ことが分かれば整数化できる。
+            // - 入力が整数証明済み → そのまま（round(int) == int）。
+            // - 入力が div(intV, 非零定数) → 有限（intV 有限 ÷ 非零は有限、
+            //   オーバーフローなし）なので区間を丸めて返す。
+            //   math_round の round(k_i/7) 典型形。
+            if (op->operands.size() != 1) return intUnknown(false);
+            const Value& xr = op->operands[0];
+            IntVal xa = evalIntValue(xr, iv, memo);
+            if (xa.ok) {
+                // 整数入力はそのまま。
+                if (xa.lo < INT32_MIN || xa.hi > INT32_MAX)
+                    return intUnknown(xa.tainted);
+                IntVal r = intRange(xa.lo, xa.hi, xa.tainted);
+                divRanges_[op] = {r.lo, r.hi};
+                return r;
+            }
+            if (xr.op && xr.op->name == "xyo.div" &&
+                xr.op->operands.size() == 2) {
+                const Value& num = xr.op->operands[0];
+                const Value& den = xr.op->operands[1];
+                int64_t kk = 0;
+                if (!intConstValue(den, &kk) || kk == 0)
+                    return intUnknown(false);
+                IntVal na = evalIntValue(num, iv, memo);
+                if (!na.ok) return intUnknown(na.tainted);
+                if (na.lo < INT32_MIN || na.hi > INT32_MAX)
+                    return intUnknown(na.tainted);
+                // 有限 ÷ 非零 = 有限。round は単調非減少なので
+                // [round(lo/k), round(hi/k)] が健全（k の符号で逆転に注意）。
+                auto jround = [](double x) -> int64_t {
+                    double r = std::floor(x + 0.5);
+                    // jsRound の端点調整（+0.5 ちょうど等）は区間の外側へ
+                    // 丸めるので無視できる（2 以内の誤差は許さないため
+                    // 正確に floor(x+0.5) を使う）。
+                    if (r < (double)INT32_MIN || r > (double)INT32_MAX)
+                        return INT64_MAX;
+                    return (int64_t)r;
+                };
+                double kd = (double)kk;
+                int64_t rlo = jround((double)na.lo / kd);
+                int64_t rhi = jround((double)na.hi / kd);
+                if (rlo == INT64_MAX || rhi == INT64_MAX)
+                    return intUnknown(na.tainted);
+                int64_t nlo = std::min(rlo, rhi);
+                int64_t nhi = std::max(rlo, rhi);
+                if (nlo < INT32_MIN || nhi > INT32_MAX)
+                    return intUnknown(na.tainted);
+                IntVal r = intRange(nlo, nhi, na.tainted);
+                divRanges_[op] = {r.lo, r.hi};
+                return r;
+            }
+            return intUnknown(false);
+        }
         if (n == "xyo.div") {
             // 除算は原則として整数値ではない（5/2 = 2.5）。
             // ただし除数が定数 2 で被除数が偶数証明済みなら正確
@@ -1512,6 +1580,17 @@ struct Promoter {
             return m.intListRanges.count(lid) != 0;
         }
         // xyo.div は整数値ではない（実数値と切り捨て表現が一致しない）。
+        // ただし round(div(X, 非零定数)) は有限値の丸めなので整数になる。
+        if (op->name == "xyo.round" && op->operands.size() == 1) {
+            const Value& x = op->operands[0];
+            if (x.op && x.op->name == "xyo.div" &&
+                x.op->operands.size() == 2) {
+                int64_t kk = 0;
+                if (intConstValue(x.op->operands[1], &kk) && kk != 0)
+                    return intExprProvable(x.op->operands[0], intVars,
+                                           depth + 1);
+            }
+        }
         if (op->name == "xyo.add" || op->name == "xyo.sub" ||
             op->name == "xyo.mul" || op->name == "xyo.mod" ||
             op->name == "xyo.round" || op->name == "xyo.to_num") {
@@ -6632,6 +6711,60 @@ uint64_t promoteNumericArith(Module& m) {
                     continue;
                 }
                 out.resize(mark);
+            }
+            // ボックス比較の両辺が数値化できる場合はガード付き比較へ
+            // 書き換える。item 読みはここで item.num 化される（単一使用・
+            // 数値リスト）。lowering の cmp.guarded は実行時ガード付きで
+            // fcmp し、外れたら helper へ落ちるため、ホスト挿入の非数値や
+            // NaN でも正しい。while ループ内の item 比較は int ループ昇格の
+            // 対象外で boxed のまま残るため、ここで拾う。
+            // XYO_MLIR_NOCMPGUARD=1 で従来の boxed 比較に戻せる（A/B 用）。
+            if ((op->name == "xyo.lt" || op->name == "xyo.gt" ||
+                 op->name == "xyo.eq") &&
+                op->operands.size() == 2) {
+                static const bool noCmpGuard = [] {
+                    const char* e = std::getenv("XYO_MLIR_NOCMPGUARD");
+                    return e && e[0] == '1';
+                }();
+                if (!noCmpGuard) {
+                    Value a, c;
+                    const size_t mark = out.size();
+                    if (toF64(op->operands[0], &a) &&
+                        toF64(op->operands[1], &c)) {
+                        // f64 化で producer を書き換えた場合
+                        // （item→item.num）は box.f で bits を用意する
+                        // （lowering は slow 側でのみ materialize する）。
+                        // それ以外は元の boxed 値をそのまま使う。
+                        auto bitsFor = [&](const Value& orig,
+                                           const Value& fv) -> Value {
+                            bool needBox = orig.type != Type::value();
+                            if (!needBox && orig.op &&
+                                !orig.op->resultTypes.empty() &&
+                                orig.op->resultTypes[0] !=
+                                    Type::value())
+                                needBox = true;
+                            if (needBox) {
+                                Op* bx = m.create("xyo.box.f", {fv},
+                                                  {Type::value()});
+                                bx->parent = &blk;
+                                out.push_back(bx);
+                                return bx->result(0);
+                            }
+                            return orig;
+                        };
+                        Value ab = bitsFor(op->operands[0], a);
+                        Value cb = bitsFor(op->operands[1], c);
+                        const int64_t pred = op->name == "xyo.lt" ? 0
+                                           : op->name == "xyo.gt" ? 1 : 4;
+                        op->name = "xyo.cmp.guarded";
+                        op->operands = {ab, cb, a, c};
+                        op->attrs["pred"] = Attr::integer(pred);
+                        out.push_back(op);
+                        ++rewritten;
+                        continue;
+                    }
+                    out.resize(mark);
+                }
             }
             out.push_back(op);
         }

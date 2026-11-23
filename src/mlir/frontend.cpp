@@ -113,9 +113,26 @@ bool blockIntExpr(const Blocks& tb, const xyo::Block* b,
         op == "math_whole_number" || op == "math_positive_number" ||
         op == "math_angle")
         return blockIntLiteral(b);
-    if (op == "operator_round")
-        return blockIntExpr(tb, resolveInputBlock(tb, *b, "NUM"), cleanVars,
-                            cleanLists, depth + 1);
+    if (op == "operator_round") {
+        const xyo::Block* num = resolveInputBlock(tb, *b, "NUM");
+        // round(div(X, 非零定数)) は有限値の丸めなので整数になる
+        // （div 自体は整数でなくてよい）。k_acc += round(k_i/7) 典型形。
+        if (num && num->opcode == "operator_divide") {
+            const xyo::Block* den =
+                resolveInputBlock(tb, *num, "NUM2");
+            const xyo::Block* dvd =
+                resolveInputBlock(tb, *num, "NUM1");
+            if (den && dvd && blockIntLiteral(den)) {
+                int64_t kk = 0;
+                auto itf = den->fields.find("NUM");
+                if (itf != den->fields.end() &&
+                    intLiteralBits(itf->second.value.bits, &kk) && kk != 0)
+                    return blockIntExpr(tb, dvd, cleanVars, cleanLists,
+                                        depth + 1);
+            }
+        }
+        return blockIntExpr(tb, num, cleanVars, cleanLists, depth + 1);
+    }
     if (op == "operator_divide") {
         // 除算は整数値ではない。Scratch の x/m は実数（例: 5/2 = 2.5）で、
         // 整数表現（floor）に落とすと後で実数として使う箇所が変わる。
@@ -171,15 +188,27 @@ bool blockNumericExpr(const Blocks& tb, const xyo::Block* b,
         auto it = b->fields.find("VARIABLE");
         return it != b->fields.end() && vars.count(it->second.id) != 0;
     }
-    // data_itemoflist は numericLists に入っていても数値確定ではない:
-    // 証明は「スクリプト内の書き込みが全て数値」だが、ホスト（テスト・
-    // モニタ・未コンパイル経路）が実行の合間に文字列を挿入し得る。
-    // 'd' 昇格変数の box.f は必ず数値 bits を作るため、文字列を読んだ
-    // 値の比較が lexical 比較を失う（numeric promotion テストで検出）。
     if (op == "data_lengthoflist")
         return true;
     if (op == "data_itemnumoflist")
         return true;
+    if (op == "data_itemoflist") {
+        // 読み元リスト自体が数値候補に残っている間は読みも数値とみなす。
+        // swap パターン（tmp = item(L); replace(L, tmp)）のような循環は
+        // 不動点反復で収束する。ホストが実行の合間に非数値を挿入しても
+        // lowering 側の実行時ガード（item.num のタグ検査・数値キャッシュ・
+        // slow helper、numberShadow の分岐）が正しさを保つ。混合リストは
+        // 書き込み側の判定で従来通り候補から外れるため、文字列比較の
+        // lexical 性は保たれる。
+        // XYO_MLIR_NONUMITEM=1 で従来（常に非数値）に戻せる。
+        static const bool noNumItem = [] {
+            const char* e = std::getenv("XYO_MLIR_NONUMITEM");
+            return e && e[0] == '1';
+        }();
+        if (noNumItem) return false;
+        auto it = b->fields.find("LIST");
+        return it != b->fields.end() && lists.count(it->second.id) != 0;
+    }
     return false;
 }
 
