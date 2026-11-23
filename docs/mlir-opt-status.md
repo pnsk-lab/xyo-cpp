@@ -602,3 +602,121 @@ MLIR frontend がまるごと legacy へ fallback していた
   キャッシュ fast path）に限定できる**。`XYO_MLIR_LISTHDR=1`
   スケッチでは -2〜+2% しか出なかったので、ヘッダだけでなく
   変数スロット側が支配的と思われる。
+
+## Round 243: 範囲外リスト読みの inline 化 + 数値文字列 fast path
+
+### 動機
+
+`abl_read_varidx_50000000`（索引がリスト長を超えるループ）で
+MLIR 201ms / legacy 65ms。内訳を見ると、範囲外の反復が
+`xyo_list_item` + `xyo_to_num` の 2 連続 helper 呼び出しだった。
+legacy は範囲外を `""`（to_num で 0）に畳む。
+
+### 変更（`lower_llvm.cpp`）
+
+- `xyo.list.item[.i]`：範囲外は helper を呼ばず `kEmptyStr` 定数を返す
+  （3 入力 PHI）。`null` リストも範囲外扱いに統一。
+- `xyo.list.item.num[.i]`：範囲外は `0.0` 定数。タグ付き要素は
+  `numericStringFast`（`SStr` の `numState(acquire)/numCache` を読む
+  legacy 同形の inline fast path）を通してから helper へ。
+  state==2（NaN）は 0.0。
+- `numericStringFast` の `str` 変換は `inttoptr`（GEP の基底は
+  ポインタでなければならず、i64 のままでは verify 落ちする）。
+
+### 効果
+
+- `abl_read_varidx` 201→67ms（legacy 65ms と parity）、
+  `micro_read` 239→88ms（legacy 87ms と parity）、
+  `abl_read_const` 276→90ms（legacy 90ms）。
+- `XYO_JIT_MEGA=1 xyo-tests` 0 FAIL（`test_mlir` の warp 手続き
+  コンパイル確認で GEP verify 落ちを検出して修正）。
+- 落とし穴：修正直後にスイートが全面 ~1.0x になったのは、メイン
+  スクリプトが fallback して legacy を測っていたため。
+  `XYO_MLIR_TRACE` の fallback 行で必ず確認すること。
+
+## Round 244: 整数プロモーションの穴埋め（正準形文字列・条件 narrowing）
+
+### 動機
+
+`micro_read`（`i>1000` で wrap するカウンタ＋リスト読み）が
+MLIR 142ms / legacy 88ms。`analyzeIntLoop` が `v_i` を落としていた。
+原因は 2 つ：
+
+1. `exactIntOperand` の `xyo.const` 判定が `isNumericBits` のみで、
+   Scratch の数値リテラル shadow（生文字列 `"1"`）を弾いていた。
+   `intLiteralBits`（正準形の整数文字列）は `toString` 往復を保証する
+   ため、i32 経由の格納でも観測可能な表現は変わらない。
+   ただし `list.item` は受け入れない（host が非正準形文字列を挿入し得る。
+   `set x to (item)` で `s:"03"` が `num(3)` になる件は
+   `test_numeric_promotion` の "restores raw arm" が検出する）。
+2. `if (i > 1000) i = 1` の wrap が区間に反映されず、動的 trip の
+   ループは widening（3 回連続成長で閾値へジャンプ）で発散→落下
+   していた。
+
+### 変更（`passes.cpp`）
+
+- `exactIntOperand` の const 分岐で `intLiteralBits` を許容。
+- `evalBlock` の `xyo.if` 処理に `assumeBranch`/`assumeConstBound` を
+  追加：条件が「整数候補 V と定数 C の比較」なら分岐評価前に区間を
+  交差させる。`cmp.i/cmp.f/cmp.guarded/lt/gt/eq`＋`bnot/not` 反転、
+  `to_num/box.f` 透過、`add/sub` 定数の逆向き伝播
+  （`(i+1)>1000` → `i>999`）に対応。f64 定数は整数値のみ。
+- widening 発火時に条件キャップへジャンプ（`narrowCapHi`）。
+  外れ値は union で戻り、収束判定が健全性を保証する。
+
+### 効果
+
+- `micro_read` 142→82ms（legacy 88ms を逆転）、
+  `micro_write` 134→82ms、`abl_read_varidx` 67→48ms、
+  `micro_read_const` 144→72ms、`abl_read_const` 90→69ms。
+- スイート geomean 0.481→0.550x（life 0.24→0.44、raycast
+  0.22→0.69、collatz 0.09→0.22、matmul 0.58→0.66 など）。
+- `test_numeric_promotion` 1514 checks、`nan_codegen` 124093 checks、
+  `xcheck.py` 45/45、Mega 0 FAIL を維持。
+
+## Round 245: リストヘッダのレジスタ運搬を既定化＋warp 限定
+
+### 変更（`lower_llvm.cpp`）
+
+- `XYO_MLIR_LISTHDR` の極性を反転（既定 on、`XYO_MLIR_LISTHDR=0` で
+  off）。読み専用ループの `Variable.list/len/items` を前置で読み、
+  alloca 経由（mem2reg でレジスタ化）で運ぶ。
+- `pushLoopScope` に warp フラグを渡し、非 warp ループではヘッダを
+  作らない。非 warp は毎反復 yield し、他スクリプトの書き換えを
+  毎回読み直す必要があるため、ヘッダ化の意味が無いばかりか古い配列を
+  読む（`test_list_read_memo` の writer 混在ケースで検出）。
+
+### 効果
+
+- `XYO_JIT_MEGA=1 xyo-tests` 0 FAIL（memo 836 checks 含む）。
+- マイクロベンチは横ばい（L1 ヒットの 3 連鎖ロードは律速でない）。
+- スイート list_read は不動（0.21x のまま） — ボトルネックは別にある。
+
+## Round 246: `int_exact_ok` が文字列 entry を誤却下（guard 全滅）
+
+### 発見
+
+`int_exact_ok` の lowering が最終段で `isNum`（素の double 判定）を
+AND していたため、正準形の整数文字列（`"0"` 等）の entry が全て偽に
+なり、guard/box が常に float 側へ落ちていた。コメントには「文字列も
+通す」と書いてあるのに実装が矛盾していた。
+
+### 変更（`lower_llvm.cpp`）
+
+最終の AND から `isNum` を外す（`f` は既に `to_num` で数値化済み）。
+
+### 効果
+
+- `XYO_JIT_MEGA=1 xyo-tests` 0 FAIL を維持。
+- スイート再測定（r247）: **list_read 0.21→0.97x**、
+  **list_replace 0.37→1.22x**（legacy 超え）、algo_primes
+  0.21→0.45x、algo_matmul 0.65→0.74x、math_round 0.46→0.54x、
+  math_expsqrt 0.33→0.44x、str_letter 0.26→0.34x、
+  app_projection 0.91→0.97x。geomean 2.05→2.27x。
+  algo_sort 0.80→0.74x は要監視（揺動か回帰か）。
+  math_collatz は不動（0.22x）— 別経路の問題。
+- box/guard の効果測定（`XYO_MLIR_BOX=0` との A/B、修正前）:
+  `math_collatz` 80k→182k（box-int が効いている）、
+  `algo_primes` 33k→13k（box-int が逆効果 — 要調査）、
+  `list_read` は不変（box-int も float も同速＝int が走っていないか、
+  int 自体が遅い）。
