@@ -302,7 +302,15 @@ struct Verifier {
     bool visible(const Value& v, const Block* cur, size_t curIndex,
                  Op* user) {
         if (!v.valid()) {
-            fail(user, "operand is empty for " + user->name);
+            std::string ctx;
+            const Block* pb = cur;
+            for (int d = 0; d < 3 && pb; ++d) {
+                Op* ow = pb->parent ? pb->parent->owner : nullptr;
+                ctx += ow ? " <" + ow->name + ">" : " <top>";
+                pb = ow ? ow->parent : nullptr;
+            }
+            fail(user, "operand is empty for " + user->name + " idx=" +
+                     std::to_string(user->operands.size()) + " ctx:" + ctx);
             return false;
         }
         if (!v.type.valid()) {

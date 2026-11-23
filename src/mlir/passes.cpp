@@ -2698,7 +2698,15 @@ struct Promoter {
                     // 整数ループ: SSA 値を運ぶだけで実メモリに触れない。
                     // iOf が空を返したら空のまま伝播させ、verifier が
                     // 落として既存 JIT へフォールバックする（黙った誤りなし）。
-                    c.iv = iOf(op->operands[0], b, out);
+                    Value ivv = iOf(op->operands[0], b, out);
+                    if (!ivv && intDebug()) {
+                        Op* src = op->operands[0].op;
+                        std::fprintf(stderr,
+                            "[mlir-int] iOf EMPTY id=%s op=%s\n",
+                            it->first.c_str(),
+                            src ? src->name.c_str() : "(null)");
+                    }
+                    c.iv = ivv;
                     continue;
                 }
                 Value x = op->operands[0];
@@ -3820,10 +3828,10 @@ struct Promoter {
         for (auto& [o, k] : modSubK) {
             auto f = cl.opMap.find(o);
             if (f != cl.opMap.end()) pt.modSubK[f->second] = k;
+        }
         for (auto& [o, r] : divRanges_) {
             auto f = cl.opMap.find(o);
             if (f != cl.opMap.end()) pt.divRanges_[f->second] = r;
-        }
         }
         for (Op* o : intProvenOps) {
             auto f = cl.opMap.find(o);
@@ -4326,10 +4334,10 @@ struct Promoter {
         for (auto& [o, k] : modSubK) {
             auto f = cl.opMap.find(o);
             if (f != cl.opMap.end()) pt.modSubK[f->second] = k;
+        }
         for (auto& [o, r] : divRanges_) {
             auto f = cl.opMap.find(o);
             if (f != cl.opMap.end()) pt.divRanges_[f->second] = r;
-        }
         }
         for (Op* o : intProvenOps) {
             auto f = cl.opMap.find(o);
@@ -4474,10 +4482,10 @@ struct Promoter {
         for (auto& [o, k] : modSubK) {
             auto f = cl.opMap.find(o);
             if (f != cl.opMap.end()) pi.modSubK[f->second] = k;
+        }
         for (auto& [o, r] : divRanges_) {
             auto f = cl.opMap.find(o);
             if (f != cl.opMap.end()) pi.divRanges_[f->second] = r;
-        }
         }
         for (Op* o : intProvenOps) {
             auto f = cl.opMap.find(o);
@@ -4818,10 +4826,10 @@ struct Promoter {
         for (auto& [o, k] : modSubK) {
             auto f = cl.opMap.find(o);
             if (f != cl.opMap.end()) pi.modSubK[f->second] = k;
+        }
         for (auto& [o, r] : divRanges_) {
             auto f = cl.opMap.find(o);
             if (f != cl.opMap.end()) pi.divRanges_[f->second] = r;
-        }
         }
         for (Op* o : intProvenOps) {
             auto f = cl.opMap.find(o);
