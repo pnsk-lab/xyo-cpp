@@ -308,24 +308,43 @@ jobs:
           ls -lh dist/xyo-macos-${{ matrix.arch }}.tar.gz
 
       # 焼いた .app 自体を起動して確認する（ビルド直後のバイナリではなく、
-      # 同梱物だけで動くか）。SDL3 の dlopen 失敗と Qt プラグイン解決は
-      # ここでしか捕まらない。
-      - name: Smoke (packaged xyo.app)
+      # 同梱物だけで動くか）。brew の Qt プラグイン/QML と SDL を一時的に
+      # 隠してから起動することで、バンドル内の qt.conf/リンク/SDL3 が
+      # 実際に効いていることを証明する（QT_DEBUG_PLUGINS は release ビルドの
+      # Qt では出力されないため使わない）。
+      - name: Smoke (packaged xyo.app, brew Qt hidden)
         run: |
           set -o pipefail
           bin=dist/xyo.app/Contents/MacOS/xyo
+          qt="$(brew --prefix qt)"
+          sdl2="$(brew --prefix sdl2)"
+          sdl3="$(brew --prefix sdl3)"
+          moved=()
+          hide() { [ -d "$1" ] && { mv "$1" "$1.hidden-for-smoke"; moved+=("$1"); }; }
+          restore() {
+            for d in "${moved[@]:-}"; do
+              [ -d "$d.hidden-for-smoke" ] && mv "$d.hidden-for-smoke" "$d" || true
+            done
+          }
+          trap restore EXIT
+          hide "$qt/plugins"
+          hide "$qt/qml"
+          hide "$sdl2/lib"
+          hide "$sdl3/lib"
           log="$(mktemp)"
-          QT_QPA_PLATFORM=offscreen QT_DEBUG_PLUGINS=1 XYO_GUI_ACTIONS=quit \
-            "$bin" gui >"$log" 2>&1 || true
-          cat "$log" | tail -30
+          SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy QT_QPA_PLATFORM=offscreen \
+            XYO_GUI_ACTIONS=quit "$bin" gui >"$log" 2>&1
+          rc=$?
+          tail -30 "$log"
+          restore
+          trap - EXIT
+          [ "$rc" -eq 0 ] || { echo "パッケージ済み .app の起動に失敗 (rc=$rc)" >&2; exit 1; }
           if grep -q "Failed loading SDL3" "$log"; then
             echo "sdl2-compat が SDL3 をロードできていません" >&2; exit 1
           fi
-          # プラグイン探索がアプリバンドル内へ向いていること。
-          grep -q "xyo.app/Contents/.*platforms" "$log" \
-            || { echo "Qt がバンドル内の platforms を探索していません" >&2; exit 1; }
-          grep -q "xyo.app/Contents/.*qml" "$log" \
-            || { echo "Qt がバンドル内の qml を探索していません" >&2; exit 1; }
+          if grep -qE "no Qt platform plugin|could not be initialized" "$log"; then
+            echo "Qt プラットフォームプラグインを解決できていません" >&2; exit 1
+          fi
           bash tools/ci/smoke.sh gui "$bin"
 
       - name: Upload artifact
