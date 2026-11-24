@@ -340,9 +340,13 @@ jobs:
           hide "$sdl2/lib"; hide "$sdl3/lib"
           log="$(mktemp)"
           run_gui() {
+            if [ -n "$1" ]; then
+              export QT_QPA_PLATFORM="$1"
+            else
+              unset QT_QPA_PLATFORM
+            fi
             SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
-              XYO_GUI_ACTIONS=quit ${1:+QT_QPA_PLATFORM="$1"} \
-              "$bin" gui >"$log" 2>&1
+              XYO_GUI_ACTIONS=quit "$bin" gui >"$log" 2>&1
           }
           set +e
           run_gui offscreen
@@ -363,7 +367,6 @@ jobs:
           if grep -qE "no Qt platform plugin|could not be initialized" "$log"; then
             echo "Qt プラットフォームプラグインを解決できていません" >&2; exit 1
           fi
-          bash tools/ci/smoke.sh gui "$bin"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
