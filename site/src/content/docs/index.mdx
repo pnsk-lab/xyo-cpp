@@ -1,29 +1,365 @@
 ---
 title: xyo-cpp
-description: Scratch プロジェクトをネイティブで動かす LLVM JIT ランタイム
+description: Scratch 3 プロジェクトをネイティブで動かす LLVM JIT / AOT ランタイム
 template: splash
 hero:
-  tagline: Scratch をより速く、より深く。
+  title: xyo-cpp
+  tagline: Scratch 3 を、ネイティブの速度へ。インタプリタ、LLVM JIT、AOT コンパイルを備えた C++20 製ランタイム。
   actions:
     - text: はじめる
       link: /xyo-cpp/getting-started/
       icon: right-arrow
       variant: primary
+    - text: 最適化一覧
+      link: /xyo-cpp/guide/optimizations/
+      icon: rocket
+      variant: secondary
     - text: GitHub
       link: https://github.com/pnsk-lab/xyo-cpp
       icon: external
       variant: minimal
 ---
 import { CardGrid, LinkCard } from '@astrojs/starlight/components';
+import launcherImg from './reference/launcher.png';
+import editorImg from './reference/native-editor.png';
+import wasmImg from './reference/wasm-browser.png';
 
-xyo-cpp は Scratch 3 形式のプロジェクトを読み込み、インタプリタ・LLVM JIT・AOT で実行する C++20 製ランタイムです。
+<div class="xyo-showcase">
+  <div class="xyo-panel">
+    <div class="xyo-panel-label">
+      <span>Execution Pipeline</span>
+      <span class="xyo-badge-live">Mega Preset Default</span>
+    </div>
+    <div class="xyo-pipeline">
+      <div class="xyo-pipe-step">
+        <span class="xyo-pipe-tag sb3">.sb3 / .sb2</span>
+        <div class="xyo-pipe-text">
+          <strong>ローダ &amp; 静的解析・自動変換</strong>
+          <span>依存解析、再帰 DP メモ化、構造書き換え</span>
+        </div>
+      </div>
+      <div class="xyo-pipe-step">
+        <span class="xyo-pipe-tag ir">IR / MLIR</span>
+        <div class="xyo-pipe-text">
+          <strong>xyo Dialect &amp; 数値型推論</strong>
+          <span>matpow 行列累乗化、par-for 並列化、SSA 最適化</span>
+        </div>
+      </div>
+      <div class="xyo-pipe-step">
+        <span class="xyo-pipe-tag jit">LLVM ORC JIT</span>
+        <div class="xyo-pipe-text">
+          <strong>HotSpot / Eager / スタックレス継続</strong>
+          <span>手続き融合とコルーチンによる高速スケジューリング</span>
+        </div>
+      </div>
+      <div class="xyo-pipe-step">
+        <span class="xyo-pipe-tag out">Native / AOT</span>
+        <div class="xyo-pipe-text">
+          <strong>単体実行ファイル・SDL2 / Qt6 GUI・WASM</strong>
+          <span>CLI ヘッドレス実行からデスクトップ GUI まで対応</span>
+        </div>
+      </div>
+    </div>
+  </div>
 
-<CardGrid>
-  <LinkCard title="クイックスタート" href="/xyo-cpp/getting-started/" description="SB3 プロジェクトをすぐに実行します。" />
-  <LinkCard title="実行モード" href="/xyo-cpp/guide/execution/" description="HotSpot、Eager JIT、インタプリタを理解します。" />
-  <LinkCard title="内部構造" href="/xyo-cpp/architecture/overview/" description="IR・ファイバ・スケジューラの構成。" />
-  <LinkCard title="最適化一覧" href="/xyo-cpp/guide/optimizations/" description="JIT・文字列・リスト・GC・スケジューラの最適化を網羅。" />
-  <LinkCard title="パフォーマンス" href="/xyo-cpp/development/testing/" description="測定と互換性の検証方法。" />
-</CardGrid>
+  <div class="xyo-terminal" data-xyo-terminal>
+    <div class="xyo-term-bar">
+      <div class="xyo-term-dots" aria-hidden="true"><i></i><i></i><i></i></div>
+      <div class="xyo-term-tabs" role="tablist">
+        <button type="button" class="xyo-term-tab is-active" data-tab="run">run (JIT)</button>
+        <button type="button" class="xyo-term-tab" data-tab="aot">aot</button>
+        <button type="button" class="xyo-term-tab" data-tab="analyze">analyze</button>
+        <button type="button" class="xyo-term-tab" data-tab="gui">gui / play</button>
+      </div>
+    </div>
+    <div class="xyo-term-body">
+      <pre class="xyo-term-pane is-active" data-pane="run" data-cmd="./xyo run examples/play_demo.sb3 --frames 120"><span class="xyo-term-cmd">$ ./xyo run examples/play_demo.sb3 --frames 120</span>
+<span class="xyo-term-out">[load]  examples/play_demo.sb3 (2 targets, 14 blocks)
+[jit]   mega-preset active (MLIR + stackless coro + matpow + DP)
+[run]   120 frames completed in 1.8 ms (score = 100)</span>
+<span class="xyo-term-ok">✓ done (exit 0)</span></pre>
 
-ネイティブ実行のほか、SDL2 を使った画面表示、単体実行ファイルの書き出し、SB3 の解析・最適化、WebAssembly ビルドにも対応しています。機能と制限はプラットフォームによって異なります。
+      <pre class="xyo-term-pane" data-pane="aot" data-cmd="./xyo aot project.sb3 -o app && ./app run --frames 300"><span class="xyo-term-cmd">$ ./xyo aot project.sb3 -o app &amp;&amp; ./app run --frames 300</span>
+<span class="xyo-term-out">[aot]   emitting LLVM IR → O2 → native object (portable x86-64)
+[aot]   packed [sb3 + object + footer] → ./app</span>
+<span class="xyo-term-ok">✓ standalone binary ready (zero runtime JIT warmup)</span></pre>
+
+      <pre class="xyo-term-pane" data-pane="analyze" data-cmd="./xyo analyze project.sb3 --complexity"><span class="xyo-term-cmd">$ ./xyo analyze project.sb3 --complexity</span>
+<span class="xyo-term-out">[graph] 56 scripts | workerSafe: 41 | hotspots: 3
+[pass]  warp candidate: bsp:optimize:back (99 blocks, yield-free)
+[comp]  repeat(480/Res) → O(480/Res) | broadcast 'bsp' ×1</span>
+<span class="xyo-term-ok">✓ static analysis complete without executing project</span></pre>
+
+      <pre class="xyo-term-pane" data-pane="gui" data-cmd="./xyo gui examples"><span class="xyo-term-cmd">$ ./xyo gui examples</span>
+<span class="xyo-term-out">[gui]   Qt6 Quick Launcher (live .sb3 thumbnails)
+[play]  SDL2 renderer + 7 visual effects + audio engine
+[edit]  Native block editor + stage preview</span>
+<span class="xyo-term-ok">✓ desktop studio ready</span></pre>
+
+      <div class="xyo-term-foot">
+        <span>Linux / macOS / Windows / WebAssembly</span>
+        <button type="button" class="xyo-copy-btn" data-copy-btn>Copy</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="xyo-stats">
+  <div class="xyo-stat">
+    <div class="xyo-stat-num">O(log N)</div>
+    <div class="xyo-stat-label">行列累乗 &amp; 自動 DP</div>
+    <div class="xyo-stat-sub">線形漸化式ループを行列累乗へ、純粋再帰をメモ化へ自動変換</div>
+  </div>
+  <div class="xyo-stat">
+    <div class="xyo-stat-num">5.4×</div>
+    <div class="xyo-stat-label">依存解析ワーカー並列</div>
+    <div class="xyo-stat-sub">衝突しない独立スクリプトと append ループを自動で並列実行</div>
+  </div>
+  <div class="xyo-stat">
+    <div class="xyo-stat-num">100%</div>
+    <div class="xyo-stat-label">差分互換ハーネス検証</div>
+    <div class="xyo-stat-sub">scratch-vm 準拠の実行意味論・V8 fdlibm 数学・Unicode 小文字化</div>
+  </div>
+  <div class="xyo-stat">
+    <div class="xyo-stat-num">1 Binary</div>
+    <div class="xyo-stat-label">AOT 単体実行ファイル</div>
+    <div class="xyo-stat-sub">SB3 とコンパイル済みネイティブコードを 1 本の実行ファイルに統合</div>
+  </div>
+</div>
+
+<section class="xyo-section">
+  <div class="xyo-section-head">
+    <span class="xyo-kicker">Architecture &amp; Passes</span>
+    <h2>Scratch の意味論を保ったまま、コンパイラ技術を総動員</h2>
+    <p>動的型・暗黙キャスト・フレーム同期・Warp 時間制限といった Scratch 固有の仕様を厳密に守りつつ、計算・スケジュール・メモリを多層で最適化します。</p>
+  </div>
+
+  <div class="xyo-bento">
+    <div class="xyo-card xyo-span-3">
+      <div class="xyo-card-head">
+        <span class="xyo-card-title">MLIR 前段 &amp; LLVM ORC JIT</span>
+        <span class="xyo-pill">xyo dialect</span>
+      </div>
+      <p>ブロック木を独自の <code>xyo</code> MLIR 風 IR へ落とし込み、値域・整数性・数値ビット証明を伝播させたうえで LLVM ORC JIT がネイティブ機械語を生成します。インタプリタ開始の HotSpot と即時コンパイルの Eager を選択可能です。</p>
+      <div class="xyo-card-tags">
+        <code>--jit=hotspot</code><code>--jit=eager</code><code>XYO_MLIR=1</code>
+      </div>
+    </div>
+
+    <div class="xyo-card xyo-span-3">
+      <div class="xyo-card-head">
+        <span class="xyo-card-title">Mega スケジューラ &amp; スタックレス継続</span>
+        <span class="xyo-pill">Fiberless</span>
+      </div>
+      <p>手続きグラフを 1 関数へ融合し、yield を含む非 warp スクリプトや再帰手続きも LLVM コルーチンへ変換。OS ファイバの切り替えコストを抑えながら、依存解析に基づく安全なマルチスレッド並列実行を行います。</p>
+      <div class="xyo-card-tags">
+        <code>--mega</code><code>llvm.coro</code><code>Worker Pool</code>
+      </div>
+    </div>
+
+    <div class="xyo-card xyo-span-2">
+      <div class="xyo-card-head">
+        <span class="xyo-card-title">matpow / par-for / DP</span>
+        <span class="xyo-pill">Auto Transform</span>
+      </div>
+      <p>漸化式ループの O(log N) 行列累乗化（f64 厳密範囲証明付き）、純粋再帰のトップダウン DP 化、独立 append ループの並列化を自動で適用します。</p>
+    </div>
+
+    <div class="xyo-card xyo-span-2">
+      <div class="xyo-card-head">
+        <span class="xyo-card-title">AOT 単体コンパイル</span>
+        <span class="xyo-pill">Zero Warmup</span>
+      </div>
+      <p>全スクリプトを O2 でオブジェクト化し、プロジェクトデータと同梱した単体バイナリを生成。非対応箇所は安全にフォールバックします。</p>
+    </div>
+
+    <div class="xyo-card xyo-span-2">
+      <div class="xyo-card-head">
+        <span class="xyo-card-title">解析・縮小・書き換えツール</span>
+        <span class="xyo-pill">CLI Suite</span>
+      </div>
+      <p>実行せずに構造と計算量を解析する <code>analyze</code>、可逆圧縮の <code>minify</code>、安全な warp 化を行う <code>rewrite</code> を内蔵しています。</p>
+    </div>
+  </div>
+</section>
+
+<section class="xyo-section">
+  <div class="xyo-section-head">
+    <span class="xyo-kicker">Benchmarks</span>
+    <h2>実測パフォーマンス（v1.3.4 / algo-bench）</h2>
+    <p>古典アルゴリズムや自動最適化パスの実測比較です。短いほど高速です。</p>
+  </div>
+
+  <div class="xyo-bench-grid">
+    <div class="xyo-bench-card">
+      <div class="xyo-bench-top">
+        <strong>fib(31) — 再帰手続き</strong>
+        <span class="xyo-bench-win">1.50× vs TurboWarp</span>
+      </div>
+      <div class="xyo-bar-row">
+        <span class="xyo-bar-name">xyo JIT</span>
+        <div class="xyo-bar-track"><div class="xyo-bar-fill xyo" style="width: 18%;"></div></div>
+        <span class="xyo-bar-val">36 ms</span>
+      </div>
+      <div class="xyo-bar-row">
+        <span class="xyo-bar-name">TurboWarp</span>
+        <div class="xyo-bar-track"><div class="xyo-bar-fill tw" style="width: 27%;"></div></div>
+        <span class="xyo-bar-val">54 ms</span>
+      </div>
+      <div class="xyo-bar-row">
+        <span class="xyo-bar-name">xyo Interp</span>
+        <div class="xyo-bar-track"><div class="xyo-bar-fill interp" style="width: 100%;"></div></div>
+        <span class="xyo-bar-val">4,833 ms</span>
+      </div>
+    </div>
+
+    <div class="xyo-bench-card">
+      <div class="xyo-bench-top">
+        <strong>SHA-256 (65,536 bytes)</strong>
+        <span class="xyo-bench-win">1.43× vs TurboWarp</span>
+      </div>
+      <div class="xyo-bar-row">
+        <span class="xyo-bar-name">xyo JIT</span>
+        <div class="xyo-bar-track"><div class="xyo-bar-fill xyo" style="width: 24%;"></div></div>
+        <span class="xyo-bar-val">61 ms</span>
+      </div>
+      <div class="xyo-bar-row">
+        <span class="xyo-bar-name">TurboWarp</span>
+        <div class="xyo-bar-track"><div class="xyo-bar-fill tw" style="width: 34%;"></div></div>
+        <span class="xyo-bar-val">87 ms</span>
+      </div>
+      <div class="xyo-bar-row">
+        <span class="xyo-bar-name">xyo Interp</span>
+        <div class="xyo-bar-track"><div class="xyo-bar-fill interp" style="width: 100%;"></div></div>
+        <span class="xyo-bar-val">16,128 ms</span>
+      </div>
+    </div>
+
+    <div class="xyo-bench-card">
+      <div class="xyo-bench-top">
+        <strong>repeat(2e9) 漸化式 (matpow)</strong>
+        <span class="xyo-bench-win">14.5× (O(log N))</span>
+      </div>
+      <div class="xyo-bar-row">
+        <span class="xyo-bar-name">matpow ON</span>
+        <div class="xyo-bar-track"><div class="xyo-bar-fill xyo" style="width: 7%;"></div></div>
+        <span class="xyo-bar-val">37 ms</span>
+      </div>
+      <div class="xyo-bar-row">
+        <span class="xyo-bar-name">逐次ループ</span>
+        <div class="xyo-bar-track"><div class="xyo-bar-fill interp" style="width: 100%;"></div></div>
+        <span class="xyo-bar-val">536 ms</span>
+      </div>
+    </div>
+
+    <div class="xyo-bench-card">
+      <div class="xyo-bench-top">
+        <strong>fib(36) — 自動 DP メモ化</strong>
+        <span class="xyo-bench-win">49.6× (O(N))</span>
+      </div>
+      <div class="xyo-bar-row">
+        <span class="xyo-bar-name">DP ON</span>
+        <div class="xyo-bar-track"><div class="xyo-bar-fill xyo" style="width: 4%;"></div></div>
+        <span class="xyo-bar-val">43 ms</span>
+      </div>
+      <div class="xyo-bar-row">
+        <span class="xyo-bar-name">DP OFF</span>
+        <div class="xyo-bar-track"><div class="xyo-bar-fill interp" style="width: 100%;"></div></div>
+        <span class="xyo-bar-val">2,134 ms</span>
+      </div>
+    </div>
+  </div>
+  <p class="xyo-bench-note">
+    ※ 計測条件: Intel Core i7-12700 / Linux x86-64 / LLVM 23。リスト索引が中心のソート系ベンチマークでは TurboWarp が優位なケースもあります。詳細な比較と条件は <a href="/xyo-cpp/research/algo-bench/">algo-bench</a> および <a href="/xyo-cpp/reference/scratch-bench/">scratch-bench</a> を参照してください。
+  </p>
+</section>
+
+<section class="xyo-section">
+  <div class="xyo-section-head">
+    <span class="xyo-kicker">Studio &amp; Targets</span>
+    <h2>CLI だけではない、GUI ランチャー・エディタ・ブラウザ対応</h2>
+    <p>Qt6 Quick ランチャー、ブロックエディタ、SDL2 プレイヤー、Emscripten による WebAssembly ビルドまで統合されています。</p>
+  </div>
+
+  <div class="xyo-gallery">
+    <div class="xyo-shot">
+      <div class="xyo-shot-media">
+        <img src={launcherImg.src} alt="xyo Qt6 Quick ランチャーのスクリーンショット" loading="lazy" />
+      </div>
+      <div class="xyo-shot-body">
+        <strong>Finder 風プロジェクトランチャー</strong>
+        <p>ライブサムネイル生成、検索・履歴、実行設定ダイアログ、ワンクリックでの AOT 実行・単体書き出しに対応。</p>
+      </div>
+    </div>
+
+    <div class="xyo-shot">
+      <div class="xyo-shot-media">
+        <img src={editorImg.src} alt="xyo ネイティブブロックエディタのスクリーンショット" loading="lazy" />
+      </div>
+      <div class="xyo-shot-body">
+        <strong>ネイティブブロックエディタ</strong>
+        <p>ブロック編集、コスチューム／サウンド管理、バックパック、埋め込みステージのライブ実行を統合。</p>
+      </div>
+    </div>
+
+    <div class="xyo-shot">
+      <div class="xyo-shot-media">
+        <img src={wasmImg.src} alt="WebAssembly ブラウザ再生のスクリーンショット" loading="lazy" />
+      </div>
+      <div class="xyo-shot-body">
+        <strong>WebAssembly プレイヤー</strong>
+        <p>Emscripten + SDL2 canvas + Asyncify によりブラウザ上で .sb3 をそのまま描画・実行可能。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="xyo-section">
+  <div class="xyo-section-head">
+    <span class="xyo-kicker">Documentation</span>
+    <h2>ドキュメントを探す</h2>
+  </div>
+
+  <CardGrid>
+    <LinkCard title="クイックスタート" href="/xyo-cpp/getting-started/" description="SB3 プロジェクトの実行と基本コマンドを数分で試します。" />
+    <LinkCard title="実行モードと JIT" href="/xyo-cpp/guide/execution/" description="HotSpot、Eager JIT、インタプリタの使い分けと遅延コンパイル。" />
+    <LinkCard title="CLI リファレンス" href="/xyo-cpp/guide/cli/" description="run / play / aot / analyze / minify / rewrite の使い方。" />
+    <LinkCard title="最適化一覧" href="/xyo-cpp/guide/optimizations/" description="JIT・文字列・リスト・GC・スケジューラの最適化カタログ。" />
+    <LinkCard title="アーキテクチャ" href="/xyo-cpp/architecture/overview/" description="IR・ファイバ・並列スケジューラ・ランタイムの内部設計。" />
+    <LinkCard title="テストと性能測定" href="/xyo-cpp/development/testing/" description="ctest、scratch-vm 差分検証、ベンチマークの実行方法。" />
+  </CardGrid>
+</section>
+
+<script>{`
+  (() => {
+    const root = document.querySelector('[data-xyo-terminal]');
+    if (!root) return;
+    const tabs = root.querySelectorAll('[data-tab]');
+    const panes = root.querySelectorAll('[data-pane]');
+    const copyBtn = root.querySelector('[data-copy-btn]');
+
+    const activate = (id) => {
+      tabs.forEach((t) => t.classList.toggle('is-active', t.dataset.tab === id));
+      panes.forEach((p) => p.classList.toggle('is-active', p.dataset.pane === id));
+    };
+
+    tabs.forEach((tab) => {
+      tab.addEventListener('click', () => activate(tab.dataset.tab));
+    });
+
+    if (copyBtn) {
+      copyBtn.addEventListener('click', async () => {
+        const active = root.querySelector('.xyo-term-pane.is-active');
+        const cmd = active?.getAttribute('data-cmd') || '';
+        if (!cmd) return;
+        try {
+          await navigator.clipboard.writeText(cmd);
+          copyBtn.textContent = 'Copied!';
+          setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1400);
+        } catch {
+          copyBtn.textContent = 'Copy';
+        }
+      });
+    }
+  })();
+`}</script>
