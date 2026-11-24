@@ -403,8 +403,8 @@ jobs:
             dist/xyo-linux-x86_64-static.tar.gz
             dist/xyo-windows-x86_64.zip
             dist/xyo-macos-arm64.tar.gz
-            dist/xyo-macos-x86_64.tar.gz
             dist/SHA256SUMS.txt
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
+          # x86_64 の macOS 成果物は同梱修正後にここへ戻す（現状は arm64 のみ）。
           fail_on_unmatched_files: true
