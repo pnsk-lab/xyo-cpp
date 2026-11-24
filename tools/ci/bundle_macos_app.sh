@@ -60,6 +60,17 @@ Imports = Resources/qml
 Qml2Imports = Resources/qml
 CONF
 
+# 依存の同梱は dylibbundler（検証済みの定番ツール）に任せ、その後に
+# 自前の正規化パス（@rpath 化・検証）を通す。dylibbundler が無い環境でも
+# 動くよう失敗は致命にしない。
+if command -v dylibbundler >/dev/null 2>&1; then
+  dylibbundler -cd -of -b -x "$MACOS/xyo" -d "$FW" \
+    -p "@executable_path/../Frameworks" \
+    || echo "dylibbundler が警告付きで終了しました（自前の正規化を続行）" >&2
+else
+  echo "dylibbundler が見つかりません（brew install dylibbundler）" >&2
+fi
+
 # 実行ファイルが参照する非 Qt・非システムの dylib を Frameworks へ
 # 再帰的にコピーし、@rpath 参照へ書き換える。brew の絶対パス
 # （/opt/homebrew, /usr/local）に留まる依存が無くなるまで繰り返す。
@@ -83,7 +94,7 @@ while [ $pass -lt 20 ]; do
   # 対象: 実行ファイル + Frameworks 内の（Qt 以外の）dylib。
   targets=("$MACOS/xyo")
   while IFS= read -r -d '' f; do targets+=("$f"); done < \
-    <(find "$FW" -type f -print0 2>/dev/null || true)
+    <(find "$FW" \( -type f -o -type l \) -print0 2>/dev/null || true)
   for t in "${targets[@]}"; do
     # macdeployqt が ad-hoc 署名した Mach-O は install_name_tool での
     # load command 書き換えを受け付けない（code signature invalid）。
@@ -118,10 +129,15 @@ done
 
 # 検証: brew 等の絶対パス依存が残っていないこと。
 bad=0
-for t in "$MACOS/xyo" $(find "$FW" -type f 2>/dev/null); do
+for t in "$MACOS/xyo" $(find "$FW" \( -type f -o -type l \) 2>/dev/null); do
   while IFS= read -r dep; do
     if ! is_system_or_rpath "$dep" && ! is_qt_framework "$dep"; then
       echo "未同梱の依存: $t -> $dep" >&2
+      echo "--- otool -L $t ---" >&2
+      otool -L "$t" >&2 || true
+      echo "--- install_name_tool で書き換えを再試行 ---" >&2
+      install_name_tool -change "$dep" "@rpath/$(basename "$dep")" "$t" \
+        || echo "書き換えに失敗（署名/書式の問題）" >&2
       bad=1
     fi
   done < <(otool -L "$t" | awk 'NR>1 {print $1}')

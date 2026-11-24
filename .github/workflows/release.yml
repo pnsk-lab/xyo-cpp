@@ -252,7 +252,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          brew install llvm ninja sdl2 pkgconf qt zstd
+          brew install llvm ninja sdl2 pkgconf qt zstd dylibbundler
           # zstd は keg-only なので、静的 LLVM のリンク時に lib を明示する
           # （llvm-config --system-libs が -lzstd を要求する）。
           echo "XYO_ZSTD_LIB=$(brew --prefix zstd)/lib" >> "$GITHUB_ENV" 
