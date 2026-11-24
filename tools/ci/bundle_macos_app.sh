@@ -50,7 +50,7 @@ is_qt_framework() {
 # --- 2) Qt 以外の依存を先に集める（元ファイルは未署名なので書き換え可能） -----
 bundle_deps() {
 pass=0
-while [ $pass -lt 20 ]; do
+while [ $pass -lt 6 ]; do
   pass=$((pass + 1))
   changed=0
   targets=("$MACOS/xyo")
@@ -58,6 +58,9 @@ while [ $pass -lt 20 ]; do
     <(find "$FW" \( -type f -o -type l \) -print0 2>/dev/null || true)
   for t in "${targets[@]}"; do
     chmod u+w "$t" 2>/dev/null || true
+    # 1 ファイルにつき install_name_tool は 1 回だけ呼ぶ（巨大バイナリでは
+    # 1 回の書き換えに十数秒かかるため、依存ごとに呼ぶと時間切れになる）。
+    changes=()
     while IFS= read -r dep; do
       is_system_or_rpath "$dep" && continue
       is_qt_framework "$dep" && continue
@@ -67,15 +70,18 @@ while [ $pass -lt 20 ]; do
         echo "bundle: $base"
         cp -L "$dep" "$FW/$base"
         chmod u+w "$FW/$base"
-        install_name_tool -id "@rpath/$base" "$FW/$base"
+        install_name_tool -id "@rpath/$base" "$FW/$base" 2>/dev/null || true
         install_name_tool -add_rpath "@loader_path" "$FW/$base" 2>/dev/null || true
       fi
-      if install_name_tool -change "$dep" "@rpath/$base" "$t"; then
+      changes+=(-change "$dep" "@rpath/$base")
+    done < <(otool -L "$t" 2>/dev/null | awk 'NR>1 {print $1}')
+    if [ ${#changes[@]} -gt 0 ]; then
+      if install_name_tool "${changes[@]}" "$t"; then
         changed=1
       else
-        echo "[bundle] install_name_tool 失敗: $t <- $dep" >&2
+        echo "[bundle] install_name_tool 失敗: $t" >&2
       fi
-    done < <(otool -L "$t" 2>/dev/null | awk 'NR>1 {print $1}')
+    fi
   done
   [ $changed -eq 0 ] && break
 done
@@ -175,7 +181,7 @@ for pass in 1 2 3; do
   while IFS= read -r -d '' f; do targets+=("$f"); done < \
     <(find "$FW" \( -type f -o -type l \) -print0 2>/dev/null || true)
   for t in "${targets[@]}"; do
-    chmod u+w "$t" 2>/dev/null || true
+    changes=()
     while IFS= read -r dep; do
       is_system_or_rpath "$dep" && continue
       is_qt_framework "$dep" && continue
@@ -185,22 +191,16 @@ for pass in 1 2 3; do
         echo "bundle(late): $base"
         cp -L "$dep" "$FW/$base"
         chmod u+w "$FW/$base"
-        install_name_tool -id "@rpath/$base" "$FW/$base"
+        install_name_tool -id "@rpath/$base" "$FW/$base" 2>/dev/null || true
       fi
-      codesign --remove-signature "$t" 2>/dev/null || true
-      install_name_tool -change "$dep" "@rpath/$base" "$t" || {
-        # 署名剥がしで壊れた場合は元ファイルから入れ直して再試行する。
-        if [ -f "$dep" ]; then
-          codesign --remove-signature "$t" 2>/dev/null || true
-          cp -f "$dep" "$t"
-          chmod u+w "$t"
-          install_name_tool -id "@rpath/$(basename "$t")" "$t" 2>/dev/null || true
-          install_name_tool -change "$dep" "@rpath/$base" "$t"
-        else
-          echo "書き換えに失敗（元ファイルも無し）: $t <- $dep" >&2
-        fi
-      }
+      changes+=(-change "$dep" "@rpath/$base")
     done < <(otool -L "$t" 2>/dev/null | awk 'NR>1 {print $1}')
+    if [ ${#changes[@]} -gt 0 ]; then
+      chmod u+w "$t" 2>/dev/null || true
+      codesign --remove-signature "$t" 2>/dev/null || true
+      install_name_tool "${changes[@]}" "$t" || \
+        echo "[bundle] 後段の install_name_tool 失敗: $t" >&2
+    fi
   done
   [ $remain -eq 0 ] && break
 done
