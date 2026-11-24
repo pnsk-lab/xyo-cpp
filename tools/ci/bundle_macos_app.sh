@@ -49,6 +49,17 @@ if [ -z "$DEPLOYQT" ]; then
 fi
 "$DEPLOYQT" "$APP" -qmldir="$QMLDIR" -verbose=1
 
+# macdeployqt は Qt のバージョンによって qt.conf を生成しないことがある。
+# バンドル内の探索パスを固定するため、明示的に書く（Prefix は Contents、
+# QML は macdeployqt が置く Resources/qml）。
+cat > "$RES/qt.conf" <<'CONF'
+[Paths]
+Prefix = ..
+PlugIns = PlugIns
+Imports = Resources/qml
+Qml2Imports = Resources/qml
+CONF
+
 # 実行ファイルが参照する非 Qt・非システムの dylib を Frameworks へ
 # 再帰的にコピーし、@rpath 参照へ書き換える。brew の絶対パス
 # （/opt/homebrew, /usr/local）に留まる依存が無くなるまで繰り返す。
@@ -72,7 +83,7 @@ while [ $pass -lt 10 ]; do
   # 対象: 実行ファイル + Frameworks 内の（Qt 以外の）dylib。
   targets=("$MACOS/xyo")
   while IFS= read -r -d '' f; do targets+=("$f"); done < \
-    <(find "$FW" -name '*.dylib' -print0 2>/dev/null || true)
+    <(find "$FW" -type f -print0 2>/dev/null || true)
   for t in "${targets[@]}"; do
     chmod u+w "$t" 2>/dev/null || true
     while IFS= read -r dep; do
@@ -99,7 +110,7 @@ done
 
 # 検証: brew 等の絶対パス依存が残っていないこと。
 bad=0
-for t in "$MACOS/xyo" $(find "$FW" -name '*.dylib' 2>/dev/null); do
+for t in "$MACOS/xyo" $(find "$FW" -type f 2>/dev/null); do
   while IFS= read -r dep; do
     if ! is_system_or_rpath "$dep" && ! is_qt_framework "$dep"; then
       echo "未同梱の依存: $t -> $dep" >&2
