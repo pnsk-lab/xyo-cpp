@@ -252,7 +252,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          brew install llvm ninja sdl2 pkgconf qt zstd
+          brew install llvm ninja sdl2 pkgconf qt zstd sdl3
           # zstd は keg-only なので、静的 LLVM のリンク時に lib を明示する
           # （llvm-config --system-libs が -lzstd を要求する）。
           echo "XYO_ZSTD_LIB=$(brew --prefix zstd)/lib" >> "$GITHUB_ENV" 
@@ -306,6 +306,27 @@ jobs:
           tar -C dist/pkg -czf dist/xyo-macos-${{ matrix.arch }}.tar.gz \
             xyo.app LICENSE THIRD-PARTY-NOTICES.txt RUNNING.txt docs/macos.md
           ls -lh dist/xyo-macos-${{ matrix.arch }}.tar.gz
+
+      # 焼いた .app 自体を起動して確認する（ビルド直後のバイナリではなく、
+      # 同梱物だけで動くか）。SDL3 の dlopen 失敗と Qt プラグイン解決は
+      # ここでしか捕まらない。
+      - name: Smoke (packaged xyo.app)
+        run: |
+          set -o pipefail
+          bin=dist/xyo.app/Contents/MacOS/xyo
+          log="$(mktemp)"
+          QT_QPA_PLATFORM=offscreen QT_DEBUG_PLUGINS=1 XYO_GUI_ACTIONS=quit \
+            "$bin" gui >"$log" 2>&1 || true
+          cat "$log" | tail -30
+          if grep -q "Failed loading SDL3" "$log"; then
+            echo "sdl2-compat が SDL3 をロードできていません" >&2; exit 1
+          fi
+          # プラグイン探索がアプリバンドル内へ向いていること。
+          grep -q "xyo.app/Contents/.*platforms" "$log" \
+            || { echo "Qt がバンドル内の platforms を探索していません" >&2; exit 1; }
+          grep -q "xyo.app/Contents/.*qml" "$log" \
+            || { echo "Qt がバンドル内の qml を探索していません" >&2; exit 1; }
+          bash tools/ci/smoke.sh gui "$bin"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5

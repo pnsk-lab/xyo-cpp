@@ -48,6 +48,7 @@ is_qt_framework() {
 }
 
 # --- 2) Qt 以外の依存を先に集める（元ファイルは未署名なので書き換え可能） -----
+bundle_deps() {
 pass=0
 while [ $pass -lt 20 ]; do
   pass=$((pass + 1))
@@ -78,6 +79,34 @@ while [ $pass -lt 20 ]; do
   done
   [ $changed -eq 0 ] && break
 done
+}
+
+bundle_deps
+
+# sdl2-compat は実行時に SDL3 を dlopen する（@loader_path / @executable_path
+# の "libSDL3.dylib"）。同梱 SDL2 が sdl2-compat なら SDL3 も入れないと
+# 起動直後に "Failed loading SDL3 library" で落ちる。
+SDL2_DYLIB="$(ls "$FW"/libSDL2*.dylib 2>/dev/null | head -1 || true)"
+if [ -n "$SDL2_DYLIB" ] && strings -a "$SDL2_DYLIB" | grep -q "libSDL3\.dylib"; then
+  SDL3_SRC=""
+  if command -v brew >/dev/null 2>&1; then
+    p="$(brew --prefix sdl3 2>/dev/null || true)"
+    [ -n "$p" ] && SDL3_SRC="$(ls "$p"/lib/libSDL3*.dylib 2>/dev/null | head -1 || true)"
+  fi
+  if [ -z "$SDL3_SRC" ]; then
+    echo "sdl2-compat ですが SDL3 が見つかりません（brew install sdl3）" >&2
+    exit 1
+  fi
+  echo "bundle: libSDL3.dylib (sdl2-compat の実行時依存)"
+  cp -L "$SDL3_SRC" "$FW/libSDL3.dylib"
+  chmod u+w "$FW/libSDL3.dylib"
+  install_name_tool -id "@rpath/libSDL3.dylib" "$FW/libSDL3.dylib"
+  install_name_tool -add_rpath "@loader_path" "$FW/libSDL3.dylib" 2>/dev/null || true
+  # sdl2-compat は @executable_path/libSDL3.dylib も試すので実行ファイル隣にも置く。
+  ln -sfn ../Frameworks/libSDL3.dylib "$MACOS/libSDL3.dylib"
+  # SDL3 自身の依存も取り込む。
+  bundle_deps
+fi
 
 # --- 3) macdeployqt -------------------------------------------------------
 DEPLOYQT="$(command -v macdeployqt || true)"
@@ -102,6 +131,21 @@ PlugIns = PlugIns
 Imports = Resources/qml
 Qml2Imports = Resources/qml
 CONF
+
+# Qt が読むのは実行ファイルと同じディレクトリの qt.conf。
+# Prefix を書かない場合、相対パスは実行ファイルのディレクトリ基準になる。
+cat > "$MACOS/qt.conf" <<'CONF'
+[Paths]
+PlugIns = ../PlugIns
+Imports = ../Resources/qml
+Qml2Imports = ../Resources/qml
+CONF
+
+# qt.conf が効かない経路（バンドル外から素のバイナリとして起動、
+# 一部 Qt バージョン等）でも cocoa プラグインと QML を見つけられるよう、
+# 実行ファイル隣から実体へ相対シンボリックリンクを張る。
+ln -sfn ../PlugIns/platforms "$MACOS/platforms"
+ln -sfn ../Resources/qml "$MACOS/qml"
 
 # --- 4) 残った絶対パス依存の正規化（macdeployqt が後から足した分） -----------
 for pass in 1 2 3; do
@@ -159,7 +203,22 @@ test -d "$RES/qml/QtQuick/Layouts" \
 test -d "$RES/qml/QtQuick/Controls" \
   || { echo "qml/QtQuick/Controls が同梱されていません" >&2; exit 1; }
 test -f "$RES/qt.conf" \
-  || { echo "qt.conf が生成されていません" >&2; exit 1; }
+  || { echo "qt.conf(Resources) が生成されていません" >&2; exit 1; }
+test -f "$MACOS/qt.conf" \
+  || { echo "qt.conf(MacOS) が生成されていません" >&2; exit 1; }
+# Qt が実際に探す場所から cocoa プラグインと QML が見えること。
+test -f "$MACOS/platforms/libqcocoa.dylib" \
+  || { echo "platforms/libqcocoa.dylib が見つかりません（qt.conf/リンク不備）" >&2; exit 1; }
+test -f "$MACOS/qml/QtQuick/Controls/qmldir" \
+  || { echo "qml/QtQuick/Controls が見つかりません（qt.conf/リンク不備）" >&2; exit 1; }
+# sdl2-compat なら SDL3 が実行ファイル隣と Frameworks の両方から解決できること。
+SDL2_DYLIB="$(ls "$FW"/libSDL2*.dylib 2>/dev/null | head -1 || true)"
+if [ -n "$SDL2_DYLIB" ] && strings -a "$SDL2_DYLIB" | grep -q "libSDL3\.dylib"; then
+  test -f "$FW/libSDL3.dylib" \
+    || { echo "sdl2-compat 用の SDL3 が同梱されていません" >&2; exit 1; }
+  test -f "$MACOS/libSDL3.dylib" \
+    || { echo "SDL3 が実行ファイル隣にありません（@executable_path で解決不可）" >&2; exit 1; }
+fi
 
 # 署名は install_name_tool で剥がれている。公証はしないので ad-hoc 署名で整える
 # （Gatekeeper 通過には従来どおり quarantine 解除が必要）。
