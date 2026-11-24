@@ -275,8 +275,9 @@ jobs:
             -DCMAKE_EXE_LINKER_FLAGS="-L$XYO_ZSTD_LIB"
           cmake --build build-macos --parallel 2
           echo "--- Qt framework への動的リンクを確認（LGPL） ---"
-          # Qt の framework 名は QtQuick/QtCore 等（"Qt6" ではない）。
-          otool -L build-macos/xyo | grep -E "\.framework/Qt" \
+          # Qt の framework は <prefix>/lib/QtQuick.framework/Versions/A/QtQuick
+          # の形（"Qt6" でも "framework/Qt" でもない）。
+          otool -L build-macos/xyo | grep -E "/Qt[A-Za-z]+\.framework/" \
             || { echo "Qt framework にリンクされていません"; exit 1; }
           echo "--- libLLVM は静的リンクであること ---"
           otool -L build-macos/xyo | grep -i "libLLVM" \
