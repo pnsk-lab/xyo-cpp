@@ -314,27 +314,35 @@ jobs:
       # Qt では出力されないため使わない）。
       - name: Smoke (packaged xyo.app, brew Qt hidden)
         run: |
-          set -o pipefail
           bin=dist/xyo.app/Contents/MacOS/xyo
-          qt="$(brew --prefix qt)"
-          sdl2="$(brew --prefix sdl2)"
-          sdl3="$(brew --prefix sdl3)"
+          qt="$(brew --prefix qt 2>/dev/null || true)"
+          sdl2="$(brew --prefix sdl2 2>/dev/null || true)"
+          sdl3="$(brew --prefix sdl3 2>/dev/null || true)"
+          echo "qt=$qt sdl2=$sdl2 sdl3=$sdl3"
           moved=()
-          hide() { [ -d "$1" ] && { mv "$1" "$1.hidden-for-smoke"; moved+=("$1"); }; }
+          hide() {
+            if [ -n "$1" ] && [ -d "$1" ]; then
+              mv "$1" "$1.hidden-for-smoke" && moved+=("$1")
+            fi
+            return 0
+          }
           restore() {
-            for d in "${moved[@]:-}"; do
-              [ -d "$d.hidden-for-smoke" ] && mv "$d.hidden-for-smoke" "$d" || true
+            for d in ${moved[@]+"${moved[@]}"}; do
+              if [ -d "$d.hidden-for-smoke" ]; then
+                mv "$d.hidden-for-smoke" "$d" || true
+              fi
             done
+            return 0
           }
           trap restore EXIT
-          hide "$qt/plugins"
-          hide "$qt/qml"
-          hide "$sdl2/lib"
-          hide "$sdl3/lib"
+          hide "$qt/plugins"; hide "$qt/qml"
+          hide "$sdl2/lib"; hide "$sdl3/lib"
           log="$(mktemp)"
+          set +e
           SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy QT_QPA_PLATFORM=offscreen \
             XYO_GUI_ACTIONS=quit "$bin" gui >"$log" 2>&1
           rc=$?
+          set -e
           tail -30 "$log"
           restore
           trap - EXIT
