@@ -118,7 +118,10 @@ if [ -z "$DEPLOYQT" ]; then
   echo "macdeployqt が見つかりません（brew install qt）" >&2
   exit 1
 fi
-"$DEPLOYQT" "$APP" -qmldir="$QMLDIR" -verbose=1 || \
+# offscreen / minimal も同梱する（ヘッドレス CI やサーバでの GUI 起動用。
+# macdeployqt の既定は cocoa だけで、QT_QPA_PLATFORM=offscreen が使えない）。
+"$DEPLOYQT" "$APP" -qmldir="$QMLDIR" -verbose=1 \
+  -extra-plugins=platforms/libqoffscreen.dylib,platforms/libqminimal.dylib || \
   echo "macdeployqt が警告付きで終了しました（検証は続行）" >&2
 
 # macdeployqt は Qt のバージョンにより qt.conf を生成しないことがある。

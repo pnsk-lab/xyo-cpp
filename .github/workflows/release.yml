@@ -339,10 +339,19 @@ jobs:
           hide "$qt/plugins"; hide "$qt/qml"
           hide "$sdl2/lib"; hide "$sdl3/lib"
           log="$(mktemp)"
+          run_gui() {
+            SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+              XYO_GUI_ACTIONS=quit ${1:+QT_QPA_PLATFORM="$1"} \
+              "$bin" gui >"$log" 2>&1
+          }
           set +e
-          SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy QT_QPA_PLATFORM=offscreen \
-            XYO_GUI_ACTIONS=quit "$bin" gui >"$log" 2>&1
+          run_gui offscreen
           rc=$?
+          if [ "$rc" -ne 0 ] && grep -q 'Could not find the Qt platform plugin "offscreen"' "$log"; then
+            echo "offscreen プラグイン未同梱のため cocoa で再試行" >&2
+            run_gui ""
+            rc=$?
+          fi
           set -e
           tail -30 "$log"
           restore
