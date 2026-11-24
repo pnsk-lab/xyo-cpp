@@ -658,6 +658,8 @@ extern int test_deps_main();
 extern int test_analysis_main();
 extern int test_complexity_main();
 extern int test_parfor_main();
+extern int test_matpow_main();
+extern int test_dp_main();
 extern int test_pen_hoist_main();
 extern int test_rewrite_main();
 extern int test_parallel_strings_main();
@@ -720,6 +722,8 @@ int main() {
     int analysisFail = test_analysis_main();
     int complexityFail = test_complexity_main();
     int parforFail = test_parfor_main();
+    int matpowFail = test_matpow_main();
+    int dpFail = test_dp_main();
     int penHoistFail = test_pen_hoist_main();
     int rewriteFail = test_rewrite_main();
     int parallelStringsFail = test_parallel_strings_main();
@@ -746,7 +750,7 @@ int main() {
     int mlirFail = test_mlir_main();
     return (g_fail + e2eFail + penFail + aotFail + wasmEmitFail +
             wasmCompileFail + minifyFail + depsFail + analysisFail + complexityFail + parforFail + penHoistFail + rewriteFail +
-            parallelStringsFail + schedulerFail +
+            parallelStringsFail + schedulerFail + matpowFail + dpFail +
             equalityLiteralFail + colorFastFail + motionNumericFail + slotHoistFail +
             listCodegenBoundsFail + nanCodegenFail + literalContextFail + numericPromotionFail + typeProfileFail + dangerFail + listStringInternFail +
             glChunkPlanFail + scratchCompatFail + listLimitFail + listReadMemoFail + sstrConsFail + gcPoolFail +

@@ -20,6 +20,7 @@
 #include "../core/cast.hpp"
 #include "../core/sstr.hpp"
 #include "../core/value.hpp"
+#include "../jit/matpow.hpp"
 #include "../jit/parfor.hpp"
 #include "../model/blocks.hpp"
 
@@ -247,12 +248,22 @@ private:
 
     bool emitChain(Builder& b, std::string id, int depth = 0);
     bool emitStatement(Builder& b, const xyo::Block& blk);
+    /// repeat until / while の行列累乗変換を一時的に止める
+    /// （変換の else 分岐で元のループを同じ形で再 emit するため）。
+    bool suppressMatPowCond_ = false;
     bool emitSubstack(Builder& b, const xyo::Block& blk, const char* name) {
         const xyo::BlockInput* sub = findInput(blk, name);
         if (sub && !sub->block.empty()) {
+            // 分岐本体内の return / stop はその本体だけを終わらせる。
+            // terminated_ は「今の鎖の後ろは実行されない」を表すので、
+            // 本体を抜けたら必ず外側の値へ戻す（戻さないと、if の then で
+            // return した後に続く文が丸ごと消える）。
+            const bool savedTerm = terminated_;
+            terminated_ = false;
             ++branchDepth_;
             const bool ok = emitChain(b, sub->block);
             --branchDepth_;
+            terminated_ = savedTerm;
             return ok;
         }
         return true;
@@ -1060,6 +1071,86 @@ bool ScriptBuilder::emitStatement(Builder& b, const xyo::Block& blk) {
             if (failed()) return false;
             operands.push_back(count);
         }
+        // 線形漸化式ループ（行列累乗 O(log n)）。本体が状態変数の affine
+        // 更新だけなら xyo.matpow.try が真を返して逐次ループをスキップする。
+        // 範囲証明が立たないときは else の通常 xyo.repeat へ落ちる。
+        // （MEXP-001: ここから matpow ブロック — 全書き換え時も保持すること）
+        if (repeat && inWarp_ && !suppressMatPowCond_) {
+            const xyo::BlockInput* mpSub = findInput(blk, "SUBSTACK");
+            static const bool matPowOn = [] {
+                const char* e = std::getenv("XYO_MATPOW");
+                return !e || e[0] != '0';
+            }();
+            std::string mpWhy;
+            auto mpOpt = (matPowOn && mpSub && !mpSub->block.empty())
+                ? jit::analyzeMatPow(blocks_, &blk, &mpWhy)
+                : std::optional<jit::MatPowPlan>{};
+            if (std::getenv("XYO_MATPOW_DEBUG"))
+                std::fprintf(stderr, "[mlir] matpow %s: plan=%d %s\n",
+                             blk.id.c_str(), int(mpOpt.has_value()),
+                             mpWhy.c_str());
+            if (mpOpt && mpOpt->condKind == 0) {
+                jit::MatPowPlan& plan = *mpOpt;
+                std::string varsAttr;
+                for (const xyo::BlockField* vf : plan.vars) {
+                    if (!varsAttr.empty()) varsAttr.push_back('\x1e');
+                    varsAttr += vf->id;
+                    varsAttr.push_back('\x1f');
+                    varsAttr += fieldName(*vf);
+                }
+                const int64_t dim = int64_t(plan.vars.size()) + 1;
+                auto hex64 = [](uint64_t v) {
+                    char buf[17];
+                    std::snprintf(buf, sizeof buf, "%016llx",
+                                  (unsigned long long)v);
+                    return std::string(buf);
+                };
+                std::string matAttr;
+                matAttr.reserve(plan.mat.size() * 16);
+                for (int64_t m : plan.mat) matAttr += hex64(uint64_t(m));
+                std::string postAttr;
+                postAttr.reserve(plan.postSrc.size() * 8);
+                for (int32_t ps : plan.postSrc) {
+                    char buf[9];
+                    std::snprintf(buf, sizeof buf, "%08x", unsigned(ps));
+                    postAttr += buf;
+                }
+                std::string writAttr;
+                writAttr.reserve(plan.written.size());
+                for (char wv : plan.written)
+                    writAttr.push_back(wv ? '1' : '0');
+                Op* tryOp = b.create(
+                    "xyo.matpow.try", {count}, {Type::boolean()},
+                    {{"vars", Attr::str(std::move(varsAttr))},
+                     {"mat", Attr::str(std::move(matAttr))},
+                     {"post", Attr::str(std::move(postAttr))},
+                     {"writ", Attr::str(std::move(writAttr))},
+                     {"flags", Attr::integer(plan.needsNonnegState ? 1 : 0)},
+                     {"dim", Attr::integer(dim)},
+                     {"bound", Attr::integer(plan.stmtBound)}});
+                Op* ifOp = b.create("xyo.if", {tryOp->result(0)}, {});
+                Region* tr = ifOp->addRegion();
+                {
+                    Block* tb = tr->addBlock();
+                    Builder hb(m_);
+                    hb.setBlock(tb);
+                    hb.createTerminator("xyo.yield", {});
+                }
+                Region* er = ifOp->addRegion();
+                {
+                    Block* eb = er->addBlock();
+                    Builder ebb(m_);
+                    ebb.setBlock(eb);
+                    const bool savedSuppress = suppressMatPowCond_;
+                    suppressMatPowCond_ = true;
+                    const bool okEmit = emitStatement(ebb, blk);
+                    suppressMatPowCond_ = savedSuppress;
+                    if (!okEmit) return false;
+                    ebb.createTerminator("xyo.yield", {});
+                }
+                return true;
+            }
+        }
         // 並列 append ループ（par-for）。「反復カウンタ + 各リストへ
         // 1 個ずつ append」の warp repeat をワーカー分割へ委譲する。
         // 成功なら xyo.parfor.try が真を返して逐次ループをスキップ、
@@ -1255,41 +1346,141 @@ bool ScriptBuilder::emitStatement(Builder& b, const xyo::Block& blk) {
             const xyo::BlockInput* subIn = findInput(blk, "SUBSTACK");
             return subIn && !subIn->block.empty() && bodyStartId.empty();
         }();
-        Op* loop = b.create(repeat ? "xyo.repeat"
-                             : forever ? "xyo.forever" : "xyo.while",
-                            std::move(operands), {}, std::move(attrs));
-        if (!repeat && !forever) {
-            Region* beforeR = loop->addRegion();
-            Block* before = beforeR->addBlock();
-            Builder nb(m_);
-            nb.setBlock(before);
-            Value cond = emitCondition(nb, blk, "CONDITION");
-            if (failed()) return false;
-            if (until)
-                cond = nb.create("xyo.bnot", {cond}, {Type::boolean()})
-                           ->result(0);
-            nb.createTerminator("xyo.condition", {cond});
+        // 通常のループ op を指定ビルダへ emit する（条件付きループの
+        // matpow が失敗したときの else 分岐でも同じ形を使う）。
+        const std::vector<Value> loopArgs = operands;
+        const AttrMap loopAttrs = attrs;
+        auto emitLoopOp = [&](Builder& nb0) -> bool {
+            Op* loop =
+                nb0.create(repeat ? "xyo.repeat"
+                                  : forever ? "xyo.forever" : "xyo.while",
+                           loopArgs, {}, loopAttrs);
+            if (!repeat && !forever) {
+                Region* beforeR = loop->addRegion();
+                Block* before = beforeR->addBlock();
+                Builder nb(m_);
+                nb.setBlock(before);
+                Value cond = emitCondition(nb, blk, "CONDITION");
+                if (failed()) return false;
+                if (until)
+                    cond = nb.create("xyo.bnot", {cond}, {Type::boolean()})
+                               ->result(0);
+                nb.createTerminator("xyo.condition", {cond});
+            }
+            Region* bodyR = loop->addRegion();
+            Block* body = bodyR->addBlock();
+            Builder nb2(m_);
+            nb2.setBlock(body);
+            if (hoistedWholeBody) {
+                // 全本体をホイストした: 空本体のまま終端へ（二重 emit 防止）。
+            } else if (!bodyStartId.empty()) {
+                const bool savedTerm2 = terminated_;
+                terminated_ = false;
+                ++branchDepth_;
+                const bool ok = emitChain(nb2, bodyStartId, 0);
+                --branchDepth_;
+                terminated_ = savedTerm2;
+                if (!ok) return false;
+            } else if (!emitSubstack(nb2, blk, "SUBSTACK")) {
+                return false;
+            }
+            if (inWarp_)
+                nb2.createTerminator("xyo.loop_yield", {},
+                                     {{"warp", Attr::integer(1)}});
+            else
+                nb2.createTerminator("xyo.loop_yield", {});
+            nb2.createTerminator("xyo.yield", {});
+            return true;
+        };
+
+        // 条件付きループ（repeat until / while）が単調な affine 比較なら、
+        // 反復回数を二分探索して行列累乗 O(log N) へ置き換える。
+        static const bool matPowCondOn = [] {
+            const char* e = std::getenv("XYO_MATPOW_MLIR_COND");
+            return !e || e[0] != '0';
+        }();
+        if (!repeat && !forever && inWarp_ && matPowCondOn &&
+            !suppressMatPowCond_) {
+            static const bool matPowOn = [] {
+                const char* e = std::getenv("XYO_MATPOW");
+                return !e || e[0] != '0';
+            }();
+            std::string mpWhy;
+            auto mpOpt = matPowOn
+                ? jit::analyzeMatPow(blocks_, &blk, &mpWhy)
+                : std::optional<jit::MatPowPlan>{};
+            if (mpOpt && mpOpt->condKind != 0) {
+                jit::MatPowPlan& plan = *mpOpt;
+                std::string varsAttr;
+                for (const xyo::BlockField* vf : plan.vars) {
+                    if (!varsAttr.empty()) varsAttr.push_back('\x1e');
+                    varsAttr += vf->id;
+                    varsAttr.push_back('\x1f');
+                    varsAttr += fieldName(*vf);
+                }
+                const int64_t dim = int64_t(plan.vars.size()) + 1;
+                auto hex64 = [](uint64_t v) {
+                    char buf[17];
+                    std::snprintf(buf, sizeof buf, "%016llx",
+                                  (unsigned long long)v);
+                    return std::string(buf);
+                };
+                std::string matAttr;
+                matAttr.reserve(plan.mat.size() * 16);
+                for (int64_t m : plan.mat) matAttr += hex64(uint64_t(m));
+                std::string postAttr;
+                postAttr.reserve(plan.postSrc.size() * 8);
+                for (int32_t ps : plan.postSrc) {
+                    char buf[9];
+                    std::snprintf(buf, sizeof buf, "%08x", unsigned(ps));
+                    postAttr += buf;
+                }
+                std::string writAttr;
+                writAttr.reserve(plan.written.size());
+                for (char wv : plan.written)
+                    writAttr.push_back(wv ? '1' : '0');
+                std::string diffAttr;
+                diffAttr.reserve(plan.diff.size() * 16);
+                for (int64_t dv : plan.diff) diffAttr += hex64(uint64_t(dv));
+                Op* tryOp = b.create(
+                    "xyo.matpow.try", {}, {Type::boolean()},
+                    {{"vars", Attr::str(std::move(varsAttr))},
+                     {"mat", Attr::str(std::move(matAttr))},
+                     {"post", Attr::str(std::move(postAttr))},
+                     {"writ", Attr::str(std::move(writAttr))},
+                     {"diff", Attr::str(std::move(diffAttr))},
+                     {"cond", Attr::integer(plan.condKind)},
+                     {"cmp", Attr::integer(plan.cmpKind)},
+                     {"flags", Attr::integer(plan.needsNonnegState ? 1 : 0)},
+                     {"dim", Attr::integer(dim)},
+                     {"bound", Attr::integer(plan.stmtBound)}});
+                Op* ifOp = b.create("xyo.if", {tryOp->result(0)}, {});
+                Region* tr = ifOp->addRegion();
+                {
+                    Block* tb = tr->addBlock();
+                    Builder hb(m_);
+                    hb.setBlock(tb);
+                    hb.createTerminator("xyo.yield", {});
+                }
+                Region* er = ifOp->addRegion();
+                {
+                    Block* eb = er->addBlock();
+                    Builder ebb(m_);
+                    ebb.setBlock(eb);
+                    // 元のループを「変換しない」状態で再 emit する。
+                    // 通常の文 emission をそのまま通すので、条件評価・本体・
+                    // 終端の組み立てが本経路と完全に一致する。
+                    const bool savedSuppress = suppressMatPowCond_;
+                    suppressMatPowCond_ = true;
+                    const bool okEmit = emitStatement(ebb, blk);
+                    suppressMatPowCond_ = savedSuppress;
+                    if (!okEmit) return false;
+                    ebb.createTerminator("xyo.yield", {});
+                }
+                return true;
+            }
         }
-        Region* bodyR = loop->addRegion();
-        Block* body = bodyR->addBlock();
-        Builder nb2(m_);
-        nb2.setBlock(body);
-        if (hoistedWholeBody) {
-            // 全本体をホイストした: 空本体のまま終端へ（二重 emit 防止）。
-        } else if (!bodyStartId.empty()) {
-            ++branchDepth_;
-            const bool ok = emitChain(nb2, bodyStartId, 0);
-            --branchDepth_;
-            if (!ok) return false;
-        } else if (!emitSubstack(nb2, blk, "SUBSTACK")) {
-            return false;
-        }
-        if (inWarp_)
-            nb2.createTerminator("xyo.loop_yield", {},
-                                 {{"warp", Attr::integer(1)}});
-        else
-            nb2.createTerminator("xyo.loop_yield", {});
-        nb2.createTerminator("xyo.yield", {});
+        if (!emitLoopOp(b)) return false;
         return true;
     }
     //--- run without screen refresh: 本体だけ isWarp=1 ---

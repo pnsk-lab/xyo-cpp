@@ -695,6 +695,26 @@ void testSampledWarpClock() {
 
 int test_danger_main() {
     GpuEnvGuard gpuDisabled;
+    // この節は「warp ループが時間予算で yield する」ことと、その前後で
+    // 昇格変数が実メモリへ spill/reload されることを検証する。線形漸化式
+    // ループの行列累乗（MEXP-001）が有効だと `change v by 1` のループが
+    // O(log n) のヘルパ呼出しへ置換され、poll 自体が消えて予算で譲らない
+    // （意味論は同じだが、ここで見たい機構が動かない）。この節だけ無効化する。
+    struct MatPowOff {
+        bool had = false;
+        std::string prev;
+        MatPowOff() {
+            if (const char* v = std::getenv("XYO_MATPOW")) {
+                had = true;
+                prev = v;
+            }
+            setenv("XYO_MATPOW", "0", 1);
+        }
+        ~MatPowOff() {
+            if (had) setenv("XYO_MATPOW", prev.c_str(), 1);
+            else unsetenv("XYO_MATPOW");
+        }
+    } matPowOff;
     testSampledWarpClock();
     testTransientRepeatEdges();
     const JitMode modes[] = {JitMode::Off, JitMode::Eager};

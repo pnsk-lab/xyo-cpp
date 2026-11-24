@@ -1,4 +1,5 @@
 // xyo-cpp: serialization/sb3.js 移植。
+#include "dp_transform.hpp"
 #include "sb3.hpp"
 
 #include <algorithm>
@@ -996,6 +997,10 @@ static Sb3LoadResult loadSb3Parsed(Runtime& runtime, const JsonValue& json,
     // monitors
     for (const auto& m : json.get("monitors").asArray())
         loadMonitor(runtime, m, result.targets);
+
+    // DP 変換（純粋な自己再帰 reporter 手続きの自動メモ化）。ファイルは
+    // 書き換えずロード後のブロックグラフだけを変更する（XYO_DP=0 で無効）。
+    dp::applyToRuntime(runtime);
 
     result.ok = true;
     return result;

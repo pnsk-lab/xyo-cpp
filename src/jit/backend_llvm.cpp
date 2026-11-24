@@ -491,6 +491,12 @@ void xyo_par_slot(void* list, int64_t idx, int64_t bits);
 int xyo_par_for(JitCtx*, int64_t trip, double init, double delta,
                 void** lists, int64_t* bases, int64_t nl,
                 void (*body)(JitCtx*, int64_t, double, void**, int64_t*));
+// matpow（線形漸化式ループの行列累乗）— matpow_rt.cpp
+int xyo_matpow(void*, double n, const Value* const* vars, int64_t k,
+               const int64_t* mat, int64_t dim, int64_t stmtBound,
+               double* out, const int32_t* postSrc, const uint8_t* writ,
+               int32_t flags, int32_t condKind, int32_t cmpKind,
+               const int64_t* diff);
 }
 
 // Native-only guard slow-path telemetry. This function is referenced by
@@ -786,6 +792,7 @@ const std::pair<const char*, void*> kRtSymbols[] = {
     {"xyo_list_reserve", (void*)&xyo_list_reserve},
     {"xyo_par_slot", (void*)&xyo_par_slot},
     {"xyo_par_for", (void*)&xyo_par_for},
+    {"xyo_matpow", (void*)&xyo_matpow},
     {"xyo_arg_get", (void*)&xyo_arg_get},
     {"xyo_rt_wait", (void*)&xyo_rt_wait},
     {"xyo_wait_begin", (void*)&xyo_wait_begin},
@@ -4144,7 +4151,7 @@ std::unique_ptr<CompiledScript> LLVMBackend::compile(
         // Script-to-script scheduling and coroutine resume remain separate.
         // Abort before any transformation if an oversized or recursive
         // call graph cannot be represented as a bounded single function.
-        if (emitOk && !cs->mlirFrontend && !runtime.blockCountEnabled &&
+        if (emitOk && !runtime.blockCountEnabled &&
             !std::getenv("XYO_JIT_CALLFRAME") &&
             !std::getenv("XYO_PROF") && mega_goto::enabled()) {
             const auto mega = mega_goto::fuse(
@@ -4164,8 +4171,7 @@ std::unique_ptr<CompiledScript> LLVMBackend::compile(
         // Size-bounded partial fusion is deliberately separate from the
         // all-or-nothing dispatcher. The IR remains callable through
         // original procedure symbols when only a subset is inlined.
-        if (emitOk && !cs->mlirFrontend && !megaFused &&
-            !runtime.blockCountEnabled &&
+        if (emitOk && !megaFused && !runtime.blockCountEnabled &&
             !std::getenv("XYO_JIT_CALLFRAME") &&
             !std::getenv("XYO_PROF") && mega_partial::enabled()) {
             const auto partial = mega_partial::fuse(*mod, procNameMap);
@@ -4188,7 +4194,7 @@ std::unique_ptr<CompiledScript> LLVMBackend::compile(
         const bool generalCoro = !narrowCoro &&
             stackless::generalCandidate(*blocks, *top);
         const bool candidate =
-            emitOk && !cs->mlirFrontend && !runtime.blockCountEnabled &&
+            emitOk && !runtime.blockCountEnabled &&
             !std::getenv("XYO_JIT_CALLFRAME") &&
             !std::getenv("XYO_PROF") &&
             (narrowCoro || generalCoro);

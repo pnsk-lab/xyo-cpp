@@ -9,6 +9,7 @@
 #include "llvm_helper_attributes.hpp"
 #include "aot_emit.hpp"
 #include "parfor.hpp"
+#include "matpow.hpp"
 #include "../ir/numeric.hpp"
 #include "../ir/diamond.hpp"
 #include "../ir/loop.hpp"
@@ -315,6 +316,8 @@ struct Codegen {
     bool parForDisabled = guardNativeVarSlots ||
                           (std::getenv("XYO_PARFOR") != nullptr &&
                            std::getenv("XYO_PARFOR")[0] == '0');
+    bool matPowDisabled = std::getenv("XYO_MATPOW") != nullptr &&
+                          std::getenv("XYO_MATPOW")[0] == '0';
 
     // --- ループ不変 pen setter のホイスト -------------------------------
     // warp 手続き内のループで、本体先頭に並ぶ pen 設定（サイズ/色）の引数が
@@ -623,6 +626,146 @@ struct Codegen {
         llvm::Value* fin = b.CreateFAdd(
             initF, b.CreateFMul(b.CreateSIToFP(trip, f64t), cf64(plan.delta)));
         emitVarSet(plan.counterField, emitCanon(fin));
+        b.CreateBr(merge);
+        return true;
+    }
+
+    /// 線形漸化式ループを行列累乗 O(log n) で実行する。
+    /// xyo_matpow の戻り値: 0=逐次へ（fallback）、1=結果あり（書き戻して
+    /// merge）、2=0 反復（何もせず merge）。warp 中のみ試す。
+    /// 計画を IR に落とす本体。condGate は呼び出し前の追加条件
+    /// （nullptr なら warp と n の範囲だけ）。
+
+    /// 回数付き repeat 用の入口。
+    bool tryEmitMatPow(Block* blk, llvm::Value* n, BasicBlock* fallback,
+                       BasicBlock* merge) {
+        if (captureReporterListReadEvaluation || matPowDisabled || aot ||
+            runtime.blockCountEnabled || !blocks)
+            return false;
+        std::string why;
+        auto planOpt = jit::analyzeMatPow(*blocks, blk, &why);
+        if (!planOpt) {
+            if (verbose)
+                std::fprintf(stderr, "xyo-jit: matpow skip (%s): %s\n",
+                             blk->id.c_str(), why.c_str());
+            return false;
+        }
+        if (planOpt->condKind != 0) return false;
+        return emitMatPowPlan(*planOpt, n, fallback, merge, nullptr);
+    }
+
+    /// 条件付きループ（repeat until / while）用の入口。条件が単調な affine
+    /// 比較であることを検出器が証明したときだけ、反復回数を実行時に
+    /// 二分探索して行列累乗へ置き換える。
+    bool tryEmitMatPowCond(Block* blk, BasicBlock* fallback,
+                           BasicBlock* merge) {
+        if (captureReporterListReadEvaluation || matPowDisabled || aot ||
+            runtime.blockCountEnabled || !blocks)
+            return false;
+        std::string why;
+        auto planOpt = jit::analyzeMatPow(*blocks, blk, &why);
+        if (!planOpt) {
+            if (verbose)
+                std::fprintf(stderr, "xyo-jit: matpow skip (%s): %s\n",
+                             blk->id.c_str(), why.c_str());
+            return false;
+        }
+        if (planOpt->condKind == 0) return false;
+        if (std::getenv("XYO_MATPOW_DEBUG")) {
+            std::fprintf(stderr, "xyo-jit: matpow cond k=%d post/writ:",
+                         int(planOpt->postSrc.size()));
+            for (size_t i = 0; i < planOpt->postSrc.size(); ++i)
+                std::fprintf(stderr, " %d/%d", planOpt->postSrc[i],
+                             int(planOpt->written[i]));
+            std::fprintf(stderr, "\n");
+        }
+        return emitMatPowPlan(*planOpt, cf64(0.0), fallback, merge, nullptr);
+    }
+
+    bool emitMatPowPlan(jit::MatPowPlan& plan, llvm::Value* n,
+                        BasicBlock* fallback, BasicBlock* merge,
+                        llvm::Value* condGate) {
+        const int64_t k = int64_t(plan.vars.size());
+        const int64_t dim = k + 1;
+
+        // 拡大行列（int64、(dim x dim) row-major）を定数グローバルへ
+        ArrayType* i64Arr = ArrayType::get(i64t, uint64_t(dim));
+        ArrayType* matTy = ArrayType::get(i64Arr, uint64_t(dim));
+        std::vector<Constant*> rows;
+        rows.reserve(size_t(dim));
+        for (int64_t r = 0; r < dim; ++r) {
+            std::vector<Constant*> cols;
+            cols.reserve(size_t(dim));
+            for (int64_t c = 0; c < dim; ++c)
+                cols.push_back(ci64(uint64_t(
+                    plan.mat[size_t(r) * dim + c])));
+            rows.push_back(ConstantArray::get(i64Arr, cols));
+        }
+        auto* matGlobal = new GlobalVariable(
+            mod, matTy, /*isConstant=*/true, GlobalValue::PrivateLinkage,
+            ConstantArray::get(matTy, rows),
+            prefix + "_matpow_" + std::to_string(procCounter++));
+
+        // 状態変数の Value* 配列と結果の f64 配列
+        AllocaInst* varsArr = entryAlloca(ptrt, uint32_t(k), "mp_vars");
+        AllocaInst* outArr = entryAlloca(f64t, uint32_t(k), "mp_out");
+        // 読み出しは varValuePtr（= ループ昇格中のスロット、非昇格なら
+        // 実ストレージ）。昇格スロットは beginLoopPromotion がループ入口で
+        // 実メモリから初期化済みで、内側ループから呼ぶ場合も本体の更新が
+        // スロットに載っているため実メモリより新しい。書き戻しも
+        // emitVarSet 経由で同じスロットへ入り、merge の endLoopPromotion が
+        // 実メモリへ流す（p.written が立つ）。
+        for (int64_t i = 0; i < k; ++i)
+            b.CreateStore(varValuePtr(plan.vars[size_t(i)]),
+                          b.CreateGEP(ptrt, varsArr, ci64(uint64_t(i))));
+
+        // warp 中かつ（条件ループなら）条件が affine 単調であることを
+        // 検出時に証明済み — 実行時の追加条件があれば併せる。
+        llvm::Value* cond = b.CreateICmpNE(loadIsWarp(), ci32(0));
+        if (condGate) cond = b.CreateAnd(cond, condGate);
+        BasicBlock* callBB = BasicBlock::Create(lc, "", fn);
+        BasicBlock* applyBB = BasicBlock::Create(lc, "", fn);
+        b.CreateCondBr(cond, callBB, fallback);
+        b.SetInsertPoint(callBB);
+        // postSrc: -1 = 算術で数値確定、w>=0 = 初期値 w の型を引き継ぐ
+        AllocaInst* postArr = entryAlloca(i32t, uint32_t(k), "mp_post");
+        for (int64_t i = 0; i < k; ++i)
+            b.CreateStore(ci32(uint32_t(plan.postSrc[size_t(i)])),
+                          b.CreateGEP(i32t, postArr, ci64(uint64_t(i))));
+        AllocaInst* wrArr = entryAlloca(i8t, uint32_t(k), "mp_wr");
+        for (int64_t i = 0; i < k; ++i)
+            b.CreateStore(ci8(uint8_t(plan.written[size_t(i)])),
+                          b.CreateGEP(i8t, wrArr, ci64(uint64_t(i))));
+        AllocaInst* diffArr = nullptr;
+        if (plan.condKind != 0) {
+            diffArr = entryAlloca(i64t, uint32_t(dim), "mp_diff");
+            for (int64_t i = 0; i < dim; ++i)
+                b.CreateStore(ci64(uint64_t(plan.diff[size_t(i)])),
+                              b.CreateGEP(i64t, diffArr, ci64(uint64_t(i))));
+        }
+        llvm::Value* r = callN(
+            "xyo_matpow", i32t,
+            {ctxArg, n, varsArr, ci64(uint64_t(k)),
+             b.CreatePointerCast(matGlobal, ptrt), ci64(uint64_t(dim)),
+             ci64(uint64_t(plan.stmtBound)), outArr, postArr, wrArr,
+             ci32(plan.needsNonnegState ? 1u : 0u),
+             ci32(uint32_t(plan.condKind)), ci32(uint32_t(plan.cmpKind)),
+             diffArr
+                 ? static_cast<llvm::Value*>(diffArr)
+                 : static_cast<llvm::Value*>(ConstantPointerNull::get(
+                       llvm::cast<PointerType>(ptrt)))});
+        auto* sw = b.CreateSwitch(r, fallback, 2);
+        sw->addCase(llvm::cast<llvm::ConstantInt>(ci32(1)), applyBB);
+        sw->addCase(llvm::cast<llvm::ConstantInt>(ci32(2)), merge);
+        b.SetInsertPoint(applyBB);
+        for (int64_t i = 0; i < k; ++i) {
+            // 読み専用の変数はループで変化しない — 書き戻さない
+            // （文字列のまま保持され得る値を数値で上書きしないため）。
+            if (!plan.written[size_t(i)]) continue;
+            llvm::Value* d = b.CreateLoad(
+                f64t, b.CreateGEP(f64t, outArr, ci64(uint64_t(i))));
+            emitVarSet(plan.vars[size_t(i)], emitCanon(d));
+        }
         b.CreateBr(merge);
         return true;
     }
@@ -6126,23 +6269,32 @@ struct Codegen {
         ir::kListNumericOnlyOffset;
     void invalidateNumericList(llvm::Value* list, llvm::Value* item,
                                bool replacement = false) {
+        // SList::monitorDirty への毎反復 store は除去済み（読み手が存在しない
+        // ため。helper 経路は従来通り設定する）。ここでは numericOnly のみ扱う。
         llvm::Value* flag = b.CreateConstGEP1_32(
             i8t, list, kListNumericOnlyOff);
         static const bool lazyInvalidation = [] {
-            // Default on for list replacement only. Keep add/append on its
-            // established fast path; =0 restores unconditional read/AND/store.
+            // Default on for list writes. =0 restores unconditional
+            // read/AND/store.
             const char* env = std::getenv("XYO_JIT_LIST_MONOTONE_FLAG");
             return !env || env[0] != '0';
         }();
-        if (replacement && lazyInvalidation) {
+        // コンパイル時に数値と確定する ITEM は何もしない（SList::numericOnly
+        // は単調で、数値書き込みはフラグを変えない）。
+        if (knownNum.count(item)) return;
+        if (constNumV(item).has_value()) return;
+        if (lazyInvalidation) {
             // SList::numericOnly is monotonic for push/replace: writing
             // a numeric Value cannot change it. In the nonnumeric case
             // clear the flag exactly once (idempotent if already false).
             // No list code or synchronization rule is otherwise changed.
-            if (knownNum.count(item)) return;
+            // `bits < kFalse` (signed) は Value::isNumber と等価:
+            // 非負域では kNan 以下が数値、負域は全て数値。emitIsNum の
+            // lshr+and+or 連鎖より1命令で済み、movabs も共有できる。
             BasicBlock* nonNumeric = newBB("list.numflag.invalidate");
             BasicBlock* done = newBB("list.numflag.done");
-            hotBr(emitIsNum(item), done, nonNumeric, 500, 1);
+            hotBr(b.CreateICmpSLT(item, ci64(val::kFalse)), done, nonNumeric,
+                  500, 1);
             b.SetInsertPoint(nonNumeric);
             b.CreateStore(b.getInt1(false), flag);
             b.CreateBr(done);
@@ -6152,6 +6304,7 @@ struct Codegen {
         llvm::Value* prior = b.CreateLoad(b.getInt1Ty(), flag);
         llvm::Value* valid = b.CreateAnd(prior, emitIsNum(item));
         b.CreateStore(valid, flag);
+        (void)replacement;
     }
     static constexpr uint32_t kListItemsOff =
         ir::kListItemsOffset;
@@ -6847,8 +7000,9 @@ struct Codegen {
         beginListContentWrite();
         b.CreateStore(item, b.CreateGEP(i64t, items, i0));
         endListContentWrite();
-        b.CreateStore(b.getInt8(1),
-                      b.CreateConstGEP1_32(i8t, l, kListDirtyOff));
+        // SList::monitorDirty は読み手が存在しないため fast path では書かない
+        //（helper 経路の xyo_list_replace が設定する）。毎反復の1バイト
+        // store とヘッダキャッシュラインの dirty 化を避ける。
         b.CreateBr(merge);
         b.SetInsertPoint(slowBB);
         callN("xyo_list_replace", voidt,
@@ -6923,13 +7077,23 @@ struct Codegen {
             i32t, b.CreateConstGEP1_32(i8t, l, kListLenOff));
         llvm::Value* cap = b.CreateLoad(
             i32t, b.CreateConstGEP1_32(i8t, l, kListCapOff));
-        // リスト長上限（0 = 無制限）。上限に達していたら helper 経由にして
-        // 追加を落とす（SList::push が上限を見る）。
-        llvm::Value* lim = b.CreateLoad(i32t, listLimitGlobal());
-        llvm::Value* room = b.CreateOr(b.CreateICmpEQ(lim, ci32(0)),
-                                       b.CreateICmpULT(len, lim));
+        // リスト長上限（0 = 無制限）。JIT では emit 時の値で特化する
+        //（起動前に決まり実行中に変わらない。AOT は実行時値が違う場合が
+        // あるため常に従来の実行時チェック）。上限に達していたら helper
+        // 経由にして追加を落とす（SList::push が上限を見る）。
+        // SList::monitorDirty は読み手が存在しないため fast path では書かない。
+        bool noLimitAtEmit = !aot && xyo_list_limit == 0;
+        llvm::Value* room = nullptr;
+        llvm::Value* lim = nullptr;
+        if (!noLimitAtEmit) {
+            lim = b.CreateLoad(i32t, listLimitGlobal());
+            room = b.CreateOr(b.CreateICmpEQ(lim, ci32(0)),
+                              b.CreateICmpULT(len, lim));
+        }
         b.CreateCondBr(
-            b.CreateAnd(b.CreateICmpULT(len, cap), room), fastBB, slowBB);
+            noLimitAtEmit ? b.CreateICmpULT(len, cap)
+                          : b.CreateAnd(b.CreateICmpULT(len, cap), room),
+            fastBB, slowBB);
         b.SetInsertPoint(fastBB);
         llvm::Value* items = b.CreateLoad(
             ptrt, b.CreateConstGEP1_32(i8t, l, kListItemsOff));
@@ -6940,8 +7104,6 @@ struct Codegen {
                                   b.CreateZExt(len, i64t)));
         b.CreateStore(b.CreateAdd(len, ci32(1)),
                       b.CreateConstGEP1_32(i8t, l, kListLenOff));
-        b.CreateStore(b.getInt8(1),
-                      b.CreateConstGEP1_32(i8t, l, kListDirtyOff));
         endListContentWrite();
         b.CreateBr(merge);
         b.SetInsertPoint(slowBB);
@@ -10113,11 +10275,16 @@ struct Codegen {
             BasicBlock* merge = BasicBlock::Create(lc, "", fn);
             // 「カウンタ + append」ループなら par-for を試す（warp 実行中のみ）。
             // 失敗（0 返却）時は従来の CPU ループへ落ちる。
-            const bool triedParFor =
+            const bool osrProtected =
                 nestedOsrInFlightGuard &&
-                (osrFirstLoop || protectedNativeInner)
+                (osrFirstLoop || protectedNativeInner);
+            const bool triedMatPow =
+                osrProtected ? false
+                             : tryEmitMatPow(blk, n, head, merge);
+            const bool triedParFor =
+                osrProtected || triedMatPow
                     ? false : tryEmitParFor(blk, n, head, merge);
-            if (!triedParFor) {
+            if (!triedParFor && !triedMatPow) {
                 if (gp) {
                     llvm::Value* done =
                         callN("xyo_gpu_repeat", i32t,
@@ -10244,6 +10411,19 @@ struct Codegen {
 
         if (op == "control_while" || op == "control_repeat_until") {
             BasicBlock* inductionDone = nullptr;
+            BasicBlock* head = BasicBlock::Create(lc, "", fn);
+            BasicBlock* bodyBB = BasicBlock::Create(lc, "", fn);
+            BasicBlock* merge = BasicBlock::Create(lc, "", fn);
+            // 条件が単調な affine 比較なら、反復回数を二分探索して行列累乗
+            // O(log N) へ置き換える。ここで成功した場合は以下のチョーク型
+            // 誘導ループ／GPU／逐次ループを丸ごと省略する（意味論は同じ）。
+            const bool matPowApplied =
+                !nestedOsrInFlightGuard && !runtime.blockCountEnabled &&
+                tryEmitMatPowCond(blk, head, merge);
+            if (matPowApplied) {
+                b.SetInsertPoint(merge);
+                return;
+            }
             if (!runtime.blockCountEnabled)
             if (auto plan = warpInductionPlan(blk)) {
                 BasicBlock* fallback = newBB("induction.fallback");
@@ -10262,9 +10442,6 @@ struct Codegen {
                     return;
                 }
             }
-            BasicBlock* head = BasicBlock::Create(lc, "", fn);
-            BasicBlock* bodyBB = BasicBlock::Create(lc, "", fn);
-            BasicBlock* merge = BasicBlock::Create(lc, "", fn);
             // 不変性が証明された counted while/until は GPU 並列へ —
             // 境界は limitParent/limitInput が指す不変オペランドを
             // ループ前に一度だけ評価する。元の条件は CPU パスで

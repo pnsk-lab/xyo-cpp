@@ -415,6 +415,7 @@ struct Lowerer {
     void emitRepeat(Op& op);
     void emitForever(Op& op);
     void emitParForTry(Op& op);
+    void emitMatPowTry(Op& op);
     void emitPendingParFors();
     void emitCompat(Op& op, bool asValue);
     void emitAllAtOnce(Op& op);
@@ -1918,6 +1919,204 @@ void Lowerer::emitParForTry(Op& op) {
     b.SetInsertPoint(merge);
     auto* phi = b.CreatePHI(b.getInt1Ty(), 2);
     phi->addIncoming(b.getInt1(true), succEnd);
+    phi->addIncoming(b.getInt1(false), fb);
+    vals[keyOf(op.result(0))] = phi;
+}
+
+void Lowerer::emitMatPowTry(Op& op) {
+    // 線形漸化式ループの行列累乗（legacy の tryEmitMatPow と同じ意味論）。
+    // 戻り値: 0 = 逐次フォールバック、1 = out[] を変数へ書き戻す、
+    // 2 = 0 反復（producer 結果 = 真、書き込み無し）。
+    // 条件付きループ（until/while）はオペランドを持たない — 反復回数は
+    // 実行時に条件の単調性を使って二分探索する。
+    LValue* n = op.operands.empty()
+        ? static_cast<LValue*>(llvm::ConstantFP::get(f64(), 0.0))
+        : numberShadow(op.operands[0]);
+
+    // "id\x1fname\x1eid\x1fname..." を分解
+    std::vector<std::pair<std::string, std::string>> vars;
+    {
+        const std::string raw(op.attrStr("vars"));
+        size_t pos = 0;
+        while (pos < raw.size()) {
+            const size_t sep = raw.find('\x1e', pos);
+            const std::string part = raw.substr(
+                pos, sep == std::string::npos ? std::string::npos
+                                              : sep - pos);
+            if (part.empty()) break;
+            const size_t mid = part.find('\x1f');
+            if (mid == std::string::npos) {
+                error = "matpow: bad vars attr";
+                return;
+            }
+            vars.emplace_back(part.substr(0, mid), part.substr(mid + 1));
+            if (sep == std::string::npos) break;
+            pos = sep + 1;
+        }
+    }
+    const int64_t kv = int64_t(vars.size());
+    const int64_t dim = op.attrInt("dim", kv + 1);
+    const int64_t bound = op.attrInt("bound", 1);
+    const int64_t condKind = op.attrInt("cond", 0);
+    const int64_t cmpKind = op.attrInt("cmp", 0);
+    if (kv <= 0 || dim != kv + 1) { error = "matpow: bad attrs"; return; }
+
+    auto unhex = [](char ch) -> int {
+        if (ch >= '0' && ch <= '9') return ch - '0';
+        if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+        return -1;
+    };
+    auto parseHex64 = [&](const std::string& hex, size_t idx,
+                          uint64_t* out) -> bool {
+        uint64_t v = 0;
+        for (int h = 0; h < 16; ++h) {
+            const int dg = unhex(hex[idx * 16 + size_t(h)]);
+            if (dg < 0) return false;
+            v = (v << 4) | uint64_t(dg);
+        }
+        *out = v;
+        return true;
+    };
+
+    // 定数行列（int64 dim x dim）。IR はテキストへ印字→再読込されるので
+    // NUL を含むバイナリではなく 16 進文字列で運ばれている。
+    const std::string matHex(op.attrStr("mat"));
+    if (int64_t(matHex.size()) != dim * dim * 16) {
+        error = "matpow: bad mat size";
+        return;
+    }
+    auto* i64Arr = llvm::ArrayType::get(i64(), uint64_t(dim));
+    auto* matTy = llvm::ArrayType::get(i64Arr, uint64_t(dim));
+    std::vector<llvm::Constant*> rows;
+    rows.reserve(size_t(dim));
+    for (int64_t r = 0; r < dim; ++r) {
+        std::vector<llvm::Constant*> cols;
+        cols.reserve(size_t(dim));
+        for (int64_t c = 0; c < dim; ++c) {
+            uint64_t v = 0;
+            if (!parseHex64(matHex, size_t(r * dim + c), &v)) {
+                error = "matpow: bad mat hex";
+                return;
+            }
+            cols.push_back(llvm::ConstantInt::get(i64(), v));
+        }
+        rows.push_back(llvm::ConstantArray::get(i64Arr, cols));
+    }
+    auto* matGlobal = new llvm::GlobalVariable(
+        mod, matTy, /*isConstant=*/true, llvm::GlobalValue::PrivateLinkage,
+        llvm::ConstantArray::get(matTy, rows), ".xyo.matpow");
+
+    // 型伝播（int32 x k、8 桁 16 進）と書き込み対象（i8 x k、'0'/'1'）
+    const std::string postHex(op.attrStr("post"));
+    const std::string writRaw(op.attrStr("writ"));
+    if (int64_t(postHex.size()) != kv * 8 || int64_t(writRaw.size()) != kv) {
+        error = "matpow: bad post/writ size";
+        return;
+    }
+    llvm::AllocaInst* postArr = entryAlloca(i32(), "mp.post", uint32_t(kv));
+    llvm::AllocaInst* writArr = entryAlloca(i8(), "mp.writ", uint32_t(kv));
+    for (int64_t i = 0; i < kv; ++i) {
+        uint32_t pv = 0;
+        for (int h = 0; h < 8; ++h) {
+            const int dg = unhex(postHex[size_t(i) * 8 + size_t(h)]);
+            if (dg < 0) { error = "matpow: bad post hex"; return; }
+            pv = (pv << 4) | uint32_t(dg);
+        }
+        b.CreateStore(llvm::ConstantInt::get(i32(), pv),
+                      b.CreateGEP(i32(), postArr,
+                                  llvm::ConstantInt::get(i64(), uint64_t(i))));
+        b.CreateStore(
+            llvm::ConstantInt::get(b.getInt8Ty(),
+                                   writRaw[size_t(i)] == '1' ? 1 : 0),
+            b.CreateGEP(i8(), writArr,
+                        llvm::ConstantInt::get(i64(), uint64_t(i))));
+    }
+
+    // 条件付きループ（repeat until / while）の差分行 L-R（int64 x dim）
+    llvm::AllocaInst* diffArr = nullptr;
+    if (condKind != 0) {
+        const std::string diffHex(op.attrStr("diff"));
+        if (int64_t(diffHex.size()) != dim * 16) {
+            error = "matpow: bad diff attr";
+            return;
+        }
+        diffArr = entryAlloca(i64(), "mp.diff", uint32_t(dim));
+        for (int64_t i = 0; i < dim; ++i) {
+            uint64_t dv = 0;
+            if (!parseHex64(diffHex, size_t(i), &dv)) {
+                error = "matpow: bad diff hex";
+                return;
+            }
+            b.CreateStore(llvm::ConstantInt::get(i64(), dv),
+                          b.CreateGEP(i64(), diffArr,
+                                      llvm::ConstantInt::get(i64(),
+                                                             uint64_t(i))));
+        }
+    }
+
+    llvm::AllocaInst* varsArr = entryAlloca(ptr(), "mp.vars", uint32_t(kv));
+    llvm::AllocaInst* outArr = entryAlloca(f64(), "mp.out", uint32_t(kv));
+    std::vector<LValue*> varPtrs;
+    varPtrs.reserve(size_t(kv));
+    for (int64_t i = 0; i < kv; ++i) {
+        LValue* var =
+            slotVariable(vars[size_t(i)].first, vars[size_t(i)].second,
+                         false);
+        LValue* vp = b.CreateConstGEP1_32(
+            i8(), var, uint32_t(offsetof(Variable, value)));
+        varPtrs.push_back(vp);
+        b.CreateStore(vp, b.CreateGEP(
+            ptr(), varsArr, llvm::ConstantInt::get(i64(), uint64_t(i))));
+    }
+
+    BasicBlock* callBB = BasicBlock::Create(lc, "mp.call", fn);
+    BasicBlock* fb = BasicBlock::Create(lc, "mp.fallback", fn);
+    LValue* isWarp = b.CreateLoad(
+        i32(), ctxField(uint32_t(offsetof(JitCtx, isWarp))));
+    b.CreateCondBr(
+        b.CreateICmpNE(isWarp, llvm::ConstantInt::get(i32(), 0)), callBB, fb);
+    b.SetInsertPoint(callBB);
+    LValue* ret = b.CreateCall(
+        callee("xyo_matpow",
+               {ptr(), f64(), ptr(), i64(), ptr(), i64(), i64(), ptr(),
+                ptr(), ptr(), i32(), i32(), i32(), ptr()},
+               i32()),
+        {ctx, n, varsArr, llvm::ConstantInt::get(i64(), uint64_t(kv)),
+         b.CreatePointerCast(matGlobal, ptr()),
+         llvm::ConstantInt::get(i64(), uint64_t(dim)),
+         llvm::ConstantInt::get(i64(), uint64_t(bound)), outArr, postArr,
+         writArr,
+         llvm::ConstantInt::get(i32(),
+                                uint32_t(op.attrInt("flags", 0) & 1)),
+         llvm::ConstantInt::get(i32(), uint32_t(condKind)),
+         llvm::ConstantInt::get(i32(), uint32_t(cmpKind)),
+         diffArr
+             ? static_cast<LValue*>(diffArr)
+             : static_cast<LValue*>(llvm::ConstantPointerNull::get(
+                   llvm::cast<llvm::PointerType>(ptr())))});
+    BasicBlock* applyBB = BasicBlock::Create(lc, "mp.apply", fn);
+    BasicBlock* doneBB = BasicBlock::Create(lc, "mp.done", fn);
+    auto* sw = b.CreateSwitch(ret, fb, 2);
+    sw->addCase(llvm::cast<llvm::ConstantInt>(
+                    llvm::ConstantInt::get(i32(), 1)), applyBB);
+    sw->addCase(llvm::cast<llvm::ConstantInt>(
+                    llvm::ConstantInt::get(i32(), 2)), doneBB);
+    b.SetInsertPoint(applyBB);
+    for (int64_t i = 0; i < kv; ++i) {
+        if (writRaw[size_t(i)] != '1') continue;  // 読み専用は書き戻さない
+        LValue* dv = b.CreateLoad(
+            f64(), b.CreateGEP(f64(), outArr,
+                               llvm::ConstantInt::get(i64(), uint64_t(i))));
+        b.CreateStore(b.CreateBitCast(dv, i64()), varPtrs[size_t(i)]);
+    }
+    BasicBlock* applyEnd = b.GetInsertBlock();
+    b.CreateBr(doneBB);
+    b.SetInsertPoint(fb);
+    b.CreateBr(doneBB);
+    b.SetInsertPoint(doneBB);
+    auto* phi = b.CreatePHI(b.getInt1Ty(), 3);
+    phi->addIncoming(b.getInt1(true), applyEnd);
+    phi->addIncoming(b.getInt1(true), callBB);
     phi->addIncoming(b.getInt1(false), fb);
     vals[keyOf(op.result(0))] = phi;
 }
@@ -5515,6 +5714,7 @@ void Lowerer::emitOp(Op& op) {
         return;
     }
     if (n == "xyo.parfor.try") { emitParForTry(op); return; }
+    if (n == "xyo.matpow.try") { emitMatPowTry(op); return; }
     if (n == "xyo.if") { emitIf(op); return; }
     if (n == "xyo.while") { emitWhile(op); return; }
     if (n == "xyo.repeat") { emitRepeat(op); return; }
