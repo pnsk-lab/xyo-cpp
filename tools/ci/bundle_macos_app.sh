@@ -118,10 +118,7 @@ if [ -z "$DEPLOYQT" ]; then
   echo "macdeployqt が見つかりません（brew install qt）" >&2
   exit 1
 fi
-# offscreen / minimal も同梱する（ヘッドレス CI やサーバでの GUI 起動用。
-# macdeployqt の既定は cocoa だけで、QT_QPA_PLATFORM=offscreen が使えない）。
-"$DEPLOYQT" "$APP" -qmldir="$QMLDIR" -verbose=1 \
-  -extra-plugins=platforms/libqoffscreen.dylib,platforms/libqminimal.dylib || \
+"$DEPLOYQT" "$APP" -qmldir="$QMLDIR" -verbose=1 || \
   echo "macdeployqt が警告付きで終了しました（検証は続行）" >&2
 
 # macdeployqt は Qt のバージョンにより qt.conf を生成しないことがある。
@@ -149,6 +146,27 @@ CONF
 # 実行ファイル隣から実体へ相対シンボリックリンクを張る。
 ln -sfn ../PlugIns/platforms "$MACOS/platforms"
 ln -sfn ../Resources/qml "$MACOS/qml"
+
+# macdeployqt は cocoa しか入れない。-extra-plugins は Qt 6.11 では
+# 未対応だったので、offscreen/minimal は手動でコピーする（無くても cocoa で
+# 動くが、ヘッドレス CI やサーバでの GUI 起動に必要）。
+qt_prefix=""
+if command -v brew >/dev/null 2>&1; then
+  qt_prefix="$(brew --prefix qt 2>/dev/null || true)"
+fi
+for extra in libqoffscreen.dylib libqminimal.dylib; do
+  src="${qt_prefix:+$qt_prefix/plugins/platforms/$extra}"
+  if [ -n "$src" ] && [ -f "$src" ] && [ -d "$CONTENTS/PlugIns/platforms" ] \
+     && [ ! -f "$CONTENTS/PlugIns/platforms/$extra" ]; then
+    echo "bundle: platforms/$extra"
+    cp "$src" "$CONTENTS/PlugIns/platforms/$extra"
+    chmod u+w "$CONTENTS/PlugIns/platforms/$extra"
+    codesign --remove-signature "$CONTENTS/PlugIns/platforms/$extra" 2>/dev/null || true
+    install_name_tool -add_rpath "@loader_path/../../Frameworks" \
+      "$CONTENTS/PlugIns/platforms/$extra" 2>/dev/null || true
+  fi
+done
+bundle_deps
 
 # --- 4) 残った絶対パス依存の正規化（macdeployqt が後から足した分） -----------
 for pass in 1 2 3; do
