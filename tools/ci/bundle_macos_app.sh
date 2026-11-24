@@ -50,7 +50,7 @@ is_qt_framework() {
 # --- 2) Qt 以外の依存を先に集める（元ファイルは未署名なので書き換え可能） -----
 bundle_deps() {
 pass=0
-while [ $pass -lt 6 ]; do
+while [ $pass -lt 3 ]; do
   pass=$((pass + 1))
   changed=0
   targets=("$MACOS/xyo")
@@ -83,7 +83,13 @@ while [ $pass -lt 6 ]; do
       fi
     fi
   done
-  [ $changed -eq 0 ] && break
+  if [ $changed -eq 0 ]; then break; fi
+  if [ $pass -ge 3 ]; then
+    echo "[bundle] 依存の書き換えが 3 パスで収束しませんでした。残り:" >&2
+    for t in "$MACOS/xyo" $(find "$FW" \( -type f -o -type l \) 2>/dev/null); do
+      otool -L "$t" 2>/dev/null | awk -v f="$t" 'NR>1 && $1 !~ /^(\/usr\/lib|\/System|@rpath|@executable_path|@loader_path)/ { print f" -> "$1 }'
+    done | head -20 >&2
+  fi
 done
 }
 
