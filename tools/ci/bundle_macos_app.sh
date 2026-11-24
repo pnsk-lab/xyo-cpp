@@ -1,22 +1,20 @@
-#!/bin/bash
-# xyo 実行ファイル + Qt framework + その他の Homebrew dylib を
-# 自己完結した xyo.app に同梱する。
+#!/usr/bin/env bash
+# bundle_macos_app.sh — xyo.app を自己完結バンドルにする（macOS リリース用）
 #
-#   bundle_macos_app.sh <xyo-binary> <out.app> <qml-src-dir> <version>
+# 使い方: tools/ci/bundle_macos_app.sh <ビルド済み xyo> <出力 .app> <qml dir> [version]
 #
-# 仕組み:
-#  1) xyo.app/Contents/{MacOS,Frameworks,Resources} を作り、バイナリと
-#     最小 Info.plist を配置する。
-#  2) macdeployqt -qmldir=<qml-src-dir> が Qt6*.framework・Qt プラグイン・
-#     QML モジュール（QtQuick.Controls/Layouts 等）をコピーし、実行
-#     ファイル側の参照を @rpath へ書き換え、Resources/qt.conf も生成する。
-#     Qt は LGPL-3.0 のため framework（動的リンク）のまま同梱する
-#     （= ユーザーが差し替え可能 = LGPL 順守）。静的リンクにしない。
-#  3) 残りの非 Qt 依存（SDL2 等の Homebrew dylib）は otool -L で拾い、
-#     Frameworks へコピーして @rpath 参照に書き換える。Qt framework は
-#     macdeployqt に任せるため除外する。
-#  4) 全依存が @rpath / システムの範囲内に収まったことを検証し、
-#     qml/QtQuick/{Layouts,Controls} の存在を確認してから ad-hoc 署名する。
+# 手順:
+#   1) Contents/MacOS/xyo と最小 Info.plist を置く。
+#   2) **macdeployqt より先に**、非 Qt の Homebrew dylib（SDL2, brotli, zstd 等）
+#      をプリスティンな元ファイルから Frameworks へコピーし、@rpath へ書き換える。
+#      署名済みファイルを後から書き換えると install_name_tool が
+#      "link edit information does not fill the __LINKEDIT segment" で失敗する
+#      ため、順序が重要（macdeployqt は自身が入れたものを ad-hoc 署名する）。
+#   3) macdeployqt で Qt framework・QML モジュール・plugins・qt.conf・rpath を整える。
+#      QML が無いと起動時に型が見つからず失敗するので、後段で必ず検証する。
+#   4) 残った絶対パス依存を正規化（失敗時は元ファイルから入れ直して再試行）。
+#   5) QML/QtQuick/{Layouts,Controls} と qt.conf の存在、依存の閉包を検証し、
+#      最後に ad-hoc 署名する（公証はしない。Gatekeeper は quarantine 解除が必要）。
 set -euo pipefail
 
 BIN="$1"
@@ -33,47 +31,9 @@ RES="$CONTENTS/Resources"
 rm -rf "$APP"
 mkdir -p "$MACOS" "$FW" "$RES"
 cp "$BIN" "$MACOS/xyo"
+chmod u+w "$MACOS/xyo"
 sed "s/@XYO_APP_VERSION@/$VERSION/g" "$PLIST_IN" > "$CONTENTS/Info.plist"
 
-# macdeployqt を先に実行し、Qt framework・QML・qt.conf・rpath を整える。
-# brew の qt は keg-only で PATH に載らないことがあるため、
-# $(brew --prefix qt)/bin も探す。
-DEPLOYQT="$(command -v macdeployqt || true)"
-if [ -z "$DEPLOYQT" ] && command -v brew >/dev/null 2>&1; then
-  p="$(brew --prefix qt 2>/dev/null || true)"
-  [ -n "$p" ] && [ -x "$p/bin/macdeployqt" ] && DEPLOYQT="$p/bin/macdeployqt"
-fi
-if [ -z "$DEPLOYQT" ]; then
-  echo "macdeployqt が見つかりません（brew install qt）" >&2
-  exit 1
-fi
-"$DEPLOYQT" "$APP" -qmldir="$QMLDIR" -verbose=1
-
-# macdeployqt は Qt のバージョンによって qt.conf を生成しないことがある。
-# バンドル内の探索パスを固定するため、明示的に書く（Prefix は Contents、
-# QML は macdeployqt が置く Resources/qml）。
-cat > "$RES/qt.conf" <<'CONF'
-[Paths]
-Prefix = ..
-PlugIns = PlugIns
-Imports = Resources/qml
-Qml2Imports = Resources/qml
-CONF
-
-# 依存の同梱は dylibbundler（検証済みの定番ツール）に任せ、その後に
-# 自前の正規化パス（@rpath 化・検証）を通す。dylibbundler が無い環境でも
-# 動くよう失敗は致命にしない。
-if command -v dylibbundler >/dev/null 2>&1; then
-  dylibbundler -cd -of -b -x "$MACOS/xyo" -d "$FW" \
-    -p "@executable_path/../Frameworks" \
-    || echo "dylibbundler が警告付きで終了しました（自前の正規化を続行）" >&2
-else
-  echo "dylibbundler が見つかりません（brew install dylibbundler）" >&2
-fi
-
-# 実行ファイルが参照する非 Qt・非システムの dylib を Frameworks へ
-# 再帰的にコピーし、@rpath 参照へ書き換える。brew の絶対パス
-# （/opt/homebrew, /usr/local）に留まる依存が無くなるまで繰り返す。
 is_system_or_rpath() {
   case "$1" in
     /usr/lib/*|/System/*|@rpath/*|@executable_path/*|@loader_path/*) return 0 ;;
@@ -87,19 +47,15 @@ is_qt_framework() {
   esac
 }
 
+# --- 2) Qt 以外の依存を先に集める（元ファイルは未署名なので書き換え可能） -----
 pass=0
 while [ $pass -lt 20 ]; do
   pass=$((pass + 1))
   changed=0
-  # 対象: 実行ファイル + Frameworks 内の（Qt 以外の）dylib。
   targets=("$MACOS/xyo")
   while IFS= read -r -d '' f; do targets+=("$f"); done < \
     <(find "$FW" \( -type f -o -type l \) -print0 2>/dev/null || true)
   for t in "${targets[@]}"; do
-    # macdeployqt が ad-hoc 署名した Mach-O は install_name_tool での
-    # load command 書き換えを受け付けない（code signature invalid）。
-    # 署名を剥がしてから書き換え、最後にアプリ全体を ad-hoc 署名し直す。
-    codesign --remove-signature "$t" 2>/dev/null || true
     chmod u+w "$t" 2>/dev/null || true
     while IFS= read -r dep; do
       is_system_or_rpath "$dep" && continue
@@ -109,25 +65,82 @@ while [ $pass -lt 20 ]; do
         [ -f "$dep" ] || { echo "依存ライブラリが見つかりません: $dep" >&2; exit 1; }
         echo "bundle: $base"
         cp -L "$dep" "$FW/$base"
-        codesign --remove-signature "$FW/$base" 2>/dev/null || true
         chmod u+w "$FW/$base"
         install_name_tool -id "@rpath/$base" "$FW/$base"
-        # 同梱 dylib 自身が別の同梱 dylib を @rpath で解決できるよう
-        # @loader_path（Frameworks 内 = 自分と同じ階層）を rpath に足す。
-        install_name_tool -add_rpath "@loader_path" "$FW/$base" 2>/dev/null \
-          || true
+        install_name_tool -add_rpath "@loader_path" "$FW/$base" 2>/dev/null || true
       fi
       if install_name_tool -change "$dep" "@rpath/$base" "$t"; then
         changed=1
       else
         echo "[bundle] install_name_tool 失敗: $t <- $dep" >&2
       fi
-    done < <(otool -L "$t" | awk 'NR>1 {print $1}')
+    done < <(otool -L "$t" 2>/dev/null | awk 'NR>1 {print $1}')
   done
   [ $changed -eq 0 ] && break
 done
 
-# 検証: brew 等の絶対パス依存が残っていないこと。
+# --- 3) macdeployqt -------------------------------------------------------
+DEPLOYQT="$(command -v macdeployqt || true)"
+if [ -z "$DEPLOYQT" ] && command -v brew >/dev/null 2>&1; then
+  p="$(brew --prefix qt 2>/dev/null || true)"
+  [ -n "$p" ] && [ -x "$p/bin/macdeployqt" ] && DEPLOYQT="$p/bin/macdeployqt"
+fi
+if [ -z "$DEPLOYQT" ]; then
+  echo "macdeployqt が見つかりません（brew install qt）" >&2
+  exit 1
+fi
+"$DEPLOYQT" "$APP" -qmldir="$QMLDIR" -verbose=1 || \
+  echo "macdeployqt が警告付きで終了しました（検証は続行）" >&2
+
+# macdeployqt は Qt のバージョンにより qt.conf を生成しないことがある。
+# バンドル内の探索パスを固定するため、明示的に書く（Prefix は Contents、
+# QML は macdeployqt が置く Resources/qml）。
+cat > "$RES/qt.conf" <<'CONF'
+[Paths]
+Prefix = ..
+PlugIns = PlugIns
+Imports = Resources/qml
+Qml2Imports = Resources/qml
+CONF
+
+# --- 4) 残った絶対パス依存の正規化（macdeployqt が後から足した分） -----------
+for pass in 1 2 3; do
+  remain=0
+  targets=("$MACOS/xyo")
+  while IFS= read -r -d '' f; do targets+=("$f"); done < \
+    <(find "$FW" \( -type f -o -type l \) -print0 2>/dev/null || true)
+  for t in "${targets[@]}"; do
+    chmod u+w "$t" 2>/dev/null || true
+    while IFS= read -r dep; do
+      is_system_or_rpath "$dep" && continue
+      is_qt_framework "$dep" && continue
+      remain=1
+      base="$(basename "$dep")"
+      if [ ! -f "$FW/$base" ] && [ -f "$dep" ]; then
+        echo "bundle(late): $base"
+        cp -L "$dep" "$FW/$base"
+        chmod u+w "$FW/$base"
+        install_name_tool -id "@rpath/$base" "$FW/$base"
+      fi
+      codesign --remove-signature "$t" 2>/dev/null || true
+      install_name_tool -change "$dep" "@rpath/$base" "$t" || {
+        # 署名剥がしで壊れた場合は元ファイルから入れ直して再試行する。
+        if [ -f "$dep" ]; then
+          codesign --remove-signature "$t" 2>/dev/null || true
+          cp -f "$dep" "$t"
+          chmod u+w "$t"
+          install_name_tool -id "@rpath/$(basename "$t")" "$t" 2>/dev/null || true
+          install_name_tool -change "$dep" "@rpath/$base" "$t"
+        else
+          echo "書き換えに失敗（元ファイルも無し）: $t <- $dep" >&2
+        fi
+      }
+    done < <(otool -L "$t" 2>/dev/null | awk 'NR>1 {print $1}')
+  done
+  [ $remain -eq 0 ] && break
+done
+
+# --- 5) 検証 --------------------------------------------------------------
 bad=0
 for t in "$MACOS/xyo" $(find "$FW" \( -type f -o -type l \) 2>/dev/null); do
   while IFS= read -r dep; do
@@ -135,16 +148,12 @@ for t in "$MACOS/xyo" $(find "$FW" \( -type f -o -type l \) 2>/dev/null); do
       echo "未同梱の依存: $t -> $dep" >&2
       echo "--- otool -L $t ---" >&2
       otool -L "$t" >&2 || true
-      echo "--- install_name_tool で書き換えを再試行 ---" >&2
-      install_name_tool -change "$dep" "@rpath/$(basename "$dep")" "$t" \
-        || echo "書き換えに失敗（署名/書式の問題）" >&2
       bad=1
     fi
-  done < <(otool -L "$t" | awk 'NR>1 {print $1}')
+  done < <(otool -L "$t" 2>/dev/null | awk 'NR>1 {print $1}')
 done
 [ $bad -eq 0 ] || exit 1
 
-# QML モジュールの同梱を検証（Windows 側の欠落と同じ失敗を防ぐ）。
 test -d "$RES/qml/QtQuick/Layouts" \
   || { echo "qml/QtQuick/Layouts が同梱されていません" >&2; exit 1; }
 test -d "$RES/qml/QtQuick/Controls" \
@@ -152,8 +161,8 @@ test -d "$RES/qml/QtQuick/Controls" \
 test -f "$RES/qt.conf" \
   || { echo "qt.conf が生成されていません" >&2; exit 1; }
 
-# インストール名を書き換えたため署名は剥がれている。公証はしないので
-# ad-hoc 署名で整える（Gatekeeper 通過には従来どおり quarantine 解除が必要）。
+# 署名は install_name_tool で剥がれている。公証はしないので ad-hoc 署名で整える
+# （Gatekeeper 通過には従来どおり quarantine 解除が必要）。
 codesign --force --deep --sign - "$APP" 2>/dev/null || true
 
 echo "bundled: $APP"
