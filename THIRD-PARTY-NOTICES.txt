@@ -22,8 +22,11 @@ or the official Qt installer). The corresponding Qt source code is
 available from https://code.qt.io/ and from the same distribution channels
 that provided the libraries. Linux releases bundle the Qt (and SDL2/
 librsvg/etc.) shared libraries under lib/ next to the executable (found
-via $ORIGIN rpath); deleting lib/ makes xyo use the system libraries
-instead, and you may substitute your own builds there.
+via $ORIGIN rpath); Windows releases place the Qt6*.dll and QML modules
+next to the executable; macOS releases bundle the Qt*.framework and QML
+modules inside xyo.app/Contents/{Frameworks,Resources} (wired via qt.conf
+and @rpath). In each case the Qt binaries remain separate, replaceable
+shared libraries, and you may substitute your own builds there.
 
 Other bundled dependencies
 --------------------------

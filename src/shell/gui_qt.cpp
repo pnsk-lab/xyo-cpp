@@ -1394,6 +1394,12 @@ int guiMain(const char* startDir) {
         controller.openInitialDir(start);
 
         QQuickView view;
+        // exe 同階層の qml/ を import path に明示追加する。qt.conf が無い
+        // 配布物では QML2_IMPORT_PATH 未設定だと QLibraryInfo がビルド環境の
+        // パスを指し、QtQuick.Layouts 等が見つからず起動に失敗する。
+        view.engine()->addImportPath(
+            QCoreApplication::applicationDirPath()
+            + QStringLiteral("/qml"));
         view.engine()->addImageProvider("xyothumb",
                                         new ThumbImageProvider);
         view.rootContext()->setContextProperty("launcher", &controller);

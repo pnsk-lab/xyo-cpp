@@ -3787,6 +3787,10 @@ int xyo::editorMainQt(const char* path, bool danger) {
     rebuildThumbs();
     g_thumbRefresh = rebuildThumbs;
     QQuickView view;
+    // exe 同階層の qml/ を import path に明示追加する（gui_qt.cpp と同じ。
+    // qt.conf が無い配布物でも QtQuick.Controls/Layouts を見つけられる）。
+    view.engine()->addImportPath(
+        QCoreApplication::applicationDirPath() + QStringLiteral("/qml"));
     view.engine()->addImageProvider(QStringLiteral("xyocostume"),
                                     imgProvider);
     view.setResizeMode(QQuickView::SizeRootObjectToView);

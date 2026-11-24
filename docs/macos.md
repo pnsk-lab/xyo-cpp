@@ -43,9 +43,14 @@ cmake -S . -B build-macos -G Ninja \
   ...（上記と同じオプション）
 ```
 
-公式リリースの tarball は自己完結させるため `-DXYO_QT=OFF` で
-ビルドしてあり、`xyo gui` はスタブになっている（他コマンドは動く）。
-ランチャー付きが必要なら上記の手順で自前ビルドする。
+公式リリースの tarball は `xyo.app`（Qt framework・QML モジュール・
+SDL2 等の dylib を同梱した自己完結バンドル）を含む。Qt は LGPL-3.0
+のため framework（動的リンク）のまま同梱してあり、静的リンクでは
+ない。GUI は `xyo.app` のダブルクリック、CLI は
+`xyo.app/Contents/MacOS/xyo run|play|gui ...` で実行する（Frameworks
+内の同梱 dylib を @rpath で解決するので brew 不要）。公証はして
+いないため、初回は `xattr -d com.apple.quarantine xyo.app` が必要
+になる。
 
 CPU 別のコンパイルが必要（ユニバーサルバイナリは作らない）。
 `XYO_JIT_BACKEND=none` と `XYO_JIT=OFF` のビルドも可能。
@@ -61,8 +66,9 @@ GUI が不要なら `-DXYO_SDL2=OFF` を指定する。
 - Vulkan の計算オフロードは任意機能。glslc と Vulkan-Headers が揃い、
   Vulkan loader または MoltenVK がロードできる場合にのみ有効。
   macOS の Metal を直接呼ぶバックエンドはまだ無い。
-- リリースの macOS アーカイブは動的リンクの Homebrew 依存を含む。
-  利用先でも `brew install llvm sdl2` が必要になる場合がある。
+- リリースの macOS アーカイブに含まれる `xyo.app` は Qt framework、
+  QML モジュール、SDL2 等の dylib を同梱した自己完結バンドルで、
+  利用先に Homebrew 依存は要らない（LLVM は静的リンク）。
 - 強化ランタイム (Hardened Runtime) で署名する場合は JIT 実行権限など、
   macOS のコード署名設定が別途必要になる場合がある。
 

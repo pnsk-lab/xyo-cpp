@@ -209,6 +209,13 @@ jobs:
           test -n "$deploy" || { echo "windeployqt が見つかりません" >&2; exit 1; }
           "$deploy" --release --compiler-runtime \
             --qmldir src/shell/qml dist/pkg/xyo.exe
+          # QML モジュールが実際にデプロイされたか検証する。
+          # qmlimportscanner が見つからない等でスキャンがスキップされると
+          # Qt6*.dll だけがコピーされ、QtQuick.Layouts 不在で起動失敗する。
+          test -d dist/pkg/qml/QtQuick/Layouts \
+            || { echo "qml/QtQuick/Layouts がデプロイされていません" >&2; exit 1; }
+          test -d dist/pkg/qml/QtQuick/Controls \
+            || { echo "qml/QtQuick/Controls がデプロイされていません" >&2; exit 1; }
           ldd dist/pkg/xyo.exe | awk '/=> \/mingw64\// {print $3}' \
             | while read -r dll; do cp -n "$dll" dist/pkg/; done
           # 同梱漏れが無いことを確認 — /mingw64 側へ解決される依存が
@@ -229,7 +236,7 @@ jobs:
           if-no-files-found: error
 
   macos:
-    name: macOS / ${{ matrix.arch }} / LLVM JIT + SDL2
+    name: macOS / ${{ matrix.arch }} / LLVM JIT + SDL2 + Qt（.app 同梱）
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
@@ -244,36 +251,54 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install dependencies
-        run: brew install llvm ninja sdl2 pkgconf
+        run: brew install llvm ninja sdl2 pkgconf qt
 
-      # 配布 tarball は自己完結させるため Qt を使わない（-DXYO_QT=OFF で
-      # ランチャーはスタブ）。動的リンクの brew Qt に依存させると
-      # 未インストール環境で xyo 自体が起動しなくなるため。
+      # Qt Quick ランチャーは LGPL のため Qt framework（動的リンク）を
+      # xyo.app へ同梱する（macdeployqt が framework コピー・QML モジュール・
+      # qt.conf・rpath 書換を行う。静的リンクにはしない）。LLVM は巨大な
+      # libLLVM.dylib を同梱しないよう静的アーカイブでリンクし、SDL2 等の
+      # 残りの brew dylib は bundle_macos_app.sh が Frameworks/ に集める。
       - name: Build
         run: |
           cmake -S . -B build-macos -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DXYO_LLVM_MODE=llvm-config \
             -DLLVM_CONFIG="$(brew --prefix llvm)/bin/llvm-config" \
-            -DCMAKE_PREFIX_PATH="$(brew --prefix)" \
+            -DXYO_STATIC_LLVM=ON \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix);$(brew --prefix qt)" \
             -DXYO_BUILD_TESTS=OFF -DXYO_JIT=ON -DXYO_SDL2=ON \
             -DXYO_REQUIRE_SDL2=ON -DXYO_RSVG=OFF -DXYO_FULL_BUILD=ON \
-            -DXYO_BINARYEN_C_API=OFF -DXYO_QT=OFF
+            -DXYO_BINARYEN_C_API=OFF -DXYO_QT=ON
           cmake --build build-macos --parallel 2
+          echo "--- Qt framework への動的リンクを確認（LGPL） ---"
+          otool -L build-macos/xyo | grep -i "Qt6.*framework" \
+            || { echo "Qt framework にリンクされていません"; exit 1; }
+          echo "--- libLLVM は静的リンクであること ---"
+          otool -L build-macos/xyo | grep -i "libLLVM" \
+            && { echo "libLLVM.dylib に依存しています"; exit 1; } || true
 
       - name: Smoke
         run: |
           bash tools/ci/smoke.sh run build-macos/xyo
           bash tools/ci/smoke.sh play build-macos/xyo
+          bash tools/ci/smoke.sh gui build-macos/xyo
 
-      - name: Package
+      - name: Package (self-contained xyo.app)
         run: |
-          mkdir -p dist/pkg
-          cp build-macos/xyo LICENSE THIRD-PARTY-NOTICES.txt RUNNING.md dist/pkg/
+          ver="${GITHUB_REF_NAME#v}"
+          bash tools/ci/bundle_macos_app.sh \
+            build-macos/xyo dist/xyo.app src/shell/qml "$ver"
+          # CLI も xyo.app/Contents/MacOS/xyo で実行する（Frameworks の
+          # 同梱 dylib を @rpath で解決するので自己完結）。brew 絶対パスを
+          # 参照したままのビルド直後バイナリは同梱しない。
           mkdir -p dist/pkg/docs
+          cp LICENSE THIRD-PARTY-NOTICES.txt RUNNING.md dist/pkg/
           cp docs/macos.md dist/pkg/docs/
           mv dist/pkg/RUNNING.md dist/pkg/RUNNING.txt
+          mv dist/xyo.app dist/pkg/
+          # シンボリックリンク（framework 内）を保持して固める。
           tar -C dist/pkg -czf dist/xyo-macos-${{ matrix.arch }}.tar.gz \
-            xyo LICENSE THIRD-PARTY-NOTICES.txt RUNNING.txt docs/macos.md
+            xyo.app LICENSE THIRD-PARTY-NOTICES.txt RUNNING.txt docs/macos.md
+          ls -lh dist/xyo-macos-${{ matrix.arch }}.tar.gz
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
