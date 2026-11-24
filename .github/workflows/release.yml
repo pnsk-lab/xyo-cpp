@@ -314,7 +314,8 @@ jobs:
       # Qt では出力されないため使わない）。
       - name: Smoke (packaged xyo.app, brew Qt hidden)
         run: |
-          bin=dist/xyo.app/Contents/MacOS/xyo
+          bin=dist/pkg/xyo.app/Contents/MacOS/xyo
+          [ -x "$bin" ] || { echo "パッケージ済みバイナリがありません: $bin" >&2; ls -R dist | head -40 >&2; exit 1; }
           qt="$(brew --prefix qt 2>/dev/null || true)"
           sdl2="$(brew --prefix sdl2 2>/dev/null || true)"
           sdl3="$(brew --prefix sdl3 2>/dev/null || true)"
