@@ -251,7 +251,11 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install dependencies
-        run: brew install llvm ninja sdl2 pkgconf qt
+        run: |
+          brew install llvm ninja sdl2 pkgconf qt zstd
+          # zstd は keg-only なので、静的 LLVM のリンク時に lib を明示する
+          # （llvm-config --system-libs が -lzstd を要求する）。
+          echo "XYO_ZSTD_LIB=$(brew --prefix zstd)/lib" >> "$GITHUB_ENV" 
 
       # Qt Quick ランチャーは LGPL のため Qt framework（動的リンク）を
       # xyo.app へ同梱する（macdeployqt が framework コピー・QML モジュール・
@@ -267,10 +271,12 @@ jobs:
             -DCMAKE_PREFIX_PATH="$(brew --prefix);$(brew --prefix qt)" \
             -DXYO_BUILD_TESTS=OFF -DXYO_JIT=ON -DXYO_SDL2=ON \
             -DXYO_REQUIRE_SDL2=ON -DXYO_RSVG=OFF -DXYO_FULL_BUILD=ON \
-            -DXYO_BINARYEN_C_API=OFF -DXYO_QT=ON
+            -DXYO_BINARYEN_C_API=OFF -DXYO_QT=ON \
+            -DCMAKE_EXE_LINKER_FLAGS="-L$XYO_ZSTD_LIB"
           cmake --build build-macos --parallel 2
           echo "--- Qt framework への動的リンクを確認（LGPL） ---"
-          otool -L build-macos/xyo | grep -i "Qt6.*framework" \
+          # Qt の framework 名は QtQuick/QtCore 等（"Qt6" ではない）。
+          otool -L build-macos/xyo | grep -E "\.framework/Qt" \
             || { echo "Qt framework にリンクされていません"; exit 1; }
           echo "--- libLLVM は静的リンクであること ---"
           otool -L build-macos/xyo | grep -i "libLLVM" \
