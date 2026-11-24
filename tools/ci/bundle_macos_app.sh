@@ -77,7 +77,7 @@ is_qt_framework() {
 }
 
 pass=0
-while [ $pass -lt 10 ]; do
+while [ $pass -lt 20 ]; do
   pass=$((pass + 1))
   changed=0
   # 対象: 実行ファイル + Frameworks 内の（Qt 以外の）dylib。
@@ -85,6 +85,10 @@ while [ $pass -lt 10 ]; do
   while IFS= read -r -d '' f; do targets+=("$f"); done < \
     <(find "$FW" -type f -print0 2>/dev/null || true)
   for t in "${targets[@]}"; do
+    # macdeployqt が ad-hoc 署名した Mach-O は install_name_tool での
+    # load command 書き換えを受け付けない（code signature invalid）。
+    # 署名を剥がしてから書き換え、最後にアプリ全体を ad-hoc 署名し直す。
+    codesign --remove-signature "$t" 2>/dev/null || true
     chmod u+w "$t" 2>/dev/null || true
     while IFS= read -r dep; do
       is_system_or_rpath "$dep" && continue
@@ -94,6 +98,7 @@ while [ $pass -lt 10 ]; do
         [ -f "$dep" ] || { echo "依存ライブラリが見つかりません: $dep" >&2; exit 1; }
         echo "bundle: $base"
         cp -L "$dep" "$FW/$base"
+        codesign --remove-signature "$FW/$base" 2>/dev/null || true
         chmod u+w "$FW/$base"
         install_name_tool -id "@rpath/$base" "$FW/$base"
         # 同梱 dylib 自身が別の同梱 dylib を @rpath で解決できるよう
@@ -101,8 +106,11 @@ while [ $pass -lt 10 ]; do
         install_name_tool -add_rpath "@loader_path" "$FW/$base" 2>/dev/null \
           || true
       fi
-      install_name_tool -change "$dep" "@rpath/$base" "$t" 2>/dev/null \
-        && changed=1 || true
+      if install_name_tool -change "$dep" "@rpath/$base" "$t"; then
+        changed=1
+      else
+        echo "[bundle] install_name_tool 失敗: $t <- $dep" >&2
+      fi
     done < <(otool -L "$t" | awk 'NR>1 {print $1}')
   done
   [ $changed -eq 0 ] && break
