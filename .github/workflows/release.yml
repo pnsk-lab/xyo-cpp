@@ -245,8 +245,8 @@ jobs:
         include:
           - runner: macos-15
             arch: arm64
-          - runner: macos-15-intel
-            arch: x86_64
+          # x86_64（macos-15-intel）は dylib 同梱が未解決のため一時的に外す。
+          # 追跡: macOS x86_64 の .app 同梱がタイムアウトする（issue 起票済み）
     steps:
       - uses: actions/checkout@v5
 
