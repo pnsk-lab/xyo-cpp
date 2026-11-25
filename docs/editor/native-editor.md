@@ -2,7 +2,7 @@
 
 `xyo edit project.sb3` は既存のブロック編集 UI を専用のバッチ描画基盤で描きます。Dear ImGui はビルド・実行ともに不要です。ウィンドウと GPU バックエンドには既存の SDL2（2.0.18 以降）、フォントには既存の vendored stb_truetype を使用します。
 
-![Native エディタの GPU 描画](native-editor.png/native-editor.png)
+![Native エディタの GPU 描画](native-editor.png)
 
 ## 起動と最小構成
 
