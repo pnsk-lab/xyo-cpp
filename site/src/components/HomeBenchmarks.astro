@@ -1,0 +1,121 @@
+---
+import data from '../data/bench.json';
+const base = import.meta.env.BASE_URL;
+type Mode = { median_ms: number; valid: boolean };
+const results = data.results as Record<string, { n: number; modes: Record<string, Mode> }>;
+// Keep these workloads fixed: a list operation, recursion, and hashing.
+// Do not turn the largest observed ratio into a claim about all projects.
+const selected = [
+  { key: 'micro_append', title: 'List append' },
+  { key: 'fib', title: 'Recursive Fibonacci' },
+  { key: 'sha256', title: 'SHA-256' },
+].map(item => {
+  const result = results[item.key];
+  const tw = result?.modes['tw-compiled'];
+  const xyo = result?.modes['xyo-jit'];
+  const valid = (m?: Mode) => !!m && m.valid && Number.isFinite(m.median_ms) && m.median_ms >= 0;
+  const comparable = valid(tw) && valid(xyo) && tw.median_ms >= 1 && xyo.median_ms >= 1;
+  const value = comparable ? tw.median_ms / xyo.median_ms : null;
+  const multiplier = value === null ? null : value >= 1 ? value : 1 / value;
+  const format = (m?: Mode) => valid(m) ? `${m.median_ms < 1 ? '<1' : m.median_ms.toFixed(0)} ms` : 'Unavailable';
+  return {
+    ...item,
+    ratio: multiplier === null ? null : multiplier.toFixed(1),
+    ratioValue: multiplier,
+    // A near-equal rounded multiplier must not be advertised as a speedup.
+    verdict: value === null ? 'Ratio unavailable' : multiplier!.toFixed(1) === '1.0' ? 'About the same time' : value > 1 ? 'faster in xyo' : 'faster in TurboWarp',
+    xyo: format(xyo), tw: format(tw),
+  };
+});
+const measured = data.meta.date?.slice(0, 10);
+---
+<section class="performance" aria-labelledby="performance-title">
+  <header>
+    <p class="performance-kicker">Performance</p>
+    <h2 id="performance-title">Less time running.<br />More time making.</h2>
+    <p class="performance-intro">Native compilation speeds up the work behind your blocks.<br />Here’s how three tasks compare with TurboWarp.</p>
+  </header>
+  <div class="performance-results">
+    {selected.map(item => (
+      <article class="performance-result" aria-label={item.title}>
+        <h3>{item.title}</h3>
+        <p class="performance-value">{item.ratio ? <span class="performance-num" data-value={item.ratioValue}>{item.ratio}</span> : '—'}<span>×</span></p>
+        <p class="performance-verdict">{item.verdict}</p>
+        <dl class="performance-times">
+          <div><dt>xyo</dt><dd>{item.xyo}</dd></div>
+          <div><dt>TurboWarp</dt><dd>{item.tw}</dd></div>
+        </dl>
+      </article>
+    ))}
+  </div>
+  <a class="performance-link" href={`${base}benchmarks/`}>All results and test conditions <span aria-hidden="true">›</span></a>
+  <p class="performance-note">Selected tests, not an overall speedup. TurboWarp is faster in some tests.<br />Median execution times; loading and compilation excluded. Measured {measured}.</p>
+</section>
+
+<script>
+  // Count the multiplier up from 0 when the section scrolls into view.
+  const prefersReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const nums = document.querySelectorAll<HTMLElement>('.performance-num[data-value]');
+  if (!prefersReduced && 'IntersectionObserver' in window) {
+    const animate = (el: HTMLElement) => {
+      const target = parseFloat(el.dataset.value!);
+      const duration = 1200;
+      const start = performance.now();
+      const tick = (now: number) => {
+        const t = Math.min((now - start) / duration, 1);
+        const eased = 1 - Math.pow(1 - t, 3);
+        el.textContent = (target * eased).toFixed(1);
+        if (t < 1) requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    };
+    const observer = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.isIntersecting) {
+          observer.unobserve(entry.target);
+          animate(entry.target as HTMLElement);
+        }
+      }
+    }, { threshold: 0.6 });
+    nums.forEach(n => {
+      n.textContent = '0.0';
+      observer.observe(n);
+    });
+  }
+</script>
+
+<style>
+  .performance { padding: 6rem 2rem; text-align: center; }
+  .performance :is(p, h2, h3, dl, dd) { margin: 0; }
+  .performance-kicker { font-size: 1rem; font-weight: 500; color: var(--sl-color-gray-2); }
+  .performance h2 { margin: 1rem 0 1.5rem; font-size: clamp(2.5rem, 5vw, 4.5rem); line-height: 1.1; font-weight: 600; letter-spacing: -.055em; padding: 0; border: 0; text-wrap: balance; }
+  .performance-intro { font-size: 1.125rem; line-height: 1.65; color: var(--sl-color-gray-2); text-wrap: balance; }
+  .performance .performance-results { display: grid; width: 100%; max-width: 60rem; grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: stretch; margin-block: 3.5rem 2rem; margin-inline: auto; }
+  .performance .performance-result { display: grid; grid-template-rows: minmax(3.1875rem, auto) auto minmax(3rem, auto) auto; align-content: start; min-width: 0; margin: 0; padding: .5rem 2rem; }
+  .performance-result h3 { align-self: end; }
+  @supports (grid-template-rows: subgrid) {
+    .performance .performance-results { grid-template-rows: repeat(4, auto); }
+    .performance .performance-result { grid-row: span 4; grid-template-rows: subgrid; }
+  }
+  .performance-result + .performance-result { border-left: 1px solid var(--geo-line); }
+  .performance h3 { font-size: 1.0625rem; line-height: 1.5; letter-spacing: -.02em; font-weight: 500; }
+  .performance .performance-value { margin-top: 1.5rem; font-size: clamp(3.5rem, 6vw, 5.5rem); line-height: 1.1; letter-spacing: -.06em; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .performance-value > span { font-size: .65em; }
+  .performance-verdict { font-size: 1rem; line-height: 1.5; }
+  .performance .performance-times { margin-top: 1.75rem; font-size: .9375rem; line-height: 1.8; font-variant-numeric: tabular-nums; }
+  .performance-times > div { display: grid; grid-template-columns: 5.75rem 4.25rem; justify-content: center; gap: 1rem; }
+  .performance-times dt { color: var(--sl-color-gray-2); font-weight: 400; text-align: right; }
+  .performance-times dd { padding: 0; text-align: left; }
+  .performance-link { display: inline-flex; align-items: center; gap: .5rem; min-height: 44px; color: var(--sl-color-white); font-size: 1rem; }
+  .performance-link:hover { text-decoration: underline; }
+  .performance .performance-note { margin: 1rem auto 0; max-width: 45rem; color: var(--sl-color-gray-2); font-size: .8125rem; line-height: 1.7; }
+  @media (max-width: 900px) {
+    .performance { padding: 4rem 1.5rem; }
+    .performance-intro br { display: none; }
+    .performance .performance-results { grid-template-columns: 1fr; grid-template-rows: none; max-width: 22rem; margin-block: 2rem; margin-inline: auto; }
+    .performance .performance-result { display: block; grid-row: auto; padding: 2rem 1rem; }
+    .performance-result + .performance-result { border-left: 0; border-top: 1px solid var(--geo-line); }
+    .performance .performance-value { margin-top: 1rem; font-size: 5rem; }
+    .performance .performance-times { margin-top: 1.25rem; }
+  }
+</style>

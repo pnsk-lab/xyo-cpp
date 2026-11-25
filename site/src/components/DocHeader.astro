@@ -1,0 +1,26 @@
+---
+import DefaultHeader from '@astrojs/starlight/components/Header.astro';
+import Search from '@astrojs/starlight/components/Search.astro';
+import ThemeSelect from '@astrojs/starlight/components/ThemeSelect.astro';
+const base = import.meta.env.BASE_URL;
+const home = Astro.locals.starlightRoute.entry.data.template === 'splash';
+---
+{home ? <div class="landing-header" lang="en">
+  <a class="landing-brand" href={base} aria-label="xyo-cpp home"><svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h5l4 6 4-6h4l-6 9 6 7h-5l-5-6-4 6H3l6-9z" fill="currentColor" /></svg><span>xyo-cpp</span></a>
+  <nav aria-label="Main navigation"><a href={`${base}getting-started/`}>Docs</a><a href={`${base}benchmarks/`}>Benchmarks</a><a href="https://github.com/pnsk-lab/xyo-cpp">GitHub <span aria-hidden="true">↗</span></a></nav>
+  <div class="landing-header-actions"><Search /><ThemeSelect /><a class="header-start" href={`${base}getting-started/`}>Get started</a></div>
+</div> : <DefaultHeader />}
+<style>
+  .landing-header { display: flex; align-items: center; gap: 2.5rem; height: 100%; font-size: .8125rem; }
+  .landing-header a { color: var(--sl-color-white); text-decoration: none; white-space: nowrap; }
+  .landing-brand { display: inline-flex; align-items: center; gap: .6rem; font-size: 1.25rem; font-weight: 650; letter-spacing: -.06em; }
+  nav { display: flex; align-items: center; gap: 1.75rem; }
+  nav a { color: var(--sl-color-gray-2) !important; }
+  nav a:hover { color: var(--sl-color-white) !important; }
+  .landing-header-actions { display: flex; align-items: center; gap: 1rem; margin-left: auto; }
+  .landing-header .header-start { background: var(--geo-accent); color: var(--geo-on-accent); border-radius: 6px; padding: .4rem .875rem; font-size: .75rem; }
+  .header-start:hover { opacity: .8; }
+  @media (min-width: 50rem) { .landing-header :global(site-search button[data-open-modal]) { width: 14rem; } }
+  @media (max-width: 72rem) { .landing-header { gap: 1.5rem; } nav { gap: 1rem; } .landing-header-actions { gap: .75rem; } .landing-header :global(site-search button[data-open-modal]) { width: auto; } }
+  @media (max-width: 49.99rem) { .landing-header { gap: 1.25rem; } nav a:not(:first-child), .header-start, .landing-header :global(starlight-theme-select) { display: none; } .landing-header-actions { margin-left: auto; } }
+</style>

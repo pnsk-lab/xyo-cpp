@@ -1,0 +1,55 @@
+---
+import { blockPath, translatePath } from './scratchGeometry';
+const loopY = 52;
+const rowHeight = 56;
+const fieldHeight = 30;
+// The solid row runs from y=1 to rowHeight-7; the rest is the connector.
+const fieldInset = (rowHeight - 6 - fieldHeight) / 2;
+const nestedY = rowHeight - 8;
+const loopHeight = rowHeight + nestedY + 18;
+const repeatField = { x: 78, y: fieldInset, width: 42, height: fieldHeight };
+const changeField = { x: 206, y: nestedY + fieldInset, width: 36, height: fieldHeight };
+const repeatCenterY = loopY + repeatField.y + repeatField.height / 2;
+const changeCenterY = loopY + changeField.y + changeField.height / 2;
+const outline = [
+  blockPath('hat', 240, 60),
+  translatePath(blockPath('c', 260, loopHeight, rowHeight), 0, loopY),
+  translatePath(blockPath('stack', 240, rowHeight), 18, loopY + nestedY),
+].join(' ');
+---
+<div class="hero-backdrop" aria-hidden="true" inert>
+  <svg viewBox="0 0 660 470" width="660" height="470" focusable="false" aria-hidden="true">
+    <g transform="translate(28 22) scale(2.3)">
+      <path class="backdrop-outline" d={outline} />
+      <g data-backdrop-row="repeat" data-row-top="1" data-row-bottom={rowHeight - 7} transform={`translate(0 ${loopY})`}>
+        <path data-backdrop-input="repeat" d={blockPath('field', repeatField.width, repeatField.height)} transform={`translate(${repeatField.x} ${repeatField.y})`} />
+        <g data-backdrop-row="change" data-row-top="1" data-row-bottom={rowHeight - 7} transform={`translate(18 ${nestedY})`}>
+          <path data-backdrop-input="change" d={blockPath('field', changeField.width, changeField.height)} transform={`translate(${changeField.x - 18} ${fieldInset})`} />
+        </g>
+      </g>
+      <g class="backdrop-labels">
+        <text x="15" y="42">when</text>
+        <path d="M60 41V23M61 24Q67 20 73 24T85 24V36Q79 40 73 36T61 36" />
+        <text x="96" y="42">clicked</text>
+        <text x="15" y={repeatCenterY} dominant-baseline="central">repeat</text>
+        <text data-backdrop-value="repeat" x={repeatField.x + repeatField.width / 2} y={repeatCenterY} text-anchor="middle" dominant-baseline="central">10</text>
+        <text x="32" y={changeCenterY} dominant-baseline="central">change counter by</text>
+        <text data-backdrop-value="change" x={changeField.x + changeField.width / 2} y={changeCenterY} text-anchor="middle" dominant-baseline="central">1</text>
+      </g>
+    </g>
+  </svg>
+</div>
+<style>
+  .hero-backdrop { position: absolute; top: 0; bottom: 0; left: 50%; width: 100vw; transform: translateX(-50%); z-index: -1; overflow: hidden; pointer-events: none; user-select: none; color: var(--sl-color-white); mask-image: linear-gradient(90deg, transparent 35%, #000 78%); }
+  .hero-backdrop svg { position: absolute; left: 48%; top: 48%; display: block; width: clamp(68rem, 112vw, 96rem); max-width: none; height: auto; opacity: .12; transform: translateY(-50%) rotate(-12deg); transform-origin: 30% 50%; }
+  .hero-backdrop path { fill: none; stroke: currentColor; stroke-width: 1.2; stroke-linecap: round; stroke-linejoin: round; }
+  .backdrop-labels { font: 500 14px var(--sl-font); }
+  .backdrop-labels text { fill: currentColor; }
+  :global(:root[data-theme='light']) .hero-backdrop svg { opacity: .075; }
+  @media (max-width: 700px) {
+    .hero-backdrop { mask-image: linear-gradient(90deg, transparent 30%, #000 100%); }
+    .hero-backdrop svg { left: 42%; top: 48%; width: 60rem; opacity: .09; }
+    :global(:root[data-theme='light']) .hero-backdrop svg { opacity: .06; }
+  }
+  @media print { .hero-backdrop { display: none; } }
+</style>

@@ -1,0 +1,26 @@
+---
+import capture from '../data/llvm-ir.json';
+import CompilationExample from './CompilationExample.astro';
+const base = import.meta.env.BASE_URL;
+const { lines, startLine } = capture.excerpt;
+const tokenize = (line: string) => line.split(/(;.*$|%[\w.]+|@[\w.]+|\b(?:phi|fadd|load|store|call|add|icmp|and|br|double|ptr|i64|i1|label|nsw|nuw)\b)/g).filter(Boolean);
+const tokenClass = (token: string) => token.startsWith(';') ? 'ir-comment' : /^[%@]/.test(token) ? 'ir-symbol' : /^(phi|fadd|load|store|call|add|icmp|and|br)$/.test(token) ? 'ir-op' : '';
+---
+<div class="ir-stream" style={`--ir-duration: ${Math.max(lines.length * 2.2, 24)}s`}>
+  <div class="ir-copy">
+    <p class="eyebrow">LLVM IR</p>
+    <h3>A look inside.</h3>
+    <p>A numeric loop compiled by xyo. Recorded output, not a live compilation.</p>
+    <span class="ir-source-name">{capture.projectName}</span>
+    <div class="ir-source-links"><a href={`${base}${capture.sourceFile}`}>Full IR <span aria-hidden="true">↗</span></a><a href={`${base}ir/micro-loop.provenance.json`}>Capture details <span aria-hidden="true">↗</span></a></div>
+  </div>
+  <div class="ir-window" aria-hidden="true" data-pagefind-ignore>
+    <div class="ir-window-label"><span>LLVM IR</span><span>CAPTURED OUTPUT / REPLAY</span></div>
+    <div class="ir-viewport">
+      <div class="ir-track">
+        {[0, 1].map(() => <div class="ir-lines">{lines.map((line, index) => <div class="ir-line"><span class="ir-line-number">{startLine + index}</span><code>{tokenize(line).map(token => <span class={tokenClass(token)}>{token}</span>)}</code></div>)}</div>)}
+      </div>
+    </div>
+  </div>
+  <CompilationExample />
+</div>

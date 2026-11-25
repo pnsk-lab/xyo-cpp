@@ -1,0 +1,38 @@
+---
+title: ベンチマーク
+description: xyo と TurboWarp の実行時間比較（CI で自動更新）
+---
+import BenchTable from '../../components/BenchTable.astro';
+
+<BenchTable />
+
+## 計測内容
+
+- Scratch のブロックだけで書いたアルゴリズム（ソート、篩、fib、SHA-256）と、ループ・リスト操作のマイクロベンチマークです。
+  生成器は `tests/bench/algos/gen_algo_bench.py` です。
+- 各プロジェクトは、データを作ってから 1 回ウォームアップし、本計測を 3 回行います。時間はプロジェクト内の `days since 2000` で取ります。
+  プロジェクトのロード、データ生成、JIT コンパイルの時間は含みません。
+- 各モードを 3 プロセスずつ実行し、プロセスごとの中央値を取ったうえで、さらにその中央値を表に載せています。
+- 出力の checksum を Python の参照実装と照合しています。一致しなかった場合、表には時間ではなく「不一致」と出ます。
+- TurboWarp は `TurboWarp/scratch-vm` を Node でヘッドレス実行したものです。コンパイラは有効（TurboWarp の既定）にしています。
+- xyo は `xyo run --jit hotspot` です。
+- 「&lt;1」は 1 ms 未満を表します。カウンタだけのループは xyo の JIT で畳み込まれて実質 0 ms になるため、比は出していません。
+
+## 自動更新
+
+`.github/workflows/docs.yml` は、サイトをビルドする前に xyo を Release ビルドし、TurboWarp を取得してから
+`tests/bench/algos/bench.py` を実行します。その結果の `site/src/data/bench.json` をもとに表を作ります。
+GitHub Actions の共有ランナーで計測するため、値は実行ごとに数 % から数十 % ぶれます。
+ベンチマークのジョブが失敗したときは、リポジトリにコミットされている前回の JSON がそのまま使われます。
+
+## 手元で計測する
+
+```sh
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build
+git clone https://github.com/TurboWarp/scratch-vm refs/scratch-vm
+(cd refs/scratch-vm && npm ci --ignore-scripts)
+python3 tests/bench/algos/bench.py --micro --modes tw-compiled,xyo-jit \
+  --json site/src/data/bench.json
+```
+
+インタプリタ同士の比較と過去の結果は[研究記録の algo-bench](/xyo-cpp/research/algo-bench/) にまとめています。

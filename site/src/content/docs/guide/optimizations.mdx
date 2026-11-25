@@ -5,20 +5,13 @@ sidebar:
   order: 1
 ---
 
-import { Card, CardGrid, LinkCard, Aside } from '@astrojs/starlight/components';
+import { Aside } from '@astrojs/starlight/components';
 
 xyo-cpp に実装されている主な最適化と、試験中の最適化をまとめています。Scratch の動的型、文字列処理、スレッド間の実行順序、Warp の時間制限を維持しながら、高速な経路を選択する設計です。
 
 <Aside type="note" title="掲載範囲と性能値について">
   このページは **2026年11月5日時点の実装・研究記録**に基づきます。GitHub の安定版だけでなく、作業ツリーで検証された試験機能も含みます。「試験的」はリリース版での有効化を保証しません。性能値は記載された個別ベンチマークに限る結果であり、全プロジェクトの高速化率ではありません。
 </Aside>
-
-<CardGrid>
-  <Card title="LLVM JIT・数値演算" icon="rocket">型ガード、整数の値域証明、ループ最適化、手続きのネイティブ実行。</Card>
-  <Card title="文字列・リスト" icon="document">UTF-16、文字列連結、リスト参照・比較、変換結果の再利用。</Card>
-  <Card title="スケジューラ・GC" icon="setting">Warpのポーリング、並列実行の依存解析、メモリ確保・回収。</Card>
-  <Card title="描画・コンパイル" icon="open-book">ペンのGPU描画、遅延コンパイル、AOTと解析ツール。</Card>
-</CardGrid>
 
 ## ステータスの読み方
 
@@ -181,8 +174,8 @@ ctest --test-dir build --output-on-failure
 
 最適化の評価では、実行時間だけでなく、初回コンパイル時間・ピークRSS・出力チェックサム・タイマーおよびWarpの意味論を分けて確認してください。詳細は[ベンチマークとテスト](/xyo-cpp/development/testing/)および[Scratch Bench](/xyo-cpp/reference/scratch-bench/)を参照してください。
 
-<CardGrid>
-  <LinkCard title="実行モード" href="/xyo-cpp/guide/execution/" description="Interpreter / HotSpot / Eager JIT の使い分け" />
-  <LinkCard title="プロジェクトの最適化" href="/xyo-cpp/guide/optimization/" description="analyze・rewrite・minifyでSB3自体を解析・書き換え" />
-  <LinkCard title="研究・実験記録" href="/xyo-cpp/research/v1-optimization-program-2026-11-04/" description="実験条件、ベンチマーク、採用・撤回した案" />
-</CardGrid>
+関連ページ:
+
+- [実行モード](/xyo-cpp/guide/execution/) — Interpreter / HotSpot / Eager JIT の使い分け
+- [プロジェクトの最適化](/xyo-cpp/guide/optimization/) — analyze・rewrite・minify で SB3 自体を解析・書き換え
+- [研究・実験記録](/xyo-cpp/research/v1-optimization-program-2026-11-04/) — 実験条件、ベンチマーク、採用・撤回した案

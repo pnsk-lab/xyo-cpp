@@ -1,0 +1,69 @@
+---
+// CI writes the measured results; the detailed page keeps every workload.
+import data from '../data/bench.json';
+
+interface Props { locale?: 'ja' | 'en' }
+const english = Astro.props.locale === 'en';
+const englishLabels: Record<string, string> = {
+  sieve: 'Sieve of Eratosthenes', fib: 'Fibonacci (recursive)',
+  micro_loop: 'Counter loop', micro_read: 'List read',
+  micro_write: 'List write', micro_append: 'List append',
+};
+const labels: Record<string, string> = {
+  quicksort: 'quicksort', mergesort: 'mergesort', bubblesort: 'bubblesort',
+  sieve: 'エラトステネスの篩', fib: 'fib（再帰）', sha256: 'SHA-256',
+  micro_loop: 'カウンタループ（change i by 1）', micro_read: 'リスト読み出し',
+  micro_write: 'リスト書き換え', micro_append: 'リスト追加',
+};
+type Mode = { median_ms: number; valid: boolean };
+const results = data.results as Record<string, { n: number; modes: Record<string, Mode> }>;
+const usable = (m?: Mode) => !!m && m.valid && Number.isFinite(m.median_ms) && m.median_ms >= 0;
+const fmt = (m?: Mode) => {
+  if (!m) return '-';
+  if (!m.valid) return english ? 'Mismatch' : '不一致';
+  if (!usable(m)) return '-';
+  return m.median_ms < 1 ? '<1' : m.median_ms.toFixed(0);
+};
+const ratio = (tw?: Mode, xyo?: Mode) => {
+  if (!usable(tw) || !usable(xyo) || tw!.median_ms < 1 || xyo!.median_ms < 1) return '-';
+  return (tw!.median_ms / xyo!.median_ms).toFixed(2) + '×';
+};
+const rows = Object.entries(results).map(([name, result]) => ({
+  name: english ? (englishLabels[name] ?? (name === 'sha256' ? 'SHA-256' : name)) : (labels[name] ?? name),
+  n: result.n.toLocaleString('en-US'),
+  tw: fmt(result.modes['tw-compiled']),
+  xyo: fmt(result.modes['xyo-jit']),
+  ratio: ratio(result.modes['tw-compiled'], result.modes['xyo-jit']),
+}));
+const meta = data.meta;
+const date = meta.date ? meta.date.replace('T', ' ').replace('Z', ' UTC') : (english ? 'Unknown' : '不明');
+---
+<table>
+  <thead>
+    <tr>
+      <th scope="col">{english ? 'Benchmark' : 'ベンチマーク'}</th>
+      <th scope="col" style="text-align:right">n</th>
+      <th scope="col" style="text-align:right">TurboWarp (ms)</th>
+      <th scope="col" style="text-align:right">xyo JIT (ms)</th>
+      <th scope="col" style="text-align:right">TW / xyo</th>
+    </tr>
+  </thead>
+  <tbody>
+    {rows.map(row => (
+      <tr>
+        <td>{row.name}</td>
+        <td style="text-align:right">{row.n}</td>
+        <td style="text-align:right">{row.tw}</td>
+        <td style="text-align:right">{row.xyo}</td>
+        <td style="text-align:right">{row.ratio}</td>
+      </tr>
+    ))}
+  </tbody>
+</table>
+<p class="bench-meta">
+  {english ? 'Measured' : '計測日'} {date} ／ xyo <code>{meta.xyo_commit ?? '?'}</code> ／ TurboWarp scratch-vm <code>{meta.tw_commit ?? '?'}</code><br />
+  {meta.cpu} ／ Node {meta.node} ／ LLVM {meta.llvm}
+</p>
+<style>
+  .bench-meta { font-size: .8125rem; line-height: 1.8; color: var(--sl-color-gray-2); overflow-wrap: anywhere; }
+</style>

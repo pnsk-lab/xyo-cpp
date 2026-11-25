@@ -1,0 +1,97 @@
+---
+title: Scratch ブロック
+description: サイト内で使うScratchブロックの形状、入れ子、入力欄の見本。
+---
+import ScratchBlock from '../../../components/ScratchBlock.astro';
+import ScratchScript from '../../../components/ScratchScript.astro';
+
+Scratchの形を、単色の輪郭で表示します。ブロックの幅は文字に合わせて変わり、長い説明や入れ子でも角と接続部分の形を保ちます。
+
+## スクリプト
+
+開始ブロックから命令をつなぎ、繰り返しの中に処理を入れます。入力値は小さな角丸の枠で示します。
+
+<div class="block-demo">
+  <ScratchScript a11y="旗が押されたとき、10歩動かす処理を10回繰り返し、すべてを止める">
+    <ScratchBlock kind="hat" label="旗が押されたとき" />
+    <ScratchBlock kind="c">
+      <ScratchBlock kind="field" label="10" /> 回繰り返す
+      <ScratchScript slot="body">
+        <ScratchBlock><ScratchBlock kind="field" label="10" /> 歩動かす</ScratchBlock>
+      </ScratchScript>
+    </ScratchBlock>
+    <ScratchBlock kind="cap" label="すべてを止める" />
+  </ScratchScript>
+</div>
+
+## 形の違い
+
+<div class="block-samples">
+  <figure><div><ScratchBlock kind="hat" label="旗が押されたとき" /></div><figcaption>開始</figcaption></figure>
+  <figure><div><ScratchBlock label="次のコスチュームにする" /></div><figcaption>命令</figcaption></figure>
+  <figure><div><ScratchBlock kind="cap" label="すべてを止める" /></div><figcaption>終了</figcaption></figure>
+  <figure><div><ScratchBlock kind="reporter" label="x座標" /></div><figcaption>値</figcaption></figure>
+  <figure><div><ScratchBlock kind="boolean" label="端に触れた" /></div><figcaption>条件</figcaption></figure>
+  <figure><div><ScratchBlock kind="field" label="10" /></div><figcaption>入力値</figcaption></figure>
+</div>
+
+楕円は変数などの値、六角形は条件を表します。数値や文字列の入力欄は、値を返すブロックと見分けられる角丸の枠にしています。
+
+## 条件と入れ子
+
+条件は見出しに、実行する命令はC型の内側に置きます。囲みの右側は開いており、内側の命令が独立した箱に見えない形です。
+
+<div class="block-demo">
+  <ScratchScript a11y="端に触れた場合、180度回す">
+    <ScratchBlock kind="c">
+      もし <ScratchBlock kind="boolean" label="端に触れた" /> なら
+      <ScratchScript slot="body">
+        <ScratchBlock><ScratchBlock kind="field" label="180" /> 度回す</ScratchBlock>
+      </ScratchScript>
+    </ScratchBlock>
+  </ScratchScript>
+</div>
+
+## 使い方
+
+`ScratchBlock` が一つのブロック、`ScratchScript` が縦積みのまとまりです。繰り返しや条件の見出しは通常のスロットに、内側の処理は `slot="body"` に渡します。
+
+```astro
+import ScratchBlock from '../../../components/ScratchBlock.astro';
+import ScratchScript from '../../../components/ScratchScript.astro';
+
+<ScratchScript a11y="旗が押されたときに10歩動かす処理を10回繰り返す">
+  <ScratchBlock kind="hat" label="旗が押されたとき" />
+  <ScratchBlock kind="c">
+    <ScratchBlock kind="field" label="10" /> 回繰り返す
+    <ScratchScript slot="body">
+      <ScratchBlock><ScratchBlock kind="field" label="10" /> 歩動かす</ScratchBlock>
+    </ScratchScript>
+  </ScratchBlock>
+</ScratchScript>
+```
+
+| `kind` | 形 | 用途 |
+| --- | --- | --- |
+| `stack`（既定） | 上下に接続部分のある命令ブロック | 通常の命令 |
+| `hat` | 上部が盛り上がった開始ブロック | 旗やキーのイベント |
+| `cap` | 下に接続部分のない終端ブロック | 停止など |
+| `c` | 右側が開いたC型 | 繰り返し・条件 |
+| `reporter` | 楕円 | 変数などの値 |
+| `boolean` | 六角形 | 真偽を返す条件 |
+| `field` | 小さな角丸の枠 | 数値・文字列の入力値 |
+
+### 読み上げとテーマ
+
+`label` は表示文字と読み上げ名に使います。スロットを使う場合、その文字は読み上げから隠しません。まとまったスクリプトには `ScratchScript` の `a11y` で説明を付けられます。装飾だけの図は `decorative` を指定してください。
+
+輪郭と文字はライト／ダークのテーマに追従します。塗りつぶしや背景色で線を消す処理は使いません。ブラウザでは文字と入れ子の実寸から輪郭を描き、JavaScriptが無効な場合は静的な輪郭を表示します。
+
+<style>{`
+  .block-demo { display: flex; justify-content: center; max-width: 100%; margin-block: 1.5rem; padding: 2rem 1rem; border: 1px solid var(--geo-line); border-radius: 1rem; }
+  .block-samples { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .75rem; margin-block: 1.5rem; }
+  .block-samples figure { display: flex; flex-direction: column; justify-content: space-between; align-items: center; gap: 1rem; min-width: 0; margin: 0; padding: 1.5rem .75rem 1rem; border: 1px solid var(--geo-line); border-radius: .75rem; }
+  .block-samples figure > div { display: grid; place-items: center; min-height: 5rem; width: 100%; }
+  .block-samples figcaption { margin: 0; font-size: .8125rem; color: var(--sl-color-gray-2); }
+  @media (max-width: 500px) { .block-samples { grid-template-columns: 1fr; } }
+`}</style>

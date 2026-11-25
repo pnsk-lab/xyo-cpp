@@ -1,0 +1,35 @@
+{
+  "title": "Counter loop",
+  "sourceFile": "examples/micro-loop.sb3",
+  "projectSha256": "252045b9245e62a615cb2ca81077eeb172a593f925d9eda1c7af37bf4ef29548",
+  "irSha256": "04a401a46a2e2d48b989ac96f2ee7ff88b8c0270ff7d0ef2b4a7913cf4e7c0e3",
+  "source": {
+    "sprite": "Bench",
+    "proccode": "bench %s",
+    "argument": "n",
+    "variable": "i",
+    "initial": 0,
+    "delta": 1,
+    "exampleCount": 1000000,
+    "warp": true
+  },
+  "steps": [
+    {
+      "id": "loop",
+      "label": "repeat n",
+      "lines": [
+        445
+      ],
+      "explanation": "The remaining-repeat counter is carried between iterations with phi. Its decrement and exit test are in another basic block."
+    },
+    {
+      "id": "increment",
+      "label": "change i by 1",
+      "lines": [
+        447,
+        448
+      ],
+      "explanation": "fadd adds one to the running numeric value of i. store saves it in a compiler temporary; the variable-slot writeback is elsewhere in the module."
+    }
+  ]
+}

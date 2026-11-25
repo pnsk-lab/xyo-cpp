@@ -3,3 +3,6 @@ dist/
 .astro/
 src/content/docs/reference/
 src/content/docs/research/
+
+# ローカル検証用の一時出力
+tmp/

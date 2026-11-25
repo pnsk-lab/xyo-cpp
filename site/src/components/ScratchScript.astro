@@ -1,0 +1,71 @@
+---
+interface Props { a11y?: string; decorative?: boolean; class?: string }
+const { a11y, decorative = false, class: extra } = Astro.props;
+---
+<scratch-script class:list={['sb-script', 'not-content', extra]} role={!decorative && a11y ? 'img' : undefined} aria-label={decorative ? undefined : a11y} aria-hidden={decorative ? 'true' : undefined}>
+  <svg class="sb-script__outline" aria-hidden="true" focusable="false" preserveAspectRatio="none"><path /></svg>
+  <slot />
+</scratch-script>
+<script>
+  import { blockPath, translatePath, type BlockKind } from './scratchGeometry';
+  class ScratchScript extends HTMLElement {
+    private dispose?: () => void;
+    connectedCallback() {
+      if (this.dispose || this.parentElement?.closest('scratch-script')) return;
+      const abort = new AbortController();
+      let frame = 0;
+      let active = true;
+      const render = () => {
+        frame = 0;
+        if (!active || !this.isConnected) return;
+        const svg = this.querySelector<SVGSVGElement>(':scope > .sb-script__outline');
+        const path = svg?.querySelector('path');
+        const box = this.getBoundingClientRect();
+        if (!svg || !path || !box.width || !box.height) return;
+        const paths = [...this.querySelectorAll<HTMLElement>('.sb--stack, .sb--hat, .sb--cap, .sb--c')].flatMap(block => {
+          const rect = block.getBoundingClientRect();
+          if (!rect.width || !rect.height) return [];
+          const kind = block.querySelector<HTMLElement>(':scope > .sb__shape')?.dataset.kind as BlockKind;
+          const head = block.querySelector<HTMLElement>(':scope > .sb__head');
+          const d = blockPath(kind, rect.width, rect.height, head?.getBoundingClientRect().height);
+          return [translatePath(d, rect.left - box.left, rect.top - box.top)];
+        });
+        if (!paths.length) return;
+        svg.setAttribute('viewBox', `0 0 ${box.width} ${box.height}`);
+        // One paint operation unions coincident stroke coverage, including AA edges.
+        path.setAttribute('d', paths.join(' '));
+        this.dataset.outlineReady = 'true';
+      };
+      const schedule = () => { if (active && !frame) frame = requestAnimationFrame(render); };
+      this.addEventListener('scratch-shape-change', schedule, {signal: abort.signal});
+      const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(schedule) : null;
+      observer?.observe(this);
+      const mutations = new MutationObserver(schedule);
+      mutations.observe(this, {childList:true, subtree:true});
+      schedule();
+      this.dispose = () => {
+        active = false;
+        abort.abort();
+        if (frame) cancelAnimationFrame(frame);
+        observer?.disconnect();
+        mutations.disconnect();
+        delete this.dataset.outlineReady;
+      };
+    }
+    disconnectedCallback() { this.dispose?.(); this.dispose = undefined; }
+  }
+  if (!customElements.get('scratch-script')) customElements.define('scratch-script', ScratchScript);
+</script>
+<style is:global>
+  .sb-script { --sb-stroke: var(--sl-color-gray-2); display: flex; position: relative; isolation: isolate; flex-direction: column; align-items: flex-start; width: max-content; max-width: 100%; margin: 0; padding: 0; text-align: left; }
+  .sb-script > .sb { flex: none; margin: 0; }
+  /* Astro may place its one-time module script between component siblings. */
+  .sb-script > .sb ~ .sb { margin-top: calc(-1 * var(--sb-overlap, 8px)); }
+  .sb__body > .sb-script { margin: 0; }
+  .sb-script__outline { position: absolute; inset: 0; z-index: -1; display: block; width: 100%; height: 100%; max-width: none; overflow: visible; visibility: hidden; pointer-events: none; }
+  .sb-script__outline path { fill: none; stroke: var(--sb-stroke); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+  .sb-script[data-outline-ready] > .sb-script__outline { visibility: visible; }
+  .sb-script[data-outline-ready] :is(.sb--stack, .sb--hat, .sb--cap, .sb--c) > .sb__shape { visibility: hidden; }
+  .sb-script[data-outline-ready] .sb-script > .sb-script__outline { display: none; }
+  @media print { .sb-script { --sb-stroke: #444; } }
+</style>

@@ -1,0 +1,73 @@
+<!-- Automatic enhancement only; no motion toolbar or saved user controls. -->
+<home-motion hidden></home-motion>
+<script>
+  class HomeMotion extends HTMLElement {
+    private dispose?: () => void;
+    connectedCallback() {
+      if (this.dispose) return;
+      const home = this.closest<HTMLElement>('.doc-home');
+      if (!home) return;
+      const html = document.documentElement;
+      const reduced = matchMedia('(prefers-reduced-motion: reduce)');
+      const finePointer = matchMedia('(hover: hover) and (pointer: fine)');
+      const abort = new AbortController();
+      const { signal } = abort;
+      if (CSS.supports('transform-style', 'preserve-3d')) home.dataset.cubeReady = 'true';
+      const cubes = [...home.querySelectorAll<HTMLElement>('.cube-tilt')];
+      const resetTilt = () => cubes.forEach(cube => {
+        cube.style.removeProperty('--pointer-x');
+        cube.style.removeProperty('--pointer-y');
+      });
+      const targets = [...home.querySelectorAll<HTMLElement>('.product-feature, .execution-section, .ir-stream, .performance, .product-start')];
+      // Keep all content visible if IntersectionObserver is unavailable.
+      const observer = typeof IntersectionObserver === 'function' ? new IntersectionObserver(entries => {
+        for (const entry of entries) {
+          entry.target.classList.toggle('motion-in-view', entry.isIntersecting);
+          if (entry.isIntersecting) entry.target.classList.add('motion-revealed');
+        }
+      }, { threshold: 0.08 }) : null;
+      targets.forEach(target => {
+        if (observer) {
+          target.classList.add('motion-reveal');
+          observer.observe(target);
+        } else target.classList.add('motion-in-view');
+      });
+      const sync = () => {
+        html.dataset.homeMotion = reduced.matches ? 'paused' : 'running';
+        html.toggleAttribute('data-home-hidden', document.hidden);
+        if (reduced.matches || document.hidden) resetTilt();
+      };
+      reduced.addEventListener('change', sync, { signal });
+      finePointer.addEventListener('change', resetTilt, { signal });
+      document.addEventListener('visibilitychange', sync, { signal });
+      const execution = home.querySelector<HTMLElement>('.execution-figure');
+      execution?.addEventListener('pointermove', event => {
+        if (reduced.matches || !finePointer.matches || document.hidden || event.pointerType === 'touch') return;
+        const rect = execution.getBoundingClientRect();
+        if (!rect.width || !rect.height) return;
+        const x = Math.max(-1, Math.min(1, (event.clientX - rect.left) / rect.width * 2 - 1));
+        const y = Math.max(-1, Math.min(1, (event.clientY - rect.top) / rect.height * 2 - 1));
+        cubes.forEach(cube => {
+          cube.style.setProperty('--pointer-x', `${(-y * 10).toFixed(2)}deg`);
+          cube.style.setProperty('--pointer-y', `${(x * 16).toFixed(2)}deg`);
+        });
+      }, { signal });
+      execution?.addEventListener('pointerleave', resetTilt, { signal });
+      sync();
+      this.dispose = () => {
+        abort.abort();
+        observer?.disconnect();
+        resetTilt();
+        delete html.dataset.homeMotion;
+        html.removeAttribute('data-home-hidden');
+        delete home.dataset.cubeReady;
+        targets.forEach(target => target.classList.remove('motion-reveal', 'motion-revealed', 'motion-in-view'));
+      };
+    }
+    disconnectedCallback() {
+      this.dispose?.();
+      this.dispose = undefined;
+    }
+  }
+  if (!customElements.get('home-motion')) customElements.define('home-motion', HomeMotion);
+</script>

@@ -1,0 +1,26 @@
+---
+import ScratchBlock from './ScratchBlock.astro';
+import ScratchScript from './ScratchScript.astro';
+---
+<div class="scratch-script">
+  <ScratchScript a11y="When the flag is clicked, repeat ten times and change counter by one.">
+    <ScratchBlock kind="hat">
+      when
+      <svg class="scratch-flag" viewBox="0 0 28 28" width="22" height="22" aria-hidden="true" focusable="false">
+        <path d="M6 24V5M7 5Q11 2 16 5T25 5V17Q21 20 16 17T7 17" />
+      </svg>
+      clicked
+    </ScratchBlock>
+    <ScratchBlock kind="c">
+      repeat <ScratchBlock kind="field" label="10" />
+      <ScratchScript slot="body">
+        <ScratchBlock>change counter by <ScratchBlock kind="field" label="1" /></ScratchBlock>
+      </ScratchScript>
+    </ScratchBlock>
+  </ScratchScript>
+</div>
+<style>
+  .scratch-script { width: fit-content; max-width: 100%; margin: 2.5rem auto 0; text-align: left; }
+  .scratch-flag { display: inline-block; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+  @media (max-width: 700px) { .scratch-script { margin-top: 2rem; } }
+</style>

@@ -1,0 +1,118 @@
+---
+import { blockPath, type BlockKind } from './scratchGeometry';
+
+interface Props {
+  kind?: BlockKind;
+  label?: string;
+  a11y?: string;
+  decorative?: boolean;
+  class?: string;
+}
+const { kind = 'stack', label, a11y, decorative = false, class: extra } = Astro.props;
+const name = a11y ?? label;
+const inline = ['reporter', 'boolean', 'field'].includes(kind);
+const Tag = inline ? 'span' : 'div';
+const initialWidth = inline ? 100 : 240;
+const initialHeight = kind === 'c' ? 110 : kind === 'hat' ? 60 : inline ? 30 : 48;
+---
+<Tag class:list={['sb', `sb--${kind}`, 'not-content', extra]} role={!decorative && name ? 'img' : undefined} aria-label={decorative ? undefined : name} aria-hidden={decorative ? 'true' : undefined}>
+  <scratch-block-shape class="sb__shape" data-kind={kind} aria-hidden="true">
+    <svg viewBox={`0 0 ${initialWidth} ${initialHeight}`} preserveAspectRatio="none" focusable="false" aria-hidden="true"><path d={blockPath(kind, initialWidth, initialHeight)} /></svg>
+  </scratch-block-shape>
+  {kind === 'c' ? <>
+    <div class="sb__head"><span class="sb__label">{label}<slot name="head"><slot /></slot></span></div>
+    <div class="sb__body"><slot name="body" /></div>
+    <div class="sb__tail" aria-hidden="true"></div>
+  </> : <span class="sb__label">{label}<slot /></span>}
+</Tag>
+
+<script>
+  import { blockPath, type BlockKind } from './scratchGeometry';
+
+  // Measure the HTML, not the SVG: typography and nesting determine the size.
+  class ScratchBlockShape extends HTMLElement {
+    private observer?: ResizeObserver;
+    private active = false;
+    connectedCallback() {
+      if (this.active) return;
+      this.active = true;
+      queueMicrotask(() => {
+        if (!this.active || !this.isConnected) return;
+        const block = this.parentElement;
+        const svg = this.querySelector('svg');
+        const path = svg?.querySelector('path');
+        if (!block || !svg || !path) return;
+        const head = block.querySelector<HTMLElement>(':scope > .sb__head');
+        const draw = () => {
+          if (!this.active) return;
+          const { width, height } = block.getBoundingClientRect();
+          if (width <= 0 || height <= 0) return;
+          svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+          path.setAttribute('d', blockPath(this.dataset.kind as BlockKind, width, height, head?.getBoundingClientRect().height));
+          this.dataset.ready = 'true';
+          this.dispatchEvent(new CustomEvent('scratch-shape-change', { bubbles: true }));
+        };
+        draw();
+        if (typeof ResizeObserver === 'function') {
+          this.observer = new ResizeObserver(draw);
+          this.observer.observe(block);
+          if (head) this.observer.observe(head);
+        }
+        document.fonts?.ready.then(draw);
+      });
+    }
+    disconnectedCallback() {
+      this.active = false;
+      this.observer?.disconnect();
+      this.observer = undefined;
+    }
+  }
+  if (!customElements.get('scratch-block-shape')) customElements.define('scratch-block-shape', ScratchBlockShape);
+</script>
+
+<style is:global>
+  .sb {
+    --sb-stroke: var(--sl-color-gray-2);
+    --sb-overlap: 8px;
+    box-sizing: border-box;
+    position: relative;
+    isolation: isolate;
+    display: inline-grid;
+    align-items: center;
+    width: fit-content;
+    max-width: 100%;
+    min-width: 7rem;
+    min-height: 3rem;
+    margin: 0;
+    padding: 10px 14px 16px;
+    border: 0;
+    background: transparent;
+    color: var(--sl-color-white);
+    font-family: var(--sl-font);
+    font-size: .875rem;
+    font-weight: 500;
+    line-height: 1.5;
+    text-align: left;
+    vertical-align: middle;
+  }
+  .sb__shape { position: absolute; inset: 0; display: block; pointer-events: none; z-index: -1; }
+  .sb__shape > svg { display: block; width: 100%; height: 100%; max-width: none; overflow: visible; }
+  .sb__shape path { fill: none; stroke: var(--sb-stroke); stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+  .sb__label { display: inline-flex; align-items: center; flex-wrap: wrap; gap: .4em; min-width: 0; overflow-wrap: anywhere; }
+  /* MDX wraps rich slot text in a paragraph; it is still one block label. */
+  .sb__label > p { display: contents; }
+  .sb--hat { min-width: 9.5rem; min-height: 3.75rem; padding-top: 24px; }
+  .sb--cap { padding-bottom: 10px; }
+  .sb--c { align-items: stretch; padding: 0; }
+  .sb__head { display: flex; align-items: center; min-width: 0; min-height: 46px; padding: 10px 14px 16px; }
+  .sb__body { min-width: 0; min-height: 28px; margin: -8px 0 0; padding: 0 12px 0 18px; }
+  .sb__tail { height: 18px; }
+  .sb--reporter, .sb--boolean, .sb--field { display: inline-flex; justify-content: center; min-width: 2rem; min-height: 1.875rem; padding: 3px 10px; font-size: inherit; font-weight: inherit; line-height: 1.5; }
+  .sb--boolean { padding-inline: 18px; }
+  .sb--field { min-width: 2.25rem; padding-inline: 10px; font-variant-numeric: tabular-nums; }
+  .sb--field .sb__shape path { stroke: var(--sl-color-gray-3); }
+  @media print {
+    .sb { --sb-stroke: #444; color: #111; break-inside: avoid; }
+    .sb--field .sb__shape path { stroke: #666; }
+  }
+</style>

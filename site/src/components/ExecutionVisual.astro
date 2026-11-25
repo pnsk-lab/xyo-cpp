@@ -1,0 +1,58 @@
+---
+import RuntimeCube from './RuntimeCube.astro';
+import IRStream from './IRStream.astro';
+import ScratchBlock from './ScratchBlock.astro';
+const base = import.meta.env.BASE_URL;
+---
+<section class="execution-section" aria-labelledby="execution-title">
+  <header class="execution-heading">
+    <h2 id="execution-title">From blocks to native code.</h2>
+    <a href={`${base}guide/execution/`}>How xyo runs your project <span aria-hidden="true">›</span></a>
+  </header>
+  <figure class="execution-figure">
+    <div class="execution-visual">
+      <svg viewBox="0 0 1000 230" role="img" aria-labelledby="execution-svg-title execution-svg-desc">
+        <title id="execution-svg-title">Project execution paths</title>
+        <desc id="execution-svg-desc">xyo loads Scratch SB3 and SB2 projects. Interpreter, LLVM JIT, and ahead-of-time compilation are available execution paths, depending on the selected mode.</desc>
+        <g class="flow-lines" fill="none" stroke="currentColor" stroke-width="1"><path d="M250 115H444 M556 115H650Q680 115 680 85V57Q680 41 696 41H766 M556 115H766 M556 115H650Q680 115 680 145V173Q680 189 696 189H766"/><path d="m758 37 4 4-4 4 m0 66 4 4-4 4 m0 66 4 4-4 4" /></g>
+        <g class="flow-beams" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+          <path class="beam-input" pathLength="1" d="M250 115H444" />
+          <path class="beam-output" pathLength="1" d="M556 115H650Q680 115 680 85V57Q680 41 696 41H766" />
+          <path class="beam-output beam-middle" pathLength="1" d="M556 115H766" />
+          <path class="beam-output beam-bottom" pathLength="1" d="M556 115H650Q680 115 680 145V173Q680 189 696 189H766" />
+        </g>
+        <rect class="flow-halo" x="433" y="48" width="134" height="134" rx="18" />
+        <rect class="flow-core" x="444" y="59" width="112" height="112" rx="10" />
+        <text class="flow-logo" x="500" y="126" text-anchor="middle">xyo</text>
+        <g class="flow-node"><rect x="766" y="19" width="160" height="44" rx="6"/><rect x="766" y="93" width="160" height="44" rx="6"/><rect x="766" y="167" width="160" height="44" rx="6"/></g>
+        <g class="flow-label" text-anchor="middle"><text x="846" y="46">Interpreter</text><text x="846" y="120">LLVM JIT</text><text x="846" y="194">AOT</text></g>
+      </svg>
+      <div class="flow-project" aria-hidden="true"><ScratchBlock label=".sb3 / .sb2" /></div>
+      <RuntimeCube />
+    </div>
+    <div class="mobile-execution" aria-label="SB3 and SB2 projects run in xyo through the interpreter, LLVM JIT, or AOT">
+      <div class="mobile-project"><ScratchBlock label=".sb3 / .sb2" /></div><span class="mobile-flow-line" aria-hidden="true"></span>
+      <div class="mobile-runtime"><RuntimeCube /><strong class="mobile-runtime-fallback">xyo</strong></div>
+      <span class="mobile-flow-line" aria-hidden="true"></span>
+      <div class="mobile-modes"><span>Interpreter</span><span>LLVM JIT</span><span>AOT</span></div>
+    </div>
+  </figure>
+  <IRStream />
+</section>
+<style>
+  .execution-section { margin: 4rem 1.5rem 0 !important; border: 1px solid var(--geo-line); border-radius: 1.5rem; overflow: hidden; }
+  .execution-heading { padding: 2.5rem 2rem 1rem; text-align: center; }
+  .execution-heading h2 { margin: 0 0 .75rem; padding: 0; border: 0; font-size: clamp(1.75rem, 3vw, 2.5rem); font-weight: 550; letter-spacing: -.045em; }
+  .execution-heading a { display: inline-flex; align-items: center; gap: .5rem; min-height: 44px; font-size: .9375rem; }
+  .execution-heading a:hover { text-decoration: underline; }
+  .execution-figure { padding-block: 1rem 2rem; }
+  .execution-visual { width: 100%; max-width: 62.5rem; margin-inline: auto !important; }
+  .execution-visual svg { margin-inline: auto; }
+  .flow-project { position: absolute; left: 16.5%; top: 50%; width: 17%; transform: translate(-50%, -50%); }
+  .flow-project :global(.sb) { width: 100%; min-height: 3.375rem; justify-content: center; }
+  .mobile-execution .mobile-project { padding: 0; border: 0; border-radius: 0; background: none; }
+  @media (max-width: 700px) {
+    .execution-section { margin: 3rem 1rem 0 !important; border-radius: 1rem; }
+    .execution-heading { padding: 1.5rem 1rem .5rem; }
+  }
+</style>

@@ -1,0 +1,34 @@
+{
+  "project": "tests/bench/algos/out/micro_loop_1000000.sb3",
+  "projectName": "micro_loop_1000000.sb3",
+  "description": "Scratch repeat n: change i by 1",
+  "captureCommand": "XYO_JIT_DUMP2=1 ./build/xyo run tests/bench/algos/out/micro_loop_1000000.sb3 --jit=eager --no-mega --frames 3000",
+  "capturedAt": "2026-11-25T10:39:09.228Z",
+  "captureRepositoryCommit": "36a4b95c8afd9b378e353dee7a3907b7f2a487b8",
+  "binarySha256": "1742690b6e740d1a8a52127aeed4578d3fce38e2ce1820068914dc0fe7146e66",
+  "projectSha256": "252045b9245e62a615cb2ca81077eeb172a593f925d9eda1c7af37bf4ef29548",
+  "irSha256": "04a401a46a2e2d48b989ac96f2ee7ff88b8c0270ff7d0ef2b4a7913cf4e7c0e3",
+  "note": "Captured optimized LLVM IR from the existing build/xyo binary; the capture-time repository commit is not a claim that this binary was built from that exact revision. This is a recorded snapshot, not live browser compilation.",
+  "target": "x86_64-pc-linux-gnu",
+  "moduleLines": 640,
+  "sourceFile": "ir/micro-loop.ll",
+  "excerpt": {
+    "startLine": 442,
+    "endLine": 454,
+    "lines": [
+      ".lr.ph.split:                                     ; preds = %.lr.ph, %cmpok.done6",
+      "  %ycnt.051 = phi i64 [ %119, %cmpok.done6 ], [ %17, %.lr.ph ]",
+      "  %pvd.050 = phi double [ %pvd.1, %cmpok.done6 ], [ %47, %.lr.ph ]",
+      "  %rep_i.049 = phi double [ %144, %cmpok.done6 ], [ %15, %.lr.ph ]",
+      "  %117 = load i64, ptr %19, align 8",
+      "  %118 = fadd double %pvd.050, 1.000000e+00",
+      "  store double %118, ptr %pv, align 8",
+      "  %119 = add i64 %ycnt.051, 1",
+      "  %120 = call i64 @llvm.umin.i64(i64 %117, i64 16384)",
+      "  %121 = add nsw i64 %120, -1",
+      "  %122 = and i64 %121, %119",
+      "  %123 = icmp eq i64 %122, 0",
+      "  br i1 %123, label %132, label %cmpok.done6, !prof !2"
+    ]
+  }
+}

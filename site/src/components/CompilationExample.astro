@@ -1,0 +1,138 @@
+---
+import capture from '../data/llvm-ir.json';
+import example from '../data/compilation-example.json';
+import ScratchBlock from './ScratchBlock.astro';
+import ScratchScript from './ScratchScript.astro';
+const base = import.meta.env.BASE_URL;
+if (example.projectSha256 !== capture.projectSha256 || example.irSha256 !== capture.irSha256) {
+  throw new Error('Compilation example is stale. Run node site/scripts/prepare-compilation-example.mjs');
+}
+const source = example.source;
+const codeId = `compiled-example-${capture.irSha256.slice(0, 8)}`;
+const descriptionId = `${codeId}-description`;
+const rows = capture.excerpt.lines.map((text, index) => {
+  const number = capture.excerpt.startLine + index;
+  return { text, number, related: example.steps.find(step => step.lines.includes(number))?.id };
+});
+const initial = example.steps.find(step => step.id === 'increment')!;
+---
+<compilation-example class="compilation-example not-content" data-active="increment">
+  <details class="compile-example">
+    <summary><span>See the actual conversion</span><span class="compile-expand" aria-hidden="true"></span></summary>
+    <div class="compile-content">
+      <header class="compile-heading">
+        <h4>{example.title}</h4>
+        <p>The <code>bench ({source.argument})</code> procedure from the recorded benchmark. Called with {source.argument} = {source.exampleCount.toLocaleString('en-US')}.</p>
+      </header>
+      <div class="compile-focus" hidden aria-label="Follow a source block">
+        {example.steps.map(step => <button type="button" data-step={step.id} data-explanation={step.explanation} aria-pressed={step.id === initial.id ? 'true' : 'false'} aria-controls={codeId}>{step.label}</button>)}
+      </div>
+      <div class="compile-panels">
+        <figure class="compile-panel">
+          <figcaption>Scratch <span>Procedure excerpt · warp</span></figcaption>
+          <div class="compile-source">
+            <ScratchScript a11y="Define bench with argument n. Set i to zero, then repeat n times: change i by one.">
+              <ScratchBlock kind="hat">define bench <ScratchBlock kind="reporter" label={source.argument} /></ScratchBlock>
+              <ScratchBlock>set {source.variable} to <ScratchBlock kind="field" label={String(source.initial)} /></ScratchBlock>
+              <ScratchBlock kind="c" class="compile-source-loop">
+                repeat <ScratchBlock kind="reporter" label={source.argument} />
+                <ScratchScript slot="body">
+                  <ScratchBlock class="compile-source-increment">change {source.variable} by <ScratchBlock kind="field" label={String(source.delta)} /></ScratchBlock>
+                </ScratchScript>
+              </ScratchBlock>
+            </ScratchScript>
+          </div>
+        </figure>
+        <figure class="compile-panel compile-ir-panel">
+          <figcaption>LLVM IR <span>Recorded · lines {capture.excerpt.startLine}–{capture.excerpt.endLine}</span></figcaption>
+          <pre class="compile-output" id={codeId} tabindex="0" aria-label="Verbatim recorded LLVM IR basic block" aria-describedby={descriptionId}><code>{rows.map((row, index) => <><span class="compile-line" data-line={row.number} data-related={row.related}>{row.text}</span>{index < rows.length - 1 ? '\n' : ''}</>)}</code></pre>
+        </figure>
+      </div>
+      <p class="compile-explanation" id={descriptionId} aria-live="polite">{initial.explanation}</p>
+      <p class="compile-scope">One emitted numeric-loop path, not the whole module or a trace of which path ran. The full IR also contains a guarded matrix-power fast path. The project includes warm-up, timing, and a result check.</p>
+      <div class="compile-downloads">
+        <a href={`${base}${example.sourceFile}`} download={capture.projectName}>Download the Scratch project <span aria-hidden="true">↓</span></a>
+        <a href={`${base}${capture.sourceFile}`}>Full LLVM IR <span aria-hidden="true">↗</span></a>
+      </div>
+      <details class="compile-record">
+        <summary>How this was recorded</summary>
+        <p>Captured {capture.capturedAt.slice(0, 10)} · {capture.target}. This is a saved compiler output, not live browser compilation.</p>
+        <pre tabindex="0" aria-label="Capture command"><code>{capture.captureCommand}</code></pre>
+        <a href={`${base}ir/micro-loop.provenance.json`}>Capture metadata and SHA-256 hashes <span aria-hidden="true">↗</span></a>
+      </details>
+    </div>
+  </details>
+</compilation-example>
+
+<script>
+  class CompilationExample extends HTMLElement {
+    private dispose?: () => void;
+    connectedCallback() {
+      if (this.dispose) return;
+      const controls = this.querySelector<HTMLElement>('.compile-focus');
+      const explanation = this.querySelector<HTMLElement>('.compile-explanation');
+      const buttons = [...this.querySelectorAll<HTMLButtonElement>('[data-step]')];
+      if (!controls || !explanation || !buttons.length) return;
+      const abort = new AbortController();
+      buttons.forEach(button => button.addEventListener('click', () => {
+        this.dataset.active = button.dataset.step;
+        buttons.forEach(other => other.setAttribute('aria-pressed', String(other === button)));
+        explanation.textContent = button.dataset.explanation ?? '';
+      }, {signal: abort.signal}));
+      controls.hidden = false;
+      this.dispose = () => { abort.abort(); controls.hidden = true; };
+    }
+    disconnectedCallback() { this.dispose?.(); this.dispose = undefined; }
+  }
+  if (!customElements.get('compilation-example')) customElements.define('compilation-example', CompilationExample);
+</script>
+
+<style>
+  .compilation-example { display: block; grid-column: 1 / -1; width: 100%; max-width: 56rem; text-align: center; }
+  .compile-example { border: 1px solid var(--geo-line); border-radius: .75rem; }
+  .compile-example > summary { display: flex; justify-content: center; align-items: center; gap: .75rem; min-height: 52px; padding: .75rem 1rem; list-style: none; cursor: pointer; font-size: .9375rem; font-weight: 500; }
+  .compile-example > summary::-webkit-details-marker { display: none; }
+  .compile-expand::after { content: '+'; font-size: 1.125rem; font-weight: 400; }
+  .compile-example[open] > summary .compile-expand::after { content: '−'; }
+  .compile-content { min-width: 0; padding: 1.5rem; border-top: 1px solid var(--geo-line); }
+  .compile-heading h4 { margin: 0 0 .5rem; font-size: 1.25rem; font-weight: 550; letter-spacing: -.035em; }
+  .compile-heading p { max-width: 40rem; margin: 0 auto; color: var(--sl-color-gray-2); font-size: .8125rem; line-height: 1.7; }
+  .compile-focus { display: flex; justify-content: center; flex-wrap: wrap; gap: .5rem; margin: 1.25rem 0; }
+  .compile-focus[hidden] { display: none; }
+  .compile-focus button { min-height: 40px; padding: .5rem .875rem; border: 1px solid var(--geo-line); border-radius: 999px; color: var(--sl-color-gray-2); background: transparent; font: 500 .8125rem var(--sl-font); cursor: pointer; }
+  .compile-focus button[aria-pressed='true'] { color: var(--sl-color-black); background: var(--sl-color-white); border-color: var(--sl-color-white); }
+  .compile-focus button:hover { border-color: var(--sl-color-gray-2); }
+  .compile-panels { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.6fr); gap: 1rem; margin-top: 1.25rem; }
+  .compile-panels .compile-panel { min-width: 0; margin: 0; overflow: hidden; border: 1px solid var(--geo-line); border-radius: .5rem; }
+  .compile-panel figcaption { display: flex; justify-content: center; align-items: baseline; flex-wrap: wrap; gap: .25rem .75rem; padding: .75rem; border-bottom: 1px solid var(--geo-line); font-size: .8125rem; font-weight: 500; }
+  .compile-panel figcaption > span { color: var(--sl-color-gray-2); font-size: .6875rem; font-weight: 400; }
+  .compile-source { display: flex; align-items: center; justify-content: center; min-height: 20rem; padding: 1.5rem .75rem; text-align: left; }
+  .compile-output { box-sizing: border-box; min-height: 20rem; max-height: 24rem; width: 100%; margin: 0; padding: 1.25rem .75rem; overflow: auto; border: 0; border-radius: 0; background: var(--geo-surface); text-align: left; font: .75rem/1.7 var(--sl-font-mono); }
+  .compile-output code { display: block; box-sizing: border-box; min-width: 100%; width: max-content; padding-left: 3rem; color: var(--sl-color-gray-2); background: none; border: 0; font: inherit; white-space: pre; }
+  .compile-line { position: relative; }
+  .compile-line::before { content: attr(data-line); position: absolute; left: -3rem; width: 2.25rem; color: var(--sl-color-gray-3); text-align: right; user-select: none; }
+  .compilation-example[data-active='increment'] .compile-line[data-related='increment'], .compilation-example[data-active='loop'] .compile-line[data-related='loop'] { background: var(--sl-color-gray-5); color: var(--sl-color-white); }
+  .compilation-example[data-active='increment'] :global(.compile-source-increment > .sb__label), .compilation-example[data-active='loop'] :global(.compile-source-loop > .sb__head > .sb__label) { font-weight: 600; }
+  .compilation-example[data-active='increment'] :global(.compile-source-increment::after), .compilation-example[data-active='loop'] :global(.compile-source-loop::after) { content: ''; position: absolute; left: .3125rem; top: calc(50% - 3px); width: 5px; height: 5px; border-radius: 50%; transform: translateY(-50%); background: var(--sl-color-white); }
+  .compilation-example[data-active='loop'] :global(.compile-source-loop::after) { top: 25px; }
+  .compilation-example .compile-explanation { margin: 1rem 0 0; min-height: 3.4em; font-size: .875rem; line-height: 1.7; text-align: left; }
+  .compilation-example .compile-scope { margin: .75rem 0 0; color: var(--sl-color-gray-2); font-size: .75rem; line-height: 1.7; text-align: left; }
+  .compile-downloads { display: flex; justify-content: center; align-items: center; flex-wrap: wrap; gap: .5rem 1.5rem; margin-top: 1rem; }
+  .compile-downloads a { display: inline-flex; align-items: center; gap: .5rem; min-height: 44px; font-size: .8125rem; }
+  .compile-downloads a:hover, .compile-record a:hover { text-decoration: underline; }
+  .compile-record { margin-top: 1rem; border-top: 1px solid var(--geo-line); padding-top: 1rem; text-align: left; font-size: .75rem; }
+  .compile-record > summary { cursor: pointer; }
+  .compile-record p { margin-top: .75rem; color: var(--sl-color-gray-2); line-height: 1.7; }
+  .compile-record pre { overflow: auto; padding: .75rem; border: 1px solid var(--geo-line); border-radius: .5rem; background: var(--geo-surface); font: .6875rem/1.7 var(--sl-font-mono); }
+  @media (max-width: 850px) {
+    .compile-panels { grid-template-columns: minmax(0, 1fr); }
+    .compile-source { min-height: 0; padding-block: 1.5rem; }
+  }
+  @media (max-width: 500px) {
+    .compile-content { padding: 1rem .5rem; }
+    .compile-source { padding-inline: .25rem; }
+    .compile-output { padding-inline: .25rem; }
+    .compile-panel figcaption { padding-inline: .25rem; }
+  }
+  @media print { .compile-focus { display: none !important; } }
+</style>

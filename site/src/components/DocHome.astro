@@ -1,0 +1,92 @@
+---
+import HomeBenchmarks from './HomeBenchmarks.astro';
+import ExecutionVisual from './ExecutionVisual.astro';
+import HomeMotion from './HomeMotion.astro';
+import HeroBackdrop from './HeroBackdrop.astro';
+const base = import.meta.env.BASE_URL;
+const releases = 'https://github.com/pnsk-lab/xyo-cpp/releases';
+---
+<div class="doc-home product-home" lang="en">
+  <section class="product-hero" aria-labelledby="home-title">
+    <HeroBackdrop />
+    <p class="product-name">xyo-cpp</p>
+    <h1 id="home-title">Scratch.<br />At full speed.</h1>
+    <p class="product-intro">A faster way to run your Scratch projects.<br />On your computer. With the files you already have.</p>
+    <div class="product-actions">
+      <a class="product-download" href={releases}>Download xyo</a>
+      <a class="product-text-link" href={`${base}getting-started/`}>Get started <span aria-hidden="true">›</span></a>
+    </div>
+    <p class="product-platforms">macOS · Windows · Linux</p>
+  </section>
+
+  <section class="product-features" aria-label="Run and share your projects">
+    <article class="product-feature">
+      <p class="product-kicker">Your projects</p>
+      <h2>Same blocks.<br />More speed.</h2>
+      <p>Open your .sb3 or .sb2 files without converting them. xyo compiles your blocks into native code as they run.</p>
+      <a class="product-text-link" href={`${base}getting-started/`}>Run your first project <span aria-hidden="true">›</span></a>
+      <div class="product-command"><span>Play a project</span><code>./xyo play project.sb3</code></div>
+    </article>
+    <article class="product-feature">
+      <p class="product-kicker">Standalone apps</p>
+      <h2>Made in Scratch.<br />Ready to share.</h2>
+      <p>Turn a project into an executable with ahead-of-time compilation. No separate xyo installation needed to run it.</p>
+      <a class="product-text-link" href={`${base}guide/aot/`}>Build an app <span aria-hidden="true">›</span></a>
+      <div class="product-command"><span>Build an executable</span><code>./xyo aot project.sb3 -o app</code></div>
+    </article>
+  </section>
+
+  <ExecutionVisual />
+
+  <HomeBenchmarks />
+
+  <section class="product-start" aria-labelledby="start-title">
+    <h2 id="start-title">Try your project.</h2>
+    <p>Download xyo for your computer, then open a Scratch file.</p>
+    <div class="product-actions">
+      <a class="product-download" href={releases}>Download xyo</a>
+      <a class="product-text-link" href={`${base}installation/`}>Installation guide <span aria-hidden="true">›</span></a>
+    </div>
+    <p class="product-build-note">For windowed playback, choose a build with SDL2 support.</p>
+  </section>
+  <HomeMotion />
+  <div class="product-footer"><span>xyo-cpp</span><a href="https://github.com/pnsk-lab/xyo-cpp">Open source on GitHub <span aria-hidden="true">↗</span></a></div>
+</div>
+
+<style>
+  :global(body:has(.product-home) .sl-markdown-content) { border: 0; width: 100%; max-width: 75rem; margin-inline: auto; }
+  .product-home { --product-muted: var(--sl-color-gray-2); width: 100%; max-width: 75rem; margin-inline: auto; text-align: center; font-size: 1rem; line-height: 1.6; }
+  :global(body:has(.product-home)) { overflow-x: clip; }
+  .product-home .product-hero { position: relative; isolation: isolate; overflow: visible; text-align: center; padding: 6rem 1.5rem 5rem; }
+  .product-name { font-size: 1.25rem; font-weight: 600; letter-spacing: -.04em; }
+  .product-home .product-hero h1 { font-size: clamp(3rem, 9vw, 7.5rem); line-height: 1.02; letter-spacing: -.065em; font-weight: 600; margin: 1.5rem auto 2rem; }
+  .product-home .product-intro { color: var(--product-muted); font-size: clamp(1.125rem, 2vw, 1.5rem); line-height: 1.5; text-wrap: balance; }
+  .product-home .product-actions { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 1.5rem; margin-top: 2rem; }
+  .product-home .product-download { display: inline-flex; align-items: center; justify-content: center; min-height: 48px; padding: .7rem 1.5rem; border-radius: 999px; background: var(--sl-color-white); color: var(--sl-color-black); font-size: 1rem; font-weight: 500; }
+  .product-download:hover { opacity: .85; }
+  .product-home .product-text-link { display: inline-flex; gap: .5rem; align-items: center; min-height: 44px; font-size: 1rem; }
+  .product-text-link:hover { text-decoration: underline; }
+  .product-home .product-platforms { margin-top: 1.25rem; color: var(--product-muted); font-size: .875rem; }
+  .product-features { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.25rem; padding: 0 1.5rem; }
+  .product-home .product-feature { display: flex; flex-direction: column; align-items: center; text-align: center; margin: 0; padding: clamp(1.5rem, 4vw, 3.5rem); border-radius: 1.5rem; background: var(--geo-surface); }
+  .product-kicker { color: var(--product-muted); font-size: .9375rem; font-weight: 500; }
+  .product-home .product-feature h2 { border: 0; padding: 0; margin: 1rem 0 1.5rem; font-size: clamp(2rem, 3.8vw, 3.25rem); line-height: 1.1; font-weight: 600; letter-spacing: -.05em; }
+  .product-home .product-feature > p:not(.product-kicker) { color: var(--product-muted); max-width: 29rem; font-size: 1.0625rem; line-height: 1.65; }
+  .product-home .product-feature > a { margin-top: 1rem; margin-bottom: 2rem; }
+  .product-home .product-command { width: 100%; margin-top: auto; padding-top: 1.5rem; border-top: 1px solid var(--geo-line); }
+  .product-command > span { display: block; color: var(--product-muted); font-size: .8125rem; margin-bottom: .5rem; }
+  .product-home .product-command code { display: block; width: fit-content; max-width: 100%; margin-inline: auto; text-align: left; border: 0; padding: 0; background: none; font-size: .875rem; line-height: 1.8; overflow-wrap: anywhere; }
+  .product-home .product-start { padding: 5rem 1.5rem; text-align: center; border-top: 1px solid var(--geo-line); }
+  .product-home .product-start h2 { font-size: clamp(2.5rem, 5vw, 4rem); font-weight: 600; line-height: 1.15; margin: 0 0 1.5rem; padding: 0; border: 0; letter-spacing: -.05em; }
+  .product-start > p { color: var(--product-muted); font-size: 1.125rem; }
+  .product-home .product-start .product-build-note { margin-top: 1.5rem; font-size: .8125rem; }
+  .product-footer { display: flex; justify-content: center; flex-wrap: wrap; gap: 1rem; padding: 1.5rem; border-top: 1px solid var(--geo-line); color: var(--product-muted); font-size: .8125rem; }
+  .product-footer a:hover { text-decoration: underline; }
+  @media (max-width: 700px) {
+    .product-home .product-hero { padding: 4rem 1rem; }
+    .product-features { grid-template-columns: 1fr; padding: 0 1rem; gap: 1rem; }
+    .product-home .product-feature { border-radius: 1rem; }
+    .product-home .product-intro br { display: none; }
+    .product-home .product-start { padding: 3.5rem 1rem; }
+  }
+</style>
