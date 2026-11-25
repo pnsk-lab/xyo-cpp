@@ -63,7 +63,7 @@ static_cast<int>(std::floor(channel * 255))
 
 wall timeは約1.65%、CPU時間は約2.47%短かった。ただしwall timeは5組中3組で短縮、2組では小幅に逆転し、範囲も重なる。小さい改善として扱い、全ての実行や解像度での高速化を保証しない。
 
-全試行で15,552,000ストローク、quads同数、draw=90、flush=180、CPU readback/upload=0を照合した。Res=4は描画確認の各1回で242.578→249.162 msと逆転した。両版とも972,000ストローク、draw=90、flush=90で、この単発値から速度の結論は出さない。
+全試行で15,552,000ストローク、quads同数、draw=90、flush=180、CPU readback/upload=0を照合した。Res=4は描画確認のため各1回測り、242.578→249.162 msと逆転した。両版とも972,000ストローク、draw=90、flush=90で、この単発値から速度の結論は出さない。
 
 画像の差はFPS表示内のみだった。Res=1の873画素はx=630..718・y=54..69、Res=4の908画素はx=631..730・y=54..69で、それ以外はbyte一致した。
 
@@ -95,6 +95,6 @@ python3 tools/analyze_pc_samples.py build/sample \
   --executable build/sampled-pen-bench --json build/sample-summary.json
 ```
 
-[解析スクリプト](<../../tools/analyze_pc_samples.py>)はPC数、CPUタイマーの期待イベント数、overrun/drop、書き出し成否を確認する。大量の欠落やイベントの併合がある場合は警告し、その割合を代表値として扱わない。データは`.pcs`、`.maps`、`.json`へ保存する。シグナルが既に使用中・block中・pendingならサンプリングを開始しない。Linux x86_64以外は、明示的に有効化した場合だけ非対応のメッセージを出す。
+[解析スクリプト](<../../tools/analyze_pc_samples.py>)はPC数、CPUタイマーの期待イベント数、overrun/drop、書き出し成否を確認する。大量の欠落やイベントの併合がある場合は警告する。その割合は代表値として扱わない。データは`.pcs`、`.maps`、`.json`へ保存する。シグナルが既に使用中・block中・pendingならサンプリングを開始しない。Linux x86_64以外は、明示的に有効化した場合だけ非対応のメッセージを出す。
 
 今回の生データと集計は`build/list-literal-ab/profile-2000*`と`profile-2300*`にあり、解析には[保存した対照バイナリ](<../../build/hsv-trunc-ab/probe-base>)を使う。

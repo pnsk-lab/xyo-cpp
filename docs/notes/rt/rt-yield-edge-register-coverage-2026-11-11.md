@@ -16,18 +16,18 @@
   - opt-in `XYO_RT001_YIELD_REGISTER_PROBE=1`時のみ、実JITフレームを`libunwind`で復元している位置でR13, R14, RBX(DWARF #3), R12を取得。
   - `Thread::jitCtx`の正確なアドレスと各レジスタを比較し、`[rt001-yield-register]`として真偽値を記録。スレッドの復帰先相対オフセットと`genuine_fde`も報告。raw pointer addressはログに出さない。`machine_roots_proven=0 gc_safe=0`を強制。
 - `tests/differential/rt_yield_edge_fiber_pc.py`：
-  - `llvm-readobj --stackmap`の第1locationが`Register R#N, size: 8`であることを各StackMap ID・命令オフセットに結びつける。第1locationを推定で`R13`固定にしない。実JITのyield callの戻り先と位置を突き合わせる。
+  - `llvm-readobj --stackmap`の第1locationが`Register R#N, size: 8`であることを各StackMap ID・命令オフセットに結びつける。第1locationを推測で`R13`に固定しない。実JITのyield callの戻り先と位置を突き合わせる。
   - 新`--require-register`は`--require-fde`とセットでのみ許可。2つのFiberの正規CFIログと照合し、対象戻り先でレジスタ候補が一意、callee-saved GPR `R#3/12/13/14`のいずれかであること、指定GPRを`libunwind`で正しく復元でき、その実値が`Thread::jitCtx`と一致することを必須とする。
   - volatileレジスタ、異なる2つのRegister候補、存在しないFDE、未取得レジスタ、異なるThread ID、GC許可の混入はすべて拒否。
 - `tests/differential/rt_yield_register_contract.py`：この判定を独立した純粋な関数としてテスト。R13・R14の有効な記録2種を受理し、12種類の不正記録（欠落・重複・偽装レジスタ・偽装JitCtx・FDE欠落・誤ったGC許可等）がすべて拒否されることを確認。
 - `src/ir/rt_yield_edge_stackmap.hpp`：
   - `knownPotentiallyYieldingHelper`はCodegenで既知の25種類の中断可能なヘルパと、バックエンドが直接挿入しうる`xyo_rt_async_reporter_rooted`を保持。
-  - `auditUnmappedYieldEdges`は最適化後の各`xyo_script_*`の直接callから、認証可能な`xyo_yield`/`xyo_yield_fast`の直前にStackMapがない箇所、wait系・broadcast系・非同期系など**ヘルパ内部のyield**、間接call、入れ子JIT関数呼び出しを独立に数える。
+  - `auditUnmappedYieldEdges`は最適化後の各`xyo_script_*`の直接callについて、認証可能な`xyo_yield`/`xyo_yield_fast`の直前にStackMapがない箇所、wait系・broadcast系・非同期系など**ヘルパ内部のyield**、間接call、入れ子JIT関数呼び出しを独立に数える。
   - これらについては実yield地点のレジスタとStackMapの対応を証明しておらず、すべて未対応・GC不許可と記録。
 - `src/jit/backend_llvm.cpp`：`XYO_RT_YIELD_EDGE_STACKMAP_PROBE=1`のopt-in時に限り、`[rt001-yield-edge-unmapped]`および集計`[rt001-yield-edge-coverage]`を診断。標準実行時は何も追加しない。
-- `tests/differential/rt_yield_helper_catalog.py`：生成器の`helperMayYield`をソースから解析し、診断側の一覧との一致（＋rooted async reporter）を検証。今後のCodegenへのヘルパ追加が見逃された場合は回帰テストで失敗。
+- `tests/differential/rt_yield_helper_catalog.py`：生成器の`helperMayYield`をソースから解析し、診断側の一覧との一致（＋rooted async reporter）を検証。今後のCodegenへのヘルパ追加が漏れた場合は回帰テストが失敗する。
 - `tests/platform/rt_yield_edge_stackmap_smoke.cpp`：LLVM O3後の本物のIRで、正規の直接yield2件だけにStackMapを挿入し、偽装JitCtx、wait helper、間接call、入れ子JIT callの4つの未対応要因を明示して拒否。アサート有効ビルドで検証。
-- `tests/differential/rt_yield_wait_unmapped.py`：実Scratch `control_wait_until`と別スクリプトのwriterを用い、`XYO_WAIT_DEP_FAST=0/1`と`XYO_EVENT_SCHED=0/1`で、通常`xyo_wait_yield`・イベント待機`xyo_wait_event_yield`の双方を確実に生成。Eager指定・Lazy指定どちらもInterpreterの最終状態と一致し、**待機ヘルパは必ず未対応として検出される**ことを確認。Lazy要求時もその待機スクリプトはEagerで生成され、別のwriterがLazyで生成されたため、テストは実際のコンパイルtierを参照している。
+- `tests/differential/rt_yield_wait_unmapped.py`：実Scratch `control_wait_until`と別スクリプトのwriterを用い、`XYO_WAIT_DEP_FAST=0/1`と`XYO_EVENT_SCHED=0/1`で、通常`xyo_wait_yield`・イベント待機`xyo_wait_event_yield`の双方を確実に生成。Eager指定・Lazy指定のどちらでもInterpreterの最終状態と一致し、**待機ヘルパは必ず未対応として検出される**ことを確認。Lazy要求時もその待機スクリプトはEagerで生成され、別のwriterがLazyで生成されたため、テストは実際のコンパイルtierを参照している。
 - `tests/CMakeLists.txt`：追加の3独立テスト（レジスタ一致、12偽装拒否、ヘルパ一覧のドリフト）とwait-untilの実検証をCTestに登録。
 
 ## 測定例

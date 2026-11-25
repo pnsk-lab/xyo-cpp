@@ -15,7 +15,7 @@ XYO_JIT_DUPLICATE_SCALAR_STATS=1 build/xyo run project.sb3 --jit eager
 
 `XYO_JIT_DUPLICATE_SCALAR_NUM`は**既定OFF**。
 
-1. 算術`operator_add`、`operator_subtract`、`operator_multiply`、`operator_divide`の両入力が、互いに直接の`data_variable`レポータかどうか確認する。
+1. 算術`operator_add`、`operator_subtract`、`operator_multiply`、`operator_divide`の両入力がどちらも直接の`data_variable`レポータかどうかを確認する。
 2. 両レポータの非空変数IDが一致し、そのIDで現在のTargetの**同じスカラー変数**が解決できる場合だけ、一度読み出したboxed値と`emitToNumF64`の結果を共有する。
 3. 同様に`data_changevariableby`の`VALUE`が変更対象のスカラー自身を直接読む場合、既に評価済みのデルタを変更前の値として使い、`toNumber(x)+toNumber(x)`を1回の変換で生成する。
 4. 数値文字列、非数値文字列、空白のみの文字列、NaN、±Infinity、-0などのScratchの型・数値変換規則は従来の`emitToNumF64`／`emitCanon`をそのまま用いる。
@@ -52,7 +52,7 @@ XYO_JIT_DUPLICATE_SCALAR_STATS=1 build/xyo run project.sb3 --jit eager
 | sieve_100000 | OFF / ON | 29 / 29 | 16,818 B / 16,818 B | 85.80 / 85.70ms | 103.36 / 103.73ms |
 | micro_read_1000000 | OFF / ON | 10 / 10 | 6,086 B / 6,086 B | 31.42 / 31.16ms | 48.13 / 48.52ms |
 
-専用作品では、最適化後呼び出し61箇所減（約33%）、機械語2,225バイト減（約16%）。O3コンパイル込みのウォール時間中央値も2.53ms短縮した。ただしこれは専用作品であり、一般的な高速化率ではない。ほかの4作品では適用機会が0〜2箇所で、機械語サイズは変化しなかった。
+専用作品では、最適化後の呼び出しが61箇所減り（約33%）、機械語が2,225バイト減った（約16%）。O3コンパイル込みのウォール時間中央値も2.53ms短縮した。ただしこれは専用作品であり、一般的な高速化率ではない。ほかの4作品では適用機会が0〜2箇所で、機械語サイズは変化しなかった。
 
 ## LLVM O1実測（各方式5回）
 

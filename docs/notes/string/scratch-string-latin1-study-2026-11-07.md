@@ -2,7 +2,7 @@
 
 ## Summary
 
-**Keep `rope+utf16` as the default pending representative ScratchBench
+**Keep `rope+utf16` as the default, pending a representative ScratchBench
 measurement.** Optional one-byte leaves save GC memory and make some
 Flat-join workloads faster, but Rope does not benefit significantly in the
 controlled JIT workload set, and the first contiguous UTF-16 view becomes
@@ -75,8 +75,8 @@ are milliseconds rounded to a millisecond by Scratch timing.
 Takeaways:
 - Rope is consistently strong for immutable, shared concatenation.
   Latin-1 has little effect on the Rope workload timings here.
-- The direct compact concatenation path makes Flat append 34->23ms
-  and Flat branch 56->42ms. An earlier naive Latin-1 implementation
+- The direct compact concatenation path cuts Flat append from 34 to 23ms
+  and Flat branch from 56 to 42ms. An earlier naive Latin-1 implementation
   was far worse (Flat append 131ms) because it widened every prefix.
 - Flat contains is 12->11ms, approximately equal at this timer
   resolution. Compact ASCII search avoids expanding inputs.

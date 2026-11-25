@@ -28,11 +28,11 @@ XYO_RT_POSTOPT_SSA_AUDIT=1
   - `[rt001-postopt-ssa-total]` で各最適化単位の件数と **machine_roots_proven=0, gc_safe=0** を明示。
 - 新規 `tests/platform/rt_postopt_ssa_audit_smoke.cpp`：
   - LLVM23 IRBuilderで生のポインタを取得し、checkpoint helperの後で使用する関数を2つ生成。
-  - 同じmoduleを実際にO3で最適化してから監査。正常な17引数の呼出しは生存Unknownポインタありと診断し、不正な第1引数である「偽のJitCtx」は `reportValid=false` で拒否。
+  - 同じmoduleを実際にO3で最適化してから監査。正常な17引数の呼出しは、生存Unknownポインタがあると診断し、不正な第1引数である「偽のJitCtx」は `reportValid=false` で拒否。
   - 直接LLVM23ビルド・実行 PASS。
 - 新規 `tests/differential/rt_postopt_ssa_audit.py`：
   - `ssa_budget_cross_fiber_two_hats` 実ScratchでEagerと遅延JITの独立プロセスをそれぞれ実行。
-  - 2本の緑の旗スクリプトでそれぞれ2 site ID、計4のcaputure地点を検証。全て post_unknown>=1、各地域件数の合計=post_live_ptr、全て gc_safe=0、合計ログは machine_roots_proven=0。最終Scratch状態はInterpreterと同一（y=48005）。
+  - 2本の緑の旗スクリプトでそれぞれ2 site ID、計4のcapture地点を検証。全て post_unknown>=1、各領域件数の合計=post_live_ptr、全て gc_safe=0、合計ログは machine_roots_proven=0。最終Scratch状態はInterpreterと同一（y=48005）。
   - Eager PASS、遅延JIT PASS。
 - `tests/CMakeLists.txt`：LLVM23単体テストとEager+遅延JIT差分テストをそれぞれCTestへ登録。共有ツリーのCMake全体の再生成と全CTestは未実施。
 
@@ -66,13 +66,13 @@ GC禁止を安全に取り除くには、LLVM機械コードと中断点を同�
 - `python3 tests/differential/rt_postopt_ssa_audit.py --native /home/kicky/.rt001-postopt-ssa-isolated/xyo --out build/rt001-postopt-ssa-regression` Eager PASS / Lazy PASS。
 - 全ネイティブ差分回帰ログ：`build/rt001-postopt-ssa-full.log`、**955/955 PASS**。
 - 実験フラグなしでは追加のLLVMモジュール監査は実行しない。
-- GCのsweepバリア／ソース復帰／ランタイムのLLVMSSA型付きdescriptor仕様は変更なし。コミット・pushなし。他エージェントの共有ツリー編集を保存。
+- GCのsweepバリア／ソース復帰／ランタイムのLLVMSSA型付きdescriptor仕様は変更なし。コミット・pushなし。他エージェントによる共有ツリーの編集は保持した。
 
 ## 次の実装候補
 
 1. LLVM stackmapの明示的なpatchpoint、またはGC statepointが保証するrooted boxed Valueハンドルへの書き出しを実験モードで試す。
 2. キャプチャ地点とスケジューラのFiber中断点を1対1に対応させ、各機械レジスタ/stack slotの位置をGCに知らせる。
-3. 実GCを走らせる前に、全Fiberの機械level safepoint到達・登録ルートの完全性・ルートの生存期間を検証する。どれかが不明なら引き続きGCを延期する。
+3. 実GCを走らせる前に、全Fiberの機械レベルsafepoint到達・登録ルートの完全性・ルートの生存期間を検証する。どれかが不明なら引き続きGCを延期する。
 
 
 ## 最終検証

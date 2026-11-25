@@ -22,7 +22,7 @@ cmake -S . -B build-no-llvm \
 cmake --build build-no-llvm --target xyo-cli -j8
 ~~~
 
-CMake switch XYO_BINARYEN_C_API: AUTO (default, enable C API if available), ON (require header and library), OFF (disable library). This option is independent of XYO_JIT_BACKEND; linking Binaryen never requires LLVM.
+CMake switch XYO_BINARYEN_C_API: AUTO (default, enable C API if available), ON (require the header and the library), OFF (disable library). This option is independent of XYO_JIT_BACKEND; linking Binaryen never requires LLVM.
 
 Engine selection through environment variable XYO_BINARYEN_ENGINE:
 - auto (default): prefer available in-process Binaryen C API, otherwise wasm-opt external.
@@ -46,7 +46,7 @@ The result is a standard WASM binary plus a script.wasm.json manifest with selec
 
 The function ABI is f(i32 slots) -> i32, with imported env.memory (at least 256 pages) and packed 64-bit Scratch values. Return status 0 means completion; 1 indicates a bailout. Neither this binary nor its ABI can be passed directly as a native JitBackend::CompiledScript ScriptFn.
 
-The C API implementation reads the existing WASM binary into a Binaryen module, validates it, runs optimization at O0–O3, validates again and serializes the result to a byte vector. The Binaryen optimization settings are global, so this path holds a mutex and restores previous settings. All Binaryen buffers and module objects are freed correctly.
+The C API implementation reads the existing WASM binary into a Binaryen module, validates it, runs optimization at O0–O3, validates it again, and serializes the result to a byte vector. The Binaryen optimization settings are global, so this path holds a mutex and restores the previous settings. All Binaryen buffers and module objects are freed correctly.
 
 ## Supported subset and safety
 

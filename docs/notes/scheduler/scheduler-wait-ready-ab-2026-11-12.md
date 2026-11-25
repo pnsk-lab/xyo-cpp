@@ -9,7 +9,8 @@ Feature flag: `XYO_WAIT_READY_SLEEP=1` (experimental, OFF by default)
 Use the same frozen executable and frozen project archive within each
 paired experiment. Six pairs, alternating OFF/ON order by pair,
 with process affinity pinned to CPU 16. No wait-notification diagnostics
-(`XYO_WAIT_NOTIFY_AUDIT` and `XYO_WAIT_REGISTRY_VERIFY` are absent).
+were enabled (`XYO_WAIT_NOTIFY_AUDIT` and `XYO_WAIT_REGISTRY_VERIFY` are
+absent).
 
 Both variants use the following fixed settings:
 
@@ -52,7 +53,7 @@ Binary SHA256:
 | **sched_waituntil** | **401.74** | **3681.15** | **9.0539x** | **6/6** |
 
 The `sched_waituntil` case won all six pairs, but the other cases
-showed potential 1–2% overhead when the feature was enabled even if
+showed potential 1–2% overhead when the feature was enabled even when
 no waiters had actually been suppressed.
 
 ## No-wait fast-path refinement

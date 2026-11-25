@@ -33,8 +33,8 @@ build/math009-math-diff.log.
 
 ## Latest full performance suite
 
-Using the same fixed binary and CPU12, all three math tables
-ln / exp / pow10 were enabled by default or explicitly disabled.
+Using the same fixed binary and CPU12, one run enabled all three math
+tables ln / exp / pow10 by default and the other explicitly disabled them.
 Both runs completed the unmodified 47-kernel ScratchBench performance
 project. All 47 kernel keys matched; all non-scheduler checksums
 were identical (zero mismatches).

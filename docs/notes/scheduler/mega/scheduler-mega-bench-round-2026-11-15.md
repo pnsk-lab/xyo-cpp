@@ -9,7 +9,7 @@ The previous source-certified Mega continuation ended its dynamic clock-based
 
 Now the post-measurement suffix can instead be an **argumentless,
 non-warp, direct `procedures_call bench_round`**, provided its entire
-procedure AST matches exactly the original ScratchBench sequence:
+procedure AST matches the original ScratchBench sequence exactly:
 
 ```text
 set b_ms to (b_t1 - b_t0) * 86400000
@@ -118,7 +118,7 @@ Raw results:
 
 ## Remaining barriers to full actual ScratchBench application
 
-The original `sched_pingpong` after the outer repeat performs
+After the outer repeat, the original `sched_pingpong` performs
 `b_chk = b_n` and calls the argument-bearing `bench_end`. The
 user-visible Stage's green-flag chain also includes `suite_sched`
 and further sibling benchmark procedures. The current Mega source
@@ -143,7 +143,7 @@ Focused original-SB3 source/effects test: **69/69 PASS**.
 Native Fiber and RT001 GC smoke: **3/3 PASS**.
 Python benchmark syntax checks, Release rebuild and `git diff --check`: PASS.
 
-The original unchanged extracted `sched_pingpong`, `sched_fanwait`,
+The extracted, unchanged `sched_pingpong`, `sched_fanwait`,
 `sched_restart` all finish normally with this new flag ON. No unsupported
 singleton sender continuation was installed on these original programs.
 This is intentionally different from the grafted original-procedure

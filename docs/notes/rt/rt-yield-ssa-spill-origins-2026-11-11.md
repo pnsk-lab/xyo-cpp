@@ -2,13 +2,13 @@
 
 ## 結論
 
-LLVM23のORC Eager JITが実際に生成した`.llvm_stackmaps`の**全てのi64単独診断location**について、LLVM SSAの定義IDとx86-64の機械語配置を対応付け、中断中の2本のFiberを正規DWARF FDEで巻き戻して、スタック上の配置が実際にFiberの有効なスタック領域内にあるか検証した。
+LLVM23のORC Eager JITが実際に生成した`.llvm_stackmaps`にある**i64単独の診断locationすべて**について、LLVM SSAの定義IDとx86-64の機械語配置を対応付けた。さらに、中断中の2本のFiberを正規DWARF FDEで巻き戻し、スタック上の配置が実際にFiberの有効なスタック領域内にあるかを検証した。
 
-この証明は**スタックアドレスの範囲**と**一部callee-savedレジスタの復元可能性**までであり、値の**GC所有権、boxed i64が参照か数値か、メモリ内容が保持されていること、全ポインタのrootの完備性**を保証しない。`FiberPool::unsafeCount()`によるGC禁止は変更しない。
+この証明が及ぶのは**スタックアドレスの範囲**と**一部callee-savedレジスタの復元可能性**までであり、値の**GC所有権、boxed i64が参照か数値か、メモリ内容が保持されていること、全ポインタのrootの完備性**は保証しない。`FiberPool::unsafeCount()`によるGC禁止は変更しない。
 
 ### 実測
 
-実Scratch fixture `ssa_budget_cross_fiber_two_hats`、LLVM O2/O3。2本の実中断中Fiberを対象に、各手続き2箇所、全4箇所の診断StackMapを調査。
+実Scratch fixture `ssa_budget_cross_fiber_two_hats`、LLVM O2/O3。実際に中断中のFiber 2本を対象に、各手続き2箇所、全4箇所の診断StackMapを調査した。
 
 | 指標 | 結果 |
 | --- | ---: |
@@ -27,19 +27,19 @@ LLVM23のORC Eager JITが実際に生成した`.llvm_stackmaps`の**全てのi64
 | すべてのGC管理値を復元できるという証明 | **なし** |
 | GC許可 | **なし** |
 
-**重要な不足の具体例**：最初の直接yieldのStackMapの10番目の機械locationは`Register R#0`、つまり`RAX`。x86-64 SysVで`RAX`はcaller-savedなので、`xyo_yield`の内部で中断している状態から、そのレジスタにあった値を復元できることは**保証されない**。2本のJIT Fiberで発生した計2箇所を`volatile_unrecoverable`として分類した。
+**重要な不足の例**：最初の直接yieldのStackMapの10番目の機械locationは`Register R#0`、つまり`RAX`。x86-64 SysVで`RAX`はcaller-savedなので、`xyo_yield`の内部で中断している状態から、そのレジスタにあった値を復元できることは**保証されない**。2本のJIT Fiberで発生した計2箇所を`volatile_unrecoverable`として分類した。
 
-LLVM SSAの**コンパイル時の定義ID 198**に対応し、最適化後のopcodeは`add`。この出所は新しいコンパイラoperand manifestで、1-based location番号→LLVM SSA定義ID→opcodeを逆引きした結果。元のScratchの具体的な式・ループカウンターという意味付けは未証明。
+これはLLVM SSAの**コンパイル時の定義ID 198**に対応し、最適化後のopcodeは`add`である。対応は、新しいコンパイラoperand manifestで1-based location番号→LLVM SSA定義ID→opcodeを逆引きして求めた。元のScratchの具体的な式・ループカウンターという意味付けは未証明。
 
 ## 実装と検証
 
 - `tests/platform/rt_native_fiber_cfi_unwind_smoke.cpp`
-  - opt-in `XYO_RT001_YIELD_SPILL_BOUNDS_PROBE=1`で、実JITフレームを巻き戻した時点のDWARF`RBP`、実Fiber保存`RSP`、スタック容量の**相対距離**だけを記録。生のアドレスは出力しない。正規FDEと中断中のスタック範囲外ならframe不正とする。
+  - opt-in `XYO_RT001_YIELD_SPILL_BOUNDS_PROBE=1`で、実JITフレームを巻き戻した時点のDWARF`RBP`、実Fiber保存`RSP`、スタック容量の**相対距離**だけを記録。生のアドレスは出力しない。正規FDEでない場合や、中断中のスタック範囲の外にある場合は、frameを不正と判定する。
 - `tests/differential/rt_yield_ssa_spill_bounds.py`
-  - C++ハーネスで実Scratchの2本のFiberを中断、最適化後のLLVM SSA StackMapを有効化した実ORC ELFを出力。
+  - C++ハーネスで実Scratchの2本のFiberを中断し、最適化後のLLVM SSA StackMapを有効化した実ORC ELFを出力する。
   - 既存の厳格なcall-edge検証器で、StackMap→直接yield call命令→実Fiber JIT return PCを照合し、実正規FDEの成立を要求。
   - `llvm-readobj --stackmap`の**各location**を解析して、`Indirect [R#6 + negative_offset]`のみ実スタックスロット候補として認め、8バイト整列・有効スタック領域内・保存SPより上を必須とする。レジスタ直置きではR3/R6/R12–R15をcallee-saved、R0等を**明示的な未復元値**として数える。Direct/Constantや不明なbaseレジスタは推測せず拒否。
-  - コンパイラに新しく出力するoperand manifestと、`llvm-readobj`の実際の位置番号を全152件で1対1に照合。出所／opcodeを明示し、機械位置だけで管理対象オブジェクトと断定する処理は行わない。
+  - コンパイラが新たに出力するoperand manifestと、`llvm-readobj`が報告する実際の位置番号を全152件で1対1に照合する。出所とopcodeを明示し、機械位置だけで管理対象オブジェクトと断定する処理は行わない。
 - `src/ir/rt_yield_ssa_machine_stackmap.hpp`
   - `YieldSsaOperandSource`に1-based location、分類`helper_arg/i64_instruction/i64_argument/pointer`、LLVMのsource instruction ID、opcodeを保持。実StackMapの順序と常に一致させる。
 - `src/jit/backend_llvm.cpp`
@@ -63,7 +63,7 @@ LLVM SSAの**コンパイル時の定義ID 198**に対応し、最適化後のop
 
 ## 次に必要なこと
 
-1. `RAX`に置かれたSSA ID198の`add`が実際のScratchどの構文に由来するか（変数、一時式、ループカウンター）をコンパイラの元構文との紐付けから分類する。
-2. Yield直前SSAの呼出し規約を跨ぐ際、caller-saved値の保持先（spill先、値の再計算、再構築手段）を、機械コードの正確なCFG／レジスタ割付から証明する。StackMap直前に位置が記録されただけでは十分ではない。
+1. `RAX`に置かれたSSA ID198の`add`が実際のScratchのどの構文に由来するか（変数、一時式、ループカウンター）をコンパイラの元構文との紐付けから分類する。
+2. Yield直前のSSA値が呼出し規約を跨ぐ際に、caller-saved値をどこに保持するか（spill先、値の再計算、再構築手段）を、機械コードの正確なCFG／レジスタ割付から証明する。StackMap直前に位置が記録されただけでは十分ではない。
 3. `i64`のタグ・所有権／生ポインタの根本的な参照元を照合し、GC管理値のみを識別する。
 4. Nested helperの中断など未マップ経路を網羅してもなお、全ルート証明なしにnative FiberのGC制限を解除しない。

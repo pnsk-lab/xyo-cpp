@@ -99,7 +99,7 @@ Six unchanged ScratchBench-derived diagnostics, 6 alternating pairs:
 | `list_append` | 0.9944× |
 | `math_mandel` | 0.9971× |
 
-All final checksums matched. This is no evidence of a general performance
+All final checksums matched. This is not evidence of a general performance
 improvement outside the eligible nested controls, nor evidence of a
 reproducible large regression. Raw results:
 `build/multi-bench-20261111/phi-nested-forward/other-bench-ab.{json,log}`.

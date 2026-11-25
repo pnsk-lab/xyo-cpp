@@ -6,7 +6,7 @@
 
 新フラグ: XYO_JIT_MEGA_BATCH_YIELD=1
 
-同一Targetの2〜8本の独立した緑旗Scratchスクリプトで、
+同一Target上の2〜8本の独立した緑旗Scratchスクリプトのうち、
 「イベントハット → 非warp control_repeat(整数リテラル) →
 data_changevariableby(数値リテラル)」だけを含むものを対象にする。
 
@@ -14,7 +14,7 @@ data_changevariableby(数値リテラル)」だけを含むものを対象にす
 LLVM switch(pc)により各スクリプトの初回PC（偶数）と再開PC（奇数）を
 区別し、反復回数はThread::megaRemaining、再開位置はThread::megaPc
 に保存する。UINT32_MAXが終了状態。
-各LLVM呼出しは最大1回の通常repeat本体を処理し、C++スケジューラ
+各LLVM呼出しは通常のrepeat本体を最大1回処理し、C++スケジューラ
 へ戻る。ネイティブFiberやコルーチンがC++スタックを保存することはない。
 
 この段階では**C++が次に実行するScratch Threadを選ぶ**。

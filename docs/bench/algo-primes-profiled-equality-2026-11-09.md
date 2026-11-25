@@ -2,7 +2,7 @@
 
 ## Goal
 
-Continue PERF-001: exceed the best of MistWarp, TurboWarp, NitroBolt, Scratch Everywhere! and Scratch on **all 47 original ScratchBench performance cases**. This batch targets `algo_primes`, whose inner loop repeatedly tests the Scratch scalar `k_n == 0` and computes integer modulo by another dynamically updated scalar.
+Continue PERF-001: exceed the best of MistWarp, TurboWarp, NitroBolt, Scratch Everywhere! and Scratch on **all 47 original ScratchBench performance cases**. This batch targets `algo_primes`, whose inner loop repeatedly tests the Scratch scalar `k_n == 0` and computes an integer modulo by another dynamically updated scalar.
 
 All performance comparisons on `algo_primes` use the same unchanged, source-derived `primes.sb3` fixture. ScratchBench source and competitor reports have **not been modified**.
 
@@ -37,7 +37,7 @@ A separate six-repeat, same-binary, CPU8-pinned switch matrix found the largest 
 
 Other tested range/SSA switches were near baseline. All 66 observations retained checksum **110**; no run failed. Raw `build/perf-primes-flags.{json,log}`.
 
-**Root cause:** `Codegen::emitEq` already reuses a promoted numeric-shadow value for numeric literal comparison. It can additionally insert a branch, type check, SStr cache loads and PHIs to read parsed-numeric *string* state when that numeric shadow becomes invalid. Such a string-cache probe helps projects containing dynamically typed numeric strings (e.g. `app_life`), but it is pure overhead for variables that have **only been observed as numbers** by the JIT compile time.
+**Root cause:** `Codegen::emitEq` already reuses a promoted numeric-shadow value for numeric literal comparison. It can additionally insert a branch, type check, SStr cache loads and PHIs to read parsed-numeric *string* state when that numeric shadow becomes invalid. Such a string-cache probe helps projects containing dynamically typed numeric strings (e.g. `app_life`), but it is pure overhead for variables that have **only been observed as numbers** at JIT compile time.
 
 ## General fix
 
@@ -80,7 +80,7 @@ Results: `scratch-bench/results/perf-primes-profile-{on,off}-20261109/performanc
 - Default and explicit OFF unit CTest: `build/perf-primes-profile-ctest-{default,optout}.log` (inspect final log for exact results).
 - `git diff --check` clean.
 
-**Rejected alternative:** An experimental direct IEEE bit-zero equality path was tried first. The trial binary sometimes aborted with a bad free/SIGSEGV **even when its opt-in flag was OFF**, and its ON run was much slower. Cause was not established, potentially including concurrently edited shared ABI/build artifacts. The entire trial change was rolled back and the resulting rebuild again exited 0 and returned checksum **110**. No part of that failed optimization was retained.
+**Rejected alternative:** An experimental direct IEEE bit-zero equality path was tried first. The trial binary sometimes aborted with a bad free/SIGSEGV **even when its opt-in flag was OFF**, and its ON run was much slower. No cause was established; possible causes include concurrently edited shared ABI/build artifacts. The entire trial change was rolled back and the resulting rebuild again exited 0 and returned checksum **110**. No part of that failed optimization was retained.
 
 No commits or pushes. Other agents' in-progress IR, scheduler, renderer and math changes in the shared working tree were preserved. **PERF-001 remains in progress because 47/47 is not met.**
 

@@ -5,7 +5,7 @@
 This is an **additional experimental optimization**, not general deep OSR.
 The existing selector and scheduler must already prove a single, directly
 invoked warp procedure, a safe counted `repeat`, exact declared argument
-names, a live interpreter call frame, valid lexical source path and remaining
+names, a live interpreter call frame, a valid lexical source path and a remaining
 loop counter. The interpreter executes the procedure prefix and suffix; LLVM
 executes only the remainder of the selected loop. No committed Scratch effect
 or call is replayed.
@@ -64,7 +64,7 @@ Coherent build of the updated C++ sources via
 `xyo-nested-warp-direct-arguments-osr`, CTest #54):
 
 - Numerical argument in a warp repeat: existing reporter and new direct
-  bridge both *actually promoted* and restored the caller.
+  bridge both *actually promoted* the loop and restored the caller.
 - Nested `repeat` with a Unicode / astral-plane string argument, and
   non-ASCII declared parameter names (`表示🌠`, `増分`): both
   paths promoted and preserved exact final Scratch state.
@@ -125,7 +125,7 @@ A new `hoist` mode is covered by
 `tests/differential/jit_nested_warp_direct_args.py`:
 
 - Numeric procedure argument, deep warp repeat: reporter, direct and
-  hoisted paths all **actually promoted** and returned to the source
+  hoisted paths all **actually promoted** the loop and returned to the source
   interpreter caller; final state equal to Interpreter.
 - Nested `repeat`, Japanese / surrogate-pair names (`表示🌠`, `増分`),
   GC-managed Japanese/emoji value: same promotion and parity.

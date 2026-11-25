@@ -7,7 +7,7 @@
 従来の`XYO_JIT_MEGA_SCALAR_BATCH=1`は、同じ定数加算を
 1回だけ実行するスクリプトを最大8本まとめる経路だった。
 今回は、一括実行するThreadごとに独立した
-`pc`と`remaining`を持つ「多重PCバッチ」を追加。
+`pc`と`remaining`を持つ「多重PCバッチ」を追加した。
 
 ```text
 Sequencer::runSchedulerPass
@@ -31,7 +31,7 @@ Sequencer::runSchedulerPass
 ポインタ配列を受け取る。LLVMが直接`Thread`のC++内部構造へ
 依存しないABI。反復スクリプトごとに異なる定数加算値にも対応。
 
-既存の`scalarBatchEntry`（全ソース同一の単発加算）は優先し、
+既存の`scalarBatchEntry`（全ソース同一の単発加算）を優先し、
 それがない場合に`multiPcBatchEntry`を使う。
 多重PCコードが存在しない、または検証条件に合わないThreadは
 これまでどおり標準JIT継続経路へ戻る。
@@ -80,15 +80,15 @@ XYO_JIT_MEGA_MULTI_PC_BATCH=1 \
 `repeat(3) +1`、`repeat(2) +2`、`repeat(0) +50`、
 単発`+5`、`repeat(1) +3`を混在させる。
 
-4回のScheduler pass後の総和は15で一致。
+4回のScheduler pass後の総和が15で一致した。
 各passの実行後に`pc`、`remaining`、
-稼働中Thread数を検証。
+稼働中Thread数を検証した。
 最後の1本の通常JITへの切戻しと、
 2回目のブロードキャストで同じLLVM ORCオブジェクトの再使用もPASS。
 
 新フラグ有効の全体テスト：
 **scheduler 525 checks, 0 failures**。他のテストスイートもPASS。
-PC保存後に変数を文字列100へ書き換えるテストもPASSし、通常JITへのフォールバックが既実行部分を重複せず最終値104を作ることを確認。
+PC保存後に変数を文字列100へ書き換えるテストもPASSし、通常JITへのフォールバックが既に実行した部分を重複させず、最終値104を作ることを確認。
 
 ## 測定
 
@@ -119,7 +119,7 @@ Scratch Threadの生成やjoinそのものを完全に排除した数字では�
 
 既存ScratchBenchの`sched_pingpong` / `sched_fanwait`は
 新機能の主対象ではない（特にfanwaitは従来の単発スカラー専用バッチを優先）。
-6組交互測定で、sched_pingpongの速度比は1.0060倍（4/6勝）、sched_fanwaitは0.9795倍（4/6勝）。新フラグによる安定した改善は確認できなかったが、小標本・測定値のばらつきがあり、確定的な回帰とも断定しない。
+6組の交互測定で、sched_pingpongの速度比は1.0060倍（4/6勝）、sched_fanwaitは0.9795倍（4/6勝）。新フラグによる安定した改善は確認できなかったが、小標本・測定値のばらつきがあり、確定的な回帰とも断定しない。
 測定データ：build-scheduler-rewrite-20261111/mega-multi-pc/sched-fanwait-no-regression/。
 
 ## 限界・今後
@@ -129,7 +129,7 @@ Scratch Threadの生成やjoinそのものを完全に排除した数字では�
 文字列・リスト操作、broadcast-and-waitの本体、
 一般の自作ブロックCallFrameには未対応。
 これらを一括実行するには、それぞれの再開可能な状態と
-GCルート、通知バリア、スケジューラ順序を別途厳密に定義する。
+GCルート、通知バリア、スケジューラ順序を別途厳密に定義する必要がある。
 
 既定OFF。他エージェントによる未コミット変更は保持し、
 ソースのreset・全体commitはしない。

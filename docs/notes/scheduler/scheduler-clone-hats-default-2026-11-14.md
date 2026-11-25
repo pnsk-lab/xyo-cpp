@@ -5,22 +5,23 @@
 ## このラウンドで変更したこと
 
 実際のScratchBenchで繰り返し見られるbroadcast-and-waitのjoinチェックと
-receiverハンドル確保を2件実験したが、どちらも16組/12組の再現性ある改善を
-示さなかった。そのため両案を**ソースから安全に取り除き**、実行時の
-Scratchジョイン順序・受信者Thread identity・Fiber所有権は旧経路のまま。
+receiverハンドル確保について2件の実験を行ったが、どちらも16組/12組で
+再現性のある改善を示さなかった。そのため両案を**ソースから安全に取り除き**、
+実行時のScratchジョイン順序・受信者Thread identity・Fiber所有権は旧経路のまま
+維持している。
 
-既に opt-in 実装済みだった新規クローンのハット起動直接経路を、
-現行コードのReleaseバイナリで16組交互測定したところ、
-`sched_clonechurn`で安定した改善があった。そのため
+既にopt-inで実装済みだった新規クローンのハット起動直接経路を、
+現行コードのReleaseバイナリで16組の交互測定を行ったところ、
+`sched_clonechurn`で安定した改善が見られた。そのため
 `src/model/target.cpp` の `XYO_CLONE_NEW_HATS_FAST` を既定ONに変更した。
 `=0`で旧汎用 `Runtime::startHats` 経路に戻せる。
 
-生成コールバック `onTargetCreated` があると従来経路へ戻るチェックは不変。
+生成コールバック `onTargetCreated` があると従来経路へ戻るチェックは変えていない。
 GUI/SDL/ホストがクローン生成の途中でThreadを起動する可能性がある場合は、
 未検証の高速経路へ入らない。
 `Runtime::startFreshCloneHats` 自体は以前から存在し、今回内部のロジックは変更していない。
 
-## 同一バイナリの交互A/B — クローン起動
+## 同一バイナリの交互A/B：クローン起動
 
 元のScratchBench performanceから他のschedulerケースへの起動呼び出し
 のみを取り除いたSB3。**選択したカーネル本体は変更なし**。
@@ -38,9 +39,9 @@ CPU16固定、Eager JIT、30fps、`XYO_PAR=0`、
 `build-scheduler-rewrite-20261111/clone-hat-reverify-20261114/bench-paired-16/results.json`。
 
 前段の別ビルド・別時点の6組ではclonechurn 1.0928倍、6/6勝という
-測定結果があったが、**今回の再測定と数値を平均・合成していない**。
+測定結果があったが、**今回の再測定値と平均・合成していない**。
 現時点で最も適切な主張は「clonechurn専用で約+2.9%、
-16組中14組改善」。他のScratchBench項目や47個全体への改善を示さない。
+16組中14組改善」。他のScratchBench項目や47項目全体への改善は示さない。
 
 ## 棄却した2件のブロードキャストjoin最適化
 
@@ -69,7 +70,7 @@ ON/OFFとも合格したが、実測が悪化したため実装・新規Runtime 
 1本のFiberが繰り返しbroadcast-and-waitする際の
 `std::vector<Thread*>`の反復mallocを削減する目的で、
 通常JIT送信Threadの`megaJoinRefs`ストレージを借りる実験を行った。
-ネスト時は従来のFiberローカルvectorに戻す実装と、テスト（16件）は成功。
+ネスト時は従来のFiberローカルvectorに戻す実装は成功し、テスト（16件）も通った。
 
 16組交互測定：
 - sched_pingpong：OFF 431.571、ON 423.057 ops/ms、
@@ -87,7 +88,7 @@ ON/OFFとも合格したが、実測が悪化したため実装・新規Runtime 
 
 ## ベンチハーネス
 
-`tests/bench/algos/bench_scheduler_flags.py` にのみ、
+`tests/bench/algos/bench_scheduler_flags.py` にのみ
 `--prepared-scheduler` を追加した。
 ScratchBenchの共有ビルドキャッシュが他のエージェントによって消されても、
 前回凍結したscheduler-only SB3をバイト単位で再利用する。
@@ -122,15 +123,15 @@ python3 tests/bench/algos/bench_scheduler_flags.py \
 単純なjoin集合の走査やvector確保にはなかった。
 既存のネイティブプロファイラでは、
 Fiber再開とLLVM内部の処理を含む区間の平均が数百ns級だった。
-次はJITが`broadcast and wait`で発生するFiberへの再入回数そのものを
-減らすには、正しいScratch yield・join境界の証明が必要。
+次に、`broadcast and wait`でJITがFiberへ再入する回数そのものを
+減らすには、正しいScratch yield・join境界の証明が必要になる。
 拙速なネストjoin融合やThread再利用は避ける。
 
 ## 最終回帰結果（既定ON vs 明示OFF）
 
-同じ最終Releaseバイナリで Eager JIT、Mega Scheduler βの既存フラグを
+同じ最終Releaseバイナリで、Eager JITとMega Scheduler βの既存フラグを
 両条件で等しくONにし、**新しい既定ON**と
-`XYO_CLONE_NEW_HATS_FAST=0`をそれぞれ全量実行。
+`XYO_CLONE_NEW_HATS_FAST=0`をそれぞれ全量実行した。
 
 | 条件 | Scheduler | E2E | プロセス終了 |
 | --- | --- | --- | --- |

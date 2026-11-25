@@ -24,11 +24,11 @@ XYO_RT_ORC_FDE_REGISTRATION=1 \
 
 1. 新規`src/jit/rt_orc_fde_lifecycle.hpp`（Linux x86-64実験用）：
    - `OrcJitFdeLifecyclePlugin`は`LinkGraphLinkingLayer::Plugin`を継承。
-   - `modifyPassConfig`にPostFixup passを追加。JITLinkが解決した後の`xyo_script_*` callable symbolsの**実アドレスとJITLinkが報告する正確なsymbol size**を収集。可能性のある任意の関数範囲を固定値で推定しない。
+   - `modifyPassConfig`にPostFixup passを追加。JITLinkが解決した後の`xyo_script_*` callable symbolsの**実アドレスとJITLinkが報告する正確なsymbol size**を収集。関数範囲の候補を固定値で推定しない。
    - `notifyEmitted`時にGNU `_Unwind_Find_FDE`を実JIT PCで呼び、対象関数の所有者一致を確認。FDE→関数先頭の相対オフセットが符号付き32bitに収まるものだけ、`libunwind`の`UNW_INFO_FORMAT_REMOTE_TABLE`へ登録。`unw_get_proc_info_by_ip`から**正確な先頭・末尾（symbol size）**が復元されることを検証。1つでも失敗すればそのmaterializationの一時登録を自動解除し、`[rt001-orc-fde] ... invalid_extent=1/fde_missing=1`の診断のみ表示（JITの通常実行は継続）。
    - `notifyRemovingResources`は該当ORC ResourceKeyの登録をすべて解除し`unw_flush_cache`した後に返す。ORCコード/FDEがunmapされる前に借用FDEメタデータを破棄する。
    - `notifyTransferringResources`で登録所有権をResourceKeyとともに移す。複数の並列materializationが同じresource keyを使う可能性に備え、pendingはMaterializationResponsibilityの個体IDで管理し、`std::mutex`で保護。
-   - `notifyFailed`では未完了pendingデータを破棄する。現時点のプラグインはxyo_script_*に絞っている。その他のJIT/AOT関数が対象外であり、全関数CFIを完全登録したという証明ではない。
+   - `notifyFailed`では未完了pendingデータを破棄する。現時点のプラグインはxyo_script_*に絞っている。その他のJIT/AOT関数は対象外であり、全関数CFIを完全登録したという証明ではない。
 2. `src/jit/backend_llvm.cpp`：実験マクロのあるビルドで、EagerおよびORC Lazyの`LLJIT`作成時にプラグインを追加。実行時フラグOFFなら登録なし。デフォルトの変換経路と既存GCの状態遷移を変更しない。
 3. `CMakeLists.txt`：既定OFFの`XYO_RT001_ORC_FDE_PLUGIN`を追加。Linux x86-64 LLVMかつlibunwind+libunwind-x86_64のみ受理。opt-inに限ってxyoにinclude、compile definition、libunwindのリンク依存を追加。
 4. 新規`tests/platform/rt_orc_fde_link_plugin_smoke.cpp`：本物のORC JITLink plugin callbackを使い、emit→register、ResourceTracker remove→unregister、transfer、再materializeを検証。直前までの独立所有権テストよりさらに実際のJITLink通知へ近い。
@@ -66,6 +66,6 @@ XYO_RT_ORC_FDE_REGISTRATION=1 \
 ## 次に検討する項目
 
 1. 最適化後の実StackMap PCと、`xyo_yield`実際の中断地点を1対1にするSafePointプロトコル（たとえば呼び出し直前の明示safe-liveness statepoint）。
-2. native `i64` boxed Value、GC-managed文字列／リスト参照の全ルートを機械レジスタ・スタック上に列挙して、収集の適格性を**fail-closed**判定する。
+2. native `i64` boxed Value、GC-managed文字列／リスト参照の全ルートを機械レジスタ・スタック上に列挙して、収集の適格性を**fail-closed**で判定する。
 3. 生成・アンロードが並列に進む場合のORC resource keyの生存期間とJITコードの停止・非実行保証を整理した追加テスト。
 4. すべての証明が揃うまで、`FiberPool::unsafeCount()`によるGC禁止は維持する。

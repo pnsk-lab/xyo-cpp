@@ -2,7 +2,7 @@
 
 ## Objective and safety
 
-`PERF-001` aims to win all 47 ScratchBench performance cases. This experiment targets `sched_looptick`, a warp loop repeatedly querying `sensing_dayssince2000` while incrementing a Scratch scalar. Previous native defaults use `rt::daysSince2000` for every reporter evaluation.
+`PERF-001` aims to win all 47 ScratchBench performance cases. This experiment targets `sched_looptick`, a warp loop repeatedly querying `sensing_dayssince2000` while incrementing a Scratch scalar. Previous native defaults used `rt::daysSince2000` for every reporter evaluation.
 
 There is an existing opt-in `XYO_JIT_DAYS_SHARED_CLOCK=1` that samples wall-clock milliseconds from the sequencer's 1ms watchdog. It is **not** enabled by default: a 1ms asynchronous sample may lag the exact wall-clock value, which can be observed in a sufficiently sensitive Scratch project. The old synchronous reporter remains the reference behavior.
 

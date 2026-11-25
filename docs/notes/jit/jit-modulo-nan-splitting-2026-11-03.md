@@ -2,7 +2,7 @@
 
 ## 概要
 
-ScratchBenchの `math_arith` は正の整数の固定除数による剰余で、成功する整数高速経路であっても、すべての分岐を合流させた後に `fcmp uno` とNaN正準化を実行していた。`src/jit/codegen.cpp` の `emitArithNumeric(AOp::Mod)` を変更し、**整数経路ではNaNフラグを定数false、浮動小数点フォールバック経路では実際のNaNチェック**としてSSAに合流させる方式を試した。
+ScratchBenchの `math_arith` は正の整数に対する固定除数での剰余で、整数の高速経路が成功しても、すべての分岐を合流させた後に `fcmp uno` とNaN正準化を実行していた。`src/jit/codegen.cpp` の `emitArithNumeric(AOp::Mod)` を変更し、**整数経路ではNaNフラグを定数false、浮動小数点フォールバック経路では実際のNaNチェック**としてSSAに合流させる方式を試した。
 
 実装は固定除数と可変除数の両方に対応。整数経路の戻り値が正確にNaN以外であることだけを用いるため、整数ではない値、負のゼロ、±Infinity、NaN、ゼロ除数などは従来の浮動小数点経路・正準化へ落ちる。非NaNなら通常のIEEE doubleの生ビット、NaNならScratchの正準 `kNan`、次の `toNumber` では0という不変条件を維持する。
 
@@ -19,7 +19,7 @@ ScratchBenchの `math_arith` は正の整数の固定除数による剰余で、
 | `movsd` 命令 | 28 | 28 |
 | `callq` 命令 | 24 | 24 |
 
-IR行数はPHIの追加で少し増えるが、機械語には整数fast pathに不要なNaN判定と関連処理が減る。これは静的な計数であり動的命令数ではない。生ファイルは `build/mod-nan-asm-{on,off}.ll` と `build/mod-nan-asm-{on,off}.asm`。
+IR行数はPHIの追加で少し増えるが、機械語では整数fast pathに不要なNaN判定と関連処理が減る。これは静的な計数であり動的命令数ではない。生ファイルは `build/mod-nan-asm-{on,off}.ll` と `build/mod-nan-asm-{on,off}.asm`。
 
 ### 比較試験
 

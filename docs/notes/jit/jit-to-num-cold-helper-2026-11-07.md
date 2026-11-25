@@ -10,17 +10,17 @@
 - `src/jit/backend_llvm.cpp`: `xyo_to_num_uncached` の外部シンボルを登録。LLVMのJIT/AOTどちらの解決でも利用できるようにする。
 - `src/jit/codegen.cpp`: `XYO_JIT_TO_NUM_COLD_HELPER=1` のときのみ、JITが既に検証した文字列ポインタを直接渡す。**既定OFF**、他の型・キャッシュ済み文字列・数値変換には変更なし。
 
-`numState=0` の観測後に別スレッドが同じ不変の`SStr`を解析しても、既存の`publishNumCache`の原子的公開規則を保ったまま同じ値を再解析できる。
+`numState=0` の観測後に別スレッドが同じ不変な`SStr`を解析しても、既存の`publishNumCache`の原子的公開規則を保ったまま同じ値を再解析できる。
 
 ## テスト
 
-`tests/differential/jit_to_num_fastpath.py` を、ヘルパーON／OFF×Eager／HotSpot×warp／非warpの**8構成**に拡張。新しく結合生成した数字文字列（整数、小数、指数、非数値、空白、16進接頭辞など）の出力がインタプリタと一致した。ONのEagerコンパイルでは最適化後IRに`xyo_to_num_uncached`が含まれることもチェックする。
+`tests/differential/jit_to_num_fastpath.py` を、ヘルパーON／OFF×Eager／HotSpot×warp／非warpの**8構成**に拡張。新たに結合して生成した数字文字列（整数、小数、指数、非数値、空白、16進接頭辞など）の出力がインタプリタと一致した。ONのEagerコンパイルでは最適化後IRに`xyo_to_num_uncached`が含まれることもチェックする。
 
 関連CTestは**6/6成功**（lazy型付きSSA、型フロー生成、if-PHI、duplicate scalar、to-num、OSR）。
 
 ## 速度の測定結果
 
-Releaseビルド、512種の整数文字列×3000回を、毎回`numState=0`に戻して処理するJIT条件模擬ベンチマーク。15回の中央値：
+Releaseビルド、512種の整数文字列×3000回を、毎回`numState=0`に戻して処理する、JIT条件を模したベンチマーク。15回の中央値：
 
 | 経路 | 中央値 |
 |---|---:|
@@ -55,7 +55,7 @@ Commit・Pushは未実施。
 
 ## 追加: 短い小数・指数表記の重複走査を削減
 
-同じ作業で src/core/jsnum.cpp に短いASCII十進文字列（64文字未満）の高速経路を追加。従来はUTF-16構文検証→ASCIIコピー→std::from_charsの順序だったが、新経路はASCII確認後にfrom_charsの全入力消費を要求することで重複する構文検証走査を省略した。nan/infの誤受理を防ぐ先頭文字検査を含む。
+同じ作業で src/core/jsnum.cpp に短いASCII十進文字列（64文字未満）の高速経路を追加した。従来はUTF-16構文検証→ASCIIコピー→std::from_charsの順序だったが、新経路ではASCII確認後にfrom_charsの全入力消費を要求することで重複する構文検証走査を省略した。nan/infの誤受理を防ぐ先頭文字検査を含む。
 
 Infinity、0x/0b/0o、符号・空白は既存の規則のまま。結果が範囲外の場合はCロケール固定strtod_lにフォールバックする。64文字以上は既存の文法検証を維持。
 
@@ -65,18 +65,18 @@ Infinity、0x/0b/0o、符号・空白は既存の規則のまま。結果が範�
 | 指数表記 | 22.07ns | 18.49ns |
 | 短い整数 | 10.12ns | 9.78ns |
 
-テストは tests/bench/to_num_parity.cpp の既存240,041文字列に、20文字種×長さ1〜5の3,368,420通りを追加。合計3,608,461種類で旧実装と新実装のIEEE754ビット表現が完全一致。
+テストは tests/bench/to_num_parity.cpp の既存240,041文字列に、20文字種×長さ1〜5の3,368,420通りを追加した。合計3,608,461種類で旧実装と新実装のIEEE754ビット表現が完全一致。
 
 この数値は単独パーサの性能であり、Scratch作品全体の高速化率ではない。
 
 ## 最終ビルド・回帰テスト
 
-専用ディレクトリ build-to-num-cold をRelease構成で生成し、すべてのターゲットをビルドした後にCTestを実施。既定設定で56/56成功（167.87秒）。最初の全CTestで発生した23件の「未実行」は単に一部のテスト用バイナリをまだビルドしていなかったためで、すべてのターゲットをビルドした後は解消。
+専用ディレクトリ build-to-num-cold をRelease構成で生成し、すべてのターゲットをビルドした後にCTestを実施した。既定設定で56/56成功（167.87秒）。最初の全CTestで発生した23件の「未実行」は、単に一部のテスト用バイナリをまだビルドしていなかったためで、すべてのターゲットをビルドした後は解消した。
 
-最後にXYO_JIT_TO_NUM_COLD_HELPERの判定をスクリプトのJITコンパイル時に1回だけ行うよう変更し、再ビルド。XYO_JIT_TO_NUM_COLD_HELPER=1の設定でxyo-tests、JIT型変化生成、型付きSSA、if-PHI、OSR、重複算術、to-num-fastpathの関連CTest 7/7成功（47.47秒）。
+最後にXYO_JIT_TO_NUM_COLD_HELPERの判定をスクリプトのJITコンパイル時に1回だけ行うよう変更し、再ビルドした。XYO_JIT_TO_NUM_COLD_HELPER=1の設定でxyo-tests、JIT型変化生成、型付きSSA、if-PHI、OSR、重複算術、to-num-fastpathの関連CTest 7/7成功（47.47秒）。
 
-字句・数値互換性：短い十進の重複検証走査を削減した新パーサは3,608,461文字列で旧実装とビット一致。差分テストの8構成（warp／非warp×Eager／HotSpot×flag ON／OFF）も通過。
+字句・数値互換性：短い十進の重複検証走査を削減した新パーサは3,608,461文字列で旧実装とビット一致した。差分テストの8構成（warp／非warp×Eager／HotSpot×flag ON／OFF）も通過した。
 
-追加の小数／指数パーサ高速化は既定有効。JIT冷文字列専用ヘルパーは専用作品でのウォール時間が計測ノイズ程度しか変わらないため、既定OFFを維持する。
+追加の小数／指数パーサ高速化は既定有効。JIT冷文字列専用ヘルパーは、専用作品でのウォール時間が計測ノイズの範囲でしか変わらないため、既定OFFを維持する。
 
 Commit・Pushはしていない。その他の未コミット変更に触れず、作業ディレクトリで実装・テスト済み。

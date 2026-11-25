@@ -50,7 +50,7 @@ RT profiler無効、HotSpot、30fps、CPU8固定、同一バイナリで各16回
 | sched_fanout | 1,835.30 | **2,066.92** | **1.13868倍** | **8/8** |
 | sched_fanwait | 1,812.73 | **2,124.73** | **1.18205倍** | **8/8** |
 
-[最終8ペアの生データ](../../../build-sched-light/slot-direct-final-targeted/results.json)。最初の16ペアとは別実行で、倍率を掛け合わせない。両実行を通じて各項目24/24ペアでONが速かった。
+[最終8ペアの生データ](../../../build-sched-light/slot-direct-final-targeted/results.json)。最初の16ペアとは別実行で、倍率を掛け合わせない。両実行を合わせて各項目24/24ペアでONが速かった。
 
 ### 回帰テスト
 
@@ -69,7 +69,7 @@ RT profiler無効、HotSpot、30fps、CPU8固定、同一バイナリで各16回
 
 各3回の比較で fanout は **1,670.02→1,924.03 ops/ms**、fanwait は **1,683.67→1,923.52 ops/ms**。両項目とも3/3ペアでONが速かった。pingpong もペア幾何平均1.0783倍（3/3勝）だったが、主な効果の根拠は上記の分離16＋8ペアとする。全47項目のoverall score向上や、scheduler全項目の改善を主張しない。
 
-全体3ペアで `sched_restart` は1.882k→1.802kと低下したため、追加の分離比較で確認した。CPU8の16ペアは中央値 **1,820.49→1,818.64** とほぼ同じだが、ON側に極端に遅い試行が3個ありペア幾何平均0.9061倍だった。[CPU8の生データ](../../../build-sched-light/slot-direct-restart-control/results.json)。別のP-core CPU14固定の16ペアでは **1,876.48→1,869.03**、ペア幾何平均 **0.99716倍**、7/16勝で、同程度の低下は再現しなかった。[CPU14の生データ](../../../build-sched-light/slot-direct-restart-cpu14/results.json)。restartに対する速度改善は無く、環境依存の外れ値があることは残して記録する。全項目無劣化の保証ではない。
+全体3ペアで `sched_restart` は1.882k→1.802kと低下したため、追加の分離比較で確認した。CPU8の16ペアは中央値 **1,820.49→1,818.64** とほぼ同じだが、ON側に極端に遅い試行が3個ありペア幾何平均0.9061倍だった。[CPU8の生データ](../../../build-sched-light/slot-direct-restart-control/results.json)。別のP-core CPU14固定の16ペアでは **1,876.48→1,869.03**、ペア幾何平均 **0.99716倍**、7/16勝で、同程度の低下は再現しなかった。[CPU14の生データ](../../../build-sched-light/slot-direct-restart-cpu14/results.json)。restartに対する速度改善は無く、環境依存の外れ値がある点は記録に残す。全項目無劣化の保証ではない。
 
 ### 再現用ハーネス
 

@@ -9,9 +9,9 @@ Scratch IF predecessors as `typed.merge.bits` (`i64` PHI), and—only when
 both incoming producers already have Scratch `toNumber` shadows and dynamic
 numeric-comparison eligibility—as `typed.merge.number` (`f64` PHI). That
 numeric PHI discarded the *stronger* exact-integer interval facts previously
-proved for its incoming SSA producers. Consequently, immediately following
-`list[temp]` could revert to a general float-to-i64 conversion even when
-both paths assigned bounded integers.
+proved for its incoming SSA producers. Consequently, a `list[temp]` read
+immediately after the join could revert to a general float-to-i64 conversion
+even when both paths assigned bounded integers.
 
 `src/jit/codegen.cpp` now conservatively transfers the union of the two
 integer ranges to the merged numerical SSA value **only if** all of these
@@ -29,7 +29,7 @@ conditions hold:
    existing bounded i32 domain. The result is attached only to the new
    immutable numeric PHI, not the Scratch variable.
 
-When all facts hold the compiler records that the merged boxed Value is
+When all facts hold, the compiler records that the merged boxed Value is
 numeric and forwards the union to existing users of `intInterval`, such as
 `emitListBounds`. LLVM's O3 scalar analysis remains responsible for PHI
 simplification, integer conversions and final code generation. There is no
@@ -69,9 +69,9 @@ IR captures: `build/multi-bench-20261110/phi-integer-range/*-{0,1,default}.ll`.
 
 `tests/bench/algos/bench_jit_phi_integer_range.py` measures the original
 Scratch code using daysSince2000, after warming a warp procedure. The
-project's clock has ~1ms granularity. Same binary, CPU8 affinity,
-100,000-element prepopulated list, 100 procedure invocations per measured
-interval, 3 intervals per process, 10 alternated OFF/ON pairs.
+project's clock has ~1ms granularity. Runs used the same binary, CPU8
+affinity, a 100,000-element prepopulated list, 100 procedure invocations per
+measured interval, 3 intervals per process, and 10 alternated OFF/ON pairs.
 
 | Example | Geometric mean ON/OFF speed ratio | Faster pairs |
 |---|---:|---:|
@@ -81,16 +81,16 @@ interval, 3 intervals per process, 10 alternated OFF/ON pairs.
 | A fractional and an integer on opposite branches | 0.993958× | 1/10 |
 | Nonpositive index can arise on a branch | 0.999999× | 2/10 |
 
-All checksums matched. The equal-timestamp and ~1ms timer quantization
-limits precision, and machine load affects isolated samples. In particular,
+All checksums matched. Equal timestamps and ~1ms timer quantization limit
+precision, and machine load affects isolated samples. In particular,
 **removing a conversion did not speed up the different-integer PHI case**.
 Raw: `build/multi-bench-20261110/phi-integer-range/benchmark.{json,log}`.
 
 A second, experimental native i32 PHI placed a separate `fptoui` on each
 predecessor edge, allowing LLVM to eliminate *both* original float-to-integer
-conversions in the different-integer case. Despite the cleaner IR, 10-pair
-ON/OFF geometric ratio was **0.9951×** for that workload and it did not
-consistently outperform the range-only path. This **native i32 PHI variant
+conversions in the different-integer case. Despite the cleaner IR, the
+10-pair ON/OFF geometric ratio was **0.9951×** for that workload, and it did
+not consistently outperform the range-only path. This **native i32 PHI variant
 was removed**, not left enabled as an unused optimizer flag. Experimental
 IR and benchmark captures remain at
 `phi-integer-range/*-native.ll` and `native-benchmark.{json,log}`.
@@ -124,9 +124,9 @@ a claimed performance benefit. Another test compares a numeric and string
 candidate after the join and confirms the same fallback.
 
 The compiled project uses LLVM numeric SSA without asserting any new fact
-about mutable VM variables, GC references or interpreter state. The default
-new behavior can be disabled independently of the previous proven-index,
-unary-range and ordered-IF optimizations.
+about mutable VM variables, GC references or interpreter state. The new
+behavior defaults to on and can be disabled independently of the previous
+proven-index, unary-range and ordered-IF optimizations.
 
 No commit or push. Changes from other concurrent working-tree tasks remain
 untouched.

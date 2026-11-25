@@ -6,18 +6,18 @@
 
 IR-001 は LLVM Fiber の呼出し状態を `SourceFrameSymbols`、`SourceReturnSite`、`SourceLoopResume`、`CallFrameInfo` に記録する。一方、OSR-005 は元の Interpreter の StackFrame を生かしておき、最も内側の counted `repeat` の未実行部分だけ LLVM へ移行する。
 
-今回の `XYO_JIT_OSR_NESTED_SOURCE_PROOF=1` は、**既存のネスト warp OSR が採用する直前に、Interpreter の実中断点が IR-001 の不変なソース PC 辞書と完全に対応するか検証する**オプションである。通常は OFF。
+今回の `XYO_JIT_OSR_NESTED_SOURCE_PROOF=1` は、**既存のネスト warp OSR を採用する直前に、Interpreter の実中断点が IR-001 の不変なソース PC 辞書と完全に対応するか検証する**オプションである。通常は OFF。
 
 これは同じ共通形式への**読取専用の射影**であり、ネイティブの機械 PC や SSA の任意途中位置を再構築する機能ではない。任意の非 warp yield、再帰の完全デオプト、汎用 LLVM→Interpreter 復帰をこのフラグで有効化したわけではない。
 
 ## 変更内容
 
-- `src/jit/backend_llvm.cpp`：非同期 LLVM の準備中、同じ Blocks 改訂番号から `ScratchCompilationUnit` を捕捉する。IR-001 の既存 `NativeProcedureFrameSession` を使用して不変な `SourceFrameSymbols` を構築し、`CompiledScript` に共有所有で保持。準備に失敗した場合は proof 必須である以上、native OSR 採用を拒否する。
+- `src/jit/backend_llvm.cpp`：非同期 LLVM の準備中、同じ Blocks 改訂番号から `ScratchCompilationUnit` を捕捉する。IR-001 の既存 `NativeProcedureFrameSession` を使用して不変な `SourceFrameSymbols` を構築し、`CompiledScript` に共有所有で保持。準備に失敗した場合は proof が必須である以上、native OSR 採用を拒否する。
 - `src/jit/jit.hpp`：`nestedOsrSourceProofRequired` と `nestedOsrSourceSymbols` を追加。共通 CallFrame の ABI レイアウトには変更を加えない。
 - `src/jit/nested_warp_callframe_projection.hpp`（新規）：`InterpreterOsrSnapshot` のすべての実行中フレームを元のソース PC に変換する。PC→ブロック名は IR-001 が凍結した名前表と照合する。各呼出しは `SourceReturnSite` の return PC、呼出し元手続き ID、引数数、`callerLoopPath`、`branchPath` を比較し、`validReturnTarget` を通す。外側 counted repeat の**実カウンター**は `Value::num(...).bits` の `SourceLoopResume` 形式で保存し、所有手続きと入れ子 loop PC を比較する。末端の repeat も同様に検証する。結果は `NestedWarpSourceWitness` の数値ソース情報で、実行権限は持たない。
 - `src/engine/runtime.cpp`：OSR 採用直前に `projectNestedWarpSource` を呼び出す。さらに source revision だけでは見落とす **Block::resetCache を通さない直接編集**に備え、`ScratchCompilationUnit` のソース内容識別子を採用時に再計算し、コンパイル元の `ScratchSourceDigest` と照合する。どれか一つでも不一致なら native OSR を採用しない。
 
-すべてオプトイン。通常経路のループ本体・引数読出し・GC・スケジューラ・共通 CallFrame セッションの ABI は変更しない。内容識別子の再計算はソースグラフ全体を走査するため、proof 有効時だけの追加コストを持つ。
+すべてオプトイン。通常経路のループ本体・引数読出し・GC・スケジューラ・共通 CallFrame セッションの ABI は変更しない。内容識別子の再計算はソースグラフ全体を走査するため、proof 有効時にのみ追加コストがかかる。
 
 ## 設定
 
@@ -37,7 +37,7 @@ XYO_JIT_OSR_NESTED_TRACE=1 \
   ./board/osr-callframe-proof-v2-xyo play project.sb3
 ```
 
-採用が成功すると、`[jit-osr-source-proof] calls=N parent-loops=M branches=K leaf-pc=X revision=R` と記録する。ログがあるだけでなく `[jit-osr-nested] promoted` と `restored caller` が対応することをテストで確認する。
+採用が成功すると、`[jit-osr-source-proof] calls=N parent-loops=M branches=K leaf-pc=X revision=R` と記録する。ログが出るだけでなく `[jit-osr-nested] promoted` と `restored caller` が対応することをテストで確認する。
 
 ## テスト
 
@@ -58,7 +58,7 @@ XYO_JIT_OSR_NESTED_TRACE=1 \
 
 ## 残る統合
 
-この witness は新しい LLVM CallFrame 実行フレームを作らず、外側カウンターの所有権も移さない。IR-001 / RT-001 の本来の作業である、一般的な native SSA/effect 状態の捕捉、ネイティブ yield 時の元ソース PC への実行可能な移行、再帰に跨がる任意復帰は未実装。今回の照合は、そのために必要な **同じ source-PC 証明規則**を、限定 OSR の実採用時に用いた段階である。
+この witness は新しい LLVM CallFrame 実行フレームを作らず、外側カウンターの所有権も移さない。IR-001 / RT-001 の本来の作業である一般的な native SSA/effect 状態の捕捉、ネイティブ yield 時の元ソース PC への実行可能な移行、再帰に跨がる任意復帰は未実装。今回の照合は、そのために必要な **同じ source-PC 証明規則**を、限定 OSR の実採用時に用いた段階である。
 
 共有の作業ツリーを保持するため、コミット・プッシュは行っていない。
 

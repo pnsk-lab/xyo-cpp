@@ -124,7 +124,7 @@ some workload-specific terms, detailed in the analysis JSON.
 Correctness and mechanism checks passed: V7 `ctest` 6/6 and differential repros 19/19;
 A's GC diagnostic showed separate live populations (about 15.2k cons vs 174 general
 small objects in the sampled collection); B's generated IR contained the guarded
-`join.str`/`join.generic` split and checksum 40,000; with `XYO_PROF=1`, V0 emitted
+`join.str`/`join.generic` split, and the checksum was 40,000; with `XYO_PROF=1`, V0 emitted
 16 optional profiler tags while V4 emitted none. The working `build/` is restored to
 the all-default-off baseline. No runtime defaults were changed: C is a strong
 candidate for the normal non-profiling build, but A and B should remain workload-aware

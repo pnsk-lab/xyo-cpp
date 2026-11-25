@@ -42,14 +42,15 @@ it is not a claim of 100% compatibility across all Scratch projects.
 - Sensing: clip sprite/sprite and touching-color scans to the actual stage,
   not off-stage costume intersections.
 - Clock: interactive GUI with attached audio uses the **real integer-ms**
-  clock, matching Scratch's `Date.now()`. This avoids the previously
-  synthetic +1ms/frame advancing timers faster than wall-clock audio. The
-  unthrottled headless path retains its historical monotonic progression.
+  clock, matching Scratch's `Date.now()`. This avoids the previous
+  synthetic +1ms/frame advance, which ran timers faster than wall-clock
+  audio. The unthrottled headless path retains its historical monotonic
+  progression.
   `XYO_REAL_TIME_CLOCK=1` and `XYO_REAL_TIME_CLOCK=0` explicitly override
   the default for diagnosis.
 - Promise-next-tick: resolve no earlier than a new clock millisecond on
-  both interpreter and LLVM helper paths; prevents frame-frozen timers from
-  remaining identical when turbo GUI frames execute within one ms.
+  both interpreter and LLVM helper paths; this prevents frame-frozen timers
+  from staying identical when turbo GUI frames execute within one ms.
 - Native glide: the initial non-warp frame yields *before* any interpolation;
   a Warp glide normally runs without another scheduler handoff until the
   warp budget expires. Infinite glides remain interruptible for clone
@@ -57,12 +58,12 @@ it is not a claim of 100% compatibility across all Scratch projects.
 
 ## CTest integration and core unit suite
 
-`tests/CMakeLists.txt` uses `unit/test_*.cpp` for the combined
-`xyo-tests` executable, excluding standalone `unit/jit_*_smoke.cpp`
+`tests/CMakeLists.txt` builds the combined `xyo-tests` executable from
+`unit/test_*.cpp`, excluding standalone `unit/jit_*_smoke.cpp`
 programs that define their own `main`. After reconfiguring the dedicated
 Release SDL build with `-DXYO_BUILD_TESTS=ON`:
 
-- `cmake --build ... --target xyo-tests -j 4`: PASS; previously linked
+- `cmake --build ... --target xyo-tests -j 4`: PASS; it previously hit
   duplicate `main` symbols when all `unit/*.cpp` files were globbed.
 - `ctest --test-dir ... -R '^xyo-tests$' --output-on-failure`: PASS
   (52.88 seconds).
@@ -168,7 +169,7 @@ AOT object is
 That specific output was independently checked using
 `gui_scratch_parity_regression.py --modes aot --aot-object ...`,
 requiring both actual precompiled loading and 2656/2656.
-This independently rejects a silent JIT fallback.
+This check rules out a silent JIT fallback.
 
 The optional CTest full parity test still covers three modes; the
 ScratchBench CI workflow verifies the fourth native AOT mode separately.

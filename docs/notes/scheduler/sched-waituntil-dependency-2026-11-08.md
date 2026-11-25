@@ -4,7 +4,7 @@
 
 Continue `PERF-001` to beat five other Scratch runtimes independently on all 47 `scratch-bench` performance cases. The hardest scheduler gap was `sched_waituntil` at ~0.53× the stored TurboWarp best. The workload starts 101 `wait_until sc_gate == 1` receivers while an unrelated warp script increments a different variable repeatedly. All 101 waiters were re-entered via native Fiber in most sequencer passes despite `sc_gate` remaining 0.
 
-The existing `XYO_EVENT_SCHED=1` merely records a global progress epoch. Each unrelated script execution still increments that epoch, thus **5 paired trials** showed `sched_waituntil` *regressing* from **179.33** to **111.84 ops/ms**. `XYO_PAR=0` was similarly slow at **115.54**. Interpreter was **57.22**. Raw `build/perf-wait-flags.json`.
+The existing `XYO_EVENT_SCHED=1` merely records a global progress epoch. Each unrelated script execution still increments that epoch, and **5 paired trials** showed `sched_waituntil` *regressing* from **179.33** to **111.84 ops/ms**. `XYO_PAR=0` was similarly slow at **115.54**. Interpreter was **57.22**. Raw `build/perf-wait-flags.json`.
 
 ## Implemented opt-in design
 
@@ -20,7 +20,7 @@ This is not a hard-coded `sc_gate` optimization: it applies to every source-prov
 
 ### Why not enable it by default?
 
-An experiment routing every source-proven single-variable predicate through the watcher without `XYO_EVENT_SCHED` changed broad scheduler behavior/performance: full `xyo-tests` took **189.53s** instead of ~45–50s and failed the test asserting the ordinary direct Fiber chain. Although the output ordering checks passed and parity remained unchanged in the separate opt-in configuration, the default experiment did **not** satisfy the regression standard. It was **rolled back**. The final implementation is opt-in via **both** flags. No new default scheduling behavior was shipped.
+An experiment routing every source-proven single-variable predicate through the watcher without `XYO_EVENT_SCHED` changed scheduler behavior and performance broadly: full `xyo-tests` took **189.53s** instead of ~45–50s and failed the test asserting the ordinary direct Fiber chain. Although the output ordering checks passed and parity remained unchanged in the separate opt-in configuration, the default experiment did **not** satisfy the regression standard. It was **rolled back**. The final implementation is opt-in via **both** flags. No new default scheduling behavior was shipped.
 
 ## A/B performance
 

@@ -11,7 +11,7 @@
 
 これは実装に余分な再中断がないことを示す。待ち処理の検索や一時vector
 操作を削ってもFiber切替回数は減らない。
-中断回数の削減には、Scratchのイベント起動順と待機境界を維持した
+中断回数を削減するには、Scratchのイベント起動順と待機境界を維持したまま、
 **LLVMの明示PCによる送信側継続**（Fiber不要の状態機械）が必要。
 
 ## 計測コード
@@ -84,8 +84,8 @@ EagerとHotSpotの両方で「1 native join -> 1 sender yield」を確認。
 Runtime::step()の生存Thread配列のin-place compaction、
 threadMapのidentical Thread*検証付き再構築省略を試した。
 それぞれ単独の16組測定では fanwait が1.0157x（12/16勝）、
-さらにstable-mapだけ追加した場合1.0124x（13/16勝）だったが、
-**両方同時の20組A/Bでは fanwait 0.9966x（7/20勝）**。
+さらにstable-mapだけを追加した場合は1.0124x（13/16勝）だったが、
+**両方を同時に有効にした20組A/Bでは fanwait 0.9966x（7/20勝）**。
 pingpongも0.9981x（11/20勝）で改善なし。
 
 実装2件と関連テストは安全に撤回した。
@@ -94,9 +94,9 @@ pingpongも0.9981x（11/20勝）で改善なし。
 
 ## 今後の設計
 
-優先すべきは、既定OFFのMega Scheduler βで既にある
+優先すべきは、既定OFFのMega Scheduler βに既にある
 Thread-owned PC / joinRefs / broadcastPending の継続表現を、
-実ScratchBenchの自作ブロック内まで拡張すること。
+実ScratchBenchの自作ブロック内まで拡張することだ。
 
 必要な条件は以下。
 

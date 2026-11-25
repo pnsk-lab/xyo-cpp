@@ -130,7 +130,7 @@ single sender/receiver/fast latchも共通ON。
 
 **どのケースでも今回のMega sender join STATUS_YIELD正規化を実行しない。**
 従って上記の値の変動は本新機能の直接的な高速化/悪化を示さない。
-CPUノイズやその他のベンチ環境差を排除した主張はしない。
+CPUノイズやその他のベンチ環境差を排除した上での主張はしない。
 
 記録：
 `build-scheduler-rewrite-20261111/mega-normalize-yield-20261114/bench-real-sched-12/results.json`

@@ -4,7 +4,7 @@
 
 ## 目的
 
-OSR-007 / 008 では、native Fiber の yield 前後にソース変更を検出・復帰することを確認したが、変更対象は**すでに実行を終えた初期化命令**であり、実行後のプログラム意味論が同じだった。
+OSR-007 / 008 では、native Fiber の yield 前後にソース変更を検出・復帰することを確認したが、変更対象は**すでに実行を終えた初期化命令**であり、実行後のプログラムの意味論は変わらなかった。
 
 OSR-009 は、LLVM が実際に実行中の **最内側 counted `repeat` 本体の書込命令**を変更する。旧 LLVM を誤って再開すると結果が実際に変わるため、source proof と bounded deopt が変更後の Scratch 命令を実行することを観測できる。
 
@@ -12,7 +12,7 @@ OSR-009 は、LLVM が実際に実行中の **最内側 counted `repeat` 本体�
 
 - `tests/platform/nested_warp_inflight_body_edit_smoke.cpp` は `Runtime::step()` からホストを駆動し、実行中の native JIT Fiber が **`xyo_yield` で停止した後**だけソースを編集する。公開 API の `warpTimeMs=3ms` で停止点を作り、ランタイムコードにはテスト用の改竄フックを入れない。
 - `data_changevariableby` の実行対象 `fields["VARIABLE"].id` を **`v_sum` から `v_branchCount`** に変更。今度は実際のエディタ相当の `Blocks::resetCache()` を呼び、改訂番号と source digest の双方が更新されることを確認する。
-- `v_sum` は、編集直前に LLVM が確定した値を `sumAtEdit` として厳密な整数で記録する。
+- `v_sum` については、編集直前に LLVM が確定した値を `sumAtEdit` として厳密な整数で記録する。
 - **ガード ON：** LLVM を再開せず、元の Interpreter の `ExecContext::loopCounter` に戻す。変更後の命令を用いるため、最終 `sum == sumAtEdit`、`branchCount == 48,000,000 - sumAtEdit`。
 - **ガード OFF：** ソース変更を知らないまま古い LLVM の body が実行される。最終 `sum > sumAtEdit`。ただし次の外側ループは新しい Interpreter に戻り、書込先が変更される。
 - 編集を最初の native yield と **4回目の yield** の両方で発生させ、同じ `JitCtx` が複数回の yield / native 再開を経た場合もカウンターが正しく更新されることを確認する。
@@ -62,7 +62,7 @@ Binary SHA256: 82b210b04ff68f9f48ed8e4a2f7efcc12145a8796f60bc4cd04ef2aff9ddae67
 
 ## 制限
 
-今回は OSR-008 のデオプト本体を変更していない。デオプトの対象はあくまで `native yield` に到達した、元 Interpreter の CallFrame が生きている **flat counted repeat の完了済み本体境界**。
+今回は OSR-008 のデオプト本体を変更していない。デオプトの対象はあくまで `native yield` に到達した、元 Interpreter の CallFrame が生きている **flat counted repeat の完了済み本体境界**である。
 
 同時に異なるスレッドからソースグラフを改造するケース、実行中の machine PC / SSA ローカル / 一部実行済み副作用からの一般的な復帰、内側のネスト repeat の途中からの復帰は未対応である。
 
@@ -73,7 +73,7 @@ Binary SHA256: 82b210b04ff68f9f48ed8e4a2f7efcc12145a8796f60bc4cd04ef2aff9ddae67
 ブロック数計数は一部のネイティブ scalar / repeat 最適化を無効にするため、
 `--without-block-count` でも同じ 5 モードの実 native Fiber テストを実行した。
 計数なしの高速経路でも **positive / unguarded / guarded / unguarded-late / guarded-late がすべて PASS**。
-通常（編集なし）は Interpreter と全変数が一致し、実行中編集のガードありは
+通常（編集なし）では Interpreter と全変数が一致し、実行中編集のガードありは
 `sum == sumAtEdit` と `branchCount == 48000000 - sumAtEdit` が厳密に一致した。
 ガードなしでは元 LLVM が古い `sum` へ書き込むことを対照実験で実測。
 

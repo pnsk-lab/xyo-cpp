@@ -54,9 +54,9 @@ were never changed. All 27 isolated projects passed.
 **Across the combined observations, all 47 canonical workload IDs are
 represented.** 39 workload checksums matched the full run exactly.
 The remaining 8 were the time-dependent `sched_*` benchmarks; their
-execution counts/checksums differ between isolated and full suite by
-design. This is a case-output consistency check, not the full Scratch
-parity suite.
+execution counts/checksums differ between the isolated and full
+suites by design. This is a case-output consistency check, not the
+full Scratch parity suite.
 
 Nonzero fallback counts in the isolated corpus:
 

@@ -2,7 +2,7 @@
 
 ## 対象
 
-RT-001の実験用GCソフト予算（`XYO_RT_REQUIRE_GENERATED_SSA_ROOTS=1`、`XYO_RT_GC_SOFT_BUDGET_MB=1`）では、ネイティブFiberを継続可能なままGCすると、まだルート公開されていないLLVM SSAポインタの指すGCオブジェクトを回収する恐れがある。このため以前の変更では開始済みのネイティブFiberが1本でも残る間、実際のGCを保留した。
+RT-001の実験用GCソフト予算（`XYO_RT_REQUIRE_GENERATED_SSA_ROOTS=1`、`XYO_RT_GC_SOFT_BUDGET_MB=1`）では、ネイティブFiberを継続可能な状態のままGCすると、まだルート公開されていないLLVM SSAポインタの指すGCオブジェクトを回収する恐れがある。このため以前の変更では開始済みのネイティブFiberが1本でも残る間、実際のGCを保留した。
 
 今回の目的は、従来ひとまとめにしていたLLVM生存ポインタの出自を区分し、**将来どの証明が追加で必要かを可視化すること**。危険なGC許可の緩和はしない。
 
@@ -10,7 +10,7 @@ RT-001の実験用GCソフト予算（`XYO_RT_REQUIRE_GENERATED_SSA_ROOTS=1`、`
 
 `src/jit/rt_ssa_extra_capture.hpp` に `PointerRegion` と `classifyPointerRegion` を追加。LLVMのチェックポイントにおける生存ポインタを次の4種類に分類する。
 
-- `NativeStack`: 実際のネイティブ関数内の**同一のAllocaInst**に到達することを、既存の`nativeStackPointerRoot()`で証明済み。PHI/SELECTでスタック領域が混在した場合も安全な復帰ポインタとはみなさない。
+- `NativeStack`: 生存ポインタが実際のネイティブ関数内の**同一のAllocaInst**に到達することを、既存の`nativeStackPointerRoot()`で証明済み。PHI/SELECTでスタック領域が混在した場合も安全な復帰ポインタとはみなさない。
 - `HostContext`: 明示的に指定された最初のABI引数 `JitCtx*`、そのGEP/BitCast派生、同種の全armが一致するPHI/SELECT。
 - `StaticGlobal`: LLVMのGlobalVariableまたは静的なGEP/BitCast ConstantExpr派生、同種の全armが一致するPHI/SELECT。
 - `Unknown`: ロード結果、関数呼び出し結果、`IntToPtr`、`AddrSpaceCast`、未証明引数、混合PHI/SELECT、循環したPHI、深すぎるポインタ演算、その他。
@@ -34,7 +34,7 @@ RT-001の実験用GCソフト予算（`XYO_RT_REQUIRE_GENERATED_SSA_ROOTS=1`、`
 
 ## 単体テスト
 
-新規 `tests/platform/rt_pointer_region_smoke.cpp` を作成。LLVM23の実IRBuilderから、JitCtx引数、異種未証明引数、stack alloca、静的global、静的GEP ConstantExpr、host/stack GEP、ロードしたポインタ、IntToPtr、PHI/SELECT、自己循環、深さ80のGEPを作って解析する。正しい分類だけを承認し、ロード/混合/循環/深さ超過/不正なtrustedContextを拒否する。実LLVM23の直接ビルド+実行では `PASS ... stack=3 host=4 static=1 unknown=6 total=14`。
+新規 `tests/platform/rt_pointer_region_smoke.cpp` を作成。LLVM23の実IRBuilderで、JitCtx引数、異種未証明引数、stack alloca、静的global、静的GEP ConstantExpr、host/stack GEP、ロードしたポインタ、IntToPtr、PHI/SELECT、自己循環、深さ80のGEPを作って解析する。正しい分類だけを承認し、ロード/混合/循環/深さ超過/不正なtrustedContextを拒否する。実LLVM23の直接ビルド+実行では `PASS ... stack=3 host=4 static=1 unknown=6 total=14`。
 
 `tests/CMakeLists.txt` に `xyo-rt001-pointer-region-smoke` を追加。CTestからも実行可能な定義だが、新CMake構成全体はまだ未実行。
 

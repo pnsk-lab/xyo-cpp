@@ -4,9 +4,9 @@
 
 src/jit/conditional_ssa.inc と src/jit/codegen.cpp に、条件付き repeat の整数 SSA 経路を実装。
 定数増分、set x = x +/- N や set x = y + N、ネストした if/if else、数値の加減算、正の定数剰余、比較、論理演算を静的に解析する。
-未知のブロック・副作用・変数名と ID の別名が曖昧な場合は対象外。ループ本体内の外部呼び出しを削減し、LLVM の通常の O2/O3 最適化へ PHI を持つ整数ループを渡す。
+未知のブロック、副作用、変数名と ID の別名が曖昧な場合は対象外。ループ本体内の外部呼び出しを削減し、LLVM の通常の O2/O3 最適化へ PHI を持つ整数ループを渡す。
 
-既存の exact i32 repeat と warp が成立し、参照変数が全て plain f64 の厳密な整数で絶対値が 2^40 以下のときのみ、次の64反復期限確認まで計算する。Scratch 変数を期限確認前に公開し、その後は毎回再ガードする。非 warp、文字列・小数・未知の式は既存経路へ戻る。
+既存の exact i32 repeat と warp が成立し、参照変数が全て plain f64 の厳密な整数で、絶対値が 2^40 以下のときのみ、次の64反復期限確認まで計算する。Scratch 変数は期限確認の前に公開し、その後は毎回再ガードする。非 warp、文字列・小数・未知の式は既存経路へ戻る。
 環境変数 XYO_JIT_CONDITIONAL_SSA=1 で試験的に有効化。**既定 OFF**。独立した実作品コーパスで効果が確認されるまで既定経路には適用しない。
 
 入れ子の空 repeat は従来 C++ の xyo_empty_repeat_warp 呼出しに戻っていた。新しい direct scheduler はグローバルの yieldCheckN を元のヘルパと同じ64境界で更新し、必要な warp 期限検査と実際の Fiber 切替だけ実施する。外側の private yield counter は触れない。XYO_JIT_INLINE_EMPTY_DIRECT=1 で試験的に有効化。**既定 OFF**（既存の非入れ子空ループ最適化はそのまま）。
@@ -34,9 +34,9 @@ tests/differential/jit_empty_inline_scheduler.py にはネストの空 repeat、
 ## 追加の横断検証（2026-11-06）
 
 更新したJITライブラリを既存のGUIオブジェクトと手動リンクした検証用バイナリ（build/xyo-conditional-ssa）を使用。
-他作業で進行中の GUI 側ソース変更（Launcher::button 宣言と定義の不一致）が通常の CLI 再ビルドを阻害しているため、GUI ソースには触れていない。
+他の作業で進行中の GUI 側ソース変更（Launcher::button の宣言と定義の不一致）が通常の CLI 再ビルドを妨げているため、GUI ソースには触れていない。
 
-上記12項目のScratchBenchをCPU 12へ固定し、両機能 OFF/ON を各3回交互測定した。全項目でチェックサム一致。生データ: build/conditional-ssa-crossbench.json。
+上記12項目のScratchBenchをCPU 12固定で、両機能 OFF/ON を各3回交互に測定した。全項目でチェックサム一致。生データ: build/conditional-ssa-crossbench.json。
 
 | 項目 | OFF (ops/ms) | ON (ops/ms) | 倍率 |
 |---|---:|---:|---:|

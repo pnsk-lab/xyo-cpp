@@ -8,7 +8,7 @@ OSR-008/009 の LLVM→Interpreter 実復帰は「最も外側の選択済み na
 
 OSR-010 は、**単一の内側 `repeat` が静的に1〜8反復と証明され、その本体が高々4個の `data_changevariableby` のみ**の場合に限定し、内側の LLVM スケジューラ yield を抑制する。外側 `repeat` は従来どおりネイティブ Fiber を yield し、終了済みの一反復が GC・変数に反映された境界だけを実行可能なデオプト点として利用する。
 
-一般の内側ループにおける命令途中復帰ではない。内側の反復全体が小さく、外側本体とまとめて scheduler 原子的に処理される**制約付きの実装**である。
+一般の内側ループにおける命令途中復帰ではない。内側の反復全体が小さく、外側本体とまとめてスケジューラから見て原子的に処理される**制約付きの実装**である。
 
 ## 有効化
 
@@ -43,7 +43,7 @@ export XYO_JIT_OSR_NESTED_INNER_BOUNDED=1
 - `tests/platform/nested_warp_bounded_inner_deopt_smoke.cpp` が `Runtime::step()` と実際の native Fiber の yield を観測し、内側で実行中の `data_changevariableby` の対象を `sum`→`branchCount` に変更。通常の `Blocks::resetCache()` でソース改訂番号・内容ダイジェストも更新。
 - 検証ガードあり：変更が検出されると、**次の LLVM 命令を実行せず**元 Interpreter の外側ソースループで続行。編集直前に確定していた sum 値 `sumAtEdit` と最終 sum が完全一致。新しい `branchCount = 48,000,000 - sumAtEdit`。
 - ガードなし：古い LLVM が次の native yield 後も元の `sum` に書き込む対照実験。後続の root 側呼出しでは編集済みソースが反映される。
-- 最初の native yield および実際の **4回の native yield をまたぐ**ケースを検証。4回目は高速な場合、複数の native 呼出しにまたがることがあるため、実際の promotion / normal restore 件数を計測して完全な対応を要求する。
+- 最初の native yield および実際の **4回の native yield をまたぐ**ケースを検証。4回目は、高速な場合には複数の native 呼出しにまたがることがあるため、実際の promotion / normal restore 件数を計測して完全な対応を要求する。
 - `XYO_BLOCK_COUNT=1` では Interpreter/ガードありなし/編集なしすべてで **132,000,043** 個の Scratch ブロックを実行（通常の数値変数・文字列・親手続きの suffix も一致）。`XYO_BLOCK_COUNT=0` の高速化経路でも全 Scratch 変数の一致・副作用の保存が成功。
 - `INNER_BOUNDED=0` の従来動作、および内側 `repeat(10)` では **ネスト LLVM OSR を拒否**し、Interpreter と全変数が一致することを実測で確認。
 
@@ -76,7 +76,7 @@ ctest --test-dir board/.osr-silent-edit-headless \
 - 新規 `xyo-nested-warp-bounded-inner-deopt-fast`: **1/1 PASS 71.24s**（実行ブロック数 OFF）。ネイティブ高速化が残る条件でも同じ経路を確認。
 - 旧 `xyo-nested-warp-silent-edit`: PASS 28.30s、`xyo-nested-warp-inflight-deopt`: PASS 39.74s、`xyo-nested-warp-inflight-body-edit`: PASS 46.16s、`xyo-nested-warp-inflight-body-edit-fast`: PASS 46.52s。**既存4/4、新規2/2、合計6/6 PASS**。
 - ブロック数 ON の固定内側2反復版は、Interpreter、通常Native、ガード無効Native、ガード有効デオプトの全モードで **132,000,043 ブロック**。3回の warp 呼出し、変化する外側TIMES、元のScratchの後続命令、GC管理の日本語絵文字文字列引数を含む。
-- 短い内側ループのせいで4回目の native yield が次の親呼出しに跨るケースがある。テストでは**観測した4回の実 native yield**と、その間の各 native promotion/normal restore を完全に数える。4回が同じ native 呼出しに属することは要求も主張もしない。
+- 短い内側ループのため、4回目の native yield が次の親呼出しに跨るケースがある。テストでは**観測した4回の実 native yield**と、その間の各 native promotion/normal restore を完全に数える。4回が同じ native 呼出しに属することは要求も主張もしない。
 - 凍結された一貫ビルド `board/osr-bounded-inner-verified-v2-smoke`：バイナリ SHA256 `9030f30be14ff9b8830831f060477b5e6ac1ac729791e1ac8b8b0e86642c9889`、ソース digest `66dfc484f72448dd3716025cf85dc6c4c719313f854df7831af60fbdfb0a5f98`。最後の凍結ビルドは `ninja: no work to do` でテスト済み実行ファイルを複製した。
 - 本テストは SDL2 OFF のヘッドレス C++ 実行ファイルを使用。**この変更を含む GUI parity 2123件は未実施**。
 

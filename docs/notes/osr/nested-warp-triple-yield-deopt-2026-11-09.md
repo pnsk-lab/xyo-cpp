@@ -4,9 +4,9 @@
 
 ## 対象と非対象
 
-OSR-011 は `外側 repeat → 内側 repeat`、OSR-012 は可変 `TIMES` と小数丸めに対応した。OSR-013 は **`選択された外側 repeat → 中間 repeat → 最深部 repeat` の3階層**で、最深部の native LLVM Fiber が本物の scheduler yield を行った後に source edit を検出し、3つの実カウンターから Interpreter を復帰する。中間・最深部の `TIMES` は副作用なしの変数参照・加減算が可能。
+OSR-011 は `外側 repeat → 内側 repeat`、OSR-012 は可変 `TIMES` と小数丸めに対応した。OSR-013 は **`選択された外側 repeat → 中間 repeat → 最深部 repeat` の3階層**を対象とする。最深部の native LLVM Fiber が本物の scheduler yield を行った後に source edit を検出すると、3つの実カウンターから Interpreter へ復帰する。中間・最深部の `TIMES` は副作用なしの変数参照・加減算が可能。
 
-これは **各最深部ループ本体が完全に終わった後**の yield に限定される。任意の命令位置や部分計算済み SSA の復元、4階層以上、制御構造が変更された状態の継続を保証しない。
+これは **各最深部ループ本体が完全に終わった後**の yield に限定される。任意の命令位置や部分計算済み SSA からの復元、4階層以上、制御構造が変更された状態からの継続は保証しない。
 
 既定 OFF。OSR-011/012 の source proof と in-flight guard を含む設定に追加する。
 
@@ -31,7 +31,7 @@ export XYO_JIT_OSR_NESTED_TRIPLE_YIELD=1
 
 `TIMES` はOSR-012で許可した数値リテラル（1〜8192）または深さ4・最大12ノードの純粋な変数／加減算式だけ。深さ2の source body まで、直接の単純な数値変数増減・代入だけを認める。ネストした実行は常に正確な元の LLVM private loop counter に基づき、変数の値から現在回数を再計算しない。
 
-4番目の `repeat` を追加した実際の SB3 では native OSR を拒否し、Interpreter とすべての変数値・実行ブロック数を比較して一致した。
+4番目の `repeat` を追加した実際の SB3 では native OSR を拒否した。Interpreter とすべての変数値・実行ブロック数を比較したところ、一致した。
 
 ## 保存 ABI（試験的・既定 OFF）
 
@@ -76,7 +76,7 @@ root repeat(3)
 
 追加の小数テスト：中間 `times - 15.5`（1.5→2回）、最深部 `times + 0.5`（17.5→18回）。両カウンターが正規化されて復帰できることを計数ON/OFFで比較する。
 
-4階層目を追加した条件は、実際の Interpreter と同じ最終状態になる一方、LLVM OSR を**一度も起動しない**ことを確認する。
+4階層目を追加した条件では、実際の Interpreter と同じ最終状態になる一方、LLVM OSR を**一度も起動しない**ことを確認する。
 
 新規ヘッドレス CTest は以下の4件。
 

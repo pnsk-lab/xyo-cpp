@@ -109,7 +109,7 @@ Every fixed run confirmed the guard was exercised. Additional validation:
   daysSince2000, unit tests and par-for project fixture.
   Log: `build-hotfix/bug001-targeted-ctest.log`.
 - ScratchBench **official CLI**, using the same performance project source hash
-  `e8bd5be3e7345088`, custom binary pointing to the patched
+  `e8bd5be3e7345088` and a custom binary pointing to the patched
   `build-hotfix/xyo`. All four variants: **1/1 PASS each**.
 
   | Mode | Startup (ms) | Runtime (ms) | Peak RSS (MB) |
@@ -121,7 +121,8 @@ Every fixed run confirmed the guard was exercised. Additional validation:
 
   Log: `build-hotfix/bug001-scratchbench.log`, JSON:
   `build-hotfix/scratchbench-results/performance-xyo-cpp*.json`.
-  These are single-run figures, not reliable across-run performance changes.
+  These are single-run figures and do not show reliable across-run
+  performance changes.
   The memory readings from the user's earlier run differ **even in Interpreter**,
   so they cannot be attributed to this JIT fix.
 

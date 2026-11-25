@@ -4,7 +4,7 @@
 
 実LLVM23 ORC JITで2本のScratch Fiberを同時に停止し、GNU unwinderとlibunwindが参照しているJITのDWARF FDEを比較した。GNU `_Unwind_Find_FDE`は両方のJIT手続きに対して**本物のFDEと正しい所有関数**を返すが、既定の`libunwind`は1バイトの合成手続き範囲を返していた。libunwindの通常のキャッシュを消去しても変化しなかった。
 
-今回、GNU側から取得した**すでに再配置・登録済みの本物のFDE**を`_U_dyn_register`に一時登録する、実験専用のbridgeを接続・検証した。登録後に`unw_flush_cache`し、**保存済みFiberRegsから新しいunw_cursor_tを作成**すると、両方のFiberで本物のJIT FDEを取得できた。登録解除後はそのFDEがlibunwindから見えなくなることを確認し、**ネイティブFiberを再開して最終的なScratchの状態まで一致**させた。
+今回、GNU側から取得した**すでに再配置・登録済みの本物のFDE**を`_U_dyn_register`に一時登録する実験専用のbridgeを接続して検証した。登録後に`unw_flush_cache`し、**保存済みFiberRegsから新しいunw_cursor_tを作成**すると、両方のFiberで本物のJIT FDEを取得できた。登録解除後はそのFDEがlibunwindから見えなくなることを確認し、**ネイティブFiberを再開して最終的なScratchの状態まで一致**させた。
 
 GCは引き続き禁止：本実験はFDEの可視性を示すものであり、LLVM StackMap位置でFiberが停止したこと、boxed Valueやレジスタ中のGCオブジェクトが網羅されたことは証明しない。
 
@@ -21,7 +21,7 @@ GCは引き続き禁止：本実験はFDEの可視性を示すものであり、
   - `--bridge`で上記モードを独立したプロセスに設定。
   - 2本分のGNU FDE所有関数、登録前の未取得、登録後の直接取得、**freshカーソルでの実FDE確認**、登録解除後に消失、継続実行後の`y=48005`をすべて検査。
   - `llvm-objdump --reloc`から元の`xyo_yield`の戻り先1869と古いキャプチャ呼出しの戻り先1849を区別。`llvm-readobj --stackmap`で1861を別のPCと判定。
-  - `llvm-dwarfdump --eh-frame`で実ORC ELF FDEのサイズが正確に一致することを比較：2オブジェクトとも長さ3531バイト（FDE範囲[400,3931)、[368,3899)）。
+  - `llvm-dwarfdump --eh-frame`で実ORC ELF FDEのサイズを比較し、正確に一致することを確認した：2オブジェクトとも長さ3531バイト（FDE範囲[400,3931)、[368,3899)）。
   - すべてのログで`native_safepoint_verified=0`、`machine_roots_proven=0`、`gc_safe=0`を要求。
 - `tests/CMakeLists.txt`：
   - 従来の`xyo-rt001-native-fiber-cfi-unwind-smoke`に加えて、`xyo-rt001-native-fiber-cfi-dynamic-bridge-smoke`を追加。Linux x86-64、libunwindヘッダ／ライブラリ、LLVM readobj/objdump/dwarfdumpとPythonが存在する場合のみ登録。**本番のxyo実行ファイルにはlibunwindを追加リンクしない**。

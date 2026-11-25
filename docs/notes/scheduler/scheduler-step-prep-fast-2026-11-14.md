@@ -4,8 +4,8 @@
 
 ## 目的
 
-ScratchBenchの`sched_pingpong`・`sched_fanwait`では、イベントの
-`broadcast and wait`と受信Threadの新規生成・終了が頻発する。
+ScratchBenchの`sched_pingpong`・`sched_fanwait`では、
+`broadcast and wait`イベントと受信Threadの新規生成・終了が頻発する。
 Fiberの実行回数を減らすとScratchのイベント時刻・順序が変わるため、
 まず不変なScheduler準備処理の割当・ハッシュ操作だけを対象にした。
 
@@ -14,21 +14,21 @@ Fiberの実行回数を減らすとScratchのイベント時刻・順序が変�
 `src/engine/runtime.cpp::Runtime::step()` に独立した既定OFFの機能を2件追加。
 
 - `XYO_STEP_INPLACE_PRUNE=1`：
-  旧方式は毎step新しい`std::vector<Thread*>`を確保し、殺された
+  旧方式は毎step新しい`std::vector<Thread*>`を確保し、killされた
   Threadを除く全生存ポインタを移していた。
   新方式はstable-index書込みと`resize`だけで現在の`threads`配列を
   その場圧縮する。生存者の順序・`runtimeIndex`更新・旧Threadの
   `ownedThreads`保存とjoined Thread*の寿命は不変。
-  停止者0でも配列全体の再確保が発生しない。
+  killされたThreadが0本でも、配列全体の再確保は発生しない。
 - `XYO_STEP_STABLE_THREADMAP=1`：
-  旧方式は毎step`threadMap.clear()`して全キーを再挿入する。
+  旧方式は毎step`threadMap.clear()`を呼んで全キーを再挿入する。
   新方式はeligibleな各Threadの`getId()`が実際にマップから
   **同じThread*へ解決される**ことと、
   eligible数がmapのエントリ数と一致することを検証する。
-  完全一致なら再構築をスキップ。
+  完全一致なら再構築をスキップする。
   公開`threads`への外部書き込み・不一致・map破損・
   同じscript IDの複数Thread（重複キー）は従来の再構築に戻す。
-  旧来の「後方のThreadをマップへ登録する」規則を維持。
+  旧来の「後方のThreadをマップへ登録する」規則を維持する。
   変化したマップを削除したり、Thread*の寿命を延長する変更はない。
 
 いずれも`Runtime::updateThreadMap`の外部APIは変えず、
@@ -77,7 +77,7 @@ ON/OFFは`XYO_STEP_INPLACE_PRUNE`のみ。
 ## 撤回前に検証した正しさ
 
 `tests/unit/test_scheduler.cpp::testStepInplacePrune()`：
-- 中断中の3本（host reorderあり）からkilled1本を除去。
+- 中断中の3本（host reorderあり）からkillされた1本を除去。
 - 生存者の正確な順序・statusを保つ。
 - 全生存者のruntimeIndexと`containsThread`を照合。
 - `threadMap`の旧kill IDを除去し、生存者の新IDを保持。
@@ -92,7 +92,7 @@ Fiber/GC smoke、全体回帰は最終版で併せて検証する。
 
 ## 判断
 
-ファイバーのResume回数やbroadcastの配送順序は変えていない。
+FiberのResume回数やbroadcastの配送順序は変えていない。
 `sched_fanwait`では一部改善傾向があるが、他のworkloadは
 明確な改善に届かない。**両試験機能は既定OFFのまま**。
 実行コストの主因は単なる一時vector確保/マップ再構築ではなさそうで、
@@ -102,7 +102,7 @@ Schedulerそのものの状態遷移を統合する必要がある。
 
 ## 計測3：2フラグ同時切替（20組交互・最終採否判定）
 
-初回測定で良化したfanwaitが相乗して速くなるという仮説を、
+初回測定で改善したfanwaitが相乗して速くなるという仮説を、
 同一バイナリ・同一ScratchBench SB3・CPU16固定・Eager・30fpsで
 **OFF（両フラグ0）とON（両フラグ1）をまとめて**交互測定して検証した。
 
@@ -117,9 +117,9 @@ Schedulerそのものの状態遷移を統合する必要がある。
 記録：
 `build-scheduler-rewrite-20261111/step-prep-combined-20261114/bench-paired-20/results.json`
 
-**総合して再現性ある改善は確認できない**。特にfanwaitの初回の
+**総合して、再現性のある改善は確認できない**。特にfanwaitの初回の
 +1.57%と、同じprep条件でのmap再構築省略+1.24%を合成するのは
-誤りで、最終の直接比較ではむしろ0.3%程度低下した。
+誤りで、最終的な直接比較ではむしろ0.3%程度低下した。
 
 以上から2つのopt-in環境フラグ、`Runtime::step()`の試験経路、
 専用ユニットテストは**コードから撤回済み**。

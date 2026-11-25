@@ -43,7 +43,7 @@ broadcast and wait の受信Threadも原則1本。
   - sender status、Thread-owned joinRefs、GC/retirement、source revision、
     callbackによるstop/restartへのガードは維持。
 
-旗を設定しないと既存の挙動に変更なし。
+フラグを設定しないと既存の挙動に変更なし。
 
 ## 実装箇所
 

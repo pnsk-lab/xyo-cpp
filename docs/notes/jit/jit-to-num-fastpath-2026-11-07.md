@@ -49,7 +49,7 @@ cmp build/to_num_ref.bin build/to_num_new.bin
 
 ## `xyo_to_num`本体のランタイムマイクロベンチマーク
 
-`tests/bench/to_num_runtime_micro.cpp`を`xyo-to-num-runtime-micro`（通常ビルド対象外）として登録。同一ビルド内の`cast::toNumber`経路と、JIT専用`xyo_to_num`エントリのコストを比較する。3回測定した中央値（ns/回）は次のとおり。
+`tests/bench/to_num_runtime_micro.cpp`を`xyo-to-num-runtime-micro`（通常ビルド対象外）として登録した。同一ビルド内の`cast::toNumber`経路と、JIT専用`xyo_to_num`エントリのコストを比較する。3回測定した中央値（ns/回）は次のとおり。
 
 | Value種別 | cast::toNumber（旧ヘルパ相当） | 新xyo_to_num | 高速化 |
 |---|---:|---:|---:|
@@ -75,8 +75,8 @@ Commit・Pushは行っていない。ほかの作業由来の未コミット変�
 - CMake再構成後、xyo-tests、xyo-cli、xyo-to-num-runtime-micro のビルドが成功。
 - 新規Scratch差分テスト（毎回新たに生成する数値文字列）：warp／非warp × Eager／HotSpotの4構成で結果一致。
 - xyo-tests冒頭のcast数値・文字列テスト：784チェック、0失敗。
-- 全CTestは50件中49件成功。残るxyo-testsは、既存E2EのJITコンパイル判定が4件失敗したほか、GC関連の単体テストでSegmentation faultが発生した。
-- Segfaultの回収したスタックは Gc::drainPending() → SList::get0()、tests/unit/test_gc_pool.cpp の手動リスト初期化に由来する。別の作業で追加されたSListのextraフィールドが手動初期化されていない可能性があり、数値変換処理の内部ではない。関連する別作業のコードは今回変更していない。
+- 全CTestは50件中49件成功。残るxyo-testsでは、既存E2EのJITコンパイル判定が4件失敗したほか、GC関連の単体テストでSegmentation faultが発生した。
+- Segfault時に回収したスタックは Gc::drainPending() → SList::get0()、tests/unit/test_gc_pool.cpp の手動リスト初期化に由来する。別の作業で追加されたSListのextraフィールドが手動初期化されていない可能性があり、数値変換処理の内部ではない。関連する別作業のコードは今回変更していない。
 - 他の既存JIT差分テスト、Binaryen、OSR、文字列比較テストは通過。
 - CTestの実行先だけを一時的に固定バイナリに向け、終了後に生成済み設定を復元した。
 

@@ -5,8 +5,8 @@
 ## 背景と新設フラグ
 
 単独Threadの `XYO_JIT_MEGA_REPEAT_BURST=1` は約300,000回の
-LLVM呼び出しを約1,175回へ減らす実験機能。ただし全Threadが
-2本以上稼働し続ける状況では毎パスごとにC++へ戻っていた。
+LLVM呼び出しを約1,175回へ減らす実験機能。ただし2本以上のThreadが
+稼働し続ける状況では毎パスごとにC++へ戻っていた。
 
 新設：`XYO_JIT_MEGA_MULTI_REPEAT_BURST=1`。前提として既存の
 単独Thread特化・コンパイル時source分類・Repeat Burstが有効なこと。
@@ -21,7 +21,7 @@ LLVM呼び出しを約1,175回へ減らす実験機能。ただし全Threadが
   `*_multi_pc_batch(items,count)` を1回呼び、各Threadを必ず
   スケジューラと同じ配列順に1回ずつ実行してから次パスへ移る。
   O1 LLVMパイプラインにより最終オブジェクトではbatchがインライン化される。
-  共有Variable*同士のFAddをスレッドごとに再順序化しない。
+  共有Variable*同士のFAddをスレッドごとに並べ替えない。
   各パス終了時にすべての入力変数のIEEE754指数部を調べ、
   Inf/NaNを検出すると**そのパスを完了してから**停止する。
 - `src/engine/sequencer.cpp`: `tryMegaMultiRepeatBurst()`。
@@ -43,12 +43,12 @@ LLVM native eligible、JitCtx/Fiber/OSR/Join/Waitがなく、
 `megaPc`が奇数のrepeat再開PC、2以上の残反復数があり、
 その残反復数がコンパイル時source上限内。
 
-`singleFastSourceKinds[slot]==2` で単一変数・純粋repeatを確認。
+`singleFastSourceKinds[slot]==2` により単一変数・純粋repeatであることを確認。
 renderer、blockCount、waitRegistry、indexedReady、profiler、
 pending wait queue、parallel queue等では拒否。
 
-保存済み`Variable*`は`variableBindingStamp()`の所有Target、
-StageのID、Stage/localの構造世代が一致して初めて検査する。
+保存済みの`Variable*`は、`variableBindingStamp()`の所有Target、
+StageのID、Stage/localの構造世代が一致した場合に限り検査する。
 値がscalar有限数値であることも確認。スクリプトの変数ポインタの
 別名(alias)は許容し、**実行順序を完全保持**する。
 
@@ -114,7 +114,7 @@ XYO_JIT_MEGA_MULTI_REPEAT_BURST=1 \
 - 残反復数が異なる1000回と3回：
   融合先の短いThreadをretireした後に既存単独Burstへ移行。
 - 共有変数を実行中に削除・再作成：
-  世代キャッシュ無効化を検知した通常経路で安全に再束縛、
+  世代キャッシュ無効化を検知した通常経路で安全に再束縛し、
   次パス以降で複数Thread融合を再開。
 - 値が文字列に変わるケース：Scratch型変換にフォールバック。
 - 2Thread間の1番目の加算でInfinityへ到達：

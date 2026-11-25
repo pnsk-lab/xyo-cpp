@@ -14,7 +14,7 @@ The pre-existing experimental environment setting `XYO_JIT_REPLACE_NO_NULL=1` en
 
 **Now default-enabled, guarded by a compile-time proof**: the source `Target` must have a known `Variable::kListType` with an existing `SList*` for that ID. This guard matters because a malformed Scratch file may reuse a **scalar variable ID** in a list field; then `Target::lookupOrCreateList` returns the scalar variable and the `xyo_list_replace` helper must lazily allocate an SList. Skipping this helper could silently drop the allocation. If the proof fails, the original checked branch is retained. An explicit `XYO_JIT_REPLACE_NO_NULL=0` restores the historical null check for every ordinary list replacement. Adaptive mode 7 keeps its existing separate policy.
 
-This optimization applies generically to eligible Scratch list writes, not the benchmark name, list dimensions or cellular automaton rules. Mathematical, scheduler, native continuation and IR code owned by other agents were not changed.
+This optimization applies generically to eligible Scratch list writes, not to the benchmark name, list dimensions or cellular automaton rules. Mathematical, scheduler, native continuation and IR code owned by other agents were not changed.
 
 **New correctness regression** in `tests/unit/test_list_codegen_bounds.cpp` constructs a malformed Scratch project with one scalar ID also referenced as a list in a three-iteration warp loop and asserts: both interpreter and native JIT lazily create the missing SList, the out-of-range replace remains a no-op, the scalar value is unchanged, and the script terminates. This augments the existing comprehensive list index tests (NaN/infinity/negative/fractional/numeric strings/last/random/name aliasing).
 
@@ -32,7 +32,7 @@ Raw isolated tuning: `build/perf-life-flags.{json,log}`; 11 flag/storage options
 
 Full-suite output: `scratch-bench/results/perf-life-null-{on,off}-20261108/performance-xyo-cpp.json`. Overall score ON **99,886**, OFF **99,372**; this +0.5% change is within normal run-to-run variability. The one-run per-case results include unrelated scheduler noise; do not ascribe such differences to this list-only patch.
 
-Saved five-rival comparison of the ON run: `scratch-bench/results/perf-life-null-rivals-20261108.{md,json}`: **29/47 wins**, **18/47 losses**; `app_life` **0.621×** saved MistWarp **23,477.49 ops/ms**. Final **default-enabled, statically guarded binary** run:
+Saved five-rival comparison of the ON run: `scratch-bench/results/perf-life-null-rivals-20261108.{md,json}`: **29/47 wins**, **18/47 losses**; `app_life` **0.621×** the saved MistWarp **23,477.49 ops/ms**. Final **default-enabled, statically guarded binary** run:
 `scratch-bench/results/perf-life-default-final-20261108/performance-xyo-cpp.json`, `app_life` **14,873.01 ops/ms**, overall **100,484**. Five-rival comparison in `scratch-bench/results/perf-life-default-rivals-20261108.{md,json}`: **29/47 wins, 18 losses**, `app_life` **0.634×** MistWarp's earlier **23,477.49 ops/ms**. This is a separate one-run measurement; run-to-run CPU load and order can cause fluctuations. Competitors were measured on earlier dates, so wins are provisional rather than simultaneous head-to-head runs.
 
 ## Correctness and validation

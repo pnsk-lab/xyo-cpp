@@ -3,10 +3,11 @@
 ## Motivation
 
 `xyo_eq`, `xyo_lt` and `xyo_gt` are native C++ helpers, **not GPU-to-CPU
-transfers**. However, calls from compiled LLVM JIT code to the general
-Scratch runtime limit inlining/loop optimization and may incur repeated
-dynamic string coercion. Move comparisons with locally provable semantics into
-LLVM IR while retaining the original helper for every ambiguous case.
+transfers**. However, calls from compiled LLVM JIT code into the general
+Scratch runtime limit inlining and loop optimization, and they may incur
+repeated dynamic string coercion. Move comparisons with locally provable
+semantics into LLVM IR while retaining the original helper for every
+ambiguous case.
 
 ## Implementation (`src/jit/codegen.cpp`)
 
@@ -77,8 +78,9 @@ safe remain on the helper, including cold parse caches and Unicode text.
 A 16-character ASCII extension reduced helper calls further but slowed
 `math_strcompare` to ~0.85×; a four-character version restored a speedup.
 Generating this path even when either operand was statically numeric caused
-~0.95× `algo_sort`; pruning those statically impossible cases restored parity.
-We rejected those broader specializations rather than benchmark-maximizing.
+`algo_sort` to fall to ~0.95×; pruning those statically impossible cases
+restored parity. We rejected those broader specializations rather than
+maximizing the benchmark numbers.
 
 ## Correctness
 

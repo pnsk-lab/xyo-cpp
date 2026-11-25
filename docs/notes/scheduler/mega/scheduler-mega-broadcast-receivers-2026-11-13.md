@@ -7,7 +7,7 @@
 
 `XYO_JIT_MEGA_BATCH_YIELD=1` と `XYO_JIT_MEGA_BCAST_RECEIVERS=1` を
 両方指定した場合だけ、`Runtime::startBroadcastAndWait()` が返した
-実際の受信Thread集合から、同一Targetの複数の適格な受信ハットを
+実際の受信Thread集合のうち、同一Targetの複数の適格な受信ハットを
 共有LLVM関数へ組み込む。
 
 - `src/jit/mega_yield_source.hpp`: `event_whenbroadcastreceived`も
@@ -21,9 +21,9 @@
   repeat残数、戻り先スタック、broadcast joinをそのまま再利用
 
 この経路は**送信者と受信者を1つのLLVM関数に統合しない**。
-送信者が待機する正確なThread identityは従来どおりRuntimeが取得・保持する。
+送信者がどのThreadを待機するかの正確なidentityは、従来どおりRuntimeが取得・保持する。
 受信Threadの選択と継続実行もC++ Sequencerが担当する。
-受信側だけが同じLLVM関数を共有し、C++スタック/Fiberが継続を保持しない。
+受信側だけが同じLLVM関数を共有し、C++スタック/Fiberは継続を保持しない。
 
 ### 安全性
 

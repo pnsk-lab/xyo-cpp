@@ -4,9 +4,9 @@
 
 ## Implementation
 
-Added support for exactly two ordered measurement setters after a completed
-dynamic `repeat until` and before its certified numeric suffix, inside the
-previously implemented bounded outer `repeat` continuation.
+Added support for exactly two ordered measurement setters that run after a
+completed dynamic `repeat until` and before its certified numeric suffix,
+inside the previously implemented bounded outer `repeat` continuation.
 
 ```text
 repeat 3
@@ -38,7 +38,7 @@ It is not correct to skip or substitute `bench_round`.
   (0..64), elapsed-ms condition and fixed joined broadcast rules remain.
   The new proof is separately gated by `XYO_JIT_MEGA_UNTIL_POST_SET=1`.
   An unexpected extra instruction or procedure call after the two
-  measurements fails source proof; existing scalar repeat paths unchanged.
+  measurements fails source proof; existing scalar repeat paths are unchanged.
 - `src/jit/jit.cpp` and `src/jit/backend_llvm.cpp`:
   Validate both destination variables and any source variable IDs before
   specialization. The new setters are emitted into the existing inner
@@ -51,14 +51,15 @@ It is not correct to skip or substitute `bench_round`.
   revision, target binding-generation, receiver identity and GC-root
   protections remain unchanged.
 - `tests/unit/test_scheduler.cpp`:
-  A real joined receiver updates `hits` and `total`. Assert timestamps
-  and hit snapshots untouched during the wait; after each completed
-  dynamic inner until they are updated before the suffix. Run again with
-  an expired clock budget to exercise zero-broadcast inner iterations,
-  which must still produce the measurement snapshots. A negative-control
-  `bench_round` non-warp procedure following the two setters is rejected
-  by Mega and executes through the original Fiber route exactly three
-  times; no side effects are discarded.
+  A real joined receiver updates `hits` and `total`. Assert that
+  timestamps and hit snapshots are untouched during the wait; after
+  each completed dynamic inner until, they are updated before the
+  suffix. Run again with an expired clock budget to exercise
+  zero-broadcast inner iterations, which must still produce the
+  measurement snapshots. A negative-control `bench_round` non-warp
+  procedure following the two setters is rejected by Mega and executes
+  through the original Fiber route exactly three times; no side effects
+  are discarded.
 - `tests/bench/algos/bench_mega_outer_until.py`:
   `--post-measure` option creates a fixed shared .sb3 fixture and checks
   the resulting `b_n == hits` and `b_t1 >= b_t0` as well as the exact

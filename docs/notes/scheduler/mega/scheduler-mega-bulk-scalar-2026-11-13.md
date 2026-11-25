@@ -10,8 +10,8 @@ LLVM直接storeに移したものの、まだC++ Sequencerの
 `runSchedulerPass → dispatchReadyThread → stepThread → jitStepThread`
 を1スレッドずつ通過していた。
 
-今回の実装は、安全性を静的・動的に限定できる受信Threadを、
-最大8本ずつ**1回のLLVM関数呼び出し**にまとめる。
+今回の実装は、安全性を静的・動的に限定できる受信Threadを最大8本ずつまとめ、
+**1回のLLVM関数呼び出し**で処理する。
 Threadそのものや`broadcast and wait`のjoin identityは統合しない。
 
 ## 有効化
@@ -25,32 +25,32 @@ XYO_JIT_MEGA_SCALAR_BATCH=1 \
 ./build-scheduler-rewrite-20261111/xyo run project.sb3 --fps 30
 ```
 
-任意の終了時集計は`XYO_JIT_MEGA_BULK_STATS=1`。
-実行したRuntimeのみ`[mega-bulk] calls=N threads=M`をstderrに出力。
+終了時の集計は任意で、`XYO_JIT_MEGA_BULK_STATS=1`で有効になる。
+実行したRuntimeだけが`[mega-bulk] calls=N threads=M`をstderrに出力する。
 
 ## 変更の概要
 
 - `src/jit/backend_llvm.cpp`:
-  バッチフラグONのときだけ、同じ定数`delta`を書き込む、手続き戻りsuffixを持たない
+  バッチフラグがONのときだけ、手続き戻りsuffixを持たず、同じ定数`delta`を書き込む
   `Source::Kind::Scalar`だけで構成されたバッチについて、
-  メイン`switch(pc)`とは別の`symbol_scalar_batch` LLVM関数を作成。
+  メイン`switch(pc)`とは別に`symbol_scalar_batch` LLVM関数を作成する。
   `Variable**`と要素数を受け取り、各要素の`Variable::value`を
   読み込み、浮動小数点加算を1回行い、順に書き戻す。
   LLVMの既存O1最適化を適用し、Scratch側への呼出しはしない。
 - `src/jit/jit.hpp`:
-  `MegaDispatchCode::scalarBatchEntry`を追加。利用できないバッチではnull。
+  `MegaDispatchCode::scalarBatchEntry`を追加する。利用できないバッチではnullになる。
 - `src/engine/sequencer.hpp/.cpp`:
   連続する同じORCコード所有者の受信Threadを最大8本まで検査し、
   条件が成立する2本以上の連続区間をまとめて実行する。
-  通常なら呼び出される`dispatchReadyThread`等を省略。
+  通常なら呼び出される`dispatchReadyThread`等を省略する。
   LLVM終了後に各元Threadを個別に`retireThread`し、
-  終了コンパクション・実際のThread順序を変更しない。
-  呼出回数と処理Thread数を集計可能。
+  終了時のコンパクションや実際のThread順序は変更しない。
+  呼出回数と処理Thread数を集計できる。
 - `tests/unit/test_scheduler.cpp`:
   4クローンの1回目と2回目がそれぞれLLVM一括処理になること、
   文字列/真偽値への変更時は通常経路へ戻ること、
   数値に戻れば再び一括化されること、
-  途中で変数マップのNodeを削除・再作成しても値とTarget間分離を保つことを検査。
+  途中で変数マップのNodeを削除・再作成しても値とTarget間の分離を保つことを検査する。
 
 ## 一括実行の保守的な条件
 
@@ -77,7 +77,7 @@ Fiberの汎用置換、複数のScratch処理を同じPCで実行する方式、
 
 ## 検証
 
-- `XYO_JIT_MEGA_SCALAR_BATCH=1`有効でxyo-tests
+- `XYO_JIT_MEGA_SCALAR_BATCH=1`を有効にすると、xyo-testsは
   `scheduler 514/514` PASS、全テストスイートPASS
 - 1つのRuntimeで、4クローン×4回=16 Threadを4回のLLVM呼出しで処理
 - ローカル変数の型変化、数値復帰、削除と同じIDでの再作成もPASS
@@ -97,12 +97,12 @@ Fiberの汎用置換、複数のScratch処理を同じPCで実行する方式、
 
 2行目は`sched_pingpong`も同じプロジェクトで実行したペア。
 `sched_pingpong`はON/OFF=**1.0009x**、ほぼ不変（8組中4組勝利）。
-2つの測定ケースの生スループットを無条件に混ぜず、
+2つの測定条件の生スループットをそのまま混ぜず、
 必ず同じrunの交互測定で比較する。
 
 一括ONの測定ログでは、約5.2万〜5.8万回のbulk呼出しで
 約40万〜45万Threadを処理したことを確認した。
-これは全受信Threadが最適化対象という意味ではなく、非適格分は通常経路に残る。
+これは全受信Threadが最適化対象という意味ではなく、非適格なThreadは通常経路に残る。
 
 測定元データ:
 - `build-scheduler-rewrite-20261111/mega-bulk/sched-fanwait-bulk-ab/results.json`
@@ -111,7 +111,7 @@ Fiberの汎用置換、複数のScratch処理を同じPCで実行する方式、
 
 ## 未解決
 
-ほかの`sched_*`ベンチ・複雑な実プロジェクト・GUIでの一般改善は未確認。
+ほかの`sched_*`ベンチや複雑な実プロジェクト、GUIでの一般的な改善は未確認。
 待機通知を維持した状態での一括化や、文字列を含む汎用スクリプトの
 バッチ実行は未実装。途中のイベント・時計読み・GC・外部コールバックを
 含む実行は従来JIT経路へ戻す。

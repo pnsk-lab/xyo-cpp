@@ -8,7 +8,7 @@
 
 ### 1. Math.round: hardware round-to-even + half-tie correction
 
-元の `operator_round` は毎回 `xyo_round` ヘルパを呼んだ。単純な `floor(x + 0.5)` は負のゼロや境界値で互換性が破れる。LLVMでそのままjsRoundを分岐つきで展開した試作は `math_round` が約2.6%遅くなったので撤回した。
+元の `operator_round` は毎回 `xyo_round` ヘルパを呼んだ。単純な `floor(x + 0.5)` は負のゼロや境界値で互換性が破れる。LLVMでそのままjsRoundを分岐つきで展開する試作では `math_round` が約2.6%遅くなったので、撤回した。
 
 採用した方法:
 
@@ -16,7 +16,7 @@
 2. `x - even == 0.5` に該当する「四捨五入すると大きい側へ丸めるべき、しかし偶数丸めでは小さい側へ落ちた」入力でだけ `even + 1.0` を採用。
 3. その他は `even` のまま。負のゼロ、±Infinity、巨大な整数は保持。LLVMの通常FP演算であり、fast-mathは設定しない。
 
-`emitToNumF64()` はNaNをScratchの規則に合わせて0へ直している。通常の `operator_round` は非NaN入力のみ。単純な符号・比較よりも、端数ちょうど0.5を検出することが重要。
+`emitToNumF64()` はNaNをScratchの規則に合わせて0へ直している。通常の `operator_round` は非NaN入力のみ。単純な符号や比較よりも、端数がちょうど0.5であることを検出する方が重要。
 
 - 既定 **ON**、`XYO_JIT_ROUND_INLINE=0` で旧ヘルパ呼出しに戻す。
 - 同一Releaseバイナリ、CPU 12、8ペアの `math_round` 速度比 **1.3646倍**（ペア比分布 1.488, 1.364, 1.365, 1.361, 1.341, 1.372, 1.364, 1.366）。生ログ: `build/v1-jit-roundeven-paired.log`。
@@ -24,21 +24,21 @@
 
 ### 2. 有限なら整数というSSA性質の伝播
 
-`integralWhenFinite` は各LLVMの **f64 SSA値**の集合。意味は「結果が有限ならIEEE doubleで正確な整数」。正か負か、値の大きさ、あるいは可変Scratch変数の型を勝手に仮定しない。
+`integralWhenFinite` はLLVMの各 **f64 SSA値**の集合。意味は「結果が有限ならIEEE doubleで正確な整数」。正か負か、値の大きさ、あるいは可変Scratch変数の型を勝手に仮定しない。
 
 **証明元:**
 
-- `operator_round`, `floor`, `ceiling`: 有限な結果は常に整数。これらのNaN正準化に付随する `select(isnan,0,...) `も整数性を保つ。
+- `operator_round`, `floor`, `ceiling`: 有限な結果は常に整数。これらのNaN正準化に付随する `select(isnan,0,...)`も整数性を保つ。
 - 有限で整数のLLVM定数。
 - 両オペランドが整数の加算・減算・乗算・剰余（NaNをScratch式の正準化で0へ戻したときも整数）。
 - 整数を±1で除算。
 - 別スクリプトのメモリに保持する変数や、インタプリタからの読み出し・型プロファイリングの値には伝播しない。
 
-**使い方:** `operator_mod` の既存のガード（正の32bit範囲、浮動小数点負のゼロ、符号やNaNなど）を残し、そのガードの後で `fptoui/fptosi -> uitofp/sitofp -> fcmp oeq` と戻していた整数性の再確認だけを、SSAの整数証明がある場合に省く。入力範囲外では従来の64bit/浮動小数点フォールバックが必ず残る。
+**使い方:** `operator_mod` の既存のガード（正の32bit範囲、浮動小数点負のゼロ、符号やNaNなど）を残し、そのガードの後で `fptoui/fptosi -> uitofp/sitofp -> fcmp oeq` と往復して行っていた整数性の再確認だけを、SSAの整数証明がある場合に省く。入力範囲外では従来の64bit/浮動小数点フォールバックが必ず残る。
 
 - 既定 **ON**、`XYO_JIT_INTEGRAL_FACTS=0` で以前の経路へ戻せる。
 - `round(x) % 7` の生成IR: `fcmp oeq` 3→1、`uitofp` 2→1（JIT実オブジェクト保存済み）。
-- オリジナルScratch演算だけで作った4つの診断プロジェクト。6ブロック、各ブロック3回のプロジェクト内計測の中央値:
+- オリジナルScratch演算だけで作った4つの診断プロジェクト。6ブロックについて、各ブロック3回のプロジェクト内計測の中央値:
 
 | 組合せ | 旧実装（両OFF） | 丸めのみ最適化 | 丸め＋整数性伝播 |
 |---|---:|---:|---:|
@@ -59,7 +59,7 @@
 
 同一Releaseバイナリ、8組の交互測定（丸め・整数SSAは両側ONに固定）で `math_round` **1.2137倍**、`math_expsqrt` **1.0447倍**、`app_raycast` **1.0596倍**。残りの複数ケースではほぼ差がない。生ログ: `build/v1-jit-mathfacts-paired.log`。
 
-この約21%は「丸めをハードウェア命令にすること」の速度比とは独立して測定したもので、測定対象やノイズが異なるため厳密に単純な掛け算で総合速度比を出すことはできない。
+この約21%は「丸めをハードウェア命令にすること」の速度比とは独立して測定したもので、測定対象やノイズが異なるため、単純な掛け算で総合速度比を厳密に出すことはできない。
 
 ## 回帰とパリティ検査
 
@@ -67,7 +67,7 @@
 - 負のゼロ、±Infinity、NaN、ボックス化文字列、次の表現可能値 `nextafter(0.5, 0)` と `nextafter(-0.5,-1)`、2^52近傍、32bit境界、非正規化最小値を含む。
 - 最適化ONのCTestは **8/8成功**（`build/v1-jit-final-ctest.log`）。
 - ScratchBenchパリティは Interpreter / JIT HotSpot / JIT Eager / AOT が各 **2123/2123成功**（`build/v1-jit-mathfacts-parity.log`）。
-- 元のScratchBench Performance（47項目）は、3つのスイッチをON/OFF両方に固定した2構成で **47項目すべて完走**、非スケジューラ39項目のchecksumが **39/39一致**。
+- 元のScratchBench Performance（47項目）は、3つのスイッチをON/OFF両方に固定した2構成で **47項目すべてを完走**し、非スケジューラ39項目のchecksumが **39/39一致**した。
 - AOT `--obj` で生成したオブジェクトを検査し、`vroundsd` を確認。現ホストで未解決 `roundeven` libcallはなし。`build/v1-jit-round-aot.o`。AOTの生成先CPUへの移植性は別途ターゲット選択の検証を要する。
 
 ## 既定ONでの最終総合A/B（同一Releaseバイナリ）

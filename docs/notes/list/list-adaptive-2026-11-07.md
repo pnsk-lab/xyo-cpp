@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Retain flat list's LLVM-JIT fast path until substantial in-place list editing
+Retain the flat list's LLVM-JIT fast path until substantial in-place list editing
 warrants a non-contiguous representation. The policy is generic and based on
 per-list access patterns, not on names of benchmarks or programs.
 
@@ -12,7 +12,7 @@ Set `XYO_LIST_STORAGE=adaptive`. Default `flat` is unchanged.
 
 - New list: contiguous `Value*`, JIT loads and stores inlined.
 - The list receives a non-edge insertion/deletion when `len >= 256`,
-  `index >= 32`, and at least 32 elements are at the right.
+  `index >= 32`, and at least 32 elements lie to the right.
 - Observe 24 eligible edits. If >=16 of the edits were within 32 indices of
   the preceding eligible edit, migrate to Gap Buffer; otherwise migrate to
   128-item rank-indexed chunks.
@@ -111,7 +111,7 @@ Gap Buffer. Native fast paths remain enabled in the flat state, and the data
 structure can revert after reading.
 
 Append has a surprisingly large measured gain despite an additional guard.
-Its mechanism has **not** been isolated and may depend on resulting LLVM IR,
+Its mechanism has **not** been isolated and may depend on the resulting LLVM IR,
 optimization or JIT effects; do not attribute it to the storage algorithm.
 A larger replicated study and IR comparison are recommended.
 

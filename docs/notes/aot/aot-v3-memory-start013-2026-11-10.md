@@ -10,14 +10,14 @@ For subsequent measurements, the binary, parity.sb3, and both freshly generated 
 
 ## Implementation
 
-- src/jit/jit.cpp: under opt-in XYO_AOT_WORKER_DIAG=1, count prewarm invocations, referenced descriptor visits, first resolutions, recursively generated BlockCached entries, failures, and elapsed time. At engine destruction, count all resolved lazy AOT descriptors.
+- src/jit/jit.cpp: under the opt-in XYO_AOT_WORKER_DIAG=1, count prewarm invocations, referenced descriptor visits, first resolutions, recursively generated BlockCached entries, failures, and elapsed time. At engine destruction, count all resolved lazy AOT descriptors.
 - src/engine/runtime.cpp: under the same opt-in, count current and retired BlockCached entries before the Targets are destroyed.
 - src/engine/sequencer.cpp: skip the prewarm function entirely when a parallel-eligible script has zero lazy AOT descriptors. This removes redundant empty calls, without weakening the safety check for scripts that have descriptors.
 - src/core/aot_malloc_diag.hpp: when diagnostics are enabled, inspect glibc mallinfo2(), /proc/self/status and /proc/self/smaps at AOT-load completion and Runtime shutdown. These provide arena accounting, peak/current RSS and VMA categories, not a callsite-level heap trace.
 - src/jit/nojit_stub.cpp: provide a no-JIT implementation of prepareAotWorker that conservatively returns false.
 - src/engine/sequencer.cpp: stop including the compiler-only LLVM source reporter bridge in no-JIT builds; the previous unconditional inclusion produced an undefined LLVM ABI-breaking-check reference at link time.
 - src/jit/jit.cpp: strictly opt-in, glibc-only XYO_AOT_LAZY_MALLOC_TRIM=1 executes malloc_trim(0) after v3 AOT load. It never affects the default v2 path.
-- tests/CMakeLists.txt: add trim-enabled native v3 worker/parity smoke test.
+- tests/CMakeLists.txt: add a trim-enabled native v3 worker/parity smoke test.
 - tools/bench_start013_trim_ab.py: alternating A/B measurements on the exact same AOT v3 object, varying only the trim option.
 
 All implementation changes remain uncommitted in the shared worktree.

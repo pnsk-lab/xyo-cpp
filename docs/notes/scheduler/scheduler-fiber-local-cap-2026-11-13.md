@@ -4,15 +4,15 @@
 
 ## 概要
 
-JIT Fiberの切替経路を調査。既存の `XYO_FIBER_LOCAL_POOL=1` は、FiberPool::acquire/releaseのMutexをスレッドローカルキャッシュが満たせる場合に回避する。
+JIT Fiberの切替経路を調査。既存の `XYO_FIBER_LOCAL_POOL=1` は、スレッドローカルキャッシュで賄える場合にFiberPool::acquire/releaseのMutexを回避する。
 以前の実装ではOSスレッドごとに最大16本のアイドルFiberを保持した（通常1MiBスタック予約/本）。
-新しい `XYO_FIBER_LOCAL_POOL_CAP=1..16` はローカルプールの上限を実行時指定する。今回の測定を受け、既定をローカルプールON・ローカル上限1本に切り替えた。`XYO_FIBER_LOCAL_POOL=0` で共有プールのみへ切り戻せる。
+新しい `XYO_FIBER_LOCAL_POOL_CAP=1..16` でローカルプールの上限を実行時に指定する。今回の測定を受け、既定をローカルプールON・ローカル上限1本に切り替えた。`XYO_FIBER_LOCAL_POOL=0` で共有プールのみへ切り戻せる。
 1本でも溢れたFiberは従来の共有プールへ返す。共有プールの最大64本の予約やFiberの所有、GC unsafeCount、FiberRegsを変更しない。
-0・不正な上限・未指定値は1に戻す。明示的な`XYO_FIBER_LOCAL_POOL_CAP=16`で旧ローカル容量を選択できる。プロファイル計測は `XYO_FIBER_POOL_STATS=1` で有効（`XYO_DISABLE_RT_PROF=OFF`のビルド限定）。通常のReleaseで計測処理はコンパイル除去。
+0・不正な上限・未指定値は1に戻す。明示的な`XYO_FIBER_LOCAL_POOL_CAP=16`で旧ローカル容量を選択できる。プロファイル計測は `XYO_FIBER_POOL_STATS=1` で有効（`XYO_DISABLE_RT_PROF=OFF`のビルド限定）。通常のReleaseでは計測処理はコンパイル時に除去される。
 
 ## Microbench
 
-独立したFiberPool + x86-64 SysVアセンブリを-O3でビルド。CPU16固定、14組の交互ON/OFF、同じベンチ実行ファイル。
+独立したFiberPoolとx86-64 SysVアセンブリを-O3でビルドした。CPU16固定、14組の交互ON/OFF、同じベンチ実行ファイル。
 
 | ケース | 共有プールOFF中央値 | TLSプールON中央値 | ペア速度比 | ON勝利 |
 |---|---:|---:|---:|---:|
@@ -22,13 +22,13 @@ JIT Fiberの切替経路を調査。既存の `XYO_FIBER_LOCAL_POOL=1` は、Fib
 
 独立ベンチ: `build-scheduler-rewrite-20261111/fiber-20261113/bench-fiber-pool.cc`。
 データ: `build-scheduler-rewrite-20261111/fiber-20261113/microbench-pairs.json`。
-Yieldを繰り返すコストは取得返却より大きく、TLSプールによる切替の直接高速化は確認できない。
+Yieldを繰り返すコストは取得・返却のコストより大きく、TLSプールによる切替の直接高速化は確認できない。
 
 ## ScratchBench: ローカル容量1 vs 共有のみ
 
 同一Releaseバイナリ、CPU16固定、Eager JIT、12組の交互測定。
-変数 `XYO_FIBER_LOCAL_POOL`のみON/OFF、 `XYO_FIBER_LOCAL_POOL_CAP=1` は共通。
-スコアは大きいほどよい。ベンチ対象Scratchの最終結果は各ペアで検証。
+環境変数 `XYO_FIBER_LOCAL_POOL` のみON/OFF、 `XYO_FIBER_LOCAL_POOL_CAP=1` は共通。
+スコアは大きいほどよい。各ペアでベンチ対象Scratchの最終結果を検証した。
 
 | カーネル | OFF中央値 | ON中央値 | ペアON/OFF速度比 | ON勝利 |
 |---|---:|---:|---:|---:|
@@ -41,7 +41,7 @@ Yieldを繰り返すコストは取得返却より大きく、TLSプールによ
 ## ScratchBench: 容量1 vs 容量16（TLS有効）
 
 同一Releaseバイナリ、CPU16固定、Eager JIT、12組の交互測定。
-ローカルプールを両方ON。**この計測時点のソースでは** `XYO_FIBER_LOCAL_POOL_CAP=0`は当時の既定16にフォールバック、`=1`が上限1だった。最終ソースは既定1なので再測定時は`=16`と`=1`を指定する。速度比1/16。
+ローカルプールを両方ON。**この計測時点のソースでは** `XYO_FIBER_LOCAL_POOL_CAP=0`は当時の既定16にフォールバック、`=1`が上限1だった。最終ソースは既定1なので再測定時は`=16`と`=1`を指定する。速度比は1/16。
 
 | カーネル | 容量16中央値 | 容量1中央値 | ペア1/16速度比 | 1勝利 |
 |---|---:|---:|---:|---:|
@@ -50,13 +50,13 @@ Yieldを繰り返すコストは取得返却より大きく、TLSプールによ
 | sched_fanwait | 772.198 | 768.481 | 0.99750倍 | 5/12 |
 
 原データ: `build-scheduler-rewrite-20261111/fiber-20261113/bench-local-cap1-vs16/results.json`。
-Cap1の局所メモリ予約は1OSスレッドあたり最大1MiB分の遊休Fiberスタック（グローバルプールは別枠）。
-このベンチでは容量16の効果をほぼ維持。全ワークロードへの一般化はできない。
+容量1の局所メモリ予約は、1 OSスレッドあたり最大1MiB分の遊休Fiberスタックになる（グローバルプールは別枠）。
+このベンチでは容量1でも容量16の効果をほぼ維持している。全ワークロードへの一般化はできない。
 
 ## 回帰・追加検証
 
 - Release `xyo-tests` 全体: `XYO_JIT_MODE=eager XYO_FIBER_LOCAL_POOL=1 XYO_FIBER_LOCAL_POOL_CAP=1` でScheduler 450/450、その他スイート失敗なし、終了コード0（`fiber-20261113/full-cap1.out`）。
-- 追加プロファイルではローカル取得・共有取得・新規スタック生成、ローカル返却・共有返却・実体削除の件数を計測。プロファイル専用コード以外は通常Releaseに残さない。
+- 追加プロファイルではローカル取得・共有取得・新規スタック生成、ローカル返却・共有返却・実体削除の件数を計測した。プロファイル専用コード以外は通常Releaseに残さない。
 
 ## 実行
 
@@ -103,7 +103,7 @@ ScratchBenchの反復量は試行ごとに変動するため件数の単純比�
 | ローカル容量16 | 1,291,692 | 576 | 291 | 1,291,708 |
 
 容量1では取得合計1,311,502回中1,310,500回、約99.92%が
-スレッドローカル経路。shared poolは溢れたFiberを引き続き管理する。
+スレッドローカル経路。共有プールは溢れたFiberを引き続き管理する。
 
 ## 最終ビルド・回帰
 

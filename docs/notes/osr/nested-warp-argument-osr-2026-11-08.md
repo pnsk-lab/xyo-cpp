@@ -7,7 +7,7 @@
 **手続き呼出し元を最初から再実行しない**。
 ネイティブループの終了後は残りのインタプリタ手続き本体に戻る。
 
-今回の変更は二段階。
+今回の変更は二段階である。
 
 1. `XYO_JIT_OSR_NESTED=1`：引数が存在しても、コンパイル対象のループ
    (`TIMES` を含む) が引数レポーターを使わない場合は移行できる。
@@ -18,13 +18,13 @@
 
 2. `XYO_JIT_OSR_NESTED_ARG_READS=1`：引数レポーターがループ内にある場合も
    **明示的な追加 opt-in** で試せる。静的な検証対象は
-   `argument_reporter_string_number` / `argument_reporter_boolean` で、
-   名前が呼び出し先の宣言済み引数に一致するものに限る。通常のLLVMコード生成は
+   `argument_reporter_string_number` / `argument_reporter_boolean` のうち、
+   名前が呼び出し先の宣言済み引数に一致するものに限る。通常のLLVMコード生成では、
    未解決の引数レポーターを `xyo_rt_reporter` 経由でインタプリタ評価し、
    継続中の元 `Thread` の引数マップから取得する。
    さらに並行開発で追加された `XYO_JIT_OSR_NESTED_DIRECT_ARGS=1` は
    `xyo_rt_nested_osr_arg_get` を使って、2段の元インタプリタフレームから
-   引数を直接参照する。継続状態が想定外の場合は元のレポーター評価へ退避。
+   引数を直接参照する。継続状態が想定外の場合は元のレポーター評価へ退避する。
    直接経路の実装元は `src/jit/codegen.cpp` と `src/jit/rt.cpp`。
    この実験設定に限り、純粋だがGCオブジェクトを生成する `operator_join`
    も許可する。ソースグラフの静的走査は最大256ノード。
@@ -40,10 +40,10 @@
   2,000万回の repeat に移行し、残り17,640,202回からネイティブ再開。
   prefix=2、sum=20,000,000、suffix=2、messageとdoneがInterpreterと一致。
   **6/6** のモード比較・フォールバックテスト合格。
-- 引数 `delta=2` の reporterを repeat の加算に直接使う経路は追加フラグのみ有効。
+- 引数 `delta=2` の reporter を repeat の加算に直接使う経路は、追加フラグを有効にした場合のみ使える。
   2,000万回ループで残り17,881,697回からネイティブ移行し、
   sum=40,000,000、GC文字列message、prefix/suffixが元のInterpreterと完全一致。
-  フラグがOFFなら引数依存ループは移行を拒否した。
+  フラグがOFFなら、引数依存ループの移行は拒否された。
 - GCストレスでは引数からの `operator_join` による文字列生成を
   500万回行い、`XYO_GC_THRESHOLD=1` で **368回 GC回収**。
   ネイティブ移行発生後も、引数と結果がInterpreterに一致し、
@@ -51,7 +51,7 @@
   レポーター経由と引数直接読み出しの両方で368回のGCを確認。
 - `TIMES` 自体が引数レポーターの `repeat` を2000万回実行し、
   オプトインで元インタプリタの残り回数だけをネイティブへ移すことを
-  検証。結果・suffixはInterpreterと一致。
+  検証した。結果・suffixはInterpreterと一致。
 - `safeNestedValue` は、実入力が欠落したときに評価されるshadowを
   検査から漏らさず、有効な入力（本体またはshadow）を再帰検証するよう強化した。
 - GUI Scratch Parity Test の成功判定は xyo バックエンド同士の一致と混同せず、
@@ -113,7 +113,7 @@ XYO_JIT_OSR_TIMING=1 \
 | LLVM OSR + `xyo_rt_nested_osr_arg_get` | **0.812秒** |
 
 このプロジェクトでは直接読み出しがInterpreter比約6.3倍、
-旧トランポリン比約3.5倍。100%共通の数値のトランザクション計測ではなく、
+旧トランポリン比約3.5倍。100%共通の数値を使ったトランザクション計測ではなく、
 **このソースに限った壁時計・段階移行込みの比較**。他作品のスコアを保証しない。
 
 証拠：`board/osr-direct-argreads-speed.log`、

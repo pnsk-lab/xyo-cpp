@@ -4,7 +4,7 @@
 
 Continue PERF-001 (beat the best of MistWarp, TurboWarp, NitroBolt, Scratch Everywhere! and Scratch on all 47 original ScratchBench cases). Original `algo_sieve` initializes a numeric `l_flags` list of 5,000 slots, repeatedly tests `l_flags[k_i] != k_g`, then writes `l_flags[k_j] = k_g` while incrementing `k_j` by `k_i`. All official measurements use the *unchanged* source-derived `sieve.sb3` / unchanged 47-case source hash `e8bd5be3e7345088`.
 
-Isolated probe was added as `sieve` to `tests/bench/algos/scratchbench_probe.py`, without rewriting any benchmark operations.
+An isolated probe was added as `sieve` to `tests/bench/algos/scratchbench_probe.py`, without rewriting any benchmark operations.
 
 ## Causal diagnosis
 
@@ -23,7 +23,7 @@ A CPU8-pinned 11-flag x6 rotation on the identical frozen binary (`build/perf-si
 | `XYO_JIT_EQ_STRING_CACHE=0` | 197,792 |
 | `XYO_JIT_INDUCTION_RANGES=0` | 198,303 |
 
-All 66 observations returned checksum **669**. However **null-check benefit did not reproduce** in strict 16-pair A/B: OFF 204,519.47, ON 204,341.91 ops/ms, ON only 7/16 wins. Retained the previous null-check default.
+All 66 observations returned checksum **669**. However, **the null-check benefit did not reproduce** in a strict 16-pair A/B: OFF 204,519.47, ON 204,341.91 ops/ms, ON only 7/16 wins. Retained the previous null-check default.
 
 A temporary extension to `numericListSiteHint` to include observed-number-only scalar writers plus `XYO_JIT_NUMERIC_LIST=1` gave OFF 197,785.61 / ON 198,077.94 ops/ms (12 pairs, 7/12 wins). Extending numeric-list hints to `emitCmpNumF64` was **slower**: OFF 198,400.99 / ON 196,754.99 ops/ms, ON only 1/16 paired wins. Both speculative read-path source changes were **rolled back**.
 
@@ -51,7 +51,7 @@ Frozen native Release executable `build/perf-sieve-flag-frozen-xyo`, SHA256 `88a
 | `app_life` (probe counts differently from full suite) | 26.8725 | 26.8580 | −0.05% | 5/12 |
 | `list_append` | 639,461.98 | 643,637.25 | +0.65% | 6/12 |
 
-For `algo_sieve` every checksum is **669**, for `app_life` **53**, for `list_append` **11000**, all processes exited successfully. Raw `build/perf-sieve-monotone-ab.{json,log}`. The isolated `app_life` rates reflect a diagnostic fixture's unit of work, and must not be compared numerically to the standard 47-case suite's rates.
+For `algo_sieve` every checksum is **669**, for `app_life` **53**, and for `list_append` **11000**; all processes exited successfully. Raw `build/perf-sieve-monotone-ab.{json,log}`. The isolated `app_life` rates reflect a diagnostic fixture's unit of work, and must not be compared numerically to the standard 47-case suite's rates.
 
 ## Refined final experiment: replacement-only
 
@@ -92,7 +92,7 @@ executable GUI ScratchBench parity ON **2123/2123** and OFF
 
 ## Correctness
 
-New `testMonotoneNumericFlag` in `tests/unit/test_list_codegen_bounds.cpp`: two lists begin numericOnly. One has numeric, string, numeric replacements in succession and must remain permanently nonnumeric; the other receives only numeric replacement and must retain numericOnly. Check both exact values and metadata under interpreter and Eager JIT. The existing full suite also checks list indexes, aliases, saturation bounds, mutations, cyclic tests and JIT recompilation.
+New `testMonotoneNumericFlag` in `tests/unit/test_list_codegen_bounds.cpp`: two lists begin numericOnly. One has numeric, string, numeric replacements in succession and must remain permanently nonnumeric; the other receives only numeric replacement and must retain numericOnly. It checks both exact values and metadata under interpreter and Eager JIT. The existing full suite also checks list indexes, aliases, saturation bounds, mutations, cyclic tests and JIT recompilation.
 
 - Build `cmake --build build-perf-fan-only-20261108 --target xyo xyo-tests -j4`: PASS.
 - Pre-added-test CTest: flag ON 1/1 PASS 43.03s, OFF 1/1 PASS 41.56s.
@@ -115,4 +115,4 @@ Unmodified 47-case performance (one run): overall 108,133; algo_sieve 202,665.58
 
 Saved five-rival comparison: 32/47 wins and 15 losses, scratch-bench/results/perf-sieve-default-rivals-20261109.md and .json. algo_sieve remains at 0.649x the saved MistWarp 312,462.64 ops/ms.
 
-The robust effect is the 12/12 paired CPU8 wins for the isolated unchanged sieve workload (+4.57%). The weighted overall score between experimental ON/OFF differed by only -0.03%, within plausible CPU-load noise. Rank counts compare with historical rival reports and are not simultaneous competitor A/B. 47/47 remains unmet. No commits or pushes.
+The robust effect is the 12/12 paired CPU8 wins for the isolated unchanged sieve workload (+4.57%). The weighted overall score between experimental ON/OFF differed by only -0.03%, within plausible CPU-load noise. Rank counts are compared with historical rival reports and are not a simultaneous competitor A/B. 47/47 remains unmet. No commits or pushes.

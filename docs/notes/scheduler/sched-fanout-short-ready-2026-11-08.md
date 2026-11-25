@@ -8,7 +8,7 @@ Neither benchmark fixture nor the `scratch-bench` suite was modified.
 
 ## Profiling / reason
 
-In the native Release profile build an isolated fanout run spawned about 623,000 receiver threads in ~0.4s. A previous `Thread::tryCompile` direct-cache experiment eliminated repeated `JitEngine::decideCompile` and `compile` calls but touched *all* precompiled scripts: **~585,089** per run became **3**, with median compile-related inclusive time **84.45 → 55.3 ms**. The same experiment showed no consistent `fanwait` benefit, so applying it broadly was not justified.
+In the native Release profile build, an isolated fanout run spawned about 623,000 receiver threads in ~0.4s. A previous `Thread::tryCompile` direct-cache experiment eliminated repeated `JitEngine::decideCompile` and `compile` calls but touched *all* precompiled scripts: **~585,089** per run became **3**, with median compile-related inclusive time **84.45 → 55.3 ms**. The same experiment showed no consistent `fanwait` benefit, so applying it broadly was not justified.
 
 The final implementation in `src/engine/thread.cpp` restricts direct `JitEngine::readyScript(top)` attachment to **event_whenbroadcastreceived** native compiled scripts that satisfy *all*:
 - `CompiledScript::shortSync` is true;

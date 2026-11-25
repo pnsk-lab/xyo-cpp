@@ -2,7 +2,7 @@
 
 ## 範囲
 
-短い受信者を broadcast 呼出し位置で即時実行するのではなく、既存の Thread と通常の実行待ち順を維持して初期化コストを削減する。
+短い受信者を broadcast 呼出し位置で即時実行するのではなく、既存の Thread と通常の実行待ち順は維持したまま、初期化コストを削減する。
 
 既存実装には shortSync の同期 native entry、JitCtx プール、初回／identity 置換再起動時の遅延 root StackFrame、到達可能性解析後の Thread ストレージプールが既にある。別の軽量 Thread 型やコードポインタキャッシュは導入しない。
 
@@ -30,7 +30,7 @@ Release / LLVM / SDL無効の独立ビルド。固定した実行ファイルの
 
 ### 対象経路の固定仕事量プローブ
 
-[固定仕事量プローブ](../../../tests/bench/algos/bench_broadcast_restart.py) が生成する専用 Scratch プロジェクトで、受信者を12回ウォームアップした後、warp 内から短い同じ受信者に200,000回 broadcast する。計測中に受信者は実行せず、最後の待機付きイベントで1回だけ書込みが起きること（checksum=1）を毎回確認する。コンパイルは計測外。ScratchBench のスコアではない。
+[固定仕事量プローブ](../../../tests/bench/algos/bench_broadcast_restart.py) が生成する専用 Scratch プロジェクトで、受信者を12回ウォームアップした後、warp 内から同じ短い受信者に200,000回 broadcast する。計測中に受信者は実行せず、最後の待機付きイベントで1回だけ書込みが起きること（checksum=1）を毎回確認する。コンパイルは計測外。ScratchBench のスコアではない。
 
 HotSpot / CPU8固定 / 同一バイナリ / 16交互ペア:
 

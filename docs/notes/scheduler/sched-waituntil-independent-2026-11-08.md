@@ -2,7 +2,7 @@
 
 ## Objective
 
-Continue `PERF-001`, with the long-term goal to win each of 47 ScratchBench performance workloads against five other runtimes. Previous opt-in `XYO_EVENT_SCHED=1 XYO_EVENT_SCHED_DEP=1` gave ~6× throughput on `sched_waituntil` but enabling the **global event scheduler** by default broke a low-level direct-Fiber-chain assertion and changed unrelated scheduling. Its dependency watcher had never been enabled independently.
+Continue `PERF-001`, with the long-term goal of winning each of 47 ScratchBench performance workloads against five other runtimes. Previous opt-in `XYO_EVENT_SCHED=1 XYO_EVENT_SCHED_DEP=1` gave ~6× throughput on `sched_waituntil` but enabling the **global event scheduler** by default broke a low-level direct-Fiber-chain assertion and changed unrelated scheduling. Its dependency watcher had never been enabled independently.
 
 ## Implementation
 
@@ -40,7 +40,7 @@ Same frozen executable and suite hash `e8bd5be3e7345088`, two sequential full ru
 
 Files: `scratch-bench/results/perf-wait-deponly-{on,off}-20261108/performance-xyo-cpp.json`. Rival comparison `scratch-bench/results/perf-wait-deponly-rivals-20261108.{md,json}`. Stored rival best for `sched_waituntil` was TurboWarp at **324.81 ops/ms**; the new watcher reaches ~3.04× that stored result.
 
-These 47-case scores are single-run estimates amid other agents and CPU load variation. Non-wait workload changes must **not** be attributed to a scheduling-only patch. Rival scores were measured on older dates; win counts are provisional.
+These 47-case scores are single-run estimates taken amid concurrent work by other agents and CPU load variation. Non-wait workload changes must **not** be attributed to a scheduling-only patch. Rival scores were measured on older dates; win counts are provisional.
 
 ## Verification
 
@@ -63,7 +63,7 @@ AOT/accurate block-count instruments, the independent frozen executable
 - `sched_waituntil` **1,083.61 ops/ms**, 3.336× stored TurboWarp best
   324.81, and an isolated same-binary run **1,074.824 ops/ms**.
 - Overall ScratchBench weighted score **106,318** (one run).
-- Saved five-rival comparison **31/47 wins, 16 losses**, list in
+- Saved five-rival comparison **31/47 wins, 16 losses**, listed in
   `scratch-bench/results/perf-wait-deponly-default-rivals-20261108.{md,json}`.
   Other agents' concurrent changes are reflected in this binary and
   source tree; improvement in unrelated categories is **not** claimed as

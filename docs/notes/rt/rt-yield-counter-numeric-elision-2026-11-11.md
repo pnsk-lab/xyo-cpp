@@ -23,7 +23,7 @@
   - `i64 add(PHI, 1)`であること。
   - `PHI`の2 incomingは当該`add`からのループ戻りと`load i64`の初期値であること。
   - 初期値のアドレスは第1JIT ABI引数`JitCtx*`を起点とする**単一byte GEP**であり、フィールドのoffsetはbackendが渡した`offsetof(JitCtx, yieldCheckN)`と完全一致すること。
-  - 不正なGEP、別offset、変形された加算、偽造されたctxなどは**unclassified**。LLVMの変数名`ycnt`には依存しない。
+  - 不正なGEP、別offset、変形された加算、偽造されたctxなどは**unclassified**とする。LLVMの変数名`ycnt`には依存しない。
   - マシンStackMap operand manifestに`semantic=scheduler_tick`を追加。生のポインタは出力しない。
 - `src/jit/backend_llvm.cpp`は追加の診断フラグ`XYO_RT_YIELD_SSA_TRACE_OPERANDS=1`で、構造上証明されたときのみ`[rt001-yield-ssa-semantic]`を記録。生成位置・元SSA ID・`root_kind=numeric_not_managed`・`gc_safe=0`を出す。
 - `tests/platform/rt_yield_ssa_machine_stackmap_smoke.cpp`にPHI/ADD/host ctx offsetの正負分類テストを追加。2や違うoffsetで加算したり、コンテキストが欠落／不一致なら分類拒否。実LLVM23/O3アサート有効でPASS。
@@ -56,7 +56,7 @@
 | volatile（復元不能） | 2 | **0** |
 | 合計 | 152 | **148** |
 
-LLVM実JIT Eager/Lazyの通常CLIでも4地点それぞれ**ちょうど1件を除外**、Interpreterの結果と一致。ただし通常CLIでは元からvolatileが0件の場合があり、**中断中Fiberのハーネスを使った比較と区別**する。
+LLVM実JIT Eager/Lazyの通常CLIでも4地点それぞれ**ちょうど1件を除外**し、Interpreterの結果と一致した。ただし通常CLIでは元からvolatileが0件の場合があり、**中断中Fiberのハーネスを使った比較と区別**する。
 
 `tests/differential/rt_yield_tick_exclusion.py`でEager/Lazy各4件の元SSA manifest、除外ログ、ELF machine recordsを比較。`rt_yield_ssa_spill_bounds.py --filter i64_no_tick`では2本の実Fiber CFIと4件のmachine recordsを再検査し、**volatileが1つでも復活したら拒否**する。このfixture限定の判定であり、GCを許可するものではない。
 
@@ -70,4 +70,4 @@ LLVM実JIT Eager/Lazyの通常CLIでも4地点それぞれ**ちょうど1件を�
 
 ## 未解決
 
-純数値カウンターをStackMapに載せる必要がなくなっただけ。残った148件の候補にはJitCtx ABIポインタ1件×4、boxed i64、ループ一時値などが含まれうる。これらの**内容・GC所有権・未捕捉のpointer SSA・xyo_wait_yield内部の中断・異なるABI経路**は依然として未証明。ルート完全性が成立するまで`FiberPool::unsafeCount()`によるnative Fiber GC禁止は維持する。全リポジトリCTestは未実施。
+純数値カウンターをStackMapに載せる必要がなくなっただけである。残った148件の候補にはJitCtx ABIポインタ1件×4、boxed i64、ループ一時値などが含まれうる。これらの**内容・GC所有権・未捕捉のpointer SSA・xyo_wait_yield内部の中断・異なるABI経路**は依然として未証明。ルート完全性が成立するまで`FiberPool::unsafeCount()`によるnative Fiber GC禁止は維持する。全リポジトリCTestは未実施。

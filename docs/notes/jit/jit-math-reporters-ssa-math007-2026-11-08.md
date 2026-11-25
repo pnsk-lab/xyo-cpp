@@ -47,12 +47,12 @@ The JIT now emits a constant LLVM table of pow(10, k/20) for the 51
 inputs k=0..50, evaluated through the host libm during JIT compilation.
 The fast path:
 1. Accepts a plain IEEE-754 x only within [0, 2.5].
-2. Converts x*20 to a candidate table index, avoiding undefined FPToUI
-   conversion using a safe select when x is out of range.
+2. Converts x*20 to a candidate table index, avoiding an undefined
+   FPToUI conversion by using a safe select when x is out of range.
 3. Reconstructs candidate/20 in IEEE f64 and tests exact equality to x.
 4. Selects the table value only on an exact hit. Otherwise it branches
-   to the original libm pow(10,x) call, including signed zero, NaN,
-   infinity, strings and values near but not equal to a grid point.
+   to the original libm pow(10,x) call; that path covers signed zero,
+   NaN, infinity, strings and values near but not equal to a grid point.
 
 The constant table is read-only and safe for parallel native threads.
 The generated code never skips a Scratch evaluation side effect because

@@ -22,7 +22,7 @@ variable and the entire condition/branch body can be statically checked.
   Other values remain on the full legacy conversion, bounds and comparison
   paths; no list length or list element type is assumed constant.
 
-The proof does not fold Scratch comparison itself. It only retains the
+The proof does not fold the Scratch comparison itself. It only retains the
 existing verified immutable integer interval so LLVM O3 can use the integer
 induction PHI for later list address calculations and bounds checks.
 
@@ -96,8 +96,9 @@ workloads `app_life`, `app_raycast`, `algo_primes`, `algo_sieve`,
 `list_append` and `math_mandel`. The rates had a large amount of host noise;
 paired geometric-mean ON/OFF ratios were **1.054×**, **0.988×**,
 **1.005×**, **1.000×**, **1.020×** and **1.056×**, respectively.
-Their paired medians were substantially closer than the geometry suggests,
-and there is no reliable regression claim for these unrelated workloads.
+Their paired medians were substantially closer than the geometric-mean
+ratios suggest, and there is no reliable regression claim for these
+unrelated workloads.
 All checksum comparisons passed. Raw data:
 `build/multi-bench-20261110/proven-compare/unrelated-bench-ab.{json,log}`.
 

@@ -37,14 +37,14 @@ setters, sibling procedures, a bench-round call, and complex outer call stacks.
   a constant numeric scalar set, then a scalar set to the exact
   `sensing_dayssince2000` reporter.
 - The inner condition must be the certified elapsed-ms reporter with its
-  start variable ID matching the second setter. Multiplication constant is
+  start variable ID matching the second setter. The multiplication constant is
   exactly `86400000`, original operand order is preserved, and the
   comparison budget variable is read anew at every evaluation.
 - The inner body must be ONE fixed ASCII `event_broadcastandwait`.
   The inner after-loop suffix and outer after-loop suffix must each be
   a single constant numeric variable change.
 - Any other shape, including implicit extra side effects, variable
-  reporter initializers, arbitrary arithmetic expressions, dynamic message,
+  reporter initializers, arbitrary arithmetic expressions, a dynamic message,
   or nested unknown calls, retains the normal JIT/Fiber execution path.
   Existing scalar `control_repeat` fast paths are not intercepted.
 
@@ -54,7 +54,7 @@ No native stack, LLVM SSA or live heap pointer crosses a broadcast yield.
 The existing `Thread::megaJoinRefs` stores receiver identities; its GC-root
 and membership checks are unchanged.
 
-- Initial even PC pushes statically certified procedure return PCs,
+- The initial even PC pushes statically certified procedure return PCs and
   stores the outer count in `Thread::megaRemaining`.
 - If the count is zero, only the outer after-loop suffix is executed.
 - Otherwise the LLVM outer-init block runs the literal setter, then calls
@@ -107,7 +107,7 @@ This workload is **time-bounded rather than fixed-work**.
 Each execution can complete a different number of broadcasts.
 Its score is the number of receptions divided by total process wall-time
 (including startup and LLVM compilation). Use it for exploratory
-path comparisons, **not** a definitive fixed-work throughput speedup.
+path comparisons, **not** for a definitive fixed-work throughput speedup.
 
 | Metric | Old native Fiber | New outer Mega |
 | --- | ---: | ---: |

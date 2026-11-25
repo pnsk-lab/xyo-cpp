@@ -35,13 +35,13 @@ a true display-server present-time measurement.
 
 The program's pre-existing `XYO_PLAY_PROFILE` records a CSV per frame
 of `step_ms`, `vm_ms`, `draw_ms`, `frame_interval_ms`, etc.
-No rendering-time instrumentation was invented for the benchmark.
+No rendering-time instrumentation was added for the benchmark.
 
 ## A/B harness
 
 New tool: `tests/bench/algos/bench_wait_ready_play.py`.
 
-- Freeze executable and original SB3 archives before starting.
+- Freeze the executable and the original SB3 archives before starting.
 - Pin the benchmark process and children to CPU 16.
 - Keep `XYO_JIT_MODE=eager`, `XYO_WAIT_WAKE_REGISTRY=1`,
   `XYO_SCHED_READY_INDEX=1`, `XYO_YIELD_QMODE=off` identical.
@@ -78,10 +78,10 @@ Static Scratch block inspection:
 - rubikscube: 0 `control_wait_until`, no `sensing_timer`
 - 3D2: 1 `control_wait_until`, 1 `sensing_timer`
 
-OFF screenshot snapshots also varied across repeated OFF trials for
+Screenshots from OFF runs also varied between repeated trials for
 `mandelbrot` (2 distinct hashes) and `3D2` (4 distinct hashes).
-Thus these visual differences are not attributable to the wait-ready
-flag based on the evidence here. The unchanged rubikscube project was
+On this evidence, the visual differences therefore cannot be attributed
+to the wait-ready flag. The unchanged rubikscube project was
 deterministic (4/4 image matches).
 
 ### Existing wait-heavy 3D project
@@ -152,11 +152,11 @@ scheduler bug.
 ## Interpretation
 
 The `sched_waituntil` microbenchmark improvement does **not**
-automatically turn into a 9x actual frame-rate improvement. During the
+automatically turn into an actual 9x frame-rate improvement. During the
 drawn-frame tests the runtime still typically spends ~25ms in its VM
 frame step budget, and scene drawing takes additional CPU time.
 Eliminating repeated wait-slot visits can increase throughput without
-meaningfully reducing the fixed-cost simulation frame.
+meaningfully reducing the fixed cost of a simulation frame.
 
 `ASTERIA` was not actually eligible for wait-slot suppression during
 the sampled gameplay segment, so no major improvement was expected.

@@ -136,7 +136,7 @@ arbitrary Scratch source as a coroutine.
      call frames and live return sites explicitly, with source-verified
      checkpoints. Reject dynamic/unsupported nesting until proven.
 5. **GC rooting.** A coroutine frame's raw machine pointers are NOT
-   by themselves safe GC roots; the GC must have an ownership-proof
+   by themselves safe GC roots; the GC must have an ownership proof
    for every live boxed string/list/reference across suspension.
    Incorrectly treating LLVM SSA pointer locations as roots was
    already shown unsafe in separate RT-001 negative controls.

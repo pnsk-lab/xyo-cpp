@@ -16,9 +16,9 @@ LLVM 23 / Release / SDL2 ON の共有ビルドで OSR専用CTest 37/37件はPASS
 描画可能画素中心の外接領域を最大半画素強だけ内側に補正するため、
 Spriteの中心座標が固定境界をわずかに超えても正常にフェンスされる。
 
-他担当のテスト本体を直接計測変更せず、専用コピー `board/.qa001/motion_debug.cpp` を
+他担当のテスト本体を直接書き換えて計測するのは避けた。代わりに、専用コピー `board/.qa001/motion_debug.cpp` を
 別バイナリ `board/.qa001/motion_debug` としてコンパイルして実測した。
-5件の失敗はすべて `tests/unit/test_motion_numeric.cpp` の最終境界判定のみだった。
+5件の失敗はすべて `tests/unit/test_motion_numeric.cpp` の最終境界判定だけだった。
 
 | 初期位置 | 方向 | bounce後の中心位置 |
 |---|---:|---|
@@ -42,13 +42,13 @@ Interpreterの `bounceOffEdge` とJITの `xyo_mot_edgebounce` の位置・方向
 Interpreter、JIT Eager、AOTのいずれも同じ結果。
 
 Scratchの `toFixed(10)` が `sin(-0)` を正のゼロにするため、
-既存 `src/blocks/core.cpp` `src/jit/rt.cpp` `src/jit/codegen.cpp` は
+既存の `src/blocks/core.cpp`、`src/jit/rt.cpp`、`src/jit/codegen.cpp` は
 明示的に `+0` を返す。独立したテストの参照モデルだけが
-直接 `std::sin(-0)` を使用していたため、ゼロ入力を `+0` に補正した。
+直接 `std::sin(-0)` を使用していた。そのため、ゼロ入力を `+0` に補正した。
 
 ## 変更範囲と再検証
 
-修正は次の2つの既存テストの期待値のみ。
+修正したのは、次の2つの既存テストの期待値だけ。
 
 - `tests/unit/test_motion_numeric.cpp`
 - `tests/unit/test_nan_codegen.cpp`
@@ -72,16 +72,16 @@ GitHub CI実行、commit、pushは未実施。
 
 ## CIの通常・ネイティブ復帰テストを分離して再実行（追補）
 
-共有ツリーの再ビルドと通常CTestを実施。初回の通常115件は
-**113/115 PASS**（4並列365.67秒）で2件が失敗した。
+共有ツリーの再ビルドと通常CTestを実施した。初回の通常115件では
+**113/115 PASS**（4並列365.67秒）で、2件が失敗した。
 
 1. `xyo-native-simple-deopt-parity` は `TIMEOUT 120` 秒に到達。
    `tests/differential/native_simple_resume.py` を単独で完走させ、
    **915 native resume/fail-closed parity runs 全PASS**。
-   120秒では試験規模に対して不足していた。
+   120秒は試験規模に対して短すぎた。
 2. `xyo-ir001-postopt-write-audit-parity` は監査ログの解析に失敗。
-   共有ソースの `proven_local_calls` の追加と古いバイナリが不整合だった。
-   `bun tools/consistent-build.ts` で再リンクした後、IR-001 O2/O3双方が
+   共有ソースに `proven_local_calls` を追加した変更と、古いバイナリが不整合だった。
+   `bun tools/consistent-build.ts` で再リンクした後、IR-001 O2/O3の双方とも
    **1/1 PASS（0.21秒）**。ログ `board/qa001-ir001-audit-coherent.log`。
 
 整合ビルドのsource digest:
@@ -92,7 +92,7 @@ CLI SHA256:
 ### CTestとGitHub Actionsの変更
 
 - `tests/CMakeLists.txt`: `xyo-native-simple-deopt-parity` のTIMEOUTを120から600秒へ。
-- 公式CTestは **1/1 PASS、147.52秒**。915回の実yield/deoptとfail-closedを実施。
+- 公式のCTestは **1/1 PASS、147.52秒**。915回の実yield/deoptとfail-closedを実施。
   ログ: `board/qa001-native-simple-ctest600.log`。
 - `.github/workflows/ci.yml`: 非warp native resumeをOSR専用ジョブへ移動。
   CIのCTestフィルター: `^(xyo-nested-warp-|xyo-native-simple-deopt-parity$)`。

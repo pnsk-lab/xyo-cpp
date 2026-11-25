@@ -9,7 +9,7 @@ The `clonechurn` fixture is the original source-derived `build/scratchbench-caus
 ## Failed experiments, fully reverted
 
 1. **Do not index clone-start hats in Runtime::threadMap**: `control_start_as_clone` is non-restartable, but its Thread ID was formerly generated while inserting the map entry. Removing that made `Sequencer::stepThreads` cleanup lazily call `Thread::getId()` **after its Target was destroyed**, causing a SIGSEGV. Coredump and backtrace in `build/perf-clone-map-crash.core` (via gdb). The crash was resolved in the experimental path by eliding the now-redundant map erase; yet 16 alternating CPU8 trials showed OFF 835.403 / ON 836.325 ops/ms, only 9/16 ON wins and no reliable gain. All source and test changes from this approach were reverted.
-2. **Skip the second Runtime::stopForTarget** after clone disposal: `Target::dispose` already invokes `stopForTarget`. However the experimental opt-in in both interpreter and JIT gave 16 alternating CPU8-pinned trial medians OFF 1021.627 / ON 963.161 ops/ms, ON 7/16 wins with high process variance. Fully reverted experimental edits in `src/blocks/core.cpp` and `src/jit/rt_blocks.cpp`.
+2. **Skip the second Runtime::stopForTarget** after clone disposal: `Target::dispose` already invokes `stopForTarget`. However, the experimental opt-in in both interpreter and JIT gave 16 alternating CPU8-pinned trial medians OFF 1021.627 / ON 963.161 ops/ms, ON 7/16 wins with high process variance. Fully reverted experimental edits in `src/blocks/core.cpp` and `src/jit/rt_blocks.cpp`.
 
 Raw: `build/perf-clone-map-fixed-ab.{log,json}` and `build/perf-clone-double-stop-ab.{log,json}`.
 

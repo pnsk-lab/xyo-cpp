@@ -97,8 +97,8 @@ Local validation:
 
 Isolated integration patches are prepared without mutating the Git index:
 
-- `board/qa001-ci-isolated.patch` (workflow change + checkout guard and its test suite),
-  excludes unrelated ScratchBench workflow edits already present in the
+- `board/qa001-ci-isolated.patch` (workflow change + checkout guard and its test suite);
+  it excludes unrelated ScratchBench workflow edits already present in the
   concurrent worktree. Its CI YAML parses successfully.
 - `board/qa001-unit-oracles.patch` (the two unit test reference fixes only).
 
@@ -116,8 +116,8 @@ together before GitHub Actions can pass.
   all temporary Git commits are isolated, not made in the shared repo.
 - The guard now uses git ls-tree HEAD to reject staging-only files,
   and git diff HEAD to detect modified committed dependencies.
-- A modified tests/CMakeLists.txt is now detected as well as modified
-  Python fixtures, removed C++ harnesses, and missing CTest includes.
+- The guard now detects a modified tests/CMakeLists.txt, as well as
+  modified Python fixtures, removed C++ harnesses, and missing CTest includes.
 - Current dirty working tree: **16 untracked required files** and
   **2 modified committed dependencies**, correctly rejected by strict mode.
 - Development diagnostics with --allow-uncommitted still verify existence.

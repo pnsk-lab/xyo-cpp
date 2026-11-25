@@ -101,7 +101,7 @@ build/math003-full-default.log.
 
 ## Compatibility
 
-- Custom independently generated 178-output numerical corpus compares
+- A custom independently generated 178-output numerical corpus compares
   interpreter, ordinary Eager JIT, float SSA, integer SSA, and HotSpot,
   for warp/nonwarp programs. Tests include 0/1/63/64/65/129/257 loop
   counts, -0, a negative-zero literal, strings, fractions, out-of-range

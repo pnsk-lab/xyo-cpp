@@ -39,9 +39,9 @@ ScratchBench kernel本体は一切変更していない。
   `pinned.strings` に存在する**場合のみ、LLVMのimmutable
   `i16` グローバルと文字数を作って専用ヘルパへ渡す。
   アドレスの有効性を確認するまでGC管理外の任意ポインタを逆参照しない。
-  動的 reporter、文字列以外、AOTは従来 `xyo_broadcast_wait_v`。
+  動的 reporter、文字列以外、AOTは従来の `xyo_broadcast_wait_v` を使う。
 - `src/jit/rt.cpp`: `broadcastWaitName` に既存のreceiver
-  起動/Unicode canonicalization/yield/joinを共通化。
+  起動/Unicode canonicalization/yield/joinを共通化した。
   `xyo_broadcast_wait_lit(ctx, const char16_t*, uint32_t)` はJIT object
   内の不変配列を直接 `std::u16string_view` として渡す。
   動的経路は従来の所有する `std::u16string` を保持し、
@@ -57,15 +57,15 @@ ScratchBench kernel本体は一切変更していない。
 ### 発見・修正した重大バグ
 
 最初の実装は `sched_pingpong` のように同一スクリプト内に
-他のyieldヘルパがある場合は動作したが、
+他のyieldヘルパがある場合は動作した。しかし、
 静的な `broadcast and wait` しかないスクリプトが
 Fiberなしの同期実行に誤分類された。
 Unicode Kelvin記号 U+212A の受信テストで
 `xyo_fiber_switch` がnull destinationを受け取りSIGSEGVした。
 gdbはptrace不可のため、独立した信号ハンドラと実行ファイルの
-シンボル/逆アセンブルで `xyo_fiber_switch` のnull保存先を特定。
+シンボル/逆アセンブルで `xyo_fiber_switch` のnull保存先を特定した。
 **新C ABIの `helperMayYield` 登録漏れが根本原因**だった。
-分類とコルーチン禁止リスト、RT-001のyield-edge分類を修正して
+分類、コルーチン禁止リスト、RT-001のyield-edge分類を修正し、
 静的のみのsourceも必ず `CompiledScript::mayYield=true` になるようにした。
 
 該当の実験的クラッシュ版はユーザーの既定設定に採用していない。
@@ -123,7 +123,7 @@ XYO_JIT_MODE=eager XYO_JIT_BCAST_STATIC_LITERAL=0 \
 ## 棄却した同時実験
 
 `restartThread()` の `threadMap` の既存キー再利用も試した。
-新旧Threadでキーを使い回せるか慎重に判定する実装で、
+新旧のThreadでキーを使い回せるかを慎重に判定する実装で、
 Stage Target IDのホスト変更、外部map差し替え、
 連続再起動を7件で検証し、ON/OFFとも合格したが、
 ScratchBench 16組交互では `sched_pingpong=1.00094倍`（9/16勝）、
@@ -143,7 +143,7 @@ ScratchBench 16組交互では `sched_pingpong=1.00094倍`（9/16勝）、
 既定ONへ変更後の同一Release実行ファイル、元のScratchBench
 `sched_*`カーネル本体を変更しない凍結SB3、CPU16固定、
 30fps、HotSpot、`XYO_PAR=0`、`XYO_YIELD_QMODE=off`。
-`XYO_JIT_BCAST_STATIC_LITERAL=0`と`=1`を16組で交互実行。
+`XYO_JIT_BCAST_STATIC_LITERAL=0`と`=1`を16組で交互実行した。
 
 | workload | OFF中央値 (ops/ms) | ON中央値 (ops/ms) | 対応ペア幾何平均 ON/OFF | ON勝利 |
 |---|---:|---:|---:|---:|

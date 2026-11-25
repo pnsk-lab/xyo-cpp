@@ -8,7 +8,7 @@ steps. A private native SSA chunk can execute pure expressions in
 registers and publish results only before the regular 64-tick warp
 scheduler checkpoint.
 
-The implementation is structurally recognized; no benchmark names
+Recognition is structural; no benchmark names
 or project IDs are hardcoded. Added:
 - src/jit/numeric_until_ssa.inc: pure numeric repeat-until SSA
 - src/jit/affine_until_ssa.inc: guarded integer affine/parity SSA

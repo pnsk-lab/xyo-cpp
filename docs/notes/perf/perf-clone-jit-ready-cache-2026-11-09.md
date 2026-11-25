@@ -2,7 +2,7 @@
 
 ## 計測条件・結論
 
-ScratchBench の元の `sched_clonechurn`（変更なし）を最適化。約100個のクローンを繰り返し生成・停止し、`control_start_as_clone` の生成費用が主要ボトルネック。
+ScratchBench の元の `sched_clonechurn`（変更なし）を最適化。約100個のクローンを繰り返し生成・停止するため、`control_start_as_clone` の生成費用が主要なボトルネックである。
 
 **採用:** `src/engine/thread.cpp` の `Thread::tryCompile` が、クローン開始ハット用に共有済みのネイティブ `CompiledScript` があれば `JitEngine::readyScript(top)` から直接結び付ける。既定 **ON**、`XYO_JIT_READY_CLONE=0` で従来の `decideCompile` / `compile` 経路へ復帰。JIT未生成時、共通CFG実験 `XYO_JIT_COMMON_CFG=1`、正確なブロック数計測時は従来経路を維持。LLVM/AOT用の実行フレームABIは変更しない。
 
@@ -12,7 +12,7 @@ ScratchBench の元の `sched_clonechurn`（変更なし）を最適化。約100
 
 * 約414,500回の生成: `makeClone` 合計 **173.4 ms**、そのうち `startHats` **135.6 ms**、新Target作成16.4 ms、変数コピー13.9 ms、設定7.5 ms。
 * 約414,400回の削除: `dispose` 合計 **31.4 ms**、監視表示5.6 ms、スレッド停止7.0 ms、実行順削除8.5 ms。
-* ネイティブJIT内部プロファイルを有効化した別ビルド（`XYO_DISABLE_RT_PROF=OFF`）の約285,200回生成では、`pushThread` の割り当て系 **41.6 ms**、コンパイル判定・ルートスタック初期化 **98.1 ms**。このうちJIT compileの既存計測点約64.9 ms。
+* ネイティブJIT内部プロファイルを有効化した別ビルド（`XYO_DISABLE_RT_PROF=OFF`）の約285,200回生成では、`pushThread` の割り当て系 **41.6 ms**、コンパイル判定・ルートスタック初期化 **98.1 ms**。このうち、JIT compileの既存計測点は約64.9 ms。
 * 過去の `stopForTarget` 索引化、初回ハット重複探索省略、空モニター通知省略、2–4変数 `wait until` 依存監視、待機サイトキャッシュは、有意な性能改善を示さず、すべて撤回または実験的既定OFF。詳細 `../scheduler/clonechurn-thread-lifecycle-2026-11-09.md`。
 
 ### 同一バイナリ・CPU固定のA/B
@@ -59,7 +59,7 @@ SHA256 `a609a84a0b02513f5fe2fb0a71dd02bff592dde5489f7336658b5d88efe9c1f0`、ソ�
 
 ## JIT内部で削減できた処理の確認
 
-追加のRelease計測ビルド `build-perf-clone-prof-full-20261109`（`-DXYO_DISABLE_RT_PROF=OFF`）で `XYO_PROF=1` を付け、同一バイナリ・CPU14固定、各設定を2回交互に測った。キャッシュONの場合はより多くのクローンが進行するため、**時間の累積値は総発生数が違う**ことに注意。
+追加のRelease計測ビルド `build-perf-clone-prof-full-20261109`（`-DXYO_DISABLE_RT_PROF=OFF`）で `XYO_PROF=1` を付け、同一バイナリ・CPU14固定、各設定を2回交互に測った。キャッシュONではより多くのクローンが進行するため、**累積時間は総発生数が異なる**点に注意する。
 
 | 指標 | OFF 2回 | ON 2回 |
 |---|---|---|

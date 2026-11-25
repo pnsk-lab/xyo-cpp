@@ -19,8 +19,9 @@ new float specialization is selected only if a statically eligible body:
 1. Has at least five update statements and includes sqrt.
 2. Has no modulo or other reporter with potentially different semantics.
 3. Executes under a warp script with an exact i32 repeat countdown.
-4. Has a runtime entry guard that all referenced values are genuine
-   non-NaN Scratch Number values, not strings, booleans or tagged values.
+4. Has a runtime entry guard requiring all referenced values to be
+   genuine non-NaN Scratch Number values, not strings, booleans or tagged
+   values.
 
 Otherwise the original repeat body is left intact, or an earlier restricted
 integer SSA path remains available.

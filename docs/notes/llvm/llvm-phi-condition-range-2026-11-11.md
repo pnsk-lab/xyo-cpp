@@ -30,7 +30,7 @@ Implementation: `src/jit/codegen.cpp`.
 - The operand is the *same immutable, canonical numeric boxed SSA* with a
   proven exact integer interval, not a profile prediction or mutable
   Scratch variable assertion.
-- Condition is a direct `operator_gt` / `operator_lt` comparing that
+- The condition is a direct `operator_gt` / `operator_lt` comparing that
   variable with a finite exact i32 integer primitive shadow. Numeric
   shadows serialized as string Values use the existing Scratch cast rules.
   Literal whitespace, unparseable strings, fractions, NaN, Infinity,
@@ -40,7 +40,7 @@ Implementation: `src/jit/codegen.cpp`.
   The protected variable may not be written (even through a slot alias).
 - No following read of the protected variable after the IF/ELSE.
   This is a **profitability** filter, not an additional correctness proof.
-- Measured useful conditions only: the comparator means `temp > K` with
+- Measured useful conditions only: the comparison is `temp > K` with
   integral `K >= 0`, the preexisting range crosses zero, and the true
   side has a reachable strictly positive range. The syntactically
   reversed form `K < temp` is recognized as equivalent.

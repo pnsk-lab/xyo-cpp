@@ -9,7 +9,7 @@ helper implementations, yield points, GC roots, volatile reloads, alias promises
 or fast-math flags change.
 
 The implementations live outside the generated LLVM module. Previously LLVM saw
-only their signatures, and therefore could not common identical calls even when
+only their signatures, and therefore could not merge identical calls even when
 the input SSA value was identical. The new annotations communicate the audited
 contract instead of implementing a custom expression optimizer.
 
@@ -21,8 +21,8 @@ Implementation: [attribute whitelist](../../../src/jit/llvm_helper_attributes.hp
 Their wrappers in [rt.cpp](../../../src/jit/rt.cpp) are uninstrumented forwards to
 [v8math.cpp](../../../src/core/v8math.cpp). Both implementations use constant-initialized
 coefficients and local arithmetic. Invalid inputs are rejected before square root;
-all square-root operands are nonnegative, so those calls cannot write domain
-`errno`. There are no volatile accesses, lazy initializers, allocations, callbacks,
+all square-root operands are nonnegative, so those calls cannot set `errno`
+for domain errors. There are no volatile accesses, lazy initializers, allocations, callbacks,
 or profiling counters. Return type, argument type/count, varargs and declaration
 status are checked before adding attributes.
 
@@ -55,13 +55,13 @@ x changes on each iteration
 Before, each helper is called twice with the same input SSA operand on the loop
 path. After, each is called once and LLVM reuses its result. LLVM also peels/clones
 the optimized loop, so the whole-module **static** call count happens to stay at
-two per helper. The regression checks repeated calls for identical input operands inside each
-function/basic block (SSA names are not global), not an incorrect expectation
-that total static calls must decrease.
+two per helper. The regression checks for repeated calls with identical input operands inside each
+function/basic block (SSA names are not global); it does not expect total
+static calls to decrease.
 
 ## Performance
 
-Same Release binary, seven alternating OFF/ON pairs, 5,000,000 iterations. The
+Runs used the same Release binary, seven alternating OFF/ON pairs, and 5,000,000 iterations. The
 project warms up before timing and uses its own `days since 2000` clock. Both
 variants produce checksum `900000000`.
 

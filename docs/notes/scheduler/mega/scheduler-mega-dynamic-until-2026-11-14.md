@@ -19,7 +19,7 @@ is mapped to a single LLVM function with a Thread-owned continuation PC.
 The condition is re-evaluated on entry and **after every completed joined
 broadcast**, using the existing Scratch tagged-value comparison helpers.
 The source can optionally be wrapped in up to four argumentless, non-warp,
-acyclic procedures with existing return-PC suffix rules.
+acyclic procedures under the existing return-PC suffix rules.
 
 This is NOT a general transformation of arbitrary Scratch loops,
 dynamic names, timers or reporter expressions.
@@ -35,17 +35,17 @@ dynamic names, timers or reporter expressions.
   `operator_gt`, `operator_lt` or `operator_equals` comparing
   `data_variable` to a finite numeric literal, optionally wrapped
   in `operator_not`. Both operand orders are supported. No
-  reporter input or multi-block side effects can be carried over a yield.
-- `src/jit/jit.cpp`: require the dynamic condition variable exists
+  reporter input or multi-block side effects can be carried across a yield.
+- `src/jit/jit.cpp`: require that the dynamic condition variable exists
   before source selection; recognize BroadcastUntil as an eligible
   **singleton sender** source only with the existing sender opt-in.
 - `src/jit/backend_llvm.cpp`: add a shared LLVM compare block that
   the first-entry and resume-after-join switch-PC cases both enter.
   Use `xyo_var_get` + `xyo_gt/lt/eq` (Scratch value semantics,
-  not unchecked LLVM floating-point comparisons). When condition is
+  not unchecked LLVM floating-point comparisons). When the condition is
   false, set the odd PC and hand control back to the C++ runtime to
-  launch the message. When condition is true, execute suffix and
-  unwind the saved procedure return-PCs. Register broadcast message
+  launch the message. When the condition is true, execute the suffix and
+  unwind the saved procedure return-PCs. Register the broadcast message
   in `MegaDispatchCode::broadcastNames` so Runtime actually launches
   its precise receiver identities.
 - `tests/unit/test_scheduler.cpp`: focused
@@ -55,7 +55,7 @@ dynamic names, timers or reporter expressions.
   PCs, second green flag and cached source-specialized LLVM dispatch.
 - `tests/bench/algos/bench_mega_single_receiver.py`:
   `--until --optimize until-sender` generates a real receiver-dependent
-  dynamic loop and performs alternating ON/OFF tests on identical frozen
+  dynamic loop and performs alternating ON/OFF tests on the same frozen
   CLI binary, CPU affinity and .sb3 fixture. Every run verifies the
   Stage variables match exactly.
 
@@ -69,16 +69,16 @@ Thread state:
 - Once all receivers finish, the host calls the same LLVM switch PC.
   The comparison sees the **latest variable Value**, which could have
   been changed by a receiver or external effect.
-- If condition true, execute suffix once and pop return PC stack.
-  If false, keep the odd PC to launch the next broadcast on its next
-  scheduled selection.
+- If the condition is true, execute the suffix once and pop the
+  return PC stack. If the condition is false, keep the odd PC to launch
+  the next broadcast on its next scheduled selection.
 - `STATUS_YIELD` follows the opt-in
   `XYO_JIT_MEGA_NORMALIZE_YIELD=1` rule; `STATUS_YIELD_TICK` never
   becomes immediately runnable.
 
-The old Fiber path remains unchanged if flags are absent or source proof
-does not pass. The GC root and Thread identity set are held by existing
-`megaJoinRefs`, not by LLVM stack pointers.
+The old Fiber path remains unchanged if the flags are absent or the
+source proof does not pass. The GC root and Thread identity set are
+held by existing `megaJoinRefs`, not by LLVM stack pointers.
 
 ## Focused validations
 
@@ -113,7 +113,7 @@ Raw results:
 
 The real `sched_pingpong`, `sched_fanwait` and `sched_restart`
 send paths are nested inside the Stage's `suite_sched` procedure and
-their own setup/measurement/cleanup code. Each uses
+inside their own setup/measurement/cleanup code. Each uses
 `control_repeat_until` with `sensing_dayssince2000`, numeric
 reporter arithmetic, external stopping conditions and other effects.
 They are **not** yet eligible for this narrow source-proof.

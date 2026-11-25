@@ -6,7 +6,7 @@
 
 単独Threadの純粋な `repeat(N) { change [variable] by constant }` でも、
 旧方式は反復1回ごとに `runSchedulerPass` / C++ガード /
-`multiPcSingleEntry` を呼び、300,000反復で約300,000回のLLVM呼び出しになる。
+`multiPcSingleEntry` を呼ぶため、300,000反復で約300,000回のLLVM呼び出しになる。
 
 この呼び出し回数を削減する。ただし
 **`runSchedulerPass()` の「1パス1ターン」契約は変更しない**。
@@ -17,7 +17,7 @@
   ABIは `uint64_t (*)(Variable*, uint64_t* remaining, uint64_t maxIterations)`。
   ソースslotごとに関数ポインタ `repeatBurstEntries` を保持。
 - `src/jit/backend_llvm.cpp` は `XYO_JIT_MEGA_REPEAT_BURST=1`
-  かつ single specialization の場合、source証明済みの単一変数・有限リテラル
+  かつ single specialization の場合、ソース証明済みの単一変数・有限リテラル
   repeatのみ、一つの純粋なLLVMループ関数を生成する。
   `FAdd` はfast-mathを付けず逐次実行する。ループ中の累積値は
   SSA `double` として保持し、関数の最後に一度だけScratch `Variable`
@@ -28,7 +28,7 @@
   **`stepThreads` 内の時間予算ループ**からだけ呼ぶ。
   1回の呼び出しで最大256反復。各呼び出しの合間に時間予算判定が働く。
   `runSchedulerPass` を直接呼ぶ場合は一切バーストしない。
-- Thread 1本のみ、偶数開始PCではなく有効な奇数resume PC、
+- Thread 1本のみ、偶数開始PCではなく、有効な奇数resume PC、
   `remaining > 0`、pure repeat slot、`JitCtx/Fiber`不在、
   nativeコード適格、待機/join/OSR等不在、`Blocks::revision`一致、
   variable binding stamp一致、有限数値などをすべて検査。
@@ -100,8 +100,8 @@ XYO_JIT_MEGA_REPEAT_BURST=1 \
 ## 契約と制限
 
 これは「すべてのThreadをまとめて実行する」実装ではない。
-ソースが純粋な数値加算であり、同時実行するScratch Threadが1本、
-かつheadlessでrenderer等がない限定条件だけを対象とする。
+ソースが純粋な数値加算であること、同時実行するScratch Threadが1本であること、
+headlessでrenderer等がないこと、という限定条件だけを対象とする。
 バーストは通常の `runSchedulerPass` 呼び出し契約を変えないが、
 `stepThreads` 中の内部チェック間隔を最大256反復分に延ばす。
 したがって各フレームの進捗や外部ホストからの中間観測タイミングが
