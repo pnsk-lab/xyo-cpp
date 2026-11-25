@@ -3,7 +3,7 @@
 ## Goal
 
 START-015 prevents stale native AOT v3 code from running when a source
-`Blocks` revision changes, including lazy `BlockCached` slots and
+`Blocks` revision changes, including in lazy `BlockCached` slots and
 suspended native Fibers. However, the model intentionally exposes mutable
 `Block*` via `Blocks::getBlock()`, so a field written directly without
 `resetCache()` can bypass the revision guard.
@@ -60,7 +60,7 @@ mutation path is versioned.
    `Block::inputs`, `Block::mutation`, etc. without notifying the model.
    The AOT revision guard cannot detect such a *silent* edit.
 2. Editor structural actions (drag/drop, script graph rewrites, undo/redo)
-   continue using their established `resetCache()`/ `restoreState()`
+   continue using their established `resetCache()`/`restoreState()`
    paths. They were audited but not all converted to a transaction API.
    The next recommended change is a source-edit transaction that owns
    structural graph changes and commits a revision exactly once.

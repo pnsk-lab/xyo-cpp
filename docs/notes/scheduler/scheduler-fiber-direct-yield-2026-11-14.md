@@ -1,6 +1,6 @@
 # xyo-cpp: 通常LLVMループの直接Fiber Yield実験（2026-11-14）
 
-対象：通常の非warp Scratchループが呼ぶ `xyo_yield_fast(Fiber*)`。Fiber連鎖は明示的に無効化した条件のみ。共有dirty worktreeで未コミット、他エージェントの変更はリセットしない。
+対象：通常の非warp Scratchループが呼ぶ `xyo_yield_fast(Fiber*)`。Fiber連鎖を明示的に無効化した条件のみを対象とする。共有dirty worktreeで未コミット、他エージェントの変更はリセットしない。
 
 ## 実装
 

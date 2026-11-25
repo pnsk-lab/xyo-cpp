@@ -15,7 +15,7 @@ xyo-cpp の Scratch \`operator_contains\` と文字列比較（\`operator_equals
 \`SStr\` は不変なので、最初の検索・比較時に \`lowerCp\` で文字列の性質を証明して、\`flags\` にatomicなビットとして記録する。構造体サイズは増やさない。
 
 1. **lowercase-stable**: JS/ScratchのUnicode小文字化をしても文字列が完全に同一。日本語、ハングル、絵文字、既に小文字の英語など。以後は生のUTF-16 \`find\` / 比較を使う
-2. **ASCII-fold-compatible**: 非ASCIIの文字は一切変化しないが、ASCII \`A-Z\` のみ小文字化される。英大文字が混在する日本語文字列など。比較ではASCIIだけfoldし、検索では短い針（16 UTF-16コードユニット以下）に限り、確保しない \`std::search\` を使う
+2. **ASCII-fold-compatible**: 非ASCIIの文字は一切変化しないが、ASCII \`A-Z\` のみ小文字化される。英大文字が混在する日本語文字列など。比較ではASCIIだけfoldし、検索では短い検索パターン（16 UTF-16コードユニット以下）に限り、確保しない \`std::search\` を使う
 3. **それ以外**: 従来のUnicode完全変換経路。例: \`İ\` の2文字展開、\`K\`、ギリシャ語の文脈依存語末シグマ、Deseret大文字など
 
 UTF-16サロゲートペアはUnicodeコードポイントとして解析する。不正な単独サロゲートは従来どおり変化しない。大小文字変換の証明には実際の \`u16ToLower\` と共通の \`lowerCp\` を使う。
@@ -43,13 +43,13 @@ c++ -O3 -DNDEBUG -std=c++20 -Isrc \
 build/string_unicode_case_bench
 ~~~
 
-\`tests/unit/test_sstr_cons.cpp\` に日本語、ハングル、ギリシャ語、İ、K、Deseret、絵文字、不正なサロゲートを含むケース群の、従来のUnicode小文字化結果との照合を追加した。
+\`tests/unit/test_sstr_cons.cpp\` に日本語、ハングル、ギリシャ語、İ、K、Deseret、絵文字、不正なサロゲートを含むケース群について、従来のUnicode小文字化結果との照合を追加した。
 
 \`tests/differential/string_unicode_fast.py\` は4件の実SB3構造を生成し、インタプリタ・Eager JIT・HotSpotで、経路ON/OFFの変数状態の完全一致を検証する。各作品は1,000反復。
 
 ## 実SB3の性能
 
-同じビルドで \`XYO_STRING_UNICODE_FAST=0/1\` を切り替えた。CPU 0固定、OFF/ONをランダム順に各7回、プロセス起動・JITコンパイル・変数出力を含むwall-clock中央値。
+同じビルドで \`XYO_STRING_UNICODE_FAST=0/1\` を切り替えた。CPU 0固定でOFF/ONをランダム順に各7回実行し、プロセス起動・JITコンパイル・変数出力を含むwall-clock中央値を取った。
 
 | ケース | 実行経路 | OFF | ON | 速度比 |
 |---|---|---:|---:|---:|
@@ -70,7 +70,7 @@ build/string_unicode_case_bench
 
 ## マイクロベンチマーク
 
-約768文字の日本語文字列、繰り返し同じ \`SStr\` オブジェクトを検索・比較。旧Unicode小文字化・逐次比較とキャッシュ済み高速経路を比較すると、おおむね以下。
+約768文字の日本語文字列に対し、同じ \`SStr\` オブジェクトを繰り返し検索・比較する。旧Unicode小文字化・逐次比較とキャッシュ済み高速経路を比較すると、おおむね以下。
 
 - CJK \`contains\`: 25µs程度 → 0.19µs程度（約130倍）
 - CJK 同内容の比較: 49µs程度 → 0.19µs程度（約260倍）
@@ -82,7 +82,7 @@ build/string_unicode_case_bench
 ## 制限と次の調査
 
 - 初回の判定にはO(length)のコストがかかる。**繰り返し利用されるSStrが主要対象**。
-- \`std::search\` を使うASCII-fold-compatible混在検索は針が16コードユニット以下の場合に限定し、長い場合は従来のUnicode経路を使う。
+- \`std::search\` を使うASCII-fold-compatible混在検索は検索パターンが16コードユニット以下の場合に限定し、長い場合は従来のUnicode経路を使う。
 - 数値文字列比較の意味論は \`cast::compare\` に任せる。今回の高速化は文字列比較に入った場合のみ。
 - CPU・メモリとScratchBenchの実作品については、別途ホールドアウトセットで性能とパリティを検証する必要がある。
 

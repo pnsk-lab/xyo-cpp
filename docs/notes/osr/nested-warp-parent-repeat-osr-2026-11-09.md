@@ -66,7 +66,7 @@ Source SHA256: 7b6b653e60f161a1958cdae98c9941313759bd769590435196a453aed74aa740
 
 ## 未対応
 
-一般的な source PC からの再開、非 warp yield、再帰、SSA 内部位置での rollback、任意の深さ・種類の制御フレーム、外側ループ本体の JVM/LLVM 全面実行は対象外。今回は既存のインタプリタから LLVM に限定ループだけを貸し出す方式であり、携帯可能な CallFrame の復元とは別経路。実行中のソース編集に対する一般 deopt も未実装で、移行時のソース revision 検証だけを維持する。
+一般的な source PC からの再開、非 warp yield、再帰、SSA 内部位置での rollback、任意の深さ・種類の制御フレーム、外側ループ本体の JVM/LLVM 全面実行は対象外。今回は既存のインタプリタから LLVM に限定ループだけを貸し出す方式であり、移植可能な CallFrame の復元とは別経路。実行中のソース編集に対する一般 deopt も未実装で、移行時のソース revision 検証だけを維持する。
 
 共有ツリーのため commit / push は行わない。
 

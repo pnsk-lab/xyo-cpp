@@ -17,11 +17,11 @@ interval but does **not** write `runtime.currentStepTime`. Thus,
 for projects that retain the default 30fps Scratch runtime step time,
 60fps presentation still allocates ~25ms *before* drawing. The source
 SB3 may also override `currentStepTime` through TurboWarp metadata;
-the relevant source is `src/load/sb3.cpp`.
+the relevant code is in `src/load/sb3.cpp`.
 
 This explains the prior measured `vm_ms` near 25ms on projects with
 active long-lived scripts. The scheduler is intentionally using its
-allocated per-frame CPU time; it is not proof that Ready Index
+allocated per-frame CPU time; that is not proof that Ready Index
 traversal itself consumes 25ms.
 
 ## Explicit diagnostic cap (default unchanged)
@@ -35,14 +35,14 @@ XYO_SCHED_WORK_BUDGET_MS=12.5
 
 Only valid finite real values in [0.5, 250] ms apply. If absent or
 invalid, the original `0.75 * currentStepTime` computation runs.
-This is **not an optimization in compute efficiency**: it means fewer
+This is **not a compute-efficiency optimization**: it means fewer
 scheduler passes and potentially less Scratch work per host frame.
 It should not be enabled globally without additional semantic testing.
 
 ## Controlled measurements
 
-A separate SDL2-enabled build (software rendering using SDL dummy
-driver), CPU affinity 16, eager JIT, `XYO_YIELD_QMODE=off`,
+A separate SDL2-enabled build (software rendering using the SDL
+dummy driver), CPU affinity 16, eager JIT, `XYO_YIELD_QMODE=off`,
 `XYO_WAIT_WAKE_REGISTRY=1`,
 `XYO_SCHED_READY_INDEX=1`, `XYO_WAIT_READY_SLEEP=1`.
 
@@ -91,8 +91,8 @@ Treat these as **two separate** performance topics:
    user-requested play FPS and the Scratch work-time policy
    consistent while respecting project-specific TurboWarp
    framerate overrides; consider reserving headroom for
-   rendering with explicit frame deadlines, not blind
-   per-frame 25ms busy filling. This changes scheduling
+   rendering with explicit frame deadlines rather than
+   blindly filling the 25ms budget each frame. This changes scheduling
    semantics, and requires end-to-end tests.
 2. **Actual scheduler efficiency:** measure cost per live
    dispatch, number of scheduler passes, per-pass status-change

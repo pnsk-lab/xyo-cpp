@@ -4,7 +4,7 @@
 
 Linux x86-64 SysVで中断中の実LLVMネイティブFiberのレジスタを`unw_context_t`へ復元し、`unw_init_local`と`unw_step`でJITフレームへ到達する実験を実装した。
 
-結果は重要な**部分成功と未証明箇所の分離**：
+結果の要点は、**部分成功と未証明箇所**が分かれたことだ：
 
 - Eager JITの2本の生存Fiberそれぞれで、unwinderがJIT手続き内の`xyo_yield`からの実際の戻り先を特定した（関数相対オフセット1869）。
 - 直前の実StackMapは1861、すでに終わった`xyo_rt_capture_llvm_ssa`の戻り先は1849。`llvm-objdump --reloc`による正確な再配置位置からも一致を確認した。生スタック走査で見つかった1849を誤って生存フレームと認定しない。

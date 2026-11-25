@@ -4,7 +4,7 @@
 
 ## 目的
 
-OSR-006 が追加した `XYO_JIT_OSR_NESTED_SOURCE_PROOF=1` のソース内容識別子検証を、LLVM のコンパイル完了後に **実行中の `Blocks` を直接編集する**対照実験で検証する。
+OSR-006 が追加した `XYO_JIT_OSR_NESTED_SOURCE_PROOF=1` のソース内容識別子検証を、LLVM のコンパイル完了後に **実行中の `Blocks` を直接編集する**対照実験で確かめる。
 
 既存の `Blocks::revision()` 検査だけでは、`Block` のメンバーを書き換えても `resetCache()` を呼ばない場合、LLVM に埋め込まれたソースと実際のソースの相違を検出できない。
 
@@ -16,7 +16,7 @@ OSR-006 が追加した `XYO_JIT_OSR_NESTED_SOURCE_PROOF=1` のソース内容�
 2. Interpreter が root の `set sum = 0` を実行済みであることを `entered >= 1` で確認。
 3. `JitEngine::pollAsync()` で完成済み LLVM コードが公開され、`nestedOsrEntry` とコンパイル時のソース改訂番号が一致することを確認。
 4. 次の `Runtime::step()` **より前**に、元の root の `data_setvariableto` ブロックの `fields["VARIABLE"].id` を `v_sum` から別の有効な変数 ID `v_done` に変更。**`resetCache()` は呼ばない**。
-5. 編集前後の `ScratchCompilationUnit` と `scratchSourceDigest` を実測比較し、ソース内容識別子は変わり、改訂番号は同じことを確認。改訂番号を明示的に上げる対照試験も実施。
+5. 編集前後の `ScratchCompilationUnit` と `scratchSourceDigest` を実測比較し、ソース内容識別子は変わり、改訂番号は同じであることを確認。改訂番号を明示的に上げる対照試験も実施。
 6. 続くスケジューラ実行でネイティブ OSR を採用したか検査。最後に Scratch の**全10変数**を、編集なし Interpreter 実行と型タグを含む正規化値で比較。
 
 変更したブロックは、すでに実行を終えた root の初期化であるため、現在進行中のループと残りの Scratch 実行結果は編集によって変わらない。古い LLVM 実行を拒否できるかだけを切り離して測定できる。
@@ -45,7 +45,7 @@ OSR-006 が追加した `XYO_JIT_OSR_NESTED_SOURCE_PROOF=1` のソース内容�
 
 ## ビルド
 
-共有ツリーの別エージェントによる SDL レンダラ変更に `realDlssEnabled_` 未宣言の独立ビルドエラーがあったため、そのコードには手を触れず、`-DXYO_SDL2=OFF` の独立ヘッドレス構成を使用した。
+共有ツリーの別エージェントによる SDL レンダラ変更で `realDlssEnabled_` 未宣言の独立ビルドエラーが出たため、そのコードには手を触れず、`-DXYO_SDL2=OFF` の独立ヘッドレス構成を使用した。
 
 ```bash
 cmake -S . -B board/.osr-silent-edit-headless -G Ninja \

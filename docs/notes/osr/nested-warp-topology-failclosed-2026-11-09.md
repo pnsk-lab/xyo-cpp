@@ -4,13 +4,13 @@
 
 ## 対象
 
-OSR-014 は4階層 counted repeat に対しネイティブ Fiber yield で4つの source counter を保存し Interpreter のループフレームへ復帰する。OSR-015 は、ソース編集によって保存済みフレームの制御ノードが現在のプログラムから到達不能になった場合を検証する。正解は正常継続ではなく、古い LLVM も Interpreter も再生せずにスレッドを安全に終了する fail-closed。
+OSR-014 は4階層の counted repeat に対し、ネイティブ Fiber yield で4つの source counter を保存して Interpreter のループフレームへ復帰する。OSR-015 は、ソース編集によって保存済みフレームの制御ノードが現在のプログラムから到達不能になった場合を検証する。正解は正常継続ではなく、古い LLVM も Interpreter も再生せずにスレッドを安全に終了する fail-closed。
 
 ## 変更するソース経路
 
 実行中の LLVM Fiber が位相4の最深部 yield で停止した後、CompiledScript にフリーズ済みの source ID を使って3組の親子関係を個別に切断する。外側→中間、中間→深部、深部→最深部の3つを、各々最初と4回目の native yield で試す。
 
-具体的には、子 repeat の直前にある data_setvariableto の next を空にしてその repeat を source chain から切り離す。Blocks::resetCache() でソース改訂し、revision 増加、ScratchCompilationUnit::capture の有効性、immutable source digest の変化を確認する。旧ノードと確定済み変数副作用は破壊しない。
+具体的には、子 repeat の直前にある data_setvariableto の next を空にしてその repeat を source chain から切り離す。Blocks::resetCache() でソースを改訂し、revision 増加、ScratchCompilationUnit::capture の有効性、immutable source digest の変化を確認する。旧ノードと確定済み変数副作用は破壊しない。
 
 ## 正確性の不変条件
 

@@ -46,7 +46,7 @@
 - 隔離LLVM23バイナリにリンクした単体テストを、保護モードOFF/ONそれぞれで直接実行し、両方PASS。
 - Python構文検査・関連ソースのdiff check実施。
 
-隔離バイナリ：`/home/kicky/.rt001-cross-fiber-gc-isolated/xyo`。既存の検証済みLLVM23 `libxyo.a` の複製に対し、変更した`gc.cpp`・`fiber.cpp`・`sequencer.cpp`の3オブジェクトを再コンパイル、同名アーカイブ要素を置換して再リンク。現時点の全共有ツリーからの完全な再ビルドと主張しない。
+隔離バイナリ：`/home/kicky/.rt001-cross-fiber-gc-isolated/xyo`。既存の検証済みLLVM23 `libxyo.a` の複製に対し、変更した`gc.cpp`・`fiber.cpp`・`sequencer.cpp`の3オブジェクトを再コンパイル、同名アーカイブ要素を置換して再リンク。現時点の全共有ツリーからの完全な再ビルドだとは主張しない。
 
 ## 未対応・制限
 

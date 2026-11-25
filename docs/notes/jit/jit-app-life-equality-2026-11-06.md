@@ -4,13 +4,13 @@
 
 `app_life` is a 12×12 Conway-Life simulation. In its hot neighborhood loop it
 compares offsets to zero, neighbor sums to 2/3, and the current cell to 1.
-Variable pointer resolution is **already** hoisted to native function entry,
+Variable pointer resolution is **already** hoisted to the native function entry,
 and the existing JIT uses numeric shadows for promotable loop scalars.
 Nevertheless, runtime profiling showed about 7.5M calls to `xyo_eq` per
 ~603ms execution (an instrumented run, therefore not a throughput baseline).
 
 A temporary type-pair probe in `xyo_eq` found that **all 9.1M sampled calls
-were heap-string/heap-string comparisons**, and both arguments had SStr
+were heap-string/heap-string comparisons**, and that both arguments had SStr
 `numState=1`. Each string had already been parsed as a valid number; the
 fallback wasn't doing new parsing, just dispatching through generic Scratch
 comparison despite a valid numeric cache. The type-pair probe was removed
@@ -40,7 +40,7 @@ path handles this case without replacing the original boxed string:
 This is a general numeric-literal comparison improvement, not a special case
 for `app_life`, a particular block ID or the constants 0/1/2/3. It also works
 with strings representing integers or floating-point values elsewhere. The
-existing evaluation order is unchanged. Compiled fallback uses exactly the
+existing evaluation order is unchanged. The compiled fallback uses exactly the
 same `xyo_eq` runtime helper.
 
 Compile-time A/B switch: `XYO_JIT_EQ_STRING_CACHE=0` disables this optimization
@@ -49,7 +49,7 @@ without affecting other numeric-shadow paths.
 ## Results
 
 Five alternating A/B measurements with the final **production binary**
-(type profiler removed), switch on/off, checksums identical (ops/ms, higher
+(type profiler removed), switch off and on; checksums were identical (ops/ms, higher
 is faster). Raw results: `build/life-investigation-20261106/ab_final.json`.
 
 | ScratchBench | Off | On | Change |
@@ -85,12 +85,12 @@ performance speedup estimate: type-cache probes and branching also have cost.
 numeric and nonnumeric strings, numeric shadow literals, Infinity and its
 lowercase spelling, negative zero, whitespace, empty strings, Unicode, values
 updated during a loop, and both operand orders. Results are checked against
-Scratch interpreter, Eager JIT, HotSpot JIT, O2 and disabled fast-path modes.
+the Scratch interpreter, Eager JIT, HotSpot JIT, O2 and disabled fast-path modes.
 The `app_life` benchmark checksum supplies an additional real-project parity
 check. CTest: `xyo-tests`, `xyo-jit-ascii-fastpaths`,
 `xyo-jit-warp-induction`, `xyo-jit-foreach-ssa`,
 `xyo-jit-repeat-copy-ssa`, `xyo-jit-eq-numeric-cache`: **6/6 passed**.
-AOT generation and execution with the fast path both disabled/enabled also
+AOT generation and execution with the fast path disabled and enabled also
 succeeded: 13,930 vs 14,128 ops/ms in the two single runs, checksum `53` in
 both. Those isolated AOT throughputs are not the main performance estimate.
 

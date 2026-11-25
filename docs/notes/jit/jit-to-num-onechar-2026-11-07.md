@@ -23,7 +23,7 @@
 | 無効な1文字 | 5.43 | 3.64 | 1.49倍 |
 | 空白1文字（空白/TAB混合） | 5.24 | 3.97 | 1.32倍 |
 
-`cast::toNumber`経路でもそれぞれ8.80→3.30、7.16→3.65、5.56→3.74、5.70→4.19ns。どの組み合わせも計測したチェックサムは一致した。
+`cast::toNumber`経路でもそれぞれ8.80→3.30、7.16→3.65、5.56→3.74、5.70→4.19ns。どの組み合わせでも、計測したチェックサムは一致した。
 
 保存先：`build-to-num-cold/onechar-cold-before.txt`／`onechar-cold-after.txt`。ベンチマークは`cmake --build build-to-num-cold --target xyo-to-num-runtime-micro`で実行可能。
 

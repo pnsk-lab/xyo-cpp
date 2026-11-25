@@ -26,7 +26,7 @@ JIT warp loop:
   └─ nowUs > deadlineUs ? spill / yield / reload : continue
 ```
 
-時刻はJITが直接呼び出す`steady_clock::now()`ではなく、別スレッドで更新する。締切のキャッシュラインと頻繁に更新する時刻を分離する。
+時刻はJITが直接呼び出す`steady_clock::now()`ではなく、別スレッドで更新する。締切と、頻繁に更新する時刻を別のキャッシュラインに分離する。
 
 ## 実験結果と制約
 

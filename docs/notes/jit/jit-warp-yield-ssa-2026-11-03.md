@@ -4,7 +4,7 @@
 
 ### 1. 危険な剰余・等値の融合を撤回
 
-`src/jit/codegen.cpp`から、`(a % b) == 0`の時だけ`emitModEqZero`へ置き換えるコードを削除。これはwarp手続きだけに限定しても、ScratchBenchを全体実行するとSIGSEGV（終了コード139）を発生させた。一方、`XYO_JIT_DISABLE_FUSED_MOD_EQ=1`で無効化すると完走した。コードと特化条件のどちらに根本原因があるかは未確定なので、未検証の融合を残したまま通常経路に使わない。
+`src/jit/codegen.cpp`から、`(a % b) == 0`の時だけ`emitModEqZero`へ置き換えるコードを削除。この融合はwarp手続きだけに限定しても、ScratchBench全体を実行するとSIGSEGV（終了コード139）を発生させた。一方、`XYO_JIT_DISABLE_FUSED_MOD_EQ=1`で無効化すると完走した。コードと特化条件のどちらに根本原因があるかは未確定なので、未検証の融合を残したまま通常経路に使わない。
 
 通常の`operator_mod`および`operator_equals`の汎用数値演算と型ガードは保持。剰余の検証用ケースは`tests/bench/algos/mod_eq_zero_probe.py`へ残した。
 

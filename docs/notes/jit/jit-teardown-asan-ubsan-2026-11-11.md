@@ -61,8 +61,8 @@ python3 tests/render/jit_destructor_offscreen_repro.py \
 ```
 
 Both scripts were also run for an initial two iterations per
-JIT mode. HotSpot and Eager assert successful actual LLVM compile
-telemetry; the OFF mode asserts no compiler attempts.
+JIT mode. HotSpot and Eager assert telemetry for successful actual LLVM
+compiles; the OFF mode asserts no compiler attempts.
 The capture cases validate 16 durable PPM output images and
 three aged orphan file recoveries per process.
 
@@ -81,7 +81,7 @@ count returned an internal tool error and is not included.
 - AddressSanitizer instruments the C++ runtime but **not**
   arbitrary native machine code emitted dynamically by LLVM JIT.
 - The proprietary GPU SDK and system GPU drivers were not rebuilt
-  with sanitizers. Real NGX execution did **not** run in this build.
+  with sanitizers. Real NGX execution did **not** happen in this build.
 - UBSan's `vptr` check was disabled because the project has RTTI
   disabled; other UBSan checks remained on.
 - LeakSanitizer was disabled (`detect_leaks=0`) to avoid
@@ -92,7 +92,7 @@ count returned an internal tool error and is not included.
   negative results do **not** prove its cause or its correction.
 
 Suggested follow-up: **CPU-only leak sanitizer** and
-clean ABI-coherent build targeting native JIT/OSR source symbol
+a clean ABI-coherent build targeting native JIT/OSR source symbol
 lifetimes, then a longer mixed workload.
 
 No commit/push.

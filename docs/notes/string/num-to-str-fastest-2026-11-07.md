@@ -13,7 +13,7 @@ Dragonbox (V8採用) → V8由来 SignificandToChars → ECMAScript固定/指数
 
 ## 互換性とテスト
 
-- Dragonboxによる出力は、IEEE754 binary64の1,002,023値で旧C++版と完全一致。
+- Dragonboxによる出力は、IEEE754 binary64の1,002,023値について旧C++版と完全一致。
 - Node.js/V8の`String(number)`と602,023入力で完全一致。
 - `tests/bench/num_to_str_direct_sstr_parity.cpp`を追加。100,020個の入力で最終SStrのUTF-16内容、バッファ境界番兵、数値キャッシュ状態、-0を確認する。
 - 直接出力を有効にした後も、1,002,023入力の数値文字列が旧実装と完全一致。

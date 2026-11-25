@@ -23,7 +23,7 @@ event_whenflagclicked
 
 - `src/jit/nested_warp_osr.hpp`: 任意の正しい静的 callsite 配列を最外側から最内側へ生成する有界探索に置換。再帰的な同一手続き定義・非 warp・reporter call は拒否。最大8呼出し、各層最大16引数、各手続きの直列文は最大128個。
 - `src/jit/backend_llvm.cpp`、`src/jit/jit.hpp`: 非同期コンパイル結果に正確な呼出し元ブロックIDの配列と `Blocks::revision()` を保存する。古い1/2段のメタデータ文字列は互換性のため残す。
-- `src/engine/runtime.cpp`: 現在の実インタプリタスタックのすべての ID、各 warp 手続きの署名・保留リポータ無し・実行済み call 状態、`InterpreterOsrSnapshot::validFor()`、`sourcePath()` と `returnBlockId` を照合してから移行。コンパイル元のソース revision が一致しない場合は拒否。
+- `src/engine/runtime.cpp`: 現在の実インタプリタスタックのすべての ID、各 warp 手続きの署名・保留リポータの不在・実行済み call 状態、`InterpreterOsrSnapshot::validFor()`、`sourcePath()` と `returnBlockId` を照合してから移行。コンパイル元のソース revision が一致しない場合は拒否。
 - `src/jit/rt.cpp`: 元の `stackFrames[stack.size()-2]->params` を読み取る直接・SSA 入力経路をフレーム数2..9に対応。元の引数フレームを保持し、GC ルートを勝手に別の所有形へ移さない。`undefined` は各読出し位置で従来の reporter にフォールバックする。
 - `src/engine/sequencer.cpp`: LLVM の残りループ終了時に呼出し元 ID 配列全体を再検証し、最後のループフレームだけ `goToNextBlock()` する。戻り先の各手続きは、元のインタプリタで後続ブロックを実行する。
 
@@ -79,4 +79,4 @@ Source SHA-256: 3c58db381a394289151de514e1a3fa31c5b02d50a3a5b879eddab6e88dabac0a
 
 - CTest #56: xyo-nested-warp-stack-osr **1/1 PASS**、58.08秒。
 - 旧2/3フレームの差分テストは独立再実行で全 PASS。
-- 並行ビルド中の一度だけ、旧2フレーム fixture が非同期コンパイル完了前に実行を終え、実際の OSR 移行を確認できず assertion が失敗。Scratch の出力不一致ではなく実移行を必須とするテストの時間依存であり、負荷を分離した再実行で全モードの実移行と復帰を確認した。
+- 並行ビルド中の一度だけ、旧2フレーム fixture が非同期コンパイル完了前に実行を終え、実際の OSR 移行を確認できず assertion が失敗した。これは Scratch の出力不一致ではなく、実移行を必須とするテストの時間依存によるもので、負荷を分離して再実行したところ、全モードの実移行と復帰を確認した。

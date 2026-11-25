@@ -6,7 +6,7 @@
 - ScratchBench: 同梱 `scratch-bench/`、performance source hash `e8bd5be3e7345088`、47項目
 - xyoの比較対象: 同じRelease設定（`XYO_DISABLE_RT_PROF=ON`）で再帰最適化前1回・後2回の中央値
 - TurboWarp: 2.1.46（VM commit `f26ff67`）、Node 26、compiler有効、手動直接実行1回
-- 同梱の `bun run bench` では今回TurboWarpが0終了してもDONEが得られず失敗判定となったため、`BENCH_COMPILER=1 node runtimes/node-vm.mjs turbowarp .cache/build/performance.sb3` で直接出力を取得した。生ログ `build/twmanual.log` に全47結果とDONEがある
+- 同梱の `bun run bench` では、今回TurboWarpが0で終了してもDONEが得られず失敗判定になったため、`BENCH_COMPILER=1 node runtimes/node-vm.mjs turbowarp .cache/build/performance.sb3` で直接出力を取得した。生ログ `build/twmanual.log` に全47結果とDONEがある
 - 性能は環境負荷や測定ノイズで動く。TurboWarp比較は1回なので有意差ではなく改善箇所の探索用
 - schedulerは実時間依存で、checksumが一致しないこと自体は異常ではない
 
@@ -51,8 +51,8 @@ JIT再帰のたびに呼ばれる `xyo_proc_push` / `xyo_proc_pop` は、Scratch
 
 ## 他の改善・テスト
 
-- `src/core/string_util.cpp`: `SStr::isAscii` を深いropeでもスタックオーバーフローしない反復的postorder計算に変更し、atomic fetch_orでキャッシュを公開
-- Unicodeのlowercase展開（例: `İ` → `i` + 合成点）で `contains` が誤判定する早すぎる長さチェックを修正
+- `src/core/string_util.cpp`: `SStr::isAscii` を深いropeでもスタックオーバーフローしない反復的postorder計算に変更し、atomic fetch_orでキャッシュを公開する
+- Unicodeのlowercase展開（例: `İ` → `i` + 合成点）で `contains` が誤判定する原因になっていた、早すぎる長さチェックを修正
 - `tests/unit/test_sstr_cons.cpp`: 60,000段の左右深いrope、非ASCIIの伝播、Unicode展開の回帰テスト追加
 - `CMakeLists.txt`: Releaseの既定では実行時プロファイラをコンパイル除去。診断したいときは `-DXYO_DISABLE_RT_PROF=OFF`。RelWithDebInfoの既定は従来どおり維持
 - 過去の15ブロック/1200測定の要因実験 `../core/string-factorial.md` ではプロファイラ除去が文字列10種の幾何平均で約5.6%高速化

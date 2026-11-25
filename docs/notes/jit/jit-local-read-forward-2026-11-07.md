@@ -34,7 +34,7 @@ IR出力（LLVM最適化前）での `load i64` の数：
 
 ## LLVM O3後の性能（各モード5回の中央値）
 
-`tests/bench/phi_demand_metrics.py --local-read`で測定。コンパイル時間と実行ウォール時間は別に取得し、オブジェクトサイズはORC出力の`.text`を測る。
+`tests/bench/phi_demand_metrics.py --local-read`で測定。コンパイル時間と実行時のウォール時間は別に取得し、オブジェクトサイズはORC出力の`.text`を測る。
 
 | SB3 | OFFウォール | ONウォール | OFF JIT | ON JIT | `.text` OFF/ON |
 | --- | ---: | ---: | ---: | ---: | ---: |

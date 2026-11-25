@@ -6,7 +6,7 @@
 
 既存の `tryMegaScalarBatch()` は同一 `MegaDispatchCode` に属する
 連続した2～8本のsource-certified Threadを1回のLLVM関数で処理するが、
-ほかのThreadが先に終了して1本だけになるとバッチを拒否していた。
+ほかのThreadが先に終了して1本だけになるとバッチを拒否する。
 その結果、`jitStepThread()` による `JitCtx` 準備・継続処理へ戻る。
 
 ## 実装

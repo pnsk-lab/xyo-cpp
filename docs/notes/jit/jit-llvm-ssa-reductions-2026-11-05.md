@@ -15,9 +15,9 @@ the proof or runtime guards fail.
 `repeat N { set acc to acc + C }` / `set acc to acc - C`, where the body is
 exactly one supported arithmetic update and `C` is an integer in [-65536,65536], excluding zero. This is only
 active when the existing fixed-literal `repeatIntegerCounter` proof succeeds.
-The accumulator is guarded at runtime for Scratch-numeric, integral, and
-absolute value <= 2^48. A bounded SSA recurrence is generated for at most
-64 iterations. LLVM folds its integral recurrence rather than processing
+The accumulator is guarded at runtime to be Scratch-numeric and integral,
+with absolute value <= 2^48. A bounded SSA recurrence is generated for at
+most 64 iterations. LLVM folds its integral recurrence rather than processing
 individual Scratch values. `XYO_JIT_REPEAT_SSA=0` disables this optimization.
 
 ### 2. for-each with independent linear sum
@@ -63,7 +63,7 @@ CTest entries: `xyo-jit-repeat-ssa` and `xyo-jit-foreach-ssa`.
 ### Performance
 
 Four alternating local measurements with the **same binary**, comparing the
-optimization toggles ON and OFF (medians, ops/ms). The source of truth is
+optimization toggled ON and OFF (medians, ops/ms). Raw results:
 `build/llvm-scev-loop/paired-ssa.json`.
 
 | ScratchBench | OFF | ON | Speedup | checksum |

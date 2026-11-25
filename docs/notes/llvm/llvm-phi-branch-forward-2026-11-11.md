@@ -96,8 +96,8 @@ PHI-union operation; the new dedicated test verifies the second IF.
 build was blocked by concurrent, unrelated modifications in
 `src/jit/jit.cpp` (`AotMetaArray::empty` and iterator traits).
 Those source changes were **not touched**. A separate diagnostic executable
-was linked from the newly compiled `codegen.cpp.o` and the existing
-previously compiled `jit.cpp.o`, using Ninja's generated link commands:
+was linked from the newly compiled `codegen.cpp.o` and the previously
+compiled `jit.cpp.o`, using Ninja's generated link commands:
 `build/multi-bench-20261110/phi-branch-forward/xyo-branch-default`.
 This did not overwrite the shared `libxyo.a` or `xyo` executable.
 A clean standard rebuild remains required after the unrelated changes are fixed.

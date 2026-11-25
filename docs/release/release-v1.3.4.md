@@ -28,7 +28,7 @@ affine（一次）更新」だけで書けるなら、1 反復を拡大状態ベ
 
 実測: `repeat(2e9){ change x by 3 }` 536 ms → **37 ms**、`repeat(2e8)`
 152 ms → 38 ms、`repeat until i < 1 { change i by -1; change s by i }`
-（i=1e6、逐次 1e6 反復）が O(log N) で一瞬。
+（i=1e6、逐次 1e6 反復）が O(log N) で一瞬で終わる。
 
 ## DP — 純粋な再帰手続きの自動メモ化
 
@@ -44,7 +44,7 @@ affine（一次）更新」だけで書けるなら、1 反復を拡大状態ベ
   書き換えない**（`XYO_DP=0` で無効）。
 - 文字列を作る op を禁止しているのは、キー照合が `item # of`（数値等価）で
   `"01"` と `1` を同一視するため。数値だけなら等価 ⇒ 同じ `toNumber` ⇒
-  同じ結果で安全。
+  同じ結果なので安全。
 
 実測: fib(30) 159 ms → **39 ms**、fib(32) 334 ms → **40 ms**、
 fib(36) 2134 ms → **43 ms**（n を増やしてもほぼ一定）。
@@ -68,7 +68,7 @@ fib(36) 2134 ms → **43 ms**（n を増やしてもほぼ一定）。
 
 ## 既知の制限
 
-- interpreter は 2 か所再帰の reporter 手続き（`f(n-1)+f(n-2)`）を誤る
+- interpreter は再帰呼び出しが 2 か所ある reporter 手続き（`f(n-1)+f(n-2)`）を誤る
   （MLIR 経路は正しい）。DP 変換後も同じ経路で走るため、interpreter で
   fib 形を動かすと値が違う（本リリース前からの挙動）。
 - matpow は warp 実行中のみ・AOT/`--block-count` では無効（par-for と同じ

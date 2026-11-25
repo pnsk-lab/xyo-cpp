@@ -10,12 +10,12 @@ src/jit/mega_yield_source.hpp に、引数なし・非warpの
 緑旗スクリプトの唯一の命令が手続き呼び出しである場合だけ、
 最初に解決される procedures_definition の本体を検査する。
 
-本体が従来のMega-Yieldで既に安全性を検証していた
+本体が、従来のMega-Yieldで既に安全性を検証していた
 - 非warp repeat(整数リテラル) { 変数を有限定数だけ加算 }
 - 固定ASCIIのbroadcast and wait → 変数を有限定数だけ加算
 - 非warp repeat(整数リテラル) { 固定ASCIIのbroadcast and wait }
   → 変数を有限定数だけ加算
-のいずれかに限り、LLVMの共通switch(pc)へ直接入れる。
+のいずれかに該当する場合に限り、LLVMの共通switch(pc)へ直接入れる。
 
 Source.tailProcedure は診断用ソース証明メタデータ。
 LLVMコードにはC++呼出しスタック、手続きFrameや戻りアドレスを
@@ -53,7 +53,7 @@ Source revisionや変数binding generationの安全検査も従来通り。
 tests/bench/algos/build_mega_tailproc_fixture.py
 
 入力SB3の緑旗スクリプトを、
-「緑旗→専用の自作ブロックcall」に置換し、
+「緑旗→専用の自作ブロックcall」に置き換え、
 元の本体をargument-free/nonwarpのdefinitionの下へ移動する。
 
 正しい対象条件で確認した実際の生成ログ:
@@ -69,7 +69,7 @@ rx0=6、rx1=12、v0=10、v1=20（OFF/ON一致）。
 一回broadcast-and-waitを持つ自作ブロック2本:
 rx0=3、rx1=4、v0=10、v1=20（OFF/ON一致）。
 
-引数あり、warp付き、末尾以外のcallの3変種は
+引数あり、warp付き、末尾以外のcallの3変種では
 無効になった1スクリプトだけを対象から外し、
 残り2スクリプトだけを統合した（slots=2）。
 他のエージェントの作業はリセットしていない。
@@ -120,5 +120,5 @@ XYO_BCAST_JOIN_DEAD_FASTで完了受信者へのmembership scanを
 - XYO_JIT_MEGA_BATCH_YIELD=0：xyo-tests PASS（43.40秒）
 - 単体テストではThreadごとのPC/残反復数・Fiber未使用・
   緑旗再実行のキャッシュ再利用・値の重複加算なしを確認。
-- src/jit/rt.cpp と src/engine/sequencer.cpp への
+- src/jit/rt.cpp と src/engine/sequencer.cpp に入れた
   成績不良のXYO_BCAST_JOIN_DEAD_FAST実験は削除済み。

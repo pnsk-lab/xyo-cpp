@@ -20,7 +20,8 @@ reassociation is introduced. Comparisons use `xyo_lt/gt/eq`, and
 
 The dispatcher uses the original source-certified join list, Thread
 identity and return-PC implementation. It handles initial condition
-evaluation, completion of a joined receiver, and final suffix exactly once.
+evaluation, completion of a joined receiver, and the final suffix exactly
+once.
 
 ## Precise safety limits
 
@@ -49,8 +50,9 @@ evaluation, completion of a joined receiver, and final suffix exactly once.
 ## Code and tests
 
 - `src/jit/mega_yield_source.hpp`: strict clock and elapsed-ms reporter
-  source proof. Records whether clock vs literal, clock vs variable, or
-  exact elapsed-ms expression was certified and preserves operand order.
+  source proof. Records whether the source was certified as clock vs
+  literal, clock vs variable, or the exact elapsed-ms expression, and
+  preserves operand order.
 - `src/jit/jit.cpp` and `src/jit/backend_llvm.cpp`: check all referenced
   variable IDs, call Scratch's exact time/arithmetic/compare helpers
   at the continuation condition PC, and preserve join semantics.
@@ -66,8 +68,8 @@ Earlier dynamic-until synthetic A/B for a variable-only condition
 normal Fiber median 84.44ms, Mega 87.92ms, paired geomean
 0.99372x, Mega wins 3/16. **No demonstrated performance win**.
 No runtime performance speedup is claimed for the newly added
-wall-clock form: a wall-clock-deadline workload has different
-interpretation from a fixed-work throughput benchmark.
+wall-clock form: a wall-clock-deadline workload is interpreted
+differently from a fixed-work throughput benchmark.
 
 ## Test artifacts
 

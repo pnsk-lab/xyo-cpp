@@ -55,13 +55,13 @@ modulus semantics.
   `d64a28bfd605ed0c`) with flag explicitly ON:
   **2656/2656** in Interpreter, Eager JIT, HotSpot JIT, **and AOT**.
   Results `scratch-bench/results/perf-life-smallwrap-parity-20261110/`.
-- Rebuilt with default ON and verified flag absent ≈ flag `1` and flag `0`
-  restores baseline. Example diagnostic:
+- Rebuilt with the default ON and verified that an absent flag matches
+  flag `1` and that flag `0` restores the baseline. Example diagnostic:
   default `30.272`, explicit ON `30.268`, OFF `27.858` ops/ms;
   all checksums `53`.
 - Further regression tests: `jit_arith_range.py` passed **20 cases × 4 modes**;
   `jit_induction_ranges.py --quick` passed **12 fixtures**.
-- LLVM optimized module confirms **three** `mod.wrap.fast` sites in
+- LLVM optimized module confirms **three** `mod.wrap.fast` sites in the
   `app_life` procedure (`build/life-codecompare-20261110/smallwrap-optimized-ir.txt`).
   Object dump program size increases from `0x7d41` to `0x8072` bytes;
   common hot-path work decreases despite the cold fallbacks still being emitted.

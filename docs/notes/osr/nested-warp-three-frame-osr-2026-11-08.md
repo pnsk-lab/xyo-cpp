@@ -2,7 +2,7 @@
 
 ## 対応範囲
 
-`XYO_JIT_OSR_NESTED_DEEP=1` は、従来の2フレームの途中移行に加え、次の **ちょうど3つ** の実行中インタプリタフレームを持つスクリプトに対して、内側のカウント付き `repeat` の残り部分だけを LLVM で実行する。
+`XYO_JIT_OSR_NESTED_DEEP=1` は、従来の2フレームの途中移行に加え、次のように実行中インタプリタフレームが **ちょうど3つ** あるスクリプトに対して、内側のカウント付き `repeat` の残り部分だけを LLVM で実行する。
 
 ```text
 event_whenflagclicked
@@ -11,7 +11,7 @@ event_whenflagclicked
           -> control_repeat         (stack[2], counter captured)
 ```
 
-追加の入れ子呼出しは外側手続きの **直列ステートメント** に限る。再帰全般、IF分岐下の子手続き呼出し、呼出しを含む別の制御ループ、4フレーム以上への OSR は非対応である。元の2フレーム実装は変更せず、DEEP フラグの既定値は無効。
+追加の入れ子は、外側手続きの **直列ステートメント** にある呼出しに限る。再帰全般、IF分岐下の子手続き呼出し、呼出しを含む別の制御ループ、4フレーム以上への OSR は非対応である。元の2フレーム実装は変更せず、DEEP フラグの既定値は無効。
 
 ## 実行経路と安全性
 
@@ -40,7 +40,7 @@ XYO_JIT_OSR_TIMING=1 \
 
 ## 検証
 
-新しい `tests/differential/jit_nested_warp_deep_osr.py` で、各モードが Interpreter と全変数で一致することに加え、実際のネイティブ移行 `depth=3` と復帰ログを確認。
+新しい `tests/differential/jit_nested_warp_deep_osr.py` では、各モードの全変数が Interpreter と一致することに加え、実際にネイティブへ `depth=3` で移行し、復帰することもログで確認する。
 
 | ケース | 結果 |
 | --- | --- |

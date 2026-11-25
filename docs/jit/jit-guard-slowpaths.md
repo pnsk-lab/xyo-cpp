@@ -26,7 +26,7 @@ The report is printed at process shutdown, for example:
 
 Here `sites` is the number of named pre-optimization LLVM basic blocks
 instrumented during this process. LLVM may later remove unreachable code;
-`sites` is therefore *not* necessarily the number of machine-code callsites.
+`sites` is therefore *not* necessarily the number of machine-code call sites.
 `hits` is the number of times generated native execution entered these
 blocks and called the counter. It is NOT the number of Deopts: all the
 selected branches remain within generated machine code.
@@ -83,7 +83,7 @@ performance measurement. The counters are best for identifying which
 fast paths are missed and which alternative lowering is worth exploring.
 
 This is not exhaustive. Slow blocks without one of the audited names,
-guard failures taken entirely within helper functions, and real
+guard failures that occur entirely within helper functions, and real
 Deoptimization to the interpreter (reported by PROF-003) are distinct.
 
 ## Validation

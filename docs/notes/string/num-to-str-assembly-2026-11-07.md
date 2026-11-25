@@ -21,20 +21,20 @@ ctest --test-dir build-to-num-asm --output-on-failure \
 `extern "C" size_t xyo_i64_to_ascii_asm(int64_t value, char out[32])`。
 
 - 引数: SysV AMD64 ABIの`rdi`（整数）・`rsi`（出力32バイトバッファ）。戻り値は`rax`の生成文字数で、NUL終端は書かない。
-- 正負の1〜2桁は、2桁ルックアップ表を使って`out`へ直接書く。カーネル呼び出し、ヒープ確保なし。
-- 3桁以上は2桁ずつ末尾側へ書き、最後に前方へコピーする。`|n| ≤ 2^53`の範囲では`ceil(2^68/100)`による逆数乗算で100除算の商を計算。`INT64_MIN`を含む大きな値は通常の64ビット符号なし除算を使う。
+- 正負の1〜2桁は、2桁ルックアップ表を使って`out`へ直接書く。カーネル呼び出しもヒープ確保もない。
+- 3桁以上は2桁ずつ末尾側へ書き、最後に前方へコピーする。`|n| ≤ 2^53`の範囲では`ceil(2^68/100)`による逆数乗算で100除算の商を計算する。`INT64_MIN`を含む大きな値は通常の64ビット符号なし除算を使う。
 - 呼び出し規約のcallee-savedレジスタを破壊せず、SSE/AVXの使用・動的確保・実行時関数呼び出しを行わない。
 - **実際の`jsnum::toString`では、計測で速かった符号付き2桁整数（-99〜-10、10〜99）に限定してアセンブリを選択**。3桁以上はstd::to_charsへフォールバックする。0は既存の特殊処理、1桁はstd::to_charsを維持する。
 
 ## 正確性
 
-- `tests/bench/num_to_str_asm_parity.cpp`: 最小・最大の符号付き整数、十進桁境界、乱数100万個、さらに符号付き2^53以下の乱数200万個。全**3,000,025整数**について`std::to_chars`とバイト列・桁数を比較し、範囲外のメモリ書き込みを検査。全件一致。
-- `tests/bench/num_to_str_asm_full_parity.cpp`: `jsnum::toString(double)`を従来経路とアセンブリONで別々にビルドし、浮動小数点ランダム50万個・正確な整数50万個・境界値・-999〜999を含む**1,002,023値**の実際のECMAScript出力をバイナリ比較。完全一致。
+- `tests/bench/num_to_str_asm_parity.cpp`: 最小・最大の符号付き整数、十進桁境界、乱数100万個、さらに符号付き2^53以下の乱数200万個。全**3,000,025整数**について`std::to_chars`とバイト列・桁数を比較し、範囲外のメモリ書き込みを検査した。全件が一致した。
+- `tests/bench/num_to_str_asm_full_parity.cpp`: `jsnum::toString(double)`を従来経路とアセンブリONで別々にビルドし、浮動小数点ランダム50万個・正確な整数50万個・境界値・-999〜999を含む**1,002,023値**の実際のECMAScript出力をバイナリ比較し、完全一致を確認した。
 - `tests/CMakeLists.txt`: `XYO_ASM_NUM_TO_STR=ON`時に`xyo-num-to-str-asm-parity`をCTest登録。
 
 ## 速度
 
-`tests/bench/num_to_str_asm_micro.cpp`はアセンブリの純粋な整数整形を、`tests/bench/num_to_str_asm_full_micro.cpp`は`jsnum::toString(double)`全体を測定する。各データセット256値の反復、5回の結果の中央値（ns/変換）。
+`tests/bench/num_to_str_asm_micro.cpp`はアセンブリの純粋な整数整形を、`tests/bench/num_to_str_asm_full_micro.cpp`は`jsnum::toString(double)`全体を測定する。各データセットの256値を反復し、5回の結果の中央値（ns/変換）を示す。
 
 | 値の種類 | 標準実装 | アセンブリON | 評価 |
 |---|---:|---:|---|
@@ -46,7 +46,7 @@ ctest --test-dir build-to-num-asm --output-on-failure \
 
 単体の整数整形では3桁以上で`std::to_chars`が手書き版より速かった。そのため、最終のJIT/インタプリタ経路では2桁だけを対象にしている。
 
-**Scratchでの実効果は限定的**。`cast::toString`には**-128〜1023の小整数共有キャッシュ**があり、2桁整数は通常、文字列整形自体が呼ばれない。したがってこの改善をランタイム全体の高速化とは主張できず、既定OFFとした。
+**Scratchでの実効果は限定的**。`cast::toString`には **-128〜1023の小整数共有キャッシュ**があり、2桁整数では通常、文字列整形自体が呼ばれない。したがってこの改善をランタイム全体の高速化とは主張できず、既定OFFとした。
 
 ## 追加検証
 
@@ -54,7 +54,7 @@ ctest --test-dir build-to-num-asm --output-on-failure \
 
 アセンブリ関数は`build-to-num-asm/xyo`に実際にリンクされていることも確認した（`nm -C`に`xyo_i64_to_ascii_asm`が存在）。
 
-小ベンチマークでは、直接整数整形について正の2桁が`std::to_chars`約2.19ns→アセンブリ約1.09ns、負の2桁が約2.69ns→1.05ns。一方、6桁程度からアセンブリの長整数経路は`std::to_chars`より遅いため、通常の`jsnum::toString`からは呼ばない。
+小ベンチマークの直接整数整形では、正の2桁が`std::to_chars`約2.19ns→アセンブリ約1.09ns、負の2桁が約2.69ns→1.05ns。一方、6桁程度からアセンブリの長整数経路は`std::to_chars`より遅いため、通常の`jsnum::toString`からは呼ばない。
 
 ## Git
 

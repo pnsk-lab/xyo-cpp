@@ -24,13 +24,13 @@ LLVM内の load → fadd → store に変更する。
   Target/Stage変数マップの世代番号を確認し、変化したら
   保存済みの`Variable*`をすべて失効させる。
   未解決変数が1つでもあれば**全スロットをnull**として
-  元ヘルパーへ戻す。これは同じLLVM sliceの途中でヘルパーが
-  変数を作成しても既存の直接ポインタを無効化しないため。
+  元ヘルパーへ戻す。これは、同じLLVM sliceの途中でヘルパーが
+  変数を作成しても、既存の直接ポインタを無効化しないため。
 - `src/jit/jit.cpp`: 通常のgreen flag / broadcast receiver
   のインストール・キャッシュ命中・Thread再利用時にスロットをリセットする。
 
 対応するsourceを持つスレッドとクローンはそれぞれ固有のJitCtxと
-変数ポインタを保持する。クロスターゲットでポインタは共有しない。
+変数ポインタを保持する。ターゲットをまたいでポインタは共有しない。
 
 待機通知`XYO_WAIT_WAKE_REGISTRY=1`が有効なとき、
 直接ストアからも`xyo_wait_notify_var_store`を発行する。
@@ -38,7 +38,7 @@ LLVM内の load → fadd → store に変更する。
 
 LLVM最適化は引き続きO1。追加のGC所有値や文字列ポインタを
 `MegaDispatchCode`に保存しない。変数ポインタはThread所有で
-structural generation検査後の1スケジューラslice内に限り使用。
+structural generation検査後の1スケジューラslice内に限り使用する。
 
 ## 検証
 
@@ -56,7 +56,7 @@ structural generation検査後の1スケジューラslice内に限り使用。
 
 最初の直接更新ONで全体テストの後半に一度SIGSEGV (rc139) を観測。
 同一バイナリ・同条件の再実行は終了コード0で全件PASSしたため、
-この一度の原因は特定できていない。メモリ破壊の不存在を保証するものではない。
+この一度の原因は特定できていない。メモリ破壊が起きていないことを保証するものではない。
 
 ## ScratchBench 実測
 

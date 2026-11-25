@@ -9,7 +9,8 @@ benchmark-specific condition or Scratch project rewrite.
 Only pure branch conditions and an existing statically eligible integer repeat
 can enter the native SSA chunk. At runtime, every referenced scalar must be
 a finite, integral, plain number within +/-2^40, and at most 64 iterations
-execute before publishing the Scratch variables and checking the scheduler.
+may run before the Scratch variables are published and the scheduler is
+checked.
 
 For the nonnegative modulo specialization:
 

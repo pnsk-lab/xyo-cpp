@@ -8,8 +8,8 @@ MATH-007 introduced a read-only table of pow(10, k/20) for integers
 k = 0..50. The original emitter recreated the table for EVERY Scratch
 10 ^ reporter in a compiled script. LLVM's global optimizer subsequently
 merged equivalent unnamed_addr constants, but code generation still
-performed repeated host pow calculations, constant construction,
-and generated extra intermediate globals.
+repeated host pow calculations, rebuilt the constant, and generated
+extra intermediate globals.
 
 Modified src/jit/numeric_repeat_float_ssa.inc:
 
@@ -20,7 +20,7 @@ Modified src/jit/numeric_repeat_float_ssa.inc:
   and all other arithmetic semantics.
 - Add diagnostic XYO_JIT_POW10_DUPLICATE_TABLE=1 to reproduce the
   pre-fix table-per-reporter behavior in the SAME executable.
-  Deduplication remains default.
+  Deduplication remains the default.
 
 No benchmark-name or project-ID special cases were introduced.
 
@@ -36,7 +36,7 @@ An early 16-reporter fixture was INVALID because the compiler's
 numeric-repeat parser limits the number of distinct variables to 16,
 and the added loop counter exceeded that bound. Its old measurements
 are discarded. The corrected 12-reporter fixture is verified to
-actually select the optimized JIT path using XYO_JIT_DUMP2=1:
+actually select the optimized JIT path with XYO_JIT_DUMP2=1:
 there were 48 occurrences of rep.pow10.table in the IR diagnostics.
 The module emitted a single final pow10 global in both configurations,
 but with duplication the LLVM optimizer had to coalesce dozens of

@@ -55,9 +55,9 @@ ifのみ結果: build-scheduler-rewrite-20261111/mega-ifelse/bench-branch-pair-i
 ## ScratchBench 実プロジェクトでの影響
 
 既存performance.sb3から未選択suite call siteだけを削除する
-bench_scheduler_flags.pyで、同じバイナリ、CPU16固定、eager、
-他のMegaフラグ固定、branch pairフラグだけON/OFFで8組交互測定。
-スループットは大きいほどよい。
+bench_scheduler_flags.pyを使い、同じバイナリ、CPU16固定、eager、
+他のMegaフラグ固定の条件でbranch pairフラグだけON/OFFにし、
+8組の交互測定を行った。スループットは大きいほどよい。
 
 | 選択したカーネル | OFF中央値 | ON中央値 | 対応ペアON/OFF | ON勝利 |
 |---|---:|---:|---:|---:|

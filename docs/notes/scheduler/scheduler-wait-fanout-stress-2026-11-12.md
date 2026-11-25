@@ -33,7 +33,7 @@ through `Runtime::greenFlag` and `Runtime::runUntilDone(500)`.
 - Exactly 28 threads are launched by the green flag and all have native
   JIT code before the scheduler begins executing them.
 - All scripts complete within the bounded step count without starvation.
-- Every one of four Stage gates ends at 1.
+- Every one of the four Stage gates ends at 1.
 - All 24 independent waiter sprites end with local `v=1`.
 - The native wait differential observer reports no missed or untracked
   changed dependencies in this execution.

@@ -107,7 +107,7 @@ JSON data:
 
 ## Remaining
 
-The strongest remaining costs are receiver creation / broadcast
+The largest remaining costs are receiver creation / broadcast
 launch and general scheduler infrastructure, not LLVM condition
 reentry. Full heterogeneous `suite_sched` continuation is not yet
 supported. Keep the fast join lane disabled by default until wider

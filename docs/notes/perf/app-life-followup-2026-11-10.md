@@ -16,11 +16,11 @@ toroidal indices. The test sources are unchanged.
 1. **Constant-modulus one-wrap lowering:** an opt-in guarded branch would
    avoid `urem` on exact positive values below twice a constant divisor. The
    candidate compiled but aborted with `LLVM ERROR: SmallVector unable to
-   grow` when compiling the real `app_life` diagnostic. Entire trial was
-   reverted from shared `src/jit/codegen.cpp`; original code rebuilt.
+   grow` when compiling the real `app_life` diagnostic. The entire trial was
+   reverted from the shared `src/jit/codegen.cpp`; original code rebuilt.
 2. **32-bit list index conversion:** an opt-in x86 32-bit `cvttsd2si` path,
    retaining 64-bit conversion when `list.len > INT32_MAX` and preserving
-   invalid-index behavior. On identical binary, CPU8, 14 alternating pairs,
+   invalid-index behavior. On the identical binary, CPU8, 14 alternating pairs,
    baseline median 27.840 vs candidate 25.3975 diagnostic ops/ms; speed ratio
    0.913992, **0/14 wins**. The entire change was reverted and rebuilt.
 3. **Direct cold string parse:** after a `data_itemoflist` numeric consumer

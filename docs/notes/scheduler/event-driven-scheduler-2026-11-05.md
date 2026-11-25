@@ -14,7 +14,7 @@ Disabled by default. Diagnostics: `XYO_EVENT_SCHED_STATS=1` prints skipped/woken
 
 - At block-cache/JIT compilation, inspect the `CONDITION` AST. Only a strict whitelist of side-effect-free Scratch reporters (variables, literal reporters, arithmetic, comparisons, boolean operations, string operations) can be classified pure.
 - Exclude time, keyboard, mouse, sensors, randomness, procedures, lists, extensions and unrecognized reporters.
-- A false pure `wait until` registers a wait site and the current sequencer progress epoch. Each successfully advanced Scratch script/batch or start of a new tick invalidates the epoch.
+- A pure `wait until` whose condition is false registers a wait site and the current sequencer progress epoch. Each successfully advanced Scratch script/batch or start of a new tick invalidates the epoch.
 - While no other script has advanced in the **same tick**, the scheduler skips re-running that waiter. Upon progress or at the **next tick**, it re-evaluates through the original Scratch evaluation path.
 - A wait that was exited and re-entered at the same site in a warp loop increments a separate exit counter. Site equality alone is insufficient evidence of no progress.
 - Parallel-wait resumptions use the serial scheduling path to preserve order with concurrent writers.

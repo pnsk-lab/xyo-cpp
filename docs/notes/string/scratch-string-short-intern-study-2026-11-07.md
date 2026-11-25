@@ -4,14 +4,14 @@
 
 The 8-byte NaN-boxed Value stores the existing tagged string as a GC-owned
 SStr pointer. Direct immediate small-string values would require coordinated
-changes to JIT, GC, AOT and WASM tag handling. Instead this experiment reuses
+changes to JIT, GC, AOT and WASM tag handling. Instead, this experiment reuses
 existing immutable strings and preserves the Value/SStr ABI.
 
 ## Implementation
 
 Enable with XYO_STRING_SHORT_INTERN=1 or --string-short-intern=on.
-Default: off. The cache admits only 2..4 UTF-16 code unit ASCII strings,
-including embedded NUL. The direct-mapped table has 4096 slots, with
+Default: off. The cache admits only ASCII strings of 2..4 UTF-16 code
+units, including embedded NUL. The direct-mapped table has 4096 slots, with
 strong GC roots for successful admissions. Keys include the leaf encoding
 (UTF-16 or Latin-1). Collisions bypass the interner; there is no eviction.
 Atomic publications allow concurrent creation without stale pointers.
@@ -27,7 +27,7 @@ process, with up to 4096 pinned GC objects plus a 32 KiB pointer table.
 
 250,000 operations and three independent processes per variant, GC
 collection deferred for measurement, process median elapsed time.
-The GC allocation count is not retained RSS.
+The GC allocation count is not the same as retained RSS.
 
 | Leaf | Workload | Off time | On time | Off GC alloc | On GC alloc |
 |---|---|---:|---:|---:|---:|
@@ -39,7 +39,8 @@ The GC allocation count is not retained RSS.
 Thus repeated small results reduce GC allocation bytes by approximately
 50%, with a speed improvement in this native workload. Unique short
 joins produce no allocation savings and regress by roughly 60% in this
-native workload. The extra work is hash, cache probe and admission check.
+native workload. The extra work is hashing, the cache probe and the
+admission check.
 
 ## Scratch SB3 benchmark: eager LLVM JIT, times in ms
 
@@ -67,10 +68,10 @@ at or below the precision of the clock and do not justify a global claim.
 ## Correctness
 
 Native CTest verifies intern on/off with UTF-16/Latin-1, binary-exact
-comparison, GC root retention, a concurrent admission stress, and
+comparison, GC root retention, a concurrent admission stress test, and
 non-interned literal/numeric constructors. The generated Scratch SB3 test
 verifies 42 combinations of join structure, leaf structure, JIT mode and
-intern mode including six CLI overrides. Existing xyo-tests also ran
+intern mode, including six CLI overrides. Existing xyo-tests also ran
 successfully **after a complete rebuild** with interning enabled
 (40.73s). A previous broad SStr::create interning prototype failed tests
 for project-load scope and numeric string identity; it was replaced by
@@ -89,5 +90,5 @@ join-result-only interning before the passing run.
 
 Keep short interning disabled by default. Direct interning has a clear
 repeated-string benefit, but high cardinality creates measurable
-overhead. A next experiment should measure actual runtime hit ratios
+overhead. The next experiment should measure actual runtime hit ratios
 and consider adaptive admission before shipping a default.

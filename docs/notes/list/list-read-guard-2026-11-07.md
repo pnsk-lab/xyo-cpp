@@ -10,7 +10,7 @@ This is safe only for a structurally promotable loop: its body cannot resize or 
 
 ## Evidence from the actual LLVM JIT
 
-To isolate generated code, the existing `bench_list_read.py` workload `number_varying` was converted to a 100,000-read .sb3 and executed with both storage modes under the same executable, `XYO_JIT_DUMP2=1` (optimized IR) and `XYO_JIT_DUMP_OBJECT=<prefix>` (actual ORC object). The generated IR and objects are under `build-list-read-ir/`. `llvm-objdump -d -r` generated the assembly listings. The relevant procedure is `xyo_script_0_p1`.
+To isolate generated code, the existing `bench_list_read.py` workload `number_varying` was converted to a 100,000-read .sb3 and executed with both storage modes under the same executable, with `XYO_JIT_DUMP2=1` (optimized IR) and `XYO_JIT_DUMP_OBJECT=<prefix>` (actual ORC object) set. The generated IR and objects are under `build-list-read-ir/`. `llvm-objdump -d -r` generated the assembly listings. The relevant procedure is `xyo_script_0_p1`.
 
 | JIT output | flat | old adaptive | new adaptive |
 |---|---:|---:|---:|
@@ -21,7 +21,7 @@ To isolate generated code, the existing `bench_list_read.py` workload `number_va
 | Adaptive list fallback | absent | present | present |
 | Cold epoch check | absent | present | present |
 
-These static numbers are not dynamic counts and do not imply a direct percentage of runtime cycles. The memoized numeric fast path and the cold epoch check are visible in the generated IR, not assumed from source. The dynamic CPU instruction distribution was not sampled.
+These static numbers are not dynamic counts and do not translate directly into a percentage of runtime cycles. The memoized numeric fast path and the cold epoch check are visible in the generated IR, not assumed from source. The dynamic CPU instruction distribution was not sampled.
 
 ## Dedicated 100-million-read benchmark (five to seven process samples)
 
@@ -34,7 +34,7 @@ These static numbers are not dynamic counts and do not imply a direct percentage
 | numeric string, same | 224 ms | 164 ms | 152 ms |
 | numeric string, varying | 224 ms | 260 ms | 262 ms |
 
-Repeating numeric strings favor the memo, whereas a varying sequence can suffer due to memo misses. Therefore this is not an unconditional speedup. The JIT's existing `XYO_LIST_READ_MEMO=0` environment toggle can disable number memo when the workload warrants it.
+Repeating numeric strings favor the memo, whereas a varying sequence can suffer due to memo misses. Therefore this is not an unconditional speedup. The JIT's existing `XYO_LIST_READ_MEMO=0` environment toggle can disable the number memo when the workload warrants it.
 
 A separate controlled flag A/B on the final adaptive binary, 100 million reads with six processes per mode (CPU 8):
 - Same string: memo off 291.5 ms, memo on 199.5 ms.
@@ -54,7 +54,7 @@ The complete 47-workload benchmark was run on the final binary with the same exe
 | Insert/delete | 3.7827 |
 | Search | 0.9652 |
 
-The full suite shows more read overhead than the independent microbenchmark. Different code context, JIT compilation effects and environmental variability may contribute. The experiment does **not** establish the exact cost breakdown.
+The full suite shows more read overhead than the independent microbenchmark. Different code context, JIT compilation effects, and environmental variability may contribute. The experiment does **not** establish the exact cost breakdown.
 
 A further isolation experiment copied the original `scratch-bench/performance/project` and selected only the original `@suite_lists()` call, leaving list algorithms and timing code unchanged. Using 5 rotating process samples per treatment and CPU 8, the result is `build-list-read-ir/list-suite-ab.json`:
 
@@ -66,7 +66,7 @@ There was substantial run-to-run variance even in flat, so the magnitude is not 
 
 ## Correctness
 
-The new `tests/unit/test_list_read_memo.cpp` coverage checks both:
+The new coverage in `tests/unit/test_list_read_memo.cpp` checks both:
 - A compiled read loop that is suspended, then has its list promoted from flat to a gap buffer, followed by GC and JIT resumption.
 - A compiled read loop that starts with a noncontiguous list and later flattens after repeated reads.
 

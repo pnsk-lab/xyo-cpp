@@ -6,8 +6,8 @@
 
 - `src/engine/sequencer.cpp`: `XYO_SCHED_COMPACT_SUFFIX=1`（既定OFF）を追加。最初の完了Threadの前にある生存prefixは位置を変えず、runtimeIndexが古い場合のみ修復する。doneThreadsの順序、完了ThreadのreleaseFinished、threadMap更新、スケジューラ構造世代の発行は従来と同じ。
 - `src/engine/sequencer.cpp` と `.hpp`: 診断 `XYO_SCHED_CLEANUP_PROFILE=1` を追加。compact呼出し、走査スロット、完了数、移動数、compact/retire累積ナノ秒を報告。64件に1件の標本からmap削除、releaseFinished、doneThreadsへの追加の内訳も出す。
-- `src/engine/sequencer.cpp`: 終了する旧Threadと同じIDを別の生存Threadが使う場合、`threadMap`をIDだけで削除しないよう、エントリの`Thread*`も一致した場合だけ削除する。終了したThreadが別Threadの登録を誤消去する問題を防止。
-- `tests/unit/test_scheduler.cpp`: 正順の圧縮、ほぼ全件完了、完了なし、空配列、古いruntimeIndex、同じIDの生存新Thread保持のテストを追加。環境変数 `XYO_TEST_ONLY_COMPACTION=1` と `XYO_TEST_ONLY_STACKLESS_CORO=1`で集中実行可能。
+- `src/engine/sequencer.cpp`: 終了する旧Threadと同じIDを別の生存Threadが使う場合、`threadMap`をIDだけで削除しない。エントリの`Thread*`も一致した場合だけ削除する。終了したThreadが別Threadの登録を誤って消す問題を防ぐ。
+- `tests/unit/test_scheduler.cpp`: 正順の圧縮、ほぼ全件完了、完了なし、空配列、古いruntimeIndex、同じIDの生存新Threadを保持するテストを追加。環境変数 `XYO_TEST_ONLY_COMPACTION=1` と `XYO_TEST_ONLY_STACKLESS_CORO=1`で集中実行可能。
 
 ## ScratchBench 既存ワークロードのON/OFF
 
@@ -44,9 +44,9 @@ clonechurn単独12組ではOFF中央値229.742、ON中央値230.521、対応ペ�
 
 ## 検討して採用しなかった案
 
-- std::unordered_mapをstd::pmr::unsynchronized_pool_resourceのmapに置き換える独立実験は、100万件のinsert/eraseについて通常約42-43msに対してPMR pool約58msで遅かったため採用しなかった。Runtimeのmap型は変更していない。
-- `threadMap.erase(key)`と`find(key)`+`erase(iterator)`+ポインタ確認の独立実験はそれぞれ約40ms/100万件でほぼ同速度。ポインタ確認版は誤削除防止のため採用。
-- 全生存prefixに対するruntimeIndex書込削減は、実入力でrelocatedThreads=0かつON/OFFが改善せず、既定OFF。
+- std::unordered_mapをstd::pmr::unsynchronized_pool_resourceのmapに置き換える独立実験では、100万件のinsert/eraseで通常は約42-43ms、PMR poolは約58msと遅かったため採用しなかった。Runtimeのmap型は変更していない。
+- `threadMap.erase(key)`と`find(key)`+`erase(iterator)`+ポインタ確認の独立実験はそれぞれ約40ms/100万件でほぼ同速度。ポインタ確認版は誤削除を防ぐため採用した。
+- 全生存prefixに対するruntimeIndex書込削減は、実入力でrelocatedThreads=0かつON/OFFで改善せず、既定OFF。
 
 ## 回帰テスト
 

@@ -5,7 +5,7 @@
 ## 対象
 
 従来の `Sequencer::flushParBatch` は、全Threadが同じ書込キーに衝突する場合だけ、すでに開始された複数のFiberを `Fiber::resumeChain` で直接つないでいた。
-例えばA→B→C→Aのように、グラフは連結だが全員に共通するwriterがない場合は、グラフ構築後 `groups.size() <= 1` となり、各Fiberが毎回C++スケジューラへ戻っていた。
+例えばA→B→C→Aのように、グラフは連結だが全Threadに共通するwriterがない場合は、グラフ構築後 `groups.size() <= 1` となり、各Fiberが毎回C++スケジューラへ戻っていた。
 
 ## 実装
 
@@ -42,8 +42,8 @@ SB3ジェネレータ: `build-scheduler-rewrite-20261111/fiber-20261113/bench-ge
 
 ## 注意
 
-- 新しい経路は **既定OFF**。安全性と効果を対象を広げた実テストで継続検証する。
-- ほとんどのScratchBenchでは、全員共通writerで以前からchainになるか、複数の独立成分になるため、新経路の改善対象とは異なる。
+- 新しい経路は **既定OFF**。安全性と効果は、対象を広げた実テストで継続して検証する。
+- ほとんどのScratchBenchでは、全Thread共通のwriterで以前からchainになるか、複数の独立成分になるため、新経路の改善対象にはならない。
 - 既存のソース変更・他エージェントの編集は上書きせず、新機能の差分だけ追加。
 
 ## ScratchBench実負荷（全8項目）
@@ -69,7 +69,7 @@ build-scheduler-rewrite-20261111/fiber-20261113/bench-generic-chain-scratchbench
 新しい経路自体の成立頻度を診断するため
 `XYO_FIBER_CHAIN_COMPONENT_STATS=1` を追加。
 genericComponentCandidates はグラフ構築後の単一グループ数、
-genericComponentChained は全実行時検証を通過して実際に
+genericComponentChained はすべての実行時検証を通過して実際に
 resumeChain できた回数、genericComponentThreads はその総Thread数。
 
 | 対象 | 候補 | chain成立 | chain Thread |

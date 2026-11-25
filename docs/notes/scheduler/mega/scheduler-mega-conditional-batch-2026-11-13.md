@@ -36,8 +36,8 @@ Sourceは`hasConditional`、`hasElseBranch`、`comparison`、
 `src/jit/jit.hpp`、`src/jit/jit.cpp`では、
 各sourceの真の書込変数、任意の偽枝書込変数、条件変数を個別に追跡。
 `control_if`のバッチbindingは2本、`control_if_else`は3本。
-C++側はすべて存在・`Variable::kScalarType`・有限IEEE754数値を検証し、
-型やソースrevisionが変化すると通常JITへ戻す。
+C++側は、すべてが存在し、`Variable::kScalarType`で、有限IEEE754数値であることを
+検証し、型やソースrevisionが変化すると通常JITへ戻す。
 
 待機通知レジストリ、renderer、並列キュー、OSR、実際の待機Threadなどの
 従来の一括実行ガードを維持。
@@ -90,7 +90,7 @@ OFF/Wakeログ：tests-final-feature-off.out、tests-final-wait-registry.out（�
 ## 合成SB3実測
 
 同じCLI、同じSB3、CPU16固定、交互ペア。8本の緑旗スクリプトが
-それぞれ40,000回数値変数を閾値0と比較。全変数の最終値が
+それぞれ40,000回、数値変数を閾値0と比較。全変数の最終値が
 通常MegaとLLVM一括実行で一致することを検査。
 プロセス全体の壁時計時間（ms、小さいほど高速）。
 
@@ -109,5 +109,5 @@ OFF/Wakeログ：tests-final-feature-off.out、tests-final-wait-registry.out（�
 - `tests/bench/algos/build_mega_ifelse_fixture.py`（`--reverse`、`--no-else`を指定可）
 - `tests/bench/algos/bench_mega_ifelse.py`
 
-合成テストの結果から実プロジェクトやScratchBench全体の効果は推定しない。
+合成テストの結果から、実プロジェクトやScratchBench全体の効果は推定しない。
 他エージェントの未コミット変更はreset/commit/pushしない。

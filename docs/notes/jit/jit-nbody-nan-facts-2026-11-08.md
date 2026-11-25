@@ -1,22 +1,22 @@
 # MATH-013 — N-body の冗長な NaN ガード削減（2026-11-08）
 
 ## 対象
-`src/jit/numeric_repeat_float_ssa.inc` の浮動小数点 warp repeat SSA で、演算ごとに積み上げる `FCmpORD(result,result)` の一部が、IEEE-754 の性質から不要である。
+`src/jit/numeric_repeat_float_ssa.inc` の浮動小数点 warp repeat SSA では、演算ごとに追加される `FCmpORD(result,result)` のうち一部が、IEEE-754 の性質から不要である。
 
-例: `x*x` は x が NaN でなければ Inf を含め必ず NaN にならず、`x*x+y*y` は非負で NaN にならず、その平方根も NaN にならない。JIT 入口では全キャリーが Numberかつ非NaNであることを確認済み。すでに前の文で NaN が出た場合は valid=false のため現在の反復を最後に確実に巻き戻す。
+例: `x*x` は x が NaN でなければ Inf の場合も含めて必ず NaN にならず、`x*x+y*y` は非負で NaN にならず、その平方根も NaN にならない。JIT 入口では全キャリーが Number かつ非NaNであることを確認済み。すでに前の文で NaN が出ていれば valid=false になるため、現在の反復を最後に必ず巻き戻す。
 
 ## 実装と切替
 `FloatRepeatNaNFacts` と `floatRepeatNaNFacts` を追加して、条件付きで保証される非NaN・非負の事実を解析する。静的に保証できる場合のみ、`emitFloatRepeatExpr` 末尾の `FCmpORD` を削除する。
 
 安全なケースは変数の値（valid が成立する限り）、数値リテラル、x*x、非負同士の加算、有限リテラルを片方に持つ加減算、非ゼロ有限リテラルによる乗除算、非負の平方根、abs/floor/ceil/round/atan/exp/10^、非負数の ln 等。不確定な演算は従来通り判定する。
 
-既定 ON、`XYO_JIT_FLOAT_NAN_FACTS=0` で全ての追加証明を無効にできる。実行数学演算の値は変更せず、不要と証明できたチェックだけを削除する。
+既定 ON、`XYO_JIT_FLOAT_NAN_FACTS=0` で全ての追加証明を無効にできる。実行時の数学演算の値は変更せず、不要と証明できたチェックだけを削除する。
 
 ## IRと性能
 独立した Scratch-bench N-body カーネルを抽出して、同一バイナリ Eager JIT の LLVM IR を比較した。
 
 - `rep.float.head` の `fcmp ord`: **9個 → 5個**。
-- 同ループ IRの長さ: **1948 → 1617文字**。
+- 同ループ IR の長さ: **1948 → 1617文字**。
 - 12組 ABBA/BAAB、同一バイナリ CPU12固定、`XYO_JIT_FLOAT_NAN_FACTS` ON/OFF 比較。**12/12組で改善**し、速度比中央値は **1.0128881x**（約1.29%増）。チェックサムは全48回 `51200`。
 - 生データは `build/math013-nbody-abba.json`、`build/math013-nbody-abba.log`。生成IRは `build/math013-ir-{0,1}.err`。
 - これは純粋な N-body カーネルの改善であり、全Scratchプロジェクトに同率の改善を約束するものではない。
@@ -29,7 +29,7 @@
 - 全47項目性能テストの ON/OFF チェックサム比較: `build/math013-full-{off,on}.log`。
 
 ## 所有と状態
-MATH-013 の修正対象は数学 SSA の include と、追加差分テスト、既存の計測スクリプト `tools/bench_math_abba.py`。他エージェント管理の JIT共通 codegen/RT、scheduler、renderer には介入していない。共有ツリーなのでコミット/プッシュは行っていない。
+MATH-013 の修正対象は数学 SSA の include と、追加差分テスト、既存の計測スクリプト `tools/bench_math_abba.py`。他エージェント管理の JIT 共通 codegen/RT、scheduler、renderer には介入していない。共有ツリーなのでコミット/プッシュは行っていない。
 
 ## Final full-suite and additional paired checks
 

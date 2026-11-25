@@ -19,7 +19,7 @@ c += 1
 
 The optimized LLVM IR without this transformation contains repeated
 number/type-conversion dispatch branches. The loop's values may initially be
-numeric strings, so moving these conversions away unconditionally is unsafe.
+numeric strings, so removing these conversions unconditionally is unsafe.
 
 ## Implementation
 
@@ -31,7 +31,8 @@ body with 2–12 statements over at most 8 distinct scalars. Supported forms:
 
 Assignments are interpreted in their original order, including repeated writes
 to the same variable. Each involved scalar must be proven at runtime to be a
-**plain IEEE double**, integral, non-negative-zero and within ±2^48. A numeric
+**plain IEEE double** that is integral, is not negative zero, and lies
+within ±2^48. A numeric
 string cannot be materialized as a number before a `set` statement: the guard
 rejects it, preserving Scratch's exact type and original value representation.
 
@@ -44,13 +45,14 @@ repeat counter, its warp branch generates a conventional integer SSA loop:
 - LLVM O2/O3 simplifies the SSA copy and induction recurrences; no custom
   ScalarEvolution pass is needed
 
-Each batch is limited to the next original **64-iteration warp timeout check**.
+Each batch runs up to the next original **64-iteration warp timeout check**.
 The elapsed-clock check, scheduler yield, and variable spill/reload occur at
 the same logical iteration. If another script changes the value during a yield,
-the next batch rechecks its type and range; failure resumes the ordinary
-Scratch execution from the current repeat counter. Unsupported bodies,
-non-warp, out-of-range values, signed zero and nonnumeric values always execute
-the original code. There is no benchmark name/size/variable-specific shortcut.
+the next batch rechecks its type and range; on failure, ordinary Scratch
+execution resumes from the current repeat counter. Unsupported bodies,
+non-warp execution, out-of-range values, signed zero and nonnumeric values
+always execute the original code. There is no benchmark
+name/size/variable-specific shortcut.
 
 Disable with `XYO_JIT_REPEAT_COPY_SSA=0` (per compiled invocation).
 
@@ -81,12 +83,12 @@ and proving stronger numeric/range facts is a better next optimization target.
 
 `tests/differential/jit_repeat_copy_ssa.py` builds original Scratch SB3s with
 copy chains and interleaved operations. It compares interpreter, eager JIT,
-hotspot JIT, disabled SSA and LLVM O2, for both warp and non-warp programs.
+hotspot JIT, disabled SSA and LLVM O2 for both warp and non-warp programs.
 Coverage includes 0/1/2/3/63/64/65/127/128/129/10000 iterations, initial
 numeric strings, invalid strings, fractional values, negative zero, infinity,
 precision limits, large increments, and dynamic repeat counts. The actual
 numeric-string and nonnumeric paths use the old implementation until all
-values are safe. `XYO_JIT_DUMP2=1` shows fast/slow guarded dispatch but the
+values are safe. `XYO_JIT_DUMP2=1` shows fast/slow guarded dispatch, but the
 `rep.copy.header` SSA microloop is eliminated by LLVM O3.
 
 AOT object generation and execution also preserve the same checksum. This

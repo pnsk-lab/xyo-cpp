@@ -14,7 +14,7 @@ XYO_JIT_MEGA_SCHED_PREFILTER=0で旧経路へ切り戻す。判定はScratch状�
 Scratchスケジューラ順序、動的ブロードキャスト、wait、
 Thread終了の処理には変更を加えない。
 
-大量の通常Threadに対して既存関数内の複数getenv、runner状態、
+通常Threadが多い状況では、既存関数内の複数のgetenv、runner状態、
 CompiledScript型などの不要な検査を削減する。特にMegaでない
 スクリプトが大量に動作する場合に効果が期待できる。
 
@@ -27,7 +27,7 @@ CompiledScript型などの不要な検査を削減する。特にMegaでない
 ## ScratchBench A/B
 
 同じバイナリ、同じSB3、CPU16固定、eager、8組交互測定。
-全ての他のMega実験フラグを同一にして、新しい1フラグのみON/OFF。
+他のすべてのMega実験フラグを同一にして、新しい1フラグのみON/OFF。
 スコアは大きいほどよい。実行可能なScratchカーネルから未選択suiteの
 呼出箇所のみを除去するbench_scheduler_flags.pyを使用。
 
@@ -59,8 +59,8 @@ CompiledScript型などの不要な検査を削減する。特にMegaでない
 
 ## 既定HotSpotテストの比較（機能由来ではない失敗）
 
-環境変数を一切指定しない、JIT_MODE=HotSpot（既定）での
-xyo-tests全体実行は終了コード1で、以下の5件を報告した。
+環境変数を一切指定せず、JIT_MODE=HotSpot（既定）で実行した
+xyo-tests全体は、終了コード1で以下の5件を報告した。
 この同一バイナリに対して
 XYO_JIT_MEGA_SCHED_PREFILTER=0
 を明示した再実行でも**全く同じ5件**が報告された。

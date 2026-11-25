@@ -9,8 +9,8 @@ Existing `XYO_JIT_MEGA_SINGLE_DISPATCH=1` lets exactly one surviving source-cert
 New opt-in `XYO_JIT_MEGA_SINGLE_SPECIALIZE=1` (requires `XYO_JIT_MEGA_SINGLE_DISPATCH=1`):
 
 - `src/jit/jit.hpp`: typed `MultiPcSingleEntry(MultiPcItem*)` and `ScalarSingleEntry(Variable*)` function pointers, initially null.
-- `src/jit/backend_llvm.cpp`: when a source-certified multi-PC batch is created, also creates an ORC-exported one-item wrapper around the *same* `multiPcBatchEntry` with constant `count=1`. It explicitly inlines the generic function using `llvm::InlineFunction` **before O1**, allowing constant propagation, removal of index arithmetic and loop branch. Scalar one-shot batches use a direct one-pointer `load / fadd / store` instead.
-- `src/engine/sequencer.cpp`: after all existing source revision, binding generation, finite numeric type, PC/remaining, wait registry, GC, renderer, instrumentation, JitCtx, Fiber and OSR guards pass, a one-item batch uses its specialized pointer when non-null. Multi-item batches are unchanged. Missing specialization simply uses the previous batch function.
+- `src/jit/backend_llvm.cpp`: when a source-certified multi-PC batch is created, also creates an ORC-exported one-item wrapper around the *same* `multiPcBatchEntry` with constant `count=1`. It explicitly inlines the generic function using `llvm::InlineFunction` **before O1**, allowing constant propagation, removal of index arithmetic and the loop branch. Scalar one-shot batches use a direct one-pointer `load / fadd / store` instead.
+- `src/engine/sequencer.cpp`: after all existing source revision, binding generation, finite numeric type, PC/remaining, wait registry, GC, renderer, instrumentation, JitCtx, Fiber and OSR guards pass, a one-item batch uses its specialized pointer when non-null. Multi-item batches are unchanged. A missing specialization simply falls back to the previous batch function.
 - `tests/unit/test_scheduler.cpp`: verifies opt-in symbol presence and independently compares each multi-PC transition (including terminal PC and remaining counter) and numeric scalar update against generic one-item LLVM execution.
 - `tests/bench/algos/bench_mega_single_dispatch.py --specialize`: pairs `XYO_JIT_MEGA_SINGLE_SPECIALIZE=0/1` while holding `XYO_JIT_MEGA_SINGLE_DISPATCH=1` and every other flag fixed. The original no-argument benchmark behavior is unchanged.
 
@@ -33,7 +33,7 @@ For eligible broadcast receivers add `XYO_JIT_MEGA_BCAST_RECEIVERS=1`.
 
 ## Results: per-pair specialization A/B
 
-Frozen Release binary, frozen SB3 (two green flag scripts, 120,000 and 1 repeats), CPU16, Eager O1, process wall-clock including compile and startup. 16 alternating OFF/ON pairs, **only** the specialized-single flag changes.
+Frozen Release binary, frozen SB3 (two green flag scripts with repeat counts 120,000 and 1), CPU16, Eager O1, process wall-clock including compile and startup. 16 alternating OFF/ON pairs, **only** the specialized-single flag changes.
 
 | Metric | Generic single batch | Specialized |
 |---|---:|---:|

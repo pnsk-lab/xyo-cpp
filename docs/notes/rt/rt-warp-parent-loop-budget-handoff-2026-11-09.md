@@ -104,5 +104,5 @@ Actual suite log:
 
 `python3 -m py_compile` and `git diff --check` for the modified test
 harness PASS. This run uses a previously verified full-source LLVM CLI
-binary; this follow-up did not rebuild the entire currently changing
-shared workspace, nor change production runtime code.
+binary; this follow-up neither rebuilt the entire currently changing
+shared workspace nor changed production runtime code.

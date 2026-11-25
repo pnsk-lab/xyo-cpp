@@ -50,15 +50,16 @@ when no other task launched in this sandbox. Do NOT use these runs to
 claim precise speedups. Records:
 build/math006-paired.json, build/math006-paired-isolated.json.
 
-Complete 47-kernel performance.sb3 finished both with the new feature
-disabled and default enabled. All NON-SCHEDULER output checksums matched,
-including 47241333, 421876317 and 718102. The sequential speed numbers
-shifted for many unrelated kernels because of concurrent host load;
-do not treat them as a causal ON/OFF comparison.
+The complete 47-kernel performance.sb3 finished both with the new
+feature disabled and with it enabled by default. All NON-SCHEDULER
+output checksums matched, including 47241333, 421876317 and 718102.
+The sequential speed numbers shifted for many unrelated kernels
+because of concurrent host load; do not treat them as a causal ON/OFF
+comparison.
 Logs: build/math006-full-off.log, build/math006-full-on.log.
 
 A proposed integer-only lowering for nonnegative floor/round/abs was
-slower than floating SSA by about 17% in the initial A/B test and was
+about 17% slower than floating SSA in the initial A/B test and was
 removed. Other existing integer SSA optimizations remain unchanged.
 
 ## Differential / parity
@@ -89,13 +90,13 @@ XYO_JIT_NUMERIC_REPEAT_SSA=0
 XYO_JIT_NUMERIC_UNTIL_SSA=0
 XYO_JIT_AFFINE_UNTIL=0
 
-Thus it is not caused by enabling this numerical SSA path.
+Thus the failure is not caused by enabling this numerical SSA path.
 Logs: build/math006-ctest.log,
 build/math006-ctest-allmath-off.log.
 Notified the scheduler owner in tools/board.ts SCHED-001.
 
 During the task, unrelated renderer edits made the CLI target temporarily
-fail to compile on an undefined renderScale_ member. The xyo static
+fail to compile because of an undefined renderScale_ member. The xyo static
 library compiled; the previously compiled CLI object files were relinked
 using the CMake-generated link script for a math validation executable,
 build/math006-final2-xyo. Renderer code was not modified.

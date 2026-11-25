@@ -18,7 +18,7 @@ XYO_JIT_MEGA_UNTIL_BENCH_END=1
 The implementation emits one LLVM call to a synchronous native helper,
 `xyo_mega_bench_end(JitCtx*)`. The native helper reads live Scratch
 variables, applies the original sequence of Scratch number coercions,
-multiplication, division and JavaScript-style `round`, joins
+multiplication, division, and JavaScript-style `round`, joins
 the output fragments in the source order, and appends the result to
 the existing `output` list exactly once.
 

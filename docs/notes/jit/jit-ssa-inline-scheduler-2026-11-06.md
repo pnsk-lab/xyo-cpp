@@ -6,7 +6,7 @@
 
 ## 実装
 
-`src/jit/codegen.cpp` の `emitWarpDeadlineCheck(chkBB,done)` に既存の共有時計・締切のatomic load、時計が存在しない場合のフォールバック、実際のFiber切り替えを共通化した。元の `emitLoopYield()` から呼び出し、意味を変更しない。
+`src/jit/codegen.cpp` の `emitWarpDeadlineCheck(chkBB,done)` に、既存の共有時計・締切のatomic load、時計が存在しない場合のフォールバック、実際のFiber切り替えを共通化した。元の `emitLoopYield()` から呼び出し、意味を変更しない。
 
 新しい `emitSsaChunkScheduler(ticks,chunk,toPoll,preferDirect)` は、SSAチャンクの実行が完了した時点でカウンタを直接 `ticks+chunk` に更新する。確認点に到達したときだけ `emitWarpDeadlineCheck` へ進む。これにより、専用経路ではスケジューラのwarpモード再判定、カウンタの `chunk-1` 書き込み→1加算、`n&63` 比較を省略する。
 
@@ -32,7 +32,7 @@
 | `app_brainfuck` | 1.0010倍 |
 | `math_compare` | 0.9987倍 |
 
-初期版はSSAチャンクの確認点を通常ループと同じ「1/64の低頻度」とマークしていた。実際のSSAチャンクは通常、次の確認点ちょうどで終わるため、確認点を高頻度に訂正した。ただし別の8ペアの測定でも `loops_repeat` 1.0115倍以外のSSAループは横ばいまたは悪化した（`vars_setchange` 0.9633倍）。そこで構造別の保守的な自動選択を採用し、特定SB3名による分岐は実装していない。
+初期版はSSAチャンクの確認点を通常ループと同じ「1/64の低頻度」とマークしていた。実際のSSAチャンクは通常、次の確認点でちょうど終わるため、確認点を高頻度に訂正した。ただし別の8ペアの測定でも `loops_repeat` 1.0115倍以外のSSAループは横ばいまたは悪化した（`vars_setchange` 0.9633倍）。そこで構造別の保守的な自動選択を採用し、特定SB3名による分岐は実装していない。
 
 生データ: `build/ssa-scheduler-eval/ssa-ab.json`、`weighted-ab.json`（git管理外）。これらは小さな速度差を測るもので、計測ノイズやCPU環境の影響を受ける。
 
@@ -42,7 +42,7 @@
 
 AOTは `repeat-warp` (24変数)、`copy-warp` (80変数)、`foreach-warp` (52変数)、`induction_extended-warp` (77変数)について、強制OFF/ON/自動選択の生成オブジェクトを実行し、すべての変数が一致。
 
-既存の空warp `repeat` 用 `emitInlineEmptyWarpRepeat` は別の、より大幅な最適化。今回の拡張ではその動作を変更していない。
+既存の空warp `repeat` 用 `emitInlineEmptyWarpRepeat` は別のより大幅な最適化。今回の拡張ではその動作を変更していない。
 
 ## 今後
 

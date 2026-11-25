@@ -14,11 +14,12 @@ XYO_WAIT_READY_SLEEP=1 XYO_WAIT_WAKE_REGISTRY=1 XYO_SCHED_READY_INDEX=1
 
 This extends the existing Promise-aware Ready Index with an
 *experimental* suppression path for native `wait until` fibers. A waiter
-is eligible to be omitted from later passes only after its **source and
-binding generations** and its saved dependency values are verified
-unchanged, the wait is still armed, the Thread is RUNNING, and its
-registration has **no pending writer notification**. All other waits,
-including unsupported conditions, are conservatively scanned.
+is eligible to be omitted from later passes only after all of the
+following hold: its **source and binding generations** and its saved
+dependency values are verified unchanged, the wait is still armed, the
+Thread is RUNNING, and its registration has **no pending writer
+notification**. All other waits, including unsupported conditions, are
+conservatively scanned.
 
 ## Wake and bounded fallback
 

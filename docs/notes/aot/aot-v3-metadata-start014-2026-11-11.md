@@ -61,8 +61,8 @@ runtime `XYO_AOT_FAST_META=1`.
 - The option is experimental; it is not activated by `XYO_AOT_YYJSON=ON`
   alone. Set `XYO_AOT_FAST_META=1` explicitly.
 
-Intermediate phase diagnostics showed ~2.2 MiB less allocated glibc heap
-after metadata parsing. This savings is not a whole-run RSS claim.
+Intermediate phase diagnostics showed ~2.2 MiB less glibc heap allocated
+after metadata parsing. This saving is not a whole-run RSS claim.
 
 ### Paired measurements — finalized string_view implementation
 

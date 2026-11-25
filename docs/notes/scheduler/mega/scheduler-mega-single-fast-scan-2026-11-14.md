@@ -41,7 +41,7 @@ LLVMエントリへ渡す。バッチ配列3種類（Thread/Variable/Itemの各8
   Threadのキャッシュと一致すること。**一致確認前に保存ポインタを読まない**
 - 保存済み変数がscalarであり、値がIEEE754有限数値であること
 
-1件でも外れた場合、従来 `tryMegaScalarBatch` を呼び切る経路へ
+1件でも外れた場合、従来の `tryMegaScalarBatch` を呼び切る経路へ
 そのまま戻し、変数キャッシュ失効処理・Scratch型変換処理に任せる。
 
 実行中のThread同一性・Scratch側のスケジューラ順序・各passに1反復・
@@ -84,7 +84,7 @@ XYO_JIT_MEGA_SINGLE_FAST_SCAN=1 \
 生データ：
 `build-scheduler-rewrite-20261111/mega-multi-pc/bench-single-fast-scan-300k/results.json`
 
-約4.16%の改善はこの単純な合成入力限定。
+約4.16%の改善は、この単純な合成入力に限った結果である。
 複数スクリプトや実プロジェクトへの一般化は未確認。
 両方式で同じLLVM関数を使っており、ScratchのYield回数を削減した
 という意味ではない。既定OFFを維持する。
@@ -95,7 +95,7 @@ XYO_JIT_MEGA_SINGLE_FAST_SCAN=1 \
 - 集中テスト：FAST_SCAN ON **27/27 PASS**、OFF **22/22 PASS**。
 - LIVEな変数mapから変数sを削除・再作成：
   新世代への初回アクセスでは早期経路を拒否し、
-  従来一般経路で安全に再束縛。次の反復から早期経路を再開することを確認。
+  従来の一般経路で安全に再束縛。次の反復から早期経路を再開することを確認。
 - Fiber / native GC deferral / multifiber GC barrier smoke：**3/3 PASS**。
 - `git diff --check` とbenchmark Python構文チェックPASS。
 - 全体テスト：

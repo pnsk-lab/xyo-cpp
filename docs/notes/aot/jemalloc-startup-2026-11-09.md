@@ -30,7 +30,7 @@ jemallocはBSD 2-Clause系ライセンスのオープンソース実装。
 
 ビルド時のリンクは `--no-as-needed` の区間をjemallocのみに
 限定している。実行時の `readelf -d` に
-`NEEDED libjemalloc.so.2` があることを実物のReleaseビルドで確認。
+`NEEDED libjemalloc.so.2` があることを実際のReleaseビルドで確認。
 リンカー状態の保存・復元には
 `--push-state,--no-as-needed` と `--pop-state` を使用する。
 `XYO_LINK_JEMALLOC=ON -DXYO_STATIC=ON` の構成は
@@ -84,7 +84,7 @@ CIで常時有効にはしていない。
 | 全テスト完走時間 | 17.46秒 | 17.36秒 |
 | 最大RSS | 364.45MB | **441.43MB** |
 
-**起動は高速化するが、メモリ使用量は約21%増加**した。
+**起動は高速化したが、メモリ使用量は約21%増加**した。
 メモリ制限が厳しい環境では既定のglibcを推奨する。
 
 追加実験としてjemallocの `MALLOC_CONF=narenas:1` /

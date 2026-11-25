@@ -43,10 +43,10 @@ writer's JIT store callback from unrelated scheduling order.
 
 ## Verification
 
-JIT-enabled `xyo-tests` rebuild completed, and the CTest suite with
-`XYO_YIELD_QMODE=off`, plus Wait Registry, notification audit,
-multi-variable watchers, binding verifier, Ready Index and deadline
-index enabled, passed (**53.31 s**).
+The JIT-enabled `xyo-tests` rebuild completed, and the CTest suite passed
+(**53.31 s**) with `XYO_YIELD_QMODE=off` and with the Wait Registry,
+notification audit, multi-variable watchers, binding verifier, Ready
+Index and deadline index enabled.
 
 The disabled/default scheduler path and other deployment modes are
 unchanged: notifications and audits remain opt-in. Adaptive LAYQ was

@@ -2,13 +2,13 @@
 
 ## 結論
 
-最適化後のLLVM SSAに対し、実際のORC ELFの `.llvm_stackmaps` の各i64 locationと、その定義元のSSA命令を1対1で照合する出所分類を追加した。これは**GC参照としての所有権証明ではない**。一部の出所が既知の文字列生成や手続き引数であることは、値がGCによりマーク済み、または停止中Fiberから復元可能であることを意味しない。
+最適化後のLLVM SSAについて、実際のORC ELFの `.llvm_stackmaps` にある各i64 locationと、その定義元のSSA命令を1対1で照合する出所分類を追加した。これは**GC参照としての所有権証明ではない**。一部の出所が既知の文字列生成や手続き引数であることは、値がGCによりマーク済み、または停止中Fiberから復元可能であることを意味しない。
 
 実行中は `XYO_RT_YIELD_EDGE_STACKMAP_PROBE=1`、`XYO_RT_YIELD_LIVE_SSA_STACKMAP=1`、`XYO_RT_YIELD_SSA_FILTER=i64_no_tick`、`XYO_RT_YIELD_SSA_TRACE_OPERANDS=1` を指定。通常実行ではこれらは無効。
 
 ### 実測（Eager・Lazyとも同数）
 
-実Scratchプロジェクト `ssa_budget_cross_fiber_two_hats` のそれぞれ2手続き×2 yield地点＝4地点。
+Eager・Lazyそれぞれで、実Scratchプロジェクト `ssa_budget_cross_fiber_two_hats` の2手続き×2 yield地点＝4地点。
 
 | LLVM出所 | i64 locations | 扱い |
 | --- | ---: | --- |
@@ -21,7 +21,7 @@
 | i64ビット演算（and） | 2 | `unknown_bit_arithmetic`。参照タグを維持しないか未証明 |
 | **合計** | **156** | **全件所有権未証明、gc_safe=0** |
 
-同じ4地点についてi64候補のうちLLVM scheduler `yieldCheckN` tickは既に構造的に同定して診断対象から除外されている。今回の変更は**i64 locationを一切追加・削除せず、出所メタデータのみ追加**する。
+同じ4地点について、i64候補のうちLLVM scheduler `yieldCheckN` tickは既に構造的に同定されており、診断対象から除外されている。今回の変更は**i64 locationを一切追加・削除せず、出所メタデータのみ追加**する。
 
 ## 実装
 

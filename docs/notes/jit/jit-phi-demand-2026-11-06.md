@@ -3,8 +3,8 @@
 ## Why
 
 Earlier mixed-type LLVM SSA forwarding created a boxed i64 PHI at every eligible
-`if` / `if-else` join, then a double PHI when both producers had proven
-`toNumber` and comparison-eligibility values. Some PHIs only linked values
+`if` / `if-else` join, then a double PHI when both producers' values had
+proven `toNumber` and comparison eligibility. Some PHIs only linked values
 that were overwritten before the next read. Other PHIs carried a numeric
 shadow for variables next used exclusively as strings.
 

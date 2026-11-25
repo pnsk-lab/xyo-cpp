@@ -15,7 +15,7 @@
 これを一度だけ実行する受信ハット、または固定回数repeatの本体に置ける。
 条件変数と書込先は同じIDでも別IDでもよい。ソースは番号のみのリテラル、
 data_variable、control_if_else、operator_gt/lt/equals、
-各armの定数加算1命令であることを静的検査。
+各armの定数加算1命令であることを静的に検査する。
 procedure戻りsuffix、ifの次の命令、ネストした分岐、動的レポータ、
 外部副作用・GCを伴うステートメントは拒否する。
 
@@ -32,10 +32,10 @@ procedure戻りsuffix、ifの次の命令、ネストした分岐、動的レポ
   1Thread用Mega経路では既存のxyo_var_getとxyo_gt/lt/eqを呼び、
   Scratchのcast::compareと型変換を厳密に保持
 - src/jit/jit.hpp: MultiPcItemにconditionVariableを追加し、
-  フィールドのオフセットと構造サイズをstatic_assert。
+  フィールドのオフセットと構造サイズをstatic_assert する。
   多重PC群の各スロットにconditionalメタデータを追加
 - src/engine/sequencer.cpp: then、else、conditionの3本のVariable*を
-  ソース版、現在のTarget、実行可能なThread状態と照合。
+  ソース版、現在のTarget、実行可能なThread状態と照合する。
   すべてfinite numberでなければ通常のMega/JIT継続経路へ戻す
 - src/jit/jit.cpp: green flag / broadcast受信者のインストールにおいて
   条件変数とelse変数の存在も事前チェック
@@ -46,7 +46,7 @@ procedure戻りsuffix、ifの次の命令、ネストした分岐、動的レポ
 
 従来の一括バッチ条件を維持し、reverse待機通知の
 XYO_WAIT_WAKE_REGISTRY=1のときはmultiPC一括コードを生成しない。
-初期版が扱わない分岐などはすべて通常JITへ。
+初期版が扱わない分岐などはすべて通常JITへ回す。
 
 ## 実行例
 
@@ -63,7 +63,7 @@ XYO_WAIT_WAKE_REGISTRY=1のときはmultiPC一括コードを生成しない。
 
 ## 回帰検証
 
-testMegaIfElseBatchの各scheduler pass直後の共有変数結果を確認。
+testMegaIfElseBatchの各scheduler pass直後の共有変数結果を確認する。
 数値x=3からの最終値は x=0, a=112, b=4。
 入力を数値文字列2に変えた場合もx=1, a=2, b=103に到達。
 非数値文字列abcの場合はScratchの文字列比較を用いる。
@@ -73,7 +73,7 @@ testMegaIfElseBatchの各scheduler pass直後の共有変数結果を確認。
 
 8本のgreen flagスクリプト、それぞれrepeat(40000)。
 各反復は if v_i > 0 then change v_i -1 else change v_i +3。
-初期値3、周期4のため全8変数の最終値は3。
+初期値が3、周期が4のため、全8変数の最終値は3になる。
 同一バイナリ/SB3、CPU16固定、12組の交互A/B、
 プロセス起動とLLVM JITコンパイルも含む壁時計時間。
 
@@ -100,7 +100,7 @@ testMegaIfElseBatchの各scheduler pass直後の共有変数結果を確認。
 
 ## 最終回帰・互換性確認
 
-2026-11-13の同一ソース、同一xyo-testsで次を確認。
+2026-11-13の同一ソース、同一xyo-testsで次を確認した。
 
 - 条件分岐一括ON、通常の待機通知レジストリOFF:
   Scheduler 551 checks, 0 failures、全テストPASS、終了コード0

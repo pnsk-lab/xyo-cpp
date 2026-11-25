@@ -36,7 +36,7 @@ RT-001の実験用GCソフト予算（`XYO_RT_REQUIRE_GENERATED_SSA_ROOTS=1`、`
 
 新規 `tests/platform/rt_pointer_region_smoke.cpp` を作成。LLVM23の実IRBuilderで、JitCtx引数、異種未証明引数、stack alloca、静的global、静的GEP ConstantExpr、host/stack GEP、ロードしたポインタ、IntToPtr、PHI/SELECT、自己循環、深さ80のGEPを作って解析する。正しい分類だけを承認し、ロード/混合/循環/深さ超過/不正なtrustedContextを拒否する。実LLVM23の直接ビルド+実行では `PASS ... stack=3 host=4 static=1 unknown=6 total=14`。
 
-`tests/CMakeLists.txt` に `xyo-rt001-pointer-region-smoke` を追加。CTestからも実行可能な定義だが、新CMake構成全体はまだ未実行。
+`tests/CMakeLists.txt` に `xyo-rt001-pointer-region-smoke` を追加。CTestからも実行できる定義だが、新しいCMake構成全体はまだ実行していない。
 
 `tests/differential/native_simple_resume.py` に、実Scratchの2-Fiber結果とLLVM元の生存ポインタ総数・スタック由来数・分類合計が一致すること、未証明参照が残ること、`gc_safe=0`とGC保留を維持することを確認する差分実行を追加。元の保護ロジックは変更しない。
 
@@ -49,7 +49,7 @@ RT-001の実験用GCソフト予算（`XYO_RT_REQUIRE_GENERATED_SSA_ROOTS=1`、`
 
 ## 検証環境
 
-既存の確認済みLLVM23アーカイブの**隔離コピー**へ、現在の`codegen.cpp`を再コンパイルして同名オブジェクトを置換し、CLIを再リンク。前回の`gc.cpp`、`fiber.cpp`、`sequencer.cpp`変更はコピー元に含まれる。現在の共有ツリー全体を再ビルドしたものではない。
+既存の確認済みLLVM23アーカイブの**隔離コピー**で、現在の`codegen.cpp`を再コンパイルして同名オブジェクトを置換し、CLIを再リンク。前回の`gc.cpp`、`fiber.cpp`、`sequencer.cpp`変更はコピー元に含まれる。現在の共有ツリー全体を再ビルドしたものではない。
 
 - バイナリ `/home/kicky/.rt001-pointer-region-isolated/xyo`。
 - ベンチ兼回帰ログ `build/rt001-pointer-region-full.log`。
@@ -63,4 +63,4 @@ RT-001の実験用GCソフト予算（`XYO_RT_REQUIRE_GENERATED_SSA_ROOTS=1`、`
 - `python3 -m py_compile tests/differential/native_simple_resume.py`: PASS
 - `git diff --check`（対象実装・テスト）: PASS
 - `tests/CMakeLists.txt` にはCTEST登録済み。ただし共有ビルドのCMake再生成およびCTest全体は未実施。
-- 不変の安全境界: `Gc::collect()` は引き続き実際に中断中のNative Fiberがある間、実験モードでは`FiberPool::unsafeCount()`で回収を止める。新診断はこの条件に一切接続していない。
+- 不変の安全境界: 実験モードでは、`Gc::collect()` は中断中のNative Fiberが実際にある間、引き続き`FiberPool::unsafeCount()`で回収を止める。新診断はこの条件に一切接続していない。

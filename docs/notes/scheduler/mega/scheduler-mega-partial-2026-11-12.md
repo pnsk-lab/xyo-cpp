@@ -24,7 +24,7 @@ IRサイズ512、3,000、12,000の全てでStageメインスクリプトに適�
 診断: CompiledScript::megaPartialInlined（実際にinlinedした呼出し件数）
 
 制約:
-- 対象はproccodeがsched_で始まる、実際に定義があるScratch手続きだけ。
+- 対象は、proccodeがsched_で始まり、実際に定義があるScratch手続きだけ。
 - callerごとに最大8箇所、callee IR最大384、追加IR予算最大1200命令。
 - callerへの再帰経路が存在する場合は拒否。
 - musttail、間接呼び出し、予算超過は元の呼び出しを維持する。
@@ -54,7 +54,7 @@ XYO_JIT_MEGA_PARTIAL_SITES=1を指定すると
     rejected_size=0 valid=1
 
 Stageのsched_*手続き10個が選択され、16箇所の実際のLLVM
-CallInstが変換された。以前の全体融合で同じStageの統合数は0。
+CallInstが変換された。以前の全体融合では、同じStageの統合数は0だった。
 ScratchBenchのsched_*全8項目の出力とチェックサムを照合した。
 
 ## 性能測定

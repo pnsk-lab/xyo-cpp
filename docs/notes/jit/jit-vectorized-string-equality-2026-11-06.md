@@ -14,7 +14,7 @@ ASCII/Unicode strings of up to 4 UTF-16 units. Expanding that scalar loop to
 `emitCachedNumericStringPair` in `src/jit/codegen.cpp` gained a distinct
 **equality-only** vectorized path for direct variable-vs-variable Scratch
 comparisons. It is generated only for two direct `data_variable` reporters,
-not for static numeric values, dynamic list items, and constant-vs-variable
+not for static numeric values, dynamic list items, or constant-vs-variable
 comparisons. Every runtime precondition is checked independently:
 
 - Both operands are heap `SStr` values, with populated numeric caches.
@@ -35,7 +35,7 @@ comparisons. Every runtime precondition is checked independently:
   lengths and other Scratch types retain the old semantics. The original
   boxed values are never rewritten.
 
-The only new runtime call is **none**. LLVM's regular vector lowering handles
+There is **no** new runtime call. LLVM's regular vector lowering handles
 SIMD; a custom pass is not needed. Disable this specialization at JIT/AOT
 compilation time using `XYO_JIT_EQ_ASCII_SIMD=0`.
 
@@ -71,8 +71,8 @@ Expanded `tests/differential/jit_numeric_string_pair_cmp.py` to include 8,
 9, 11, 12, 15, 16 and 17 UTF-16-character comparisons with equal/mismatched
 ASCII case, embedded NULs, same-prefix/different-length strings, mixed
 numeric strings, and Unicode (`U+0130`). It compares the interpreter, Eager
-JIT, HotSpot, O2, standard generic and all relevant optimization flags for
-warp and non-warp. All 14 combinations passed (163 compared fields each).
+JIT, HotSpot, O2 and standard generic across all relevant optimization flags,
+for warp and non-warp. All 14 combinations passed (163 compared fields each).
 
 AOT compilation with the specialization ON and OFF produced bit-identical
 results for all **166** dumped variables, including the completion flag.

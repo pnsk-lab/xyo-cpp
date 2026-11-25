@@ -4,7 +4,7 @@
 
 Mega Scheduler β の「固定repeat + 固定broadcast + 後続scalar」
 フラグ（単独sender、fast latch、STATUS_YIELD正規化）は、
-既存の小規模合成テストでは通常Fiberと同等以上になったが、
+既存の小規模合成テストでは通常Fiberと同等以上の性能になったが、
 **実ScratchBenchの sched_pingpong/fanwait/restartにはまだ送信者継続PCが適用されない**。
 
 実行中のLLVMコードを無理に再開させるのではなく、まず実際の
@@ -113,7 +113,7 @@ JitCtx ABIはtrivially-copyableを維持し、
 - `build-scheduler-rewrite-20261111/bcast-reuse-20261114/bench-synthetic-r1-12/results.json`
 - `build-scheduler-rewrite-20261111/bcast-reuse-20261114/bench-synthetic-r8-12/results.json`
 
-**結論:** 少数のjoinポインタを運ぶvectorのmallocが主要なボトルネックという仮説は実測で支持されない。実負荷改善には受信Threadの開始・終了と、呼び出し元側の一般継続状態を統合する必要がある。
+**結論:** 少数のjoinポインタを運ぶvectorのmallocが主要なボトルネックという仮説は実測で支持されない。実負荷で改善するには、受信Threadの開始・終了と、呼び出し元側の一般継続状態を統合する必要がある。
 
 診断スクリプトはソース調査用であり、Scratch互換の安全性を
-証明する認定器ではない。未コミットのまま保存。
+証明するものではない。未コミットのまま保存。

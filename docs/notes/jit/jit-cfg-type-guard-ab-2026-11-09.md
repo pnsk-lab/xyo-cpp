@@ -23,7 +23,7 @@
 
 固定した同一 Release LLVM バイナリ: `board/.prof-005-cmake/xyo`、SHA256 `991126e31c98f37c84775008463db7951c9575fd1d7945c53fd5de919ae70117`。`XYO_JIT_GUARD_STATS=0`、`XYO_JIT_MODE=hotspot`、CPU14 に固定。ソース変更なし。
 
-- Mandelbrot 24回（冒頭4回をウォームアップとして除外、各群10回）: OFF 中央値 256,676 ops/ms、ON 中央値 274,818 ops/ms（比 1.0707）。全 checksum 1957。一方この測定は変動幅が広いため一般的な +7% を断定しない。raw: `board/prof-006/mandel-clean-ab.json`。
+- Mandelbrot 24回（冒頭4回をウォームアップとして除外、各群10回）: OFF 中央値 256,676 ops/ms、ON 中央値 274,818 ops/ms（比 1.0707）。全 checksum 1957。一方、この測定は変動幅が広いため、一般的な +7% を断定しない。raw: `board/prof-006/mandel-clean-ab.json`。
 - 4ケース独立 8回ずつ（各設定4回、順序 OFF ON ON OFF ON OFF OFF ON）: Mandelbrot 比 1.0338、loops_repeat 比 1.0000、app_ast 比 0.9871、sched_clonechurn 比 0.9868。raw: `board/prof-006/isolated-ab/results.json`。独立した loops_repeat / app_ast / sched_clonechurn に全体実行と同程度の巨大な回帰は現れない。
 
 ## 全47項目 A/B（4回）

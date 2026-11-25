@@ -13,9 +13,9 @@ x86-64 `cvttsd2si64` intrinsic and perform 64-bit bounds arithmetic.
 `src/jit/codegen.cpp` now records a verified `IntInterval` for the *result*
 of `operator_round`, `operator_mathop` floor and ceiling if, and only if,
 `intInterval(x)` proved an **immutable exact-integer f64 SSA input** already
-bounded in signed-i32 range. Round/floor/ceiling return the same integer
-for any such input. `recordIntInterval` conservatively annotates only the
-result SSA producer, never a mutable Scratch value or a profile prediction.
+bounded within the signed-i32 range. Round/floor/ceiling return the same
+integer for any such input. `recordIntInterval` conservatively annotates only
+the result SSA producer, never a mutable Scratch value or a profile prediction.
 The numeric reporters themselves are **not rewritten**: JS Math.round half
 ties, signed zero, NaN-box canonicalization, and Scratch comparisons retain
 the original lowering. LLVM O3 performs later simplification and induction
@@ -48,7 +48,7 @@ Captured actual O3 IR:
 procedures with a 150,000-element list. It warms the JIT, invokes the
 for-each/list kernel 100 times per measured interval, and records three
 inside-project clock intervals per run. 8 randomized paired ON/OFF blocks,
-i7-12700 CPU8 pinned, same binary, eager JIT, no changed benchmark data.
+i7-12700 CPU8 pinned, same binary, eager JIT, benchmark data unchanged.
 The project checksum was **150000** for both modes in every measurement.
 
 | List index | OFF median | ON median | Paired speed ratio (geometric mean) | ON wins |

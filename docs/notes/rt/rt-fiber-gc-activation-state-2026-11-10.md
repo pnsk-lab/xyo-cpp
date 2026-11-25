@@ -2,7 +2,7 @@
 
 ## 背景と見つかった制約
 
-2026-11-09に導入した RT-001 の保守的GCバリアは、`XYO_RT_REQUIRE_GENERATED_SSA_ROOTS=1` で全 `FiberPool::activeCount()`（確保済み・返却前のFiber数）が0になるまでGCを止めていた。しかし **Fiberのlease** と **再開可能なネイティブSSAの存在** は異なる。
+2026-11-09に導入した RT-001 の保守的GCバリアは、`XYO_RT_REQUIRE_GENERATED_SSA_ROOTS=1` で `FiberPool::activeCount()`（確保済み・返却前のFiber数）が0になるまでGCを止めていた。しかし **Fiberのlease** と **再開可能なネイティブSSAの存在** は異なる。
 
 - プールから確保されただけの、まだ実行されていないFiberはLLVMのSSA状態を保持できない。
 - 元のentryがすでに戻ったFiberは、まだプールへ返していなくても、そのLLVM SSAを再開できない。

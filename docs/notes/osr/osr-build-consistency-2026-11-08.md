@@ -8,7 +8,7 @@
 `free(): invalid size`、`corrupted double-linked list`、SIGSEGVが発生した。
 古いcoreの破棄スタックは `CompiledScript::~CompiledScript` の
 `unordered_map<std::string, ScriptFn> procedures` で停止していた。
-これは**破損を発見した位置であって、破損させた命令の位置とは限らない**。
+これは**破損を発見した位置であり、破損を引き起こした命令の位置とは限らない**。
 
 そこで実行ファイルを独立したNinja Release buildで全再コンパイルし、
 `board/osr-isolated-frozen-xyo` にコピーした（SHA256：
@@ -24,13 +24,12 @@
 
 ## 限定ネストwarp OSR
 
-別担当が実装中の `XYO_JIT_OSR_NESTED=1` （引数なしwarp手続きの単一`repeat`のみ）を
-上記隔離バイナリで実行した。
+上記の隔離バイナリで、別担当が実装中の `XYO_JIT_OSR_NESTED=1` （引数なしwarp手続きの単一`repeat`のみ）を実行した。
 
 `tests/differential/jit_nested_warp_osr.py` により、Interpreter、
-HotSpot（途中移行ON/OFF）、Eagerで、手続きprefix・ループ・suffixの最終値が一致。
+HotSpot（途中移行ON/OFF）、Eagerで、手続きprefix・ループ・suffixの最終値が一致した。
 HotSpot ONでは実際に `[jit-osr-nested] promoted` が出た。
-一般の引数付き手続きへの途中移行ではなく、専用コンパイル済みloop entryに限定される。
+一般の引数付き手続きへ途中移行するのではなく、専用にコンパイル済みのloop entryに限定される。
 
 `tests/differential/jit_nested_warp_args_refusal.py` ではUTF-16文字列と数値の引数を持つwarp手続きを実行。
 ネストOSRをONにしても危険な途中移行は発生せず、Interpreter/HotSpot/Eagerの実行結果が一致した。
@@ -39,16 +38,16 @@ HotSpot ONでは実際に `[jit-osr-nested] promoted` が出た。
 ## タイミング依存テスト
 
 既存の `tests/differential/jit_osr.py` のトップレベルOSRでは
-`long`、`fractional`、`list`、`nested` は隔離バイナリで結果一致。
+`long`、`fractional`、`list`、`nested` は隔離バイナリで結果が一致した。
 `until` は `[jit-async] ... finished 86.529ms` のログが出た一方、ネイティブへ途中移行する前に
 インタプリタが終了したため「OSR never triggered」という検証条件に失敗した。
-**これはScratch状態の不一致ではなく、途中移行が起こるというタイミング条件の不成立**。
+**これはScratch状態の不一致ではなく、途中移行が起きるというタイミング条件が満たされなかったこと**である。
 パリティとOSR移行のテストは分離することが望ましい。
 
 ## ビルド一貫性の仕組み
 
-`tools/consistent-build.ts` は共有ソースがビルド中に変更されたかを
-`src/`、CMake設定のSHA256で確認し、変更を検知したら再実行する。
+`tools/consistent-build.ts` は `src/` とCMake設定のSHA256で、ビルド中に
+共有ソースが変更されたかを確認し、変更を検知したら再実行する。
 ビルド後、ソースが安定していた場合だけバイナリをコピーし、
 ソースとバイナリのSHA256をmanifestに記録する。
 例：
@@ -63,8 +62,8 @@ bun tools/consistent-build.ts \
 ```
 
 `--build` 先は独立した事前設定済みCMake buildである必要がある。
-共有作業中のビルドは、全 translation unit が同一 `Thread`/
-`CompiledScript` ヘッダ構造を使ったかをソース更新検出と依存再構築で
+共有作業中のビルドは、全 translation unit が同一の `Thread`/
+`CompiledScript` ヘッダ構造を使ったかを、ソース更新検出と依存再構築で
 確かめてから利用する。**SHA256はコンパイラの意味論まで検証するものではない**。
 
 ## 未解決

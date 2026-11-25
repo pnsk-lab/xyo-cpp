@@ -15,7 +15,7 @@ All of these are exact binary64 operations: `x-m` is exact in the middle
 range by **Sterbenz's lemma** (`m <= x <= 2m`), and the positive zero output
 at `2*m` is explicit. Thus the integer-only `trunc(x)==x` guard can be
 omitted, removing the runtime `vroundsd` comparison and a CFG edge for the
-common `app_life` path. The unchanged existing fallback applies to all
+common `app_life` path. The existing fallback is unchanged and applies to all
 negative values, zero (including `-0.0`), nonfinite, and out-of-range
 values. No unsafe floating-math assumption or benchmark-name matching.
 
@@ -86,6 +86,6 @@ Official output: `scratch-bench/results/perf-life-realwrap-clean-20261110/`.
 
 `app_life` is still below MistWarp. Target generic loop-carried numeric
 representation and index range facts, not merely static external-helper
-call counts. Neither the xyo code generator nor the V8 generated code
+call counts. Neither the xyo code generator nor the V8-generated code
 completely removes all type guards. Full integer SSA requires an explicit
 proof or guard with safe fallback at all scheduler handoffs.

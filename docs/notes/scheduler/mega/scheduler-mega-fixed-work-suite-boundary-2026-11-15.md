@@ -24,7 +24,7 @@ constructing the Mega dispatcher.
 `tests/bench/algos/test_mega_real_pingpong_full.py --fixed-hits N`
 retains the original ScratchBench `sched_pingpong`, `bench_begin`,
 `bench_round`, `bench_end` procedure definitions and original
-`sc_ping` receiver. The ONLY source condition change is to substitute
+`sc_ping` receiver. The ONLY change to the source conditions is replacing
 the original clock-based `operator_lt` left reporter with a live
 `sc_hits` reporter; `b_budget` is assigned N.
 
@@ -83,7 +83,7 @@ runs it exactly once on return; it matches Fiber.
 
 The new `--post-procedure` test adds a distinct argumentless
 procedure that increments a sentinel variable by 17. Source proof
-refuses Mega and the native Fiber still executes that procedure exactly
+refuses Mega, so the native Fiber still executes that procedure exactly
 once, preserving observable effects. This is a **safety boundary test**,
 not complete suite_sched integration.
 

@@ -2,7 +2,7 @@
 
 ## 動機
 
-Linux RISC-V の `RISCV.powerOn` は実行途中のスタックに、手続き呼び出し、`control_for_each`、`control_if_else` と `control_repeat` が重なっている。
+Linux RISC-V の `RISCV.powerOn` では、実行途中のスタックに手続き呼び出し、`control_for_each`、`control_if_else` と `control_repeat` が重なっている。
 実測例：6フレームの制御スタックの末端が `repeat`、残りカウンター849、呼び出し引数のあるフレームが3つ。
 既存 `XYO_JIT_OSR=1` はトップレベルのループのみを対象とし、ネストした warp 手続きには移行できない。
 
@@ -19,7 +19,7 @@ Linux RISC-V の `RISCV.powerOn` は実行途中のスタックに、手続き�
 - `hasCountedLoopCheckpoint()` は正確なrepeat counterのあるループ末端候補だけを示す。**それだけでは LLVM のネイティブ実行エントリではない**。
 
 `src/engine/runtime.cpp` の `Runtime::step` 後の Scheduler safe point に opt-in
-`XYO_INTERP_OSR_SNAPSHOT=1` 診断を追加。既定は OFF。実行は一切切り替えず、stateをログ取得後に破棄する。
+`XYO_INTERP_OSR_SNAPSHOT=1` 診断を追加。既定は OFF。実行は一切切り替えず、state をログ取得後に破棄する。
 
 ## 回帰確認
 

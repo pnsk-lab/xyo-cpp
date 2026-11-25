@@ -1,13 +1,13 @@
 # ScratchBench: JIT変数の型経路（2026-11-03）
 
-対象: `scratch-bench/performance/project` とローカルの `build/xyo` （当日の未コミット変更を含む）。診断用の一時的なLLVMコード生成ログと、JITガードの実行時カウンタで確認した。計測用のソースコードへの挿入は作業後に除去する。
+対象: `scratch-bench/performance/project` とローカルの `build/xyo`（当日の未コミット変更を含む）。診断用の一時的なLLVMコード生成ログと、JITガードの実行時カウンタで確認した。計測用にソースへ挿入したコードは、作業後に除去する。
 
 ## 要点
 
 - 全体スイートのトップスクリプトをJITで生成する際、74個の手続きについて経路を特定できた。これは「生成された経路」であり、すべてが実際に実行されたことを意味しない。
 - `math_arith` の `k_a/k_b/k_i`、`algo_primes` の `k_i/k_j/k_n/k_acc`、`app_raycast` の22変数など、内側の主要な計算では従来の **ループ内数値影（f64）** が多い。
 - 一方、`sched_*`、`algo_fib`、`algo_ack`、`list_search` などには **今回の型プロファイル用数値分岐** が生成される。
-- `str_join` の `k_s` は **文字列のBoxed昇格**、`str_contains` の `k_s` もBoxed昇格。この変数に数値特化は選ばれない。
+- `str_join` の `k_s` は **文字列のBoxed昇格**、`str_contains` の `k_s` もBoxed昇格。`k_s` には数値特化が選ばれない。
 - `list_read` は数値影（`k_i`）だけでなく、**リストヘッダ昇格** も使用している。
 - プロファイル有効時はNaN-boxガード後に数値変換。型が不一致ならScratchの一般変換・比較へ戻る。既存の数値影はこれより優先される。
 
@@ -16,7 +16,7 @@
 | 分類 | 主な適用先 |
 | --- | --- |
 | ループ内数値影 | `loops_until/while/foreach/ifelse`、`vars_setchange/many`、`math_arith/round/trig/nbody/mandel/collatz`、`algo_sort/sieve/matmul/primes`、`app_life/raycast/projection` |
-| 今回の型予測も併用 | 上記各手続きの主にタイマ `b_t0`・予算 `b_budget`・一部の外側変数 |
+| 今回の型予測も併用 | 上記各手続きの、主にタイマ `b_t0`・予算 `b_budget`・一部の外側変数 |
 | 型予測を使うが数値影が少ない | `algo_fib/ack`、`list_append/insdel/search`、`sched_*` |
 | 文字列Boxed昇格 | `str_join` の `k_s`、`str_contains` の `k_s`、`str_cast` の `k_t`、`app_brainfuck` の `bf_c` |
 | 数値影とBoxed昇格の混在 | `app_brainfuck`（例：`bf_dp` は数値影、`bf_c` はBoxed） |

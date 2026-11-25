@@ -23,7 +23,7 @@ The materialized ORC code and an anonymous target appeared
 at addresses separated by terabytes in the ASan virtual
 address-space layout. This exceeds the signed 32-bit PC-relative
 relocation range. That can make lazy symbol materialization
-fail and the call-through trampoline can reach a null
+fail, and the call-through trampoline can then reach a null
 failure address. It is distinct from the historical
 `JitEngine::~JitEngine` shared-pointer destruction crash.
 
@@ -65,9 +65,8 @@ pass selection or production default JIT code model.
 Added `tests/differential/jit_large_code_model_lazy.py`
 and registered CPU CTest
 `xyo-jit-large-code-model-lazy`.
-It verifies 148/148 Scratch assertions and actual
-`tier=lazy` and successful compilation telemetry
-for both HotSpot and Eager. The script accepts
+It verifies 148/148 Scratch assertions and checks telemetry for actual
+`tier=lazy` and successful compilation in both HotSpot and Eager. The script accepts
 `--code-model large` (default) and
 `--code-model auto` to test the sanitizer
 compile-time fallback with no environment override.

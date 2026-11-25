@@ -17,11 +17,11 @@
 
 ## 実装範囲
 
-現段階は **1つのトップレベルScratchスクリプトから到達可能な、非再帰の自作ブロック群** のみを対象とする。
+現段階では **1つのトップレベルScratchスクリプトから到達可能な、非再帰の自作ブロック群** のみを対象とする。
 
-src/jit/mega_goto.hpp はLLVM IRに対し、Scratchの手続き呼出しグラフを事前検査し、LLVM InlineFunctionで自作ブロック呼出しをBasicBlock間のジャンプ（goto相当）に変換する。トップレベルからの全呼出しが消えた後、独立した手続き関数を内部化してLLVMの通常パイプラインで削除する。
+src/jit/mega_goto.hpp は、LLVM IR上でScratchの手続き呼出しグラフを事前検査し、LLVM InlineFunctionで自作ブロック呼出しをBasicBlock間のジャンプ（goto相当）に変換する。トップレベルからの全呼出しが消えた後、独立した手続き関数を内部化してLLVMの通常パイプラインで削除する。
 
-src/jit/backend_llvm.cpp から同期コンパイル時に呼び出し、完全融合した場合は遅延ORCプロシージャ解決を行わない。
+src/jit/backend_llvm.cpp から同期コンパイル時に呼び出され、完全融合した場合は遅延ORCプロシージャ解決を行わない。
 
 再帰、上限を超えるIR、アドレスの流出、間接呼出し等は従来の関数呼出しにフォールバックする。引数評価、CallFrame、warp、yieldは生成済みIRを保存する。
 
@@ -29,7 +29,7 @@ src/jit/backend_llvm.cpp から同期コンパイル時に呼び出し、完全�
 
 ## 正しさの検証
 
-通常のSB3で P → Q → Stage変数を1増やす処理を反復した。
+通常のSB3で、P → Q → Stage変数を1増やすという処理を反復した。
 - 20,000回×Qを2回: Stage s=40000（正確）
 - XYO_JIT_INLINE_LIMIT=0での診断:
   [mega-goto] script=hat fused=1 calls=3 estimated_ir=110 remaining=0 reason=fused
@@ -72,7 +72,7 @@ A/B計測: tests/bench/algos/bench_mega_goto.py。
 - sched_fanwait 0.9835x
 - sched_waituntil 0.9898x
 
-この条件では7コンパイル対象がnot-applicable、残る1つがsize-or-callsiteで、**実際にMega Dispatchを適用したsched_*スクリプトはない**。上記の差を高速化の根拠にしてはいけない。
+この条件ではコンパイル対象7件がnot-applicable、残る1つがsize-or-callsiteで、**実際にMega Dispatchを適用したsched_*スクリプトはない**。上記の差を高速化の根拠にしてはいけない。
 
 上限を12000へ引き上げると、script=~Mv は26呼出し、推定IR=8878で統合できた。しかし4組A/Bではsched_clonechurn約0.980x、pingpong約0.993x、fanwait約0.991xで、明確な改善は見られなかった。
 

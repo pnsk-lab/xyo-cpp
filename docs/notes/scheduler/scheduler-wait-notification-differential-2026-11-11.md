@@ -55,8 +55,8 @@ expected counters are `covered=1 missed=1 unchanged_notified=1
 unchanged_quiet=2 changed_untracked=1 invalid_bindings=1`.
 
 A JIT-enabled full xyo-tests run with all experimental registry flags
-reported, in one actual scheduler fixture,
-`covered=4 missed=0 unchanged_quiet=16`.
+reported `covered=4 missed=0 unchanged_quiet=16` in one actual scheduler
+fixture.
 The synthetic fixture separately reported `covered=1 missed=1`, proving
 the injected notification omission was detected. The scheduler checks
 reported `409 checks, 0 failures`.

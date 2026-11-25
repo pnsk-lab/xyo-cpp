@@ -5,7 +5,7 @@
 V8の最短浮動小数点変換経路をxyo-cppへ実験的に移植。
 
 - third_party/dragonbox/dragonbox.h: jk-jeon/dragonbox のヘッダ実装。仮数 uint64_t と指数 int32_t を直接取得。
-- src/core/v8_decimal.cpp: V8 conversions.cc の SignificandToChars、ConvertUpTo9Digits、Convert8Digits と2桁表を独立C++20へ移植。ECMAScript表記への直接整形を行う。
+- src/core/v8_decimal.cpp: V8 conversions.cc の SignificandToChars、ConvertUpTo9Digits、Convert8Digits と2桁表を独立した C++20 コードへ移植。ECMAScript表記への直接整形を行う。
 - src/core/v8_decimal.hpp: 正の有限・非ゼロ double -> 最短10進文字列のAPI。
 - src/core/jsnum.cpp: XYO_NUM_TO_STR_DRAGONBOX=ON のときだけ移植処理へ分岐。NaN、Infinity、-0、負数、小整数の高速経路は従来どおり。
 - CMakeLists.txt: XYO_NUM_TO_STR_DRAGONBOX (現行の既定ON)。OFFなら移植ソースをリンクせず、従来のstd::to_charsを使う。
@@ -23,7 +23,7 @@ V8の最短浮動小数点変換経路をxyo-cppへ実験的に移植。
 
 ## 互換性
 
-- 旧jsnum::toStringに対しランダムな浮動小数点50万、整数50万、境界値2,023を含む1,002,023件の出力がバイト単位で一致。
+- 旧jsnum::toStringに対しランダムな浮動小数点数50万、整数50万、境界値2,023を含む1,002,023件の出力がバイト単位で一致。
 - 実際のNode.js v26.4.0のString(number)と602,023件の入力について完全一致。数値のIEEE754ビット列をNodeのBufferで復元して比較。
 - DragonboxとXYO_ASM_ECMA_FORMATの同時ONでも1,002,023件で完全一致。ただし速度はDragonbox単独の方が速い。
 - 正負0、NaN、Infinity、非正規数、2^53境界、1e-6と1e-7、1e20と1e21を含む。

@@ -2,7 +2,7 @@
 
 ## 実装
 
-`XYO_JIT_CFG_TYPE_STATS=1`でCFG型解析に限定したオプション計測を追加。`src/analysis/cfg_type_hint_telemetry.hpp`と`src/jit/codegen.cpp`の局所的なフックを使用する。カウンターは候補ループ数（eligible）、収益性による省略（skipped）、解析実行（analyses）、打ち切り（truncated）、数値影への昇格（promoted）、解析ノード（nodes）および`analyzeTypeFlow`呼び出し時間（analysis_ms）。計測OFF時は時計を読まない。CFGヒントOFF時は統計オブジェクトが構築されず、行が出ないことがある。
+`XYO_JIT_CFG_TYPE_STATS=1`でCFG型解析に限定したオプション計測を追加。`src/analysis/cfg_type_hint_telemetry.hpp`と`src/jit/codegen.cpp`の局所的なフックを使用する。カウンターは候補ループ数（eligible）、収益性による省略（skipped）、解析実行（analyses）、打ち切り（truncated）、数値影への昇格（promoted）、解析ノード（nodes）および`analyzeTypeFlow`呼び出し時間（analysis_ms）だ。計測OFF時は時計を読まない。CFGヒントOFF時は統計オブジェクトが構築されず、行が出ないことがある。
 
 出力例：
 
@@ -23,9 +23,9 @@
 | 全適用 | 8 | 0 | 8 | 176 | 2 |
 | 選択的 | 8 | 4 | 4 | 112 | 2 |
 
-CFG解析のみの時間：全適用0.481/0.328ms、選択的0.448/0.337ms（各2回）。解析回数は半減したが、解析時間はサブミリ秒で有意な減少は確認できない。
+CFG解析のみの時間：全適用0.481/0.328ms、選択的0.448/0.337ms（各2回）。解析回数は半減したが、解析時間はサブミリ秒であり、有意な減少は確認できない。
 
-JIT同期コンパイル合計：OFFは389.186/582.682ms、全適用470.359/387.872ms、選択的653.086/448.001ms。順序・環境の変動が数百msあり、解析省略によるコンパイル速度向上は測定できていない。診断ONの数値を通常時のスループットスコアと見なさない。
+JIT同期コンパイル合計：OFFは389.186/582.682ms、全適用470.359/387.872ms、選択的653.086/448.001ms。順序・環境の変動が数百msあり、解析省略によるコンパイル速度向上は測定できていない。診断ON時の数値を通常時のスループットスコアと見なさない。
 
 全適用と選択的の`XYO_JIT_VERBOSE=1`比較では、昇格対象は**両方とも`k_n`と`k_x`**。選択的フィルターが省いた4解析は、今回のベンチマークで昇格を生んでいなかった。機械語単位の同一性までは未証明だが、同じ最適化選択をしているため、前回の47項目にわたる一様な速度改善は測定ノイズの疑いが強い。
 
@@ -33,7 +33,7 @@ JIT同期コンパイル合計：OFFは389.186/582.682ms、全適用470.359/387.
 
 ## 個別ケース
 
-`board/prof-008/isolated/results.json`に各方式2回、6ケースの結果を保存。`math_mandel`は両方式とも1解析・22ノード・1昇格、`str_cast`は全適用が1解析・8ノード・昇格0（約0.019ms）、選択的は省略。`app_ast`、`algo_ack`、`loops_repeat`、`sched_clonechurn`は、CFG解析の対象なし。したがってこれらの実行性能差を型解析省略の効果と解釈しない。
+`board/prof-008/isolated/results.json`に各方式2回、6ケースの結果を保存。`math_mandel`は両方式とも1解析・22ノード・1昇格、`str_cast`は全適用が1解析・8ノード・昇格0（約0.019ms）、選択的では省略。`app_ast`、`algo_ack`、`loops_repeat`、`sched_clonechurn`は、CFG解析の対象なし。したがってこれらの実行性能差を型解析省略の効果と解釈しない。
 
 ## 検証
 
@@ -42,7 +42,7 @@ JIT同期コンパイル合計：OFFは389.186/582.682ms、全適用470.359/387.
 - Bunテスト：`tools/jit-cfg-selective-ab.test.ts`と`tools/jit-cfg-type-ab.test.ts`、6/6成功。
 - Release LLVM全ビルド、`git diff --check`成功。ScratchBenchの47件完走は正式な全Parityテストとは別。
 
-DLSS並行作業の未宣言型のため、専用の`board/.prof-008-cmake/build.ninja`の`sdl_renderer.cpp.o`だけに既存ヘッダーの`-include`を与えた。レンダラソースやOSRソースは変更していない。
+DLSS並行作業で未宣言の型があったため、専用の`board/.prof-008-cmake/build.ninja`の`sdl_renderer.cpp.o`だけに既存ヘッダーの`-include`を与えた。レンダラソースやOSRソースは変更していない。
 
 ## 再現
 

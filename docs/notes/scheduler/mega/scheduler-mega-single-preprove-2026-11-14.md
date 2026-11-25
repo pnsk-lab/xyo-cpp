@@ -17,7 +17,7 @@
 
 `XYO_JIT_MEGA_SINGLE_PREPROVE=1` が有効な場合、
 C++側の1件特化経路はこの分類だけから静的なsource適格性を取り出す。
-旧来の7種類のmetadataスキャンはフラグOFF時に保持し、交互A/B比較を可能にした。
+旧来の7種類の metadata スキャンはフラグOFF時用に残し、交互A/B比較を可能にした。
 
 重要：コンパイル時分類 **だけ** では実行を許可しない。
 source revision、Thread状態、JitCtx/Fiber/OSR不在、スケジューラ順序、
@@ -47,7 +47,7 @@ XYO_JIT_MEGA_SINGLE_PREPROVE=1 \
 
 `tests/bench/algos/bench_mega_single_dispatch.py --preprove`
 で、固定CPU16、同一凍結Releaseバイナリ、同一SB3、
-Eager JIT O1、起動・JITコンパイル込みの壁時計を測定。
+Eager JIT O1、起動・JITコンパイル込みの壁時計時間を測定。
 対象：反復300,000回 + 1回のgreen flagスクリプト。
 他の全フラグは両条件で同じ。24組でON/OFF実行順を交互に入れ替える。
 
@@ -72,8 +72,8 @@ Scratchの実行passやYield回数は変わらない。
 - 集中テスト：PREPROVE ON/OFFいずれも **31/31 PASS**。
 - source分類検証：混合Scalar/Repeatは `{2,2,2,1,2}`。
   条件分岐系は `{0,0,0,0}`。単純な2スクリプトは `{2,2}`。
-- 途中で変数mapから`s`を消して再作成：世代の不一致を検出して
-  旧バインディングを触らず通常経路で再束縛、次パスから高速経路に戻る。
+- 途中で変数 map から `s` を消して再作成：世代の不一致を検出して
+  旧バインディングを触らず通常経路で再束縛し、次パスから高速経路に戻る。
 - キャッシュ世代が変わらないまま値を数値から文字列に変更：
   早期経路を拒否し、通常のScratch数値変換後の最終値が一致。
 - `git diff --check` とベンチPython構文検証PASS。

@@ -4,8 +4,8 @@
 
 The existing `control_for_each` analysis can prove that its induction index is
 an exact, positive integer within a static `[1, ceil(bound)]` interval. Its
-legacy `finiteIndexBody` and `strictInductionBody` rejected *all* list reads,
-however, even when they could not mutate the induction variable. Consequently
+legacy `finiteIndexBody` and `strictInductionBody`, however, rejected *all*
+list reads even when they could not mutate the induction variable. Consequently
 `data_itemoflist(values, i)` needed a round trip through numeric boxing and
 IEEE double-to-i64 conversion even when LLVM had already emitted the exact
 i32 loop counter.
@@ -38,7 +38,7 @@ loop cloning or bespoke vectorization was added.
 ## LLVM O3 IR evidence
 
 `tests/differential/jit_list_proven_i32_index.py` generates ordinary Scratch
-projects with populated lists and compare modes. In the 500-element list
+projects with populated lists and compares modes. In the 500-element list
 fixture, after O3:
 
 - OFF: `fe_i32` → `uitofp` → `llvm.x86.sse2.cvttsd2si64` → `sub i64` →

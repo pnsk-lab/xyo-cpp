@@ -38,7 +38,7 @@ and removes the pending notification. `auditWaitResumeOutcome()` then
 increments a separate pair of counters (notified/quiet) for each outcome.
 The runtime destructor prints `[wait-resume-audit]` when observations exist.
 
-`XYO_WAIT_NOTIFY_AUDIT` guards the entire new scheduler path. When absent
+`XYO_WAIT_NOTIFY_AUDIT` guards the entire new scheduler path. When absent,
 the runtime incurs no extra per-thread wait notification lookup, mutex lock,
 or outcome classification. The existing variable-snapshot differential audit
 continues to collect its own `[wait-notify-audit]` counters separately.

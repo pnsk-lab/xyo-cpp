@@ -16,12 +16,12 @@ GC、GPU の一部で直接参照されるので、新しいモードでは `ite
 とし `ListStore` インターフェース `get/set/insert/erase` に転送する。
 JIT の add/item/replace は非連続モードのとき**生成時に helper に lowering**
 する（flat 系の JIT fast-path は維持）。`par-for` は直接 slot 書き込みの
-競合があるため非連続モードで非使用とする。GC は各リストの実データを走査し、
+競合があるため、非連続モードでは使用しない。GC は各リストの実データを走査し、
 解放時には `ListStore` を delete する。
 
 **注意:** 同じコード生成・同じアクセス手段で比較したわけではない。
 非連続モードはヘルパー関数呼び出しの費用も含む。
-総合性能を採用判断するには storage・JIT lowering の共同最適化が必要。
+総合性能で採用を判断するには、storage と JIT lowering の共同最適化が必要。
 
 ## ネイティブデータ構造ベンチマーク
 
@@ -29,7 +29,7 @@ JIT の add/item/replace は非連続モードのとき**生成時に helper に
 20,000 要素 → 20万回ランダム読み取り → 8,000回ランダム
 insert/delete (交互) → clear → 20万回 append。操作後全体ハッシュを照合。
 
-例示の単発測定（実行ごとの変動に注意）:
+一例として示す単発測定（実行ごとに変動する点に注意）:
 
 | mode | append ms | random get ms | middle edit ms |
 |---|---:|---:|---:|
@@ -89,10 +89,10 @@ ctest --test-dir build -R '^xyo-list-backend-' --output-on-failure
 各モードで `test_list_limit_main` の基本操作、clone、limit、
 および非連続モードでは3000回のランダム挿入・削除と参照配列の順序照合を実施。
 
-既存の `xyo-tests` の複数テストは内部構造 `list->items[i]` を直接
-参照しているため、非連続方式での実行に非対応であり、`deque` モードの
-通常 `xyo-tests` はセグメンテーション違反となる。専用ターゲットを
-別に設けた。今後既存テストを `get0` / `replace0` に移行する必要あり。
+既存の `xyo-tests` には内部構造 `list->items[i]` を直接参照するテストが
+複数あり、非連続方式では実行できない。`deque` モードで通常の `xyo-tests` を
+走らせるとセグメンテーション違反になる。専用ターゲットを
+別に設けた。今後、既存テストを `get0` / `replace0` に移行する必要がある。
 
 **判断:** 既定は `flat` のままとする。`gap` は Scratch の
 insert/delete だけ約3.1倍速いが他のアクセスで遅い。`chunked` は

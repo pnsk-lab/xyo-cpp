@@ -2,7 +2,7 @@
 
 ## Correction: the previous IR dump was *not* always post-O3
 
-The original `XYO_JIT_DUMP2=1` was printed after `jitEmitScript` but **before
+The original `XYO_JIT_DUMP2=1` output was printed after `jitEmitScript` but **before
 O3** when the script selected lazy materialization. Such modules include the
 `xyo.lazy.optimize` module flag and are optimized later by the lazy ORC IR
 transform (`configureLazyIR`). Thus an earlier `app_life` dump with many
@@ -80,8 +80,9 @@ machine conditions, and was **fully rolled back**. The earlier, tested
 
 The standard fixed-repeat integer counter is already converted to LLVM SSA
 by O3. Duplicating this optimization in C++ would not help. For the next
-larger gain, the relevant *unproved* facts are instead the Scratch variable
-and list-item types/ranges spanning each yield-free loop body. Exposing only
+larger gain, the relevant facts are instead the Scratch variable and
+list-item types/ranges spanning each yield-free loop body, which are
+still *unproved*. Exposing only
 **verified** facts to LLVM (without crossing list writes, GC, yield, or
 source mutation) is the remaining compiler-front-end task. Use the
 corrected post-O3 dumps and machine objects to distinguish existing

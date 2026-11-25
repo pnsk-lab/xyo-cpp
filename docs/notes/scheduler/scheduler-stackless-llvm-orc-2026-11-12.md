@@ -7,7 +7,7 @@ Status: opt-in experimental native LLVM implementation. Defaults OFF. No commit.
 
 - Env flags: XYO_JIT_FIBERLESS=1, XYO_JIT_CORO_DIRECT=1, XYO_JIT_CORO_SIMPLE_LOOP=1.
 - Source-verified eligibility: static Green Flag / broadcast receiver / clone-start hat, one ordinary repeat, one scalar change-by numeric-literal body. Exact finite integral repeat count, 0 through INT32_MAX. No waits, procedures, warp, dynamic reporters, nested calls or compatibility suspensions.
-- src/jit/stackless_coro_lower.hpp: converts direct native yield calls into llvm.coro.suspend; builds heap coroutine frame, final suspension, destroy path, ORC-exported resume/done/destroy wrappers. Correct enum llvm::Attribute::PresplitCoroutine is required for LLVM lowering. The previous string attribute caused unlowered llvm.coro.size and native codegen failure.
+- src/jit/stackless_coro_lower.hpp: converts direct native yield calls into llvm.coro.suspend; builds a heap coroutine frame, final suspension, destroy path, and ORC-exported resume/done/destroy wrappers. The correct enum, llvm::Attribute::PresplitCoroutine, is required for LLVM lowering. The previous string attribute caused unlowered llvm.coro.size and native codegen failure.
 - src/jit/codegen.cpp: source-guarded optional direct repeat emission, one lexical yield, no generic warp/deadline branches. No benchmark-name recognition or changes to non-eligible scripts.
 - src/jit/backend_llvm.cpp: source check, transform before optimizer, wrapper symbol lookup and lifecycle metadata. Disables lazy code materialization for this narrow native coroutine.
 - src/engine/sequencer.cpp: initial JIT entry and later heap-handle resume. Checks source Blocks revision and full Target variable-binding stamp (local/stage identity and generations) before touching a cached native Variable pointer. Completion, external stop, broadcast restart and revision or binding invalidation destroy the coroutine without re-executing committed work.
@@ -31,7 +31,7 @@ build-scheduler-rewrite-20261111/fiberless-coro/
 The final A/B JSON is bench-results.json; earlier iterations are preserved in bench-results-before.json, bench-results-post-yieldopt-O3.json, bench-results-O1-old-loop.json.
 
 Earlier generic (non-specialized) coroutine was slower than Fiber:
-80.31ms vs 59.52ms at O3; trimmed ordinary-yield branches 71.12ms vs 57.45ms at O3; O1 generic 64.55ms vs 61.01ms. The source-certified direct single-yield loop produced the current improvement. The new coro O1/O2/O3 unpaired medians were respectively 31.76/32.83/32.83 ms in three trials each; don't generalize the best tier.
+80.31ms vs 59.52ms at O3; ordinary-yield branches trimmed: 71.12ms vs 57.45ms at O3; O1 generic 64.55ms vs 61.01ms. The source-certified direct single-yield loop produced the current improvement. The new coro O1/O2/O3 unpaired medians were respectively 31.76/32.83/32.83 ms in three trials each; do not generalize from the best tier.
 
 ## Tests
 
@@ -41,7 +41,7 @@ To run the precise native coroutine test:
 
 Latest isolated checks: **20/20 passed**, interpreted_yield_scripts=0, fiber_acquires=0.
 Tests cover three exact successive resumes, source revision invalidation, binding erase-and-recreate without Blocks revision change, external stop, fresh reuse, receiver broadcast restart with 2+8 exact effects.
-Normal default xyo-tests also PASS (46.35s in latest completed ordinary run; note later code updates require retest).
+Normal default xyo-tests also PASS (46.35s in latest completed ordinary run; note that later code updates require retest).
 
 ## Limitations
 
