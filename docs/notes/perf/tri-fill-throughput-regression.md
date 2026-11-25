@@ -2,7 +2,7 @@
 
 ## 再現と原因
 
-対象は[The fastest tri fill engine.sb3](<../The fastest tri fill engine.sb3>)。既定の`@stamps=10000`では、プロジェクトのミリ秒単位の計時により約1,000万tpsが表示される場合がある。この値だけでは、高stamps時の速度を確認できない。
+対象は[The fastest tri fill engine.sb3](<../../../The fastest tri fill engine.sb3>)。既定の`@stamps=10000`では、プロジェクトのミリ秒単位の計時により約1,000万tpsが表示される場合がある。この値だけでは、高stamps時の速度を確認できない。
 
 初期`@stamps`だけを変更したアーカイブを作り、現行のheadless `run --frames 120`で確認した。10万stampsではGPUが120回実行され、最終表示は10,000,023tpsだった。100万stampsではGPU実行成功が0回、CPUフォールバックが120回で、最終表示は2,331,003tpsだった。数学boxing最適化前の保存バイナリでも、100万stampsで2,227,172tps・GPU実行成功0回となった。したがって、この再現では直近の数学boxing変更が原因ではない。
 
