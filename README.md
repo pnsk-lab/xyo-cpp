@@ -78,7 +78,7 @@ cmake --build build-macos --parallel
 ctest --test-dir build-macos --output-on-failure
 ```
 
-詳しくは [macOS ビルドガイド](docs/macos.md) を参照してください。
+詳しくは [macOS ビルドガイド](docs/platform/macos.md) を参照してください。
 
 ### Windows
 
@@ -104,13 +104,13 @@ JIT は `--jit=hotspot|eager|off` で切り替えられます。各コマンド�
 ## ドキュメント
 
 - [実行方法・配布バイナリの依存関係](RUNNING.md)
-- [macOS 対応](docs/macos.md)
+- [macOS 対応](docs/platform/macos.md)
 - [プロジェクトランチャー](docs/launcher.md)
 - [ランタイム設計](docs/design.md)
 - [WASM / Emscripten](docs/wasm.md)
-- [文字列処理の性能](docs/string-performance.md)
-- [スケジューラの性能](docs/scheduler-performance.md)
-- [ベンチマーク](docs/algo-bench.md)
+- [文字列処理の性能](docs/core/string-performance.md)
+- [スケジューラの性能](docs/scheduler/scheduler-performance.md)
+- [ベンチマーク](docs/bench/algo-bench.md)
 - [テストと差分検証](tests/differential/README.md)
 
 ## 開発・テスト

@@ -34,7 +34,7 @@ updated: 2026-11-12
 - tests/unit/jit_deopt_telemetry_smoke.cpp (new)
 - tools/jit-deopt-analyze.ts (direct counters without double counting)
 - tools/jit-deopt-analyze.test.ts (two new tests)
-- docs/jit-runtime-deopt-telemetry.md (new)
+- docs/jit/jit-runtime-deopt-telemetry.md (new)
 
 ## Known limitations
 

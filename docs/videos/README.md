@@ -40,8 +40,8 @@ Manimの出力動画:
 - RUNNING.md — JITモード、遅延JIT、AOT
 - docs/jit-backend-architecture.md — LLVMとバックエンド分離
 - docs/scratch-unified-source-ir.md — Source IRの対応範囲
-- docs/jit-interpreter-during-compile-2026-11-06.md — 非同期JIT
-- docs/jit-osr-2026-11-06.md — opt-inでの限定的OSR
-- docs/wasm-hotspot.md / docs/jit-backend-compatibility.md — WASM HotSpotの対応範囲
+- ../notes/jit/jit-interpreter-during-compile-2026-11-06.md — 非同期JIT
+- ../notes/jit/jit-osr-2026-11-06.md — opt-inでの限定的OSR
+- ../wasm/wasm-hotspot.md / docs/jit-backend-compatibility.md — WASM HotSpotの対応範囲
 
 動画は理解のために図を単純化している。共通実行可能IRへの全面移行、WASMのLLVM完全互換、一般化されたOSRを完成済みとは説明しない。OSRと非同期コンパイルは試験用オプションとして明示している。

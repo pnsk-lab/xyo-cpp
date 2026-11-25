@@ -26,5 +26,5 @@ updated: 2026-11-12
 - src/jit/compile_telemetry.hpp (new)
 - src/jit/jit.cpp (targeted instrumentation only)
 - tests/unit/jit_compile_telemetry_smoke.cpp (standalone test)
-- docs/jit-compile-telemetry.md (usage and metric semantics)
+- docs/jit/jit-compile-telemetry.md (usage and metric semantics)
 - Depends on the concurrent DLSS renderer fix before full binary testing.

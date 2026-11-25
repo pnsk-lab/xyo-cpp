@@ -2,7 +2,7 @@
 
 Scratch 3 / TurboWarp 完全互換・LLVM JIT 搭載のネイティブランタイム。
 
-対象読み物:
+参照資料:
 - `refs/scratch-vm/` — TurboWarp/scratch-vm（コンパイラ + エンジン + 全ブロック実装の正本）
 - `refs/scratch-editor/packages/scratch-render/` — 公式 scratch-render（レンダラ契約の正本）
 
@@ -60,7 +60,7 @@ project.sb3 (zip)
 ```
 
 **2 層実行の使い分け**（TurboWarp と同じ方針）:
-- 起動時にまずインタプリタで走る実装も可能だが、TW 同様「初回スレッド開始時にコンパイル」が基本
+- 起動時にまずインタプリタで走る実装も可能だが、TW と同じく「初回スレッド開始時にコンパイル」が基本
 - コンパイル失敗・未対応 opcode・`tw nocompile` コメント → そのスクリプトだけインタプリタへフォールバック（スクリプト単位の混合実行）
 - compat ブロック（JIT 未対応の一部 opcode）は JIT コード中からインタプリタ呼び出し —— TW の `executeInCompatibilityLayer` と同じ構造
 
@@ -133,7 +133,7 @@ STATUS_DONE         = 4
   - matchFields は `toUpperCase` で正規化してから比較（hatFields 側はキャッシュ時に事前大文字化 — `blocks-runtime-cache.js`）
   - `hatMeta.restartExistingThreads` → 同 (target, topBlock) の既存スレッドを `_restartThread`。実装は**新 Thread を生成して threads 配列の同じ位置に差し替え**る（実行順序を維持するための Scratch 2 互換動作 — runtime.js:2045-2066）
   - restart でないハット → 既に動いていたら追加しない（stackClick は例外）
-  - **生成したスレッドのエッジハット本体を直ちに 1 回評価**（Scratch 2 互換: `newThreads.forEach(compilerExecute)` の箇所 runtime.js:2263-2275）
+  - **生成したスレッドのエッジハット本体を直ちに 1 回評価**（Scratch 2 互換: runtime.js:2263-2275 の `newThreads.forEach(compilerExecute)` に相当）
   - ハットの restart フラグ一覧: flag/thisspriteclicked/stageclicked/backdropswitch/broadcastreceived は restart=true、keypressed は false（連打で多重起動）、touchingobject/whengreaterthan は edge-activated+no-restart
 - `_pushThread`: 新 Thread を threads 末尾へ push → `compilerOptions.enabled` なら `tryCompile`（monitor スレッドは除く）。コンパイルはスレッド生成時に同期的に行う（キャッシュはブロックコンテナ側、クローン間で共有）
 - `greenFlag()`: stopAll → PROJECT_START → currentMSecs 更新 → projectTimer リセット → 全ターゲット `clearEdgeActivatedValues` → `onGreenFlag` → `startHats('event_whenflagclicked')`
@@ -209,7 +209,7 @@ isBool(v)    = v == kFalse || v == kTrue
 asPtr(v)     = v & 0x0000'FFFF'FFFF'FFFF
 ```
 
-- **NaN 正規化規則**: 演算が生の NaN f64 を生成し得る箇所（`0/0`, `inf-inf`, `inf*0`, `sqrt(負)`, `log(負)` 等）は、型解析で `NUMBER_NAN` ビットが立つ場合に限り `xyo_canonicalize` を挿入して `kNaN` に写像。実数 NaN 演算が生む `0x7FF8`/`0xFFF8` パターンをタグと誤認しないようにする
+- **NaN 正規化規則**: 演算が生の NaN f64 を生成し得る箇所（`0/0`, `inf-inf`, `inf*0`, `sqrt(負)`, `log(負)` 等）は、型解析で `NUMBER_NAN` ビットが立つ場合に限り `xyo_canonicalize` を挿入して `kNaN` に変換。実際の NaN 演算が生む `0x7FF8`/`0xFFF8` パターンをタグと誤認しないようにする
 - `toNumber(kNaN)` → 0（Scratch は NaN を数値扱いのとき 0 にする）
 - `toString(kNaN)` → `"NaN"`、`toString(±Inf)` → `"Infinity"`/`"-Infinity"`
 
@@ -243,19 +243,19 @@ asPtr(v)     = v & 0x0000'FFFF'FFFF'FFFF
 ### 5.4 メモリ管理 — 自前 mark-sweep GC（小規模）
 - 対象オブジェクト: `SStr`（文字列）、`SList`（リスト実体: `capacity,len,Value[]`）。スキン・音声データ等は別経路
 - **GC が保守的に走査する根**: 各 `Target::variables`、モニタ値、`runtime._answer` 等、**そして全 live ファイバのスタック領域 + 保存済みレジスタ領域**
-  - 走査はワード単位、`(w>>48)==0x7FF9` → `asPtr` をヒープ所属に照合して mark。タグ付きポインタも原生ポインタも捕捉できる（自前 GC だから実現できる点）
+  - 走査はワード単位、`(w>>48)==0x7FF9` → `asPtr` をヒープ所属に照合して mark。タグ付きポインタも生ポインタも捕捉できる（自前 GC だから実現できる点）
   - 中断中ファイバは「SP〜スタック底」を走査。呼び出し規約上 suspend 時の live 値は必ず callee-saved または spill 済み
   - 実行中ファイバ上で collect が走った場合も同様に「現 SP〜そのファイバ底」を走査し、切替中のスケジューラ側退避レジスタ（`detail::gSchedulerRegs`）も対象に含める（`Runtime::markRoots` 実装）
 - **ロード中は collect を遅延**（`Gc::DeferCollect`）: `loadTargetObject` 中の Target は `runtime.targets` 未登録でルート走査から不可視。変数・リスト・ブロック field 等の GC オブジェクトがスタック残滓だけで生き延びるのは非決定的なため、区間中は回収自体を止める（debug/projects/3D2.sb3 のクラッシュ原因）
 - 割当: bump allocator + フリーリスト、マークは非移動。トリガは割当バイト数閾値（経験的に 1-2MiB 起点、ヒープ拡大係数 2.0）
   - マークフェーズ中の割当は**黒色割当**（`collecting_` 中は mark=1 で生成）— ルート走査が `Mutation::parseArgs` 等で SStr を遅延生成するため、同 sweep で即解放されるのを防ぐ
   - 上記の再入割当のため `allocMtx_` は `std::recursive_mutex`（`collect()` が mutex 保持下でルート走査を呼ぶ）
-- 停止時の平均ヒープは小さいため一時停止は通常 1ms 未満。文字列結合が多いプロジェクトでも安全に回収される
+- 停止時のヒープは平均して小さいため、一時停止は通常 1ms 未満。文字列結合が多いプロジェクトでも安全に回収される
 - **ファイバ kill 後の後片付けは GC が自動処理**: fiber を捨てるだけで、そのスタックにだけあった一時値は次回 GC で回収される（イールド中の一貫した参照を壊さない）
 
 ### 5.5 変数・リスト
 - `Variable { id, name, type, isCloud, value(Value|SList*) }`。`create()` の JS 版「変数ごとに別 hidden class」は我々には不要 —— JIT で `Variable*` 直接埋め込み
-- **クローンでの変数解決**: コンパイル済みコードはスレッド単位で `varSlots` に `Variable*` を束縛（`irgen.js` の `descendVariable` → スレッド開始時に `target.variables[id]` / `stage.variables[id]` を決め打ち。クローンは同じコード・別 ctx で各 clone の変数を指す → TW の「ファクトリ関数内で `evaluateOnce` により各スレッドの変数を閉じ込める」の同値実装）
+- **クローンでの変数解決**: コンパイル済みコードはスレッド単位で `varSlots` に `Variable*` を束縛（`irgen.js` の `descendVariable` → スレッド開始時に `target.variables[id]` / `stage.variables[id]` を決め打ち。クローンは同じコード・別 ctx で各 clone の変数を指す → TW の「ファクトリ関数内で `evaluateOnce` により各スレッドの変数を閉じ込める」のと同等の実装）
 - `LIST_TYPE` の値 = `SList*`。`_monitorUpToDate` 相当の dirty フラグを保持（モニタ用）
 
 ---
@@ -486,14 +486,14 @@ SDL2 が無い環境では `XYO_HAVE_SDL2` 未定義でヘッドレスのみビ�
   cloud 変数は拒否し、変数へ直接書き込む。
 - **バブル**: `bubbleText` を角丸白ボックス＋尾で描画（say/think）。
 - **UI**: ステージ右上に green flag/stop ボタン（角丸・ホバー強調・
-  旗はペナント/ストップは八角形、Shift+旗 = turbo で旗が橙色変化）。
+  旗はペナント/ストップは八角形、Shift+旗 = turbo で旗が橙色に変化）。
   操作対象（ボタン/スライダ/draggable スプライト/入力欄）に応じて
   システムカーソルを hand/ibeam/arrow に切替（`updateCursor`）。
 - **入力**: SDL キー/マウス → `ioDevices.keyboard/mouse` へ変換
   （クリックハットは `Mouse::pickTarget`→`pick` 経路）。
 - **スプライトドラッグ**: `draggable && visible` のみ掴み可能。
   掴み時のオフセットを保持して追従、移動時は `wasDragged` で
-  クリックハットを抑制。非移動の離脱は TW 通り mouse-up でハット発火。
+  クリックハットを抑制。動かさずに離した場合は TW 通り mouse-up でハット発火。
 - **ask and wait**: `onQuestion` で下端に入力バーを表示
   （`SDL_StartTextInput`）。丸角入力フィールド+緑の✓送信ボタン
   （クリック送信可）+ 質問テキスト表示。Enter 送信/BS/Delete/←→/Home/End、
@@ -695,7 +695,7 @@ xyo-cpp/
 
 1. **NaN-boxing の NaN 正規化漏れ**: NaN を生む全ての演算で canonicalize を忘れるとタグ誤認。IROptimizer の `NUMBER_NAN` ビットを厳密に使う
 2. **`isNotActuallyZero` 罠**: `""`/`" "`（空白のみ）/`"\t"` は `Number()` で 0 だが比較では 0 扱いしない。`compare` のこの分岐を 1 文字でも誤ると互換性が崩れる
-3. **UTF-16 基準**: `letter_of`/`length`/`contains`/`toLowerCase` を UTF-8 で実装すると絵文字・サロゲートで壊れる
+3. **UTF-16 基準**: `letter_of`/`length`/`contains`/`toLowerCase` を UTF-8 で実装すると絵文字・サロゲートでおかしくなる
 4. **手続きの `yields` 推移閉包**: 「この手続きを呼ぶ側も yield しうる」を固定点反復で求めないと、warp 内の呼び出しを誤って yield 不可能にコンパイルする
 5. **エッジハットの「直ちに一度実行」**: `startHats` で作ったスレッドを次ティックまで待たせると旧値がおかしくなる（runtime.js:2261-2275）
 6. **broadcast and wait のスレッド集合は開始時点で確定**: 開始済みスレッドのみを待つ

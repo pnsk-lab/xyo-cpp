@@ -7,7 +7,7 @@ Render:
 
 This video intentionally does not claim full WASM/LLVM feature parity or
 general on-stack replacement. Based on docs/design.md, RUNNING.md,
-docs/jit-osr-2026-11-06.md, docs/wasm-hotspot.md,
+../notes/jit/jit-osr-2026-11-06.md, ../wasm/wasm-hotspot.md,
 docs/jit-backend-compatibility.md, and docs/scratch-unified-source-ir.md.
 """
 

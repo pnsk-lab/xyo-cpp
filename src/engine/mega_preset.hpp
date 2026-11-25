@@ -74,7 +74,7 @@ inline void disableMegaPreset() {
 /// Returns true when the preset is active. Safe to call repeatedly.
 inline bool applyMegaPreset() {
     if (!megaPresetRequested()) return false;
-    // Keep this list in sync with docs/scheduler-mega-complete-2026-11-19.md.
+    // Keep this list in sync with docs/notes/scheduler/mega/scheduler-mega-complete-2026-11-19.md.
     // Diagnostics flags (TRACE / BULK_STATS / JOIN_PROFILE / ...) are
     // deliberately excluded: the preset changes behaviour, not verbosity.
     static const char* const kFeatures[] = {

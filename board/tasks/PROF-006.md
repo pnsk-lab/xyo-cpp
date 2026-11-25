@@ -27,7 +27,7 @@ Investigate PROF-005's 29.8M typed SSA slow-path hits with source-level attribut
 ## Files
 
 - `tools/jit-cfg-type-ab.ts`, `tools/jit-cfg-type-ab.test.ts`
-- `docs/jit-cfg-type-guard-ab-2026-11-09.md`
+- `docs/notes/jit/jit-cfg-type-guard-ab-2026-11-09.md`
 - `board/prof-006/flags.json`, `mandel-clean-ab.json`, `full-ab/results.json`, `isolated-ab/results.json`
 - `board/prof-006/mandel-cfg-verbose.stderr.log`
 

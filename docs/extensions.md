@@ -373,18 +373,18 @@ xyo_http_get / xyo_http_post        （permission: network）
 
 - 拡張ごとに独立した `WebAssembly.Memory`。最大ページ数を制限する。
 - import は allowlist のみ。WASI は使わない。
-- `start` セクションは実行時間を制限する。
+- `start` セクションの実行にも時間制限を掛ける。
 - 命令数 / 時間の上限（fuel）を掛けられるエンジンを選ぶ。無い場合、
   `while(1){}` でランタイム全体が止まる。
 - ホスト関数は受け取った offset / length を必ず検証する。
-- エンジンの脆弱性は更新で追う。信頼できない拡張を多数入れるなら、
+- エンジンの脆弱性には更新で追従する。信頼できない拡張を多数入れるなら、
   別プロセス実行も選択肢になる（初期スコープ外）。
 
 ### 5.5 エンジン
 
 | エンジン | 長所 | 短所 |
 |---|---|---|
-| wasm3 | MIT、小さい、組み込みやすい | メンテが緩い、メタリングが弱い |
+| wasm3 | MIT、小さい、組み込みやすい | メンテが緩い、メータリングが弱い |
 | WAMR | Apache-2.0、活発、AOT/JIT、制限機能 | やや大きい |
 | wasmtime | 堅牢、JIT、fuel | 重い（Rust/C++ ツールチェーン） |
 
@@ -413,7 +413,7 @@ xyo_http_get / xyo_http_post        （permission: network）
   積むか再入禁止を明記する。
 - **yield**: 途中中断不可 → 協調 `YIELD`。
 - **性能**: native のインタプリタはタイトなループで 5〜20 倍遅い。
-  ホットな拡張は native プロバイダを併売する。
+  ホットな拡張には native プロバイダも併せて提供する。
 - **デバッグ**: DWARF / source map は努力目標。`.so` よりは難しい。
 
 ## 6. エディタ
@@ -531,7 +531,7 @@ XYO_EXTENSION_PATH=examples/extensions ./build/xyo edit tests/fixtures/basic.sb3
 
 ## 10. 未決事項
 
-1. WASM エンジンは WAMR か wasm3 か（配布サイズ / メタリング / メンテ）。
+1. WASM エンジンは WAMR か wasm3 か（配布サイズ / メータリング / メンテ）。
 2. 拡張インスタンスはプロセスに 1 個か、ターゲットごとか。
 3. 非同期 API の形（`PENDING` + token か、ホスト側 promise か）。
 4. 動的メニューを許すか（エディタ側にエンジンが必要）。

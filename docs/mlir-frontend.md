@@ -951,7 +951,7 @@ legacy 側は内側ループを畳んでいる可能性が高く、`ops` 指標�
 数値と分かる warp ループではビット影を持ち回らず f64 影だけを
 `xyo.warp_yield` で spill する最適化を実装した（`XYO_MLIR_DONLY=1`）。
 
-- 途中で「vars_local が 159M に改善」に見えたが、それは pass 出力の
+- 途中で「vars_local が 159M に改善した」ように見えたが、それは pass 出力の
   **verifier エラー（use before definition）→ 既存 JIT へのフォールバック**
   によるものだった（box.f を commit リストの順序外に挿入していたのが原因）。
   順序を直して 26/26 に戻すと **22.7M**（d ありの 21.3M と同等）で、
@@ -1484,7 +1484,7 @@ MLIR 単独で Mistwarp の中央値を超えるためのまとめ。個別の�
   「書き込みが定数代入 or 自分自身 + 定数だけ・入れ子ループ内に
   書き込みなし」の変数について、head 区間を `entry + N*Σdelta` で
   上から押さえる。`until`/`while` は条件が `変数 (>,<) 定数` の形なら
-  bnot の偶奇から head の片側界を取る。どちらも音な上界なので
+  bnot の偶奇から head の片側界を取る。どちらも健全な上界なので
   交差してよく、これがないと `i = i + 1` の評価が i32 を溢れて
   変数ごと落ちていた。
 - **整数で閉じた op の記録**: 書き換えは前から順に op 名を `.i` へ
@@ -2273,8 +2273,8 @@ b_n に有意差なし（リスト操作自体が支配的）。matmul の `seed
 
 ## 58. round 32: -0.0 の保持（differential 回帰の修正）
 
-`jit_negzero` が Mega/HotSpot で不一致になった（`1/(-0)` が `+Inf`
-になるべきところ `-Inf`... 逆: 期待 `-Inf` が `+Inf` になった）。
+`jit_negzero` が Mega/HotSpot で不一致になった（`1/(-0)` の期待値
+`-Inf` が `+Inf` になった）。
 原因は 2 つ:
 
 1. `xyo.int_exact_ok` が -0.0 を通していた。-0 は整数だが i32 輸送で
@@ -2629,7 +2629,7 @@ box-repeat は list_read で発火する（IR で `int_exact_ok`＋int 版を確
 - ミニ（0.85〜1.0x）とスイート（0.2x）の乖離は、GC・JIT モード・
   予算・fps・box 有無では説明できず。残る候補は I-cache 圧力・
   thermal・メモリアロケータ状態等の実行文脈効果。要 perf 等での特定。
-- 次の打ち手（未着手）: item 読み fast path のインライン化彻底、
+- 次の打ち手（未着手）: item 読み fast path のインライン化徹底、
   k_acc の d-only 運搬（per-iter box.f 除去）、条件付き spill/reload
   （実際に譲る時だけメモリ往復）。いずれも影響範囲が広く、別ラウンド
   での慎重な検証が必要。
@@ -2646,10 +2646,10 @@ box-repeat は list_read で発火する（IR で `int_exact_ok`＋int 版を確
 box-repeat（添字の int 化）が効かないのは Amdahl 則どおり。
 LLVM IR の比較では、MLIR fast path は null チェック＋3 load＋
 bitcast＋NaN チェック＋select＋add.f＋box.f（NaN チェック）で、
-legacy も to_num ヘルパー呼び出し等を含む。差分の内訳特定には
+legacy も to_num ヘルパ呼び出し等を含む。差分の内訳特定には
 perf 等が必要だが、候補として (1) 毎反復 box.f（NaN→kNan）の除去
 （d-only 化）、(2) リストメタデータ（header/items/len）の
-ループ不変 hoist（現状は warp_yield・ヘルパー呼び出しがバリアに
+ループ不変 hoist（現状は warp_yield・ヘルパ呼び出しがバリアに
 なって LLVM LICM が効かない）、(3) validated reload の軽量化がある。
 
 ### 64.11 item hoist の既定ON化の確定
@@ -2808,7 +2808,7 @@ spill/reload・分岐）にあると結論。
 
 残件（いずれも要別ラウンド＋perf tools または大規模変更）:
 - list_read/list_replace（0.2x）: item 読みがボトルネック（MLIR 0.41x legacy、分離ミニで再現性あり）。box-repeat は発火するが効果なし（Amdahl 則）。
-- 脳fuck（0.24x）/letter（0.3x）: 文字列ディスパッチ中心。int 化の射程外。
+- brainfuck（0.24x）/letter（0.3x）: 文字列ディスパッチ中心。int 化の射程外。
 - sieve（0.44x）/life（0.55x）: ネストループ。box-repeat は単一 repeat のみ対象。
 - スイート vs ミニ乖離（0.2x vs 0.85x）: GC/モード/予算/fps/box/folding では説明できず。要 perf での特定（I-cache/thermal/アロケータ等）。
 
@@ -2996,7 +2996,7 @@ lrdh ミニで 2 回交互測定（チェックサム一致）:
 ### 64.37 他エージェント作業との非干渉確認（Round 41）
 
 board 上の PERF-005（in_progress）等は別 backend（mixed/共通CFG）
-の作業であり、src/mlir/（ untracked、MLIR 専用）とは競合しない。
+の作業であり、src/mlir/（untracked、MLIR 専用）とは競合しない。
 PERF-006（guarded read-only list load、done）は類似の方向性だが
 別実装・既定 OFF であり、本作業（box-repeat/hoisting/ULE/intValued）
 と独立に動作する。共有ファイル（lower_llvm.cpp など）への変更は
@@ -3074,7 +3074,7 @@ xcheck は正しさ検証に専念する方針を維持。
 
 ### 64.36 brainfuck の分析（int 化の射程外）
 
-- `bf_ip` が `unclean`（`bf_ip = lists["bf_jump"][...]` の跳转代入が
+- `bf_ip` が `unclean`（`bf_ip = lists["bf_jump"][...]` のジャンプ代入が
   int 証明できないため）。jump table 自体は整数のみ保持するが、
   intValued の単一パス分析では循環依存（bf_ip clean ⟺ jump table
   int-valued）を解決できない。要 fixpoint 化。

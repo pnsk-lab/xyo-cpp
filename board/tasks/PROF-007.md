@@ -40,7 +40,7 @@ analysis, while retaining all previous type/alias/yield safety proofs.
 - Type safety: 12/12 differential passes.
 - Output and logs: board/prof-007/full-ab/,
   board/prof-007/isolated-ab/, board/prof-007/validation-ab/.
-- Detailed report: docs/jit-cfg-type-selective-2026-11-09.md.
+- Detailed report: docs/notes/jit/jit-cfg-type-selective-2026-11-09.md.
 
 ## Files
 

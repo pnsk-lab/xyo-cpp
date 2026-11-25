@@ -38,7 +38,7 @@ opt-in with XYO_JIT_GUARD_STATS=1.
 - tests/unit/jit_guard_fallback_instrument_test.cpp (new)
 - tests/unit/jit_guard_fallback_native_test.cpp (new)
 - tools/jit-guard-analyze.ts, tools/jit-guard-analyze.test.ts (new)
-- docs/jit-guard-slowpaths.md (new)
+- docs/jit/jit-guard-slowpaths.md (new)
 
 ## Limitations
 

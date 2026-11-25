@@ -14,7 +14,7 @@
 // line) and clamp it to the loop's body class — no competitor math, no
 // shifts, no extra atomics, no danger branch in generated code.
 //
-// Design notes (see docs/layq.md for measurements):
+// Design notes (see docs/jit/layq.md for measurements):
 // - Per-thread quantum, always a power of two (keeps the mask form
 //   `q - (n & (q-1))`). Re-synced from the ctx field at loop entry;
 //   updated at every poll; never computed per iteration.

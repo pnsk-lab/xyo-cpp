@@ -2,7 +2,7 @@
 
 ## 判定基準
 
-ここで実行互換は、同じ Scratch プロジェクトの結果、スケジューラ順序、ブロック副作用、型変換が一致することを指す。これは、全 opcode を WASM で JIT コンパイルできることとは区別する。WASM 側が対応しない命令は、共通 Scratch IR から生成されたコンパイル済み区間の間でも正確なインタプリタ実行へ切り替える（hybrid regions）。スクリプト全体が未対応である必要はない。
+ここで実行互換は、同じ Scratch プロジェクトの結果、スケジューラ順序、ブロック副作用、型変換が一致することを指す。これは、全 opcode を WASM で JIT コンパイルできることとは別である。WASM 側が対応しない命令は、共通 Scratch IR から生成されたコンパイル済み区間の途中でも正確なインタプリタ実行へ切り替える（hybrid regions）。スクリプト全体が未対応である必要はない。
 
 | 対象 | LLVM ネイティブ JIT | WASM HotSpot |
 |---|---|---|
@@ -50,11 +50,11 @@ python3 tests/differential/wasm_compat_fuzz.py \
   --out build-wasm-hotspot --cases 128
 ~~~
 
-乱数生成試験の seed=42 で NaN 数値変換漏れ、seed=52 で剰余演算精度の不一致、複数ループ対応後の seed=6 でホスト剰余の一時領域が Scratch 変数に重なる不具合を検出・修正した。現在の試験では 512 シードで3方式の最終結果が一致した。
+乱数生成試験の seed=42 で NaN 数値変換漏れを、seed=52 で剰余演算精度の不一致を、複数ループ対応後の seed=6 でホスト剰余の一時領域が Scratch 変数に重なる不具合を検出・修正した。現在の試験では 512 シードで 3 方式の最終結果が一致した。
 
 ## 完全互換までの残作業
 
-既存 LLVM codegen は Scratch ブロックから LLVM IR を直接構築する。WASM は数値・分岐・トップレベルに並ぶ最大128個のループに加えて、限定的な文字列・リスト・warp 手続きの対応を進めている。全機能を Binaryen へ移植するには以下が必要。
+既存 LLVM codegen は Scratch ブロックから LLVM IR を直接構築する。WASM 側は数値・分岐・最大128個のトップレベルループに加えて、限定的な文字列・リスト・warp 手続きの対応を進めている。全機能を Binaryen へ移植するには以下が必要。
 
 - GCルートと長寿命continuationを含む任意の副作用付きreporterをサポートする完全な共通Value ABI。文字列・混合型リストの基本操作は対応したが、レンダリングなどの複雑な処理は未対応。
 - 任意深さの yield / procedure / warp / clone / stop を扱う共通継続状態。
@@ -71,13 +71,13 @@ python3 tests/differential/wasm_compat_fuzz.py \
 だけをWASMに委譲する。`XYO_NESTED_WASM=0` で完全に無効化できる。
 `XYO_NESTED_WASM=1` を明示した場合は従来どおり全候補が対象で、
 `XYO_NESTED_WASM_WARP_ONLY=1` で副作用のない数値warp反復に限定できる
-（未設定時の既定はこの warp-only）。このモードでは
+（未設定時の既定はこの warp-only）。
 
-ネストした repeat / repeat until / while / for each、条件分岐と
+このモードでは、ネストした repeat / repeat until / while / for each、条件分岐と
 引数なし・非再帰warp補助手続き、末尾の自己再帰も共通の最大1,024反復予算で
-単一WASM呼び出しにまとめる。末尾再帰は初期値が数値定数、再帰引数が数値演算、
-最大8引数・8戻り先、最後のIF内から自己呼び出しする場合に限定する。非warp反復は各ティックのyieldを保持する。
-数値if/if-elseの本体は軽量WASMで処理可能だが、非末尾再帰も、引数なしwarp手続きで再帰呼び出し箇所が1つ、数値処理のみの
+単一WASM呼び出しにまとめる。末尾再帰は、初期値が数値定数で再帰引数が数値演算であること、
+最大8引数・8戻り先であること、最後のIF内から自己呼び出しすることを条件とする。非warp反復は各ティックのyieldを保持する。
+数値if/if-elseの本体は軽量WASMで処理可能だが、非末尾再帰も、引数なしwarp手続きで再帰呼び出し箇所が1つであり、数値処理のみの
 「前処理・条件付き自己呼び出し・後処理」形に限り、戻り先を圧縮継続深度として
 保持する。複数の戻り先、引数を持つ非末尾再帰、非warp再帰・任意の副作用や
 待機はまだフォールバックする。文字列・リストを含む実験モードは `XYO_NESTED_WASM_ALL=1` を追加する。
@@ -86,7 +86,7 @@ warp ループは yield しないため、反復をまとめてもスケジュ�
 nested 0.087 秒（nested off 0.113 秒）を実測。小さいループでは昇格判定の
 オーバーヘッドが勝つことがあるため、`XYO_NESTED_WASM=0` の逃げ道を残す。
 
-詳細: [ネストしたWASM継続実行](nested-wasm-continuation-2026-11-07.md)
+詳細: [ネストしたWASM継続実行](notes/osr/nested-wasm-continuation-2026-11-07.md)
 
 ## 2026-11-16 再検証（LLVM 互換スイープ）
 
@@ -139,7 +139,7 @@ Interpreter/LLVM/builtin/Binaryen で同一だった。
 誤認する。`wasm_warp_procedure.py` と `wasm_list_extensions.py` は
 実際の `compiled script=` / `hybrid script=` を要求するよう修正した。
 この誤検出は「フォールバックしたが結果は一致」のテストを、コンパイル
-経路の検証と誤って数えるため、互換性の証拠として不適切だった。
+経路の検証と誤って数えることになるため、互換性の証拠として不適切だった。
 
 ### 結果は一致するがコンパイル被覆が違う箇所
 
@@ -219,8 +219,8 @@ kTrue/kFalse へ変換する。`tests/differential/wasm_mouse_reporters.py` が
 
 ### 2026-11-16: `sensing_loudness` と nested センサー
 
-`sensing_loudness` を host import 31 でコンパイル可能にした。オーディオ無しは
--1、有りはインタプリタと同じ `cachedLoudness`/`loudnessTimer` キャッシュを
+`sensing_loudness` を host import 31 でコンパイル可能にした。オーディオ無しでは
+-1 になり、有りの場合はインタプリタと同じ `cachedLoudness`/`loudnessTimer` キャッシュを
 共有する。また nested 数値プログラムの式ホワイトリストに Timer / MouseX /
 MouseY / MouseDown / Loudness を追加し、入れ子 warp ループ内のセンサー条件も
 （step 中に公開される Runtime* 経由で）nested WASM で評価できるようにした。
@@ -250,7 +250,7 @@ host import 40 で実行する。規則:
   命令を置かないため、rollback による再実行で二重適用しない。
 - region 内の書き込みが数値のみであることを `safeRegion` で確認する。
   非数値書き込みがあると commit 検査が効果の後に失敗し、再実行で
-  `change x by` が二重適用されるため（`string_prefix` で検証）。
+  `change x by` が二重適用されるためである（`string_prefix` で検証）。
 - host 呼び出しは `Target*` を invoke ごとに公開して実行。効果の直後は
   Completed で終了し、変数は commit される。helper が失敗した場合のみ
   rollback（効果は未適用）。

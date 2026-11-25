@@ -7,7 +7,7 @@ with TurboWarp's optional compiler disabled (`vm.setCompilerOptions({enabled:
 false})`) so it follows official Scratch's scratch-vm interpreter semantics.
 
 These are **regression cases** for the divergences documented in
-[docs/scratch-divergences.md](../../docs/scratch-divergences.md).  Before
+[docs/bench/scratch-divergences.md](../../docs/bench/scratch-divergences.md).  Before
 those fixes, these cases exposed the documented divergences and two of them
 terminated xyo with `SIGSEGV`; after the fixes `run_repros.py` must report
 `0 differ` in both modes (currently 19 cases).

@@ -33,7 +33,7 @@ updated: 2026-11-12
 - Existing cases: board/prof-005/results.json
 - Added cases: board/prof-005/isolated-results/results.json
 - New tools: tools/jit-guard-profile.ts, tools/jit-guard-profile.test.ts, tools/jit-guard-isolate.ts
-- Detailed report: docs/jit-guard-scratchbench-profiling-2026-11-09.md
+- Detailed report: docs/notes/jit/jit-guard-scratchbench-profiling-2026-11-09.md
 
 ## Next
 

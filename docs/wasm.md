@@ -188,7 +188,7 @@ wasm なので LLVM を積めず、**wasm エンコーダは自前で書く**。
   ABI は `f(i32 slots) -> i32`（`slots` は `i64[n]` の Value ビット列、返り値
   0=完走 / 1=bail）。対応: 数値リテラル・変数読み書き・`change by`・
   四則/`mod`/`round`/`neg`・`repeat`。変数は **`Value` ビットを直接 load/store**
-  し（数値タグはインライン、非数値タグは bail）、算術入力の NaN は 0、
+  し（数値タグはインライン、非数値タグは bail）、算術入力の NaN は 0 に、
   代入時の NaN は `kNan` へ正規化する。`repeat` 回数は `floor(x+0.5)`。
   非対応 opcode は `Program` 構築段階で除外し interp へフォールバックする。
 - `lowerScript(Blocks&, const Block* top, Program&)`: **実ブロック木 → `Program`**。
@@ -243,7 +243,7 @@ node web/xyo-node.mjs build-wasm-jit/xyo.js wasm-selftest
 #### 完了状況（2026-11-16）
 
 以下の当初の残作業は解消済み。詳細と再現手順は
-[Binaryen backend completion](binaryen-backend-completion-2026-11-16.md)。
+[Binaryen backend completion](notes/wasm/binaryen-backend-completion-2026-11-16.md)。
 
 1. **`lowerBlocks`（ブロック木 → `Program`）**: 実装済み。数値・リスト・
    制御構文を `Program` へ落とし、非対応 opcode を含むスクリプトは
@@ -253,7 +253,7 @@ node web/xyo-node.mjs build-wasm-jit/xyo.js wasm-selftest
    `CompiledScript` を HotSpot が選び、`xyo_host_invoke` で実行する。
    非対応・失敗時は値を書き戻さず Interpreter にフォールバックする。
 3. **検証**: execute フィクスチャ 116 件で WASM (JIT/Interpreter) が
-   ネイティブ同じ結果（115/116、残り 1 件は 4 エンジン共通の
+   ネイティブと同じ結果（115/116、残り 1 件は 4 エンジン共通の
    `control-stop-all-leaks.sb2`）。共通 CFG 33/33・手続き 55/55・
    effect fallback 8/8・emitter selection 6/6 が Interpreter/LLVM/
    Builtin/Binaryen で一致。
@@ -270,7 +270,7 @@ yield 継続位置を表現できないため Interpreter に残す。実行失�
 変更前の値を保持したまま Interpreter にフォールバックする。
 
 ビルド、Binaryen.js の任意連携、Node.js での比較テストは
-[WASM HotSpot JIT](wasm-hotspot.md) を参照。
+[WASM HotSpot JIT](wasm/wasm-hotspot.md) を参照。
 
 ## 6. 決定的な手続き解決（Phase A で修正した実バグ）
 
@@ -279,8 +279,8 @@ TurboWarp は `blocks` を JS オブジェクトとして**挿入順**にイテ�
 `std::unordered_map` のイテレーション順に依存していたため、順序が
 **実装依存**（libstdc++ と libc++ で異なる）になっていた。
 
-- 顕在化条件: sb3 ローダが ID 無し shadow ブロックへ `xyo_%08x` を振る
-  **プロセス全体の連番**（`g_uidCounter`）ため、同一プロセスで複数プロジェクトを
+- 顕在化条件: sb3 ローダが ID 無し shadow ブロックへ**プロセス全体の連番**
+  （`g_uidCounter`）で `xyo_%08x` を振るため、同一プロセスで複数プロジェクトを
   ロードすると ID が変わり、`unordered_map` のバケット配置が変わる →
   「最初の出現」が入れ替わる。`xyo test <dir>` は 116 件を 1 プロセスで回すため、
   ネイティブでは偶然通っていたものが WASM（libc++）で 1 件落ちた。

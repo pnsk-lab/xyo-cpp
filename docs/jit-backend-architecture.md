@@ -33,7 +33,7 @@ cmake --build build-no-llvm -j8
 
 現在は `XYO_JIT_BACKEND=wasm` による Emscripten HotSpot 実行と Binaryen 最適化の経路を追加済み。ただし、LLVM の最適化と全 Scratch ブロックが WASM に移植されたわけではない。
 
-実装済みの範囲・差分は [WASM HotSpot](wasm-hotspot.md) と [バックエンド互換性マトリクス](jit-backend-compatibility.md) を参照。
+実装済みの範囲・差分は [WASM HotSpot](wasm/wasm-hotspot.md) と [バックエンド互換性マトリクス](jit-backend-compatibility.md) を参照。
 
 
 ## Experimental shared numeric SSA (2026-11-06)
@@ -47,7 +47,7 @@ common two-parameter binary graphs are cached.
 
 Both native LLVM (`src/jit/codegen.cpp::emitArithNumeric`) and WASM
 (`src/wasm/wasm_compile.cpp::Gen::emitExpr`) now call this shared graph for
-basic F64 arithmetic. Scratch input coercion stays in their original code
+basic F64 arithmetic. Scratch input coercion stays in the original code
 paths, preserving the existing NaN and type handling. The separate WASM
 encoder still produces a module that the optional Binaryen optimizer consumes;
 Binaryen itself is not used as a native machine-code JIT.
@@ -119,7 +119,7 @@ values) and the standalone WASM `SK::Repeat` lowering (the induction Phi is
 represented by a WASM local and a structured `loop/br_if`). To preserve
 zero-count semantics, WASM tests for a positive iteration bound *before*
 entering the do-while-like backedge region. The Scratch rounding, guard
-and interpreter bailout behavior remains in the surrounding existing code.
+and interpreter bailout behaviors remain in the surrounding existing code.
 
 The shared loop currently supports these two selected single-latch patterns,
 not arbitrary irreducible graphs, nested-OSR continuation, value dominance
@@ -482,7 +482,7 @@ cells. No list pointers are exported. Staging is intentionally bounded
 to 65,536 numeric elements per list; larger or mixed-type lists bail
 rather than attempt unsafe speculative writes. All appended/replaced
 values must be numeric, and nonnumeric/special string indices remain in
-the interpreter. Successful commit pre-reserves destination buffers,
+the interpreter. A successful commit pre-reserves destination buffers,
 then publishes staged values/lengths and marks monitors dirty.
 
 The portable WASM AST supports `SK::ListAppend`, `SK::ListReplace`
@@ -507,8 +507,9 @@ first append or replace. Instead, `Stage` holds only the appended
 values and an index-to-value replacement map. Reads resolve the staged
 appends/replacements first and consult the original rooted list for all
 other elements. The original list remains untouched until successful
-commit. A delete may shift indices, so it materializes exactly once,
-merging all earlier staged edits into a vector before erasing.
+commit. A delete may shift indices, so the transaction materializes the
+list exactly once, merging all earlier staged edits into a vector before
+erasing.
 
 For an `n`-element list with `k` replaced elements and `a`
 appended elements, the common append/replace-only case uses

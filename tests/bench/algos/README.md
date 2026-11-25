@@ -3,7 +3,7 @@
 Scratch 3 のブロックだけで古典アルゴリズムを実装した `.sb3` を生成し、
 同じファイルを xyo と `refs/scratch-vm`（TurboWarp 2.1.46）で実行して
 **プロジェクト内で計測した実行時間**を比較する。結果と考察は
-[`docs/algo-bench.md`](../../../docs/algo-bench.md)。
+[`docs/bench/algo-bench.md`](../../../docs/bench/algo-bench.md)。
 
 ```sh
 # 生成のみ（tests/bench/algos/out/*.sb3 + manifest.json）
@@ -34,7 +34,7 @@ XYO_LIST_READ_MEMO=0 python3 tests/bench/algos/bench_list_read.py \
   --json bench-output/list-read-no-memo.json
 ```
 
-生成物は`out/list-read/`。計測結果のJSONは`.gitignore`対象で、`--json`に指定した場所へ保存される。考察・適用条件・回帰も含む記録は[リスト性能メモ](<../../../docs/list-performance.md>)を参照。
+生成物は`out/list-read/`。計測結果のJSONは`.gitignore`対象で、`--json`に指定した場所へ保存される。考察・適用条件・回帰も含む記録は[リスト性能メモ](<../../../docs/core/list-performance.md>)を参照。
 
 ## ファイル
 
@@ -117,4 +117,4 @@ xyo 側は AOT オブジェクトを逆アセンブルすると同じ粒度で�
 llvm-objdump -d --no-show-raw-insn v8out/micro_loop.o
 ```
 
-結果と考察は [`docs/v8-vs-xyo-codegen.md`](../../docs/v8-vs-xyo-codegen.md)。
+結果と考察は [`docs/bench/v8-vs-xyo-codegen.md`](../../docs/bench/v8-vs-xyo-codegen.md)。

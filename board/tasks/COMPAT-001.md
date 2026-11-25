@@ -27,7 +27,7 @@ LLVM ネイティブ JIT と Emscripten WASM/Binaryen の**実行互換**（同�
 tests/differential/llvm_wasm_compat_sweep.py (new),
 tests/differential/wasm_warp_procedure.py, tests/differential/wasm_list_extensions.py,
 CMakeLists.txt (check-wasm-compat), docs/jit-backend-compatibility.md,
-docs/wasm-hotspot.md. Dependencies: RT-001 / IR-001 for full continuation parity.
+docs/wasm/wasm-hotspot.md. Dependencies: RT-001 / IR-001 for full continuation parity.
 
 ## Validation
 

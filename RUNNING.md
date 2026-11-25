@@ -93,7 +93,7 @@ Qt は LGPL-3.0 のため **動的リンク（.so）のみ**で使っていま�
 
 Homebrew を用いた LLVM ORC JIT + SDL2 のネイティブビルドに対応。
 ビルド手順、依存ライブラリ、GPU バックエンドの制約は
-[macOS ビルドガイド](docs/macos.md) を参照してください。
+[macOS ビルドガイド](docs/platform/macos.md) を参照してください。
 
 ## Windows x86-64（xyo-windows-x86_64.zip）
 
@@ -258,4 +258,4 @@ strongly rooted cache for 2..4-unit ASCII strings created during runtime.
 The default is off: repeated tiny joins save GC allocations, whereas
 high-cardinality strings pay hashing overhead without reuse. The option
 is independent of string storage and leaf encoding. Results and caveats:
-docs/scratch-string-short-intern-study-2026-11-07.md.
+docs/notes/string/scratch-string-short-intern-study-2026-11-07.md.

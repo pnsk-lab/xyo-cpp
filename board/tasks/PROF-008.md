@@ -30,7 +30,7 @@ Add opt-in timing and counters for CFG type-flow analysis. Preserve Scratch sema
 - CFG analysis time full 0.328–0.481ms vs selective 0.337–0.448ms; JIT compile time fluctuates 388–653ms, not a proven speedup.
 - Selection of numeric shadows is unchanged across full/ selective modes for current 47-case project.
 - Log files: board/prof-008/full/, isolated/, verbose-compare.json.
-- Report: docs/jit-cfg-type-analysis-cost-2026-11-09.md
+- Report: docs/notes/jit/jit-cfg-type-analysis-cost-2026-11-09.md
 - Source: src/analysis/cfg_type_hint_telemetry.hpp, src/jit/codegen.cpp, tests/unit/jit_cfg_hint_telemetry_smoke.cpp.
 
 ## Decision

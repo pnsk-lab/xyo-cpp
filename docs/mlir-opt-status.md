@@ -35,11 +35,11 @@
     use を差し替え・未使用判定するよう修正。これでスイートが完走（チェックサム全一致）。
 
 ### P1（効果大・要大規模実装）
-- **item fast path 抜本**（推定 2〜5x）: list_read/list_replace 0.2x の主因。item 読み＋k_acc boxing＋warp_yield が支配的。index  int 化では届かない（Amdahl 則で確認）。要 lowering 書き換え＋perf tools での検証。
+- **item fast path 抜本**（推定 2〜5x）: list_read/list_replace 0.2x の主因。item 読み＋k_acc boxing＋warp_yield が支配的。index int 化では届かない（Amdahl 則で確認）。要 lowering 書き換え＋perf tools での検証。
 - **自動アンロール**（推定 1.2〜1.5x）: 手動で +20〜55% を実証（変動添字でも有効、チェックサム一致）。実装に必要な要素を特定済み（§64.41/64.44）: loop body 複製基盤（新設、~100行）、trip 調整、PHI 連鎖、yield/inrange 複製、ヒューリスティクス、box 版との相互作用。単独ラウンド規模を超えるため別途計画が必要。
 
 ### P2（効果中・要慎重検証）
-- **d-only 運搬**: per-iter box.f 除去で +5〜10% と推定。過去に hang の history あり。要慎重な検証（suspend/resume の正しさ）。
+- **d-only 運搬**: per-iter box.f 除去で +5〜10% と推定。過去に hang した履歴あり。要慎重な検証（suspend/resume の正しさ）。
 - **ネストループ対応**: sieve/matmul/primes の外側ループが未昇格（Round 233 で原因を `scanBlock` の region 打ち切りと特定、下節に設計）。legacy 比 sieve 0.43x の主因。
 - **flow-sensitive intValued**: suite での NaN skip 発火に必要（現状はミニのみ）。到達定義解析 or fill パターン認識。設計済み（§64.45）。
 
@@ -87,7 +87,7 @@
   入力が全て定数で副作用なし → 最終値を literal 化）による。チェックサムは
   全 47 ベンチで一致するので意味論は保たれている（`XYO_MLIR_NOCONSTLOOP=1` で
   legacy 同等の ops に戻ることを確認済み）。ハーネスの ops は
-  「カーネルが実行したはずの演算数」なので、畳み込めた分だけ throughput が
+  「カーネルが実行したはずの演算数」なので、畳み込まれた分だけ throughput が
   上がる。残る弱点は Lists 0.84x・Algorithms 0.57x・Applications 0.50x。
 
 ## 中央値・勝数について
@@ -175,7 +175,7 @@ Round 233 で「sieve の外側 `repeat` が昇格されない」原因は `scan
 - 内側ループの昇格は従来どおり（外側の昇格後も独立に走る）。外側の
   spill/reload は実メモリ経由なので、両者が干渉しない。
 - 2 段階にしたのは、外側優先を全ループに適用すると無関係なベンチまで
- 昇格順が変わって動くため。**入れ子を持つループだけ**先に処理し、
+ 昇格順が変わってしまうため。**入れ子を持つループだけ**先に処理し、
   残りは従来どおり内側から。
 
 ### 副産物として直した潜在バグ 2 件
@@ -200,7 +200,7 @@ Round 233 で「sieve の外側 `repeat` が昇格されない」原因は `scan
 | algo_matmul | 184,802 | 184,327 | 361,628 | 0.51x | 1.00x |
 
 - 47 ベンチ: 中央値 **+0.8%**、幾何平均 **+7.0%**。最良は mandel +95%、
-  sort +526%（定数ループ畳み込みが効く形になったため。ops の意味では
+  sort +526%（定数ループ畳み込みが効く形になったため。ops の値としては
   数値が跳ねるがチェックサムは一致）、raycast +30%、sieve +15%。
   最悪は sched_fanwait -6.3%、primes -3.6%、ack -3.4%。
 - **チェックサムは nest と legacy で全 47 ベンチ一致**（nonest と違うのは
@@ -282,7 +282,7 @@ if/else の select 化（前節）で collatz は片付いた。残りの大き�
 
 **症状**: 入れ子ループ昇格を入れた `math_mandel` のチェックサムが legacy と
 一致しない（1957 のはずが 732 / 556）。`algo_sort` も suite で 174055 に
-なっていた（mini では一致するので気付きにくかった）。
+なっていた（mini では一致するので気づきにくかった）。
 
 **原因**: `cseKey`（`src/mlir/passes.cpp`）が属性を
 `key += std::to_string(a.i); key += ':'; key += a.s;` としか連結しておらず、
@@ -430,9 +430,9 @@ legacy 29,385 ms → MLIR 29,964 ms（+2%）〜 31,906 ms（+9%）。
   非 warp 再帰向けの機構。
 - **微修正**: `xyo.call` の `rec` attr 付与は `coroMode_`（コルーチン候補）
   のときだけに限定。コルーチンにならないスクリプトでは push_ex/pop
-  フレームは純粋なオーバーヘッドなので（hotspot では `coroCandidate` が
-  `generalEnabled`/`enabled` に連動するため実質 no-op だが、非候補の
-  Fiber 経路でもフレームを emit しない形に揃えた）。
+  フレームは純粋なオーバーヘッドなので、非候補の Fiber 経路でも
+  フレームを emit しない形に揃えた（hotspot では `coroCandidate` が
+  `generalEnabled`/`enabled` に連動するため実質 no-op だが）。
 
 ## Round 241: ループ運搬の NaN 正規化とリスト読み（numFacts 解析）
 
@@ -520,7 +520,7 @@ list_read +7.1% / list_insdel +15.9% / str_cast +5.0% / math_expsqrt -2.7%。
 
 ### 次の一手（Round 241 で特定した最有力リード）
 
-スイート IR の yield 形を legacy と数えると差がはっきり出る
+スイート IR の yield 形を legacy と同じ基準で数えると差がはっきり出る
 （`performance.sb3`、post-opt IR の出現数）:
 
 | | `xyo_yield_fast` | `xyo_warp_yield_due` | `xyo_loop_yield` |
@@ -853,7 +853,7 @@ verify 落ち → スクリプト全体が fallback。
 - fallback 0 件に復帰、極端値も復活（folding は無事）。
 - **math_collatz 0.22→0.82x**（even-div が効いた）、
   algo_primes 0.55→0.50x（要調査）、list_read 0.88x、
-  list_replace 0.84x（r248 の 0.97/1.22x から後退 — 揺動か要確認）。
+  list_replace 0.84x（r248 の 0.97/1.22x から後退 — 揺動かどうか要確認）。
 - geomean 2.14x。
 
 ## Round 248-251: まとめ（現状）
@@ -924,7 +924,7 @@ verify 落ち → スクリプト全体が fallback。
    per-iter inrange + float 継続。`runBoxWhile` の雛形あり。
 3. **文字列 op**（letter 0.32x）：`letter_of` の helper 呼び出し。
 4. **float ループ一般**（mandel 0.32x、round 0.47x）：heal/影/yield の削減。
-5. **list_replace の suite 低下**（1.22→0.84x）：要再測定で切り分け
+5. **list_replace の suite 低下**（1.22→0.84x）：再測定での切り分けが必要
    （micro では headers 中立を確認済みのため揺動の可能性大）。
 
 ## Round 253: headers-off の確定（r253）
@@ -948,7 +948,7 @@ headers-off がほぼ全面改善（replace 0.85→1.19x、他 5〜10% 改善）
 
 fib/ack が 0.45〜0.50x で停滞。再帰呼び出しの `xyo.lt(n, 2)` が毎回
 `xyo_lt` helper 呼び出しになっていた。原因：Scratch の数値リテラル
-shadow は生文字列（`s:"2"` = SStr*）なので、実行時タグ検査を必ず
+shadow は生文字列（`s:"2"` = SStr*）なので、実行時タグ検査に必ず
 失敗し、fast/slow ダイヤモンドが LLVM に畳まれて直接 call になる。
 
 ### 変更（`lower_llvm.cpp`）

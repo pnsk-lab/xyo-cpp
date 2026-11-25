@@ -31,7 +31,7 @@ updated: 2026-11-12
 - tests/unit/jit_refusal_telemetry_smoke.cpp
 - tools/jit-deopt-analyze.ts
 - tools/jit-deopt-analyze.test.ts
-- docs/jit-guard-deopt-telemetry.md
+- docs/jit/jit-guard-deopt-telemetry.md
 
 ## Follow-up
 

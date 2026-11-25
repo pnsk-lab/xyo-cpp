@@ -299,12 +299,12 @@ jobs:
           # 参照したままのビルド直後バイナリは同梱しない。
           mkdir -p dist/pkg/docs
           cp LICENSE THIRD-PARTY-NOTICES.txt RUNNING.md dist/pkg/
-          cp docs/macos.md dist/pkg/docs/
+          cp docs/platform/macos.md dist/pkg/docs/
           mv dist/pkg/RUNNING.md dist/pkg/RUNNING.txt
           mv dist/xyo.app dist/pkg/
           # シンボリックリンク（framework 内）を保持して固める。
           tar -C dist/pkg -czf dist/xyo-macos-${{ matrix.arch }}.tar.gz \
-            xyo.app LICENSE THIRD-PARTY-NOTICES.txt RUNNING.txt docs/macos.md
+            xyo.app LICENSE THIRD-PARTY-NOTICES.txt RUNNING.txt docs/platform/macos.md
           ls -lh dist/xyo-macos-${{ matrix.arch }}.tar.gz
 
       # 焼いた .app 自体を起動して確認する（ビルド直後のバイナリではなく、

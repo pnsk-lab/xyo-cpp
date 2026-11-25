@@ -170,10 +170,10 @@ this subset must not silently replace normal per-block Scratch execution.
 
 - `TIMES` は有限・非負の整数リテラル（1024回以下）のみ。
   小数・負数・動的回数は、丸めなどの意味論が異なるため拒否する。
-- 反復回数はpreheaderで一度だけ確定、headerにi64 Phiを設置。
+- 反復回数はpreheaderで一度だけ確定し、headerにi64 Phiを設置する。
   比較・body・latch・backedge・exitのCFGを生成する。
   条件分岐や入れ子のrepeatを本体に含められる。
-- 入れ子ループの過大な総反復回数は静的な作業量上限で拒否する。
+- 入れ子ループの総反復回数が過大な場合は、静的な作業量上限で拒否する。
 - 各ループのlatchとheader、および元のScratchブロックIDを
   `Executable::yieldBoundaries` に記録する。CFG検証器は
   backedgeの構造を検証する。
@@ -181,10 +181,10 @@ this subset must not silently replace normal per-block Scratch execution.
   `VerifyError::RequiresScheduler` で拒否する。
   テスト専用の明示引数を指定した場合のみチェックポイントを省略する。
 - 型付きホスト入口 `invokeNumericKernel(Target&, kernel, runner)`
-  もyield境界を持つカーネルを拒否し、Scratchの通常実行へ混入しない。
+  もyield境界を持つカーネルを拒否するため、Scratchの通常実行へ混入しない。
 
 **未完了：** 通常のScratchループは反復ごとにスケジューラへ制御を返す。
-warpでも時間制限監視が必要。この共通CFGには正確なyield/resume、
+warpでも時間制限の監視が必要。この共通CFGには正確なyield/resume、
 途中確定、再開時のDeopt/GC契約がないため、本番JITでの実行は禁止。
 `repeat_until`、`while`、`forever`も未対応。
 
@@ -195,7 +195,7 @@ LLVM O2 / wasm-opt O2 を適用した後も結果を比較する。
 
 ## 共通CFGの停止・再開ABI（2026-11-07）
 
-Executable.resumable を追加した。enableResumableLoops=true で
+`Executable.resumable` を追加した。`enableResumableLoops=true` で
 生成した共通CFGはyield境界で中断し、次の呼出しで再開する。
 
 - LLVM: run(i64* stagedSlots, i64* frame) -> i64。
@@ -285,21 +285,21 @@ LLVM O2 / wasm-opt O2と照合する。
   名前が一意なコードを公開する。通常LLVM JITと同じ
   最適化レベルを使用する。別LLJITは生成しない。
 - コンパイル済みコードは `JitEngine::numericCache_` に
-  トップBlockのポインタ単位で保持して同一スクリプト再起動時に
-  再利用。各Threadは独立した `NumericContinuation` を持ち、
+  トップBlockのポインタ単位で保持し、同一スクリプトの再起動時に
+  再利用する。各Threadは独立した `NumericContinuation` を持ち、
   異なるTarget/クローンでも再登録前に変数ガードを実行する。
   `JitEngine::invalidate` でキャッシュと不適格スクリプト集合を
   消去する。ソースが変わった場合は登録直前に現在のScratch木から
   再LoweringしてCFG全体を比較し、古いコードを実行させない。
 - `Runtime::pushThread` はroot StackFrameの生成より先に
   `Thread::tryCompile` を呼ぶため、新規Threadの空スタック状態でも
-  登録を許可する。スレッドが既に実行を始めた場合は拒否する。
+  登録を許可する。スレッドが既に実行を始めている場合は拒否する。
 - `XYO_JIT=OFF` では新規入口を空スタブにし、以前欠けていた
   `JitEngine::pollAsync` / `readyScript` の空スタブも補完。
 - `xyo-numeric-sequencer-auto` のCTestは自動選択、
   2回目の起動でのコード再利用、変数型ガード、
   対応外命令の既存JITへのフォールバック、
-  Block更新時のキャッシュ拒否・invalidate後の再生成を検証。
+  Block更新時のキャッシュ拒否、invalidate後の再生成を検証する。
 
 デフォルト経路は一切変更しない。これは限定された実装を
 比較・検証するための実験フラグであり、Scratch全体の共通IR化ではない。
@@ -317,19 +317,19 @@ XYO_JIT_COMMON_CFG=1 の実験経路を、**最大16個のトップレベル・�
 - 2つ目の途中でBooleanへ変化した場合、1つ目の完了直後の型変更、0回の第1ループ、入れ子ループの自動登録拒否をテストする。
 - LLVM lliとNode WebAssemblyの差分テストで2つのループの各yieldとSSA値を照合し、LLVM O2 / Binaryen O2でも検証する。
 
-通常の実行はデフォルトOFF。対応対象は数値型のスクリプトのみであり、動的回数、手続き、任意のyieldや複雑なDeopt、一般Scratchの完全互換はまだ提供しない。
+通常の実行はデフォルトOFF。対象は数値型のスクリプトのみであり、動的回数、手続き、任意位置のyieldや複雑なDeopt、一般Scratchとの完全互換はまだ提供しない。
 
 
 ## 数値共通CFGのyield管理高速化（2026-11-07）
 
-実験フラグ XYO_JIT_COMMON_CFG=1 で使う数値共通CFGの継続実行から、**1反復ごとのSSA再検証・vector再確保**を除去した。
+実験フラグ `XYO_JIT_COMMON_CFG=1` で使う数値共通CFGの継続実行から、**1反復ごとのSSA再検証・vector再確保**を除去した。
 
-- NumericContinuation生成時にverifyExecutableを1回実行する。以降は、共有された不変のScratchNumericKernel/Executableと継続状態を前提にする。実行ごとの大きなSSAグラフコピー・支配関係検査を行わない。
+- `NumericContinuation` 生成時に `verifyExecutable` を1回実行する。以降は、共有された不変の `ScratchNumericKernel`/`Executable` と継続状態を前提にする。実行ごとの大きなSSAグラフコピー・支配関係検査は行わない。
 - 中断先を事前構築したビットマップで検証する。連続する複数repeatの異なるheaderに対応する。
 - 継続状態には通常フレームとワークフレームをそれぞれ1つだけ確保し、値のコピーと成功時swapで更新する。失敗時は通常フレームが変更されない。
-- ScratchNumericSlots::refreshは元のScratch IDを毎回再解決し、値の型とcloud条件、重複エイリアスを検証し直す。スロット用vectorは再利用。削除/再生成されたVariableへの古いポインタは参照しない。途中の型変更、割り込み、commit時競合チェックは継続する。
-- LLVM CFG loweringでは、基本ブロックが実際に使用する他ブロック定義・Phi値だけを継続フレームから読み込む。以前の「毎ブロック全SSA値をloadする」実装よりロードを削減。最適化を適用しない一括実行・WASMのABIは変更しない。
-- tests/platform/scratch_variable_slots_smoke.cppで、フレーム/スロット領域の再利用、値の外部変更、Variableのerase/recreate、失敗スライスの巻き戻しを確認。LLVM ORC実スレッド、WASM差分、LLVM O2 / Binaryen O2も回帰する。
+- `ScratchNumericSlots::refresh` は元のScratch IDを毎回再解決し、値の型とcloud条件、重複エイリアスを検証し直す。スロット用vectorは再利用する。削除/再生成されたVariableへの古いポインタは参照しない。途中の型変更、割り込み、commit時競合チェックは従来どおり継続する。
+- LLVM CFG loweringでは、基本ブロックが実際に使用する他ブロック定義・Phi値だけを継続フレームから読み込む。以前の「毎ブロック全SSA値をloadする」実装よりロードを削減した。最適化を適用しない一括実行・WASMのABIは変更しない。
+- `tests/platform/scratch_variable_slots_smoke.cpp` で、フレーム/スロット領域の再利用、値の外部変更、Variableのerase/recreate、失敗スライスの巻き戻しを確認する。LLVM ORC実スレッド、WASM差分、LLVM O2 / Binaryen O2も回帰する。
 
 手動マイクロベンチマーク:
 cmake --build build-ir-nogpu --target xyo-numeric-continuation-overhead -j4
