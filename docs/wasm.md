@@ -310,7 +310,7 @@ TurboWarp は `blocks` を JS オブジェクトとして**挿入順**にイテ�
   **nanosvg** でラスタ化する（図形のみ。`<text>`/`<tspan>` の文字は描かれない）。
 - 並列スケジューラは無効（Emscripten 単一スレッド構成。
   `parallelEnabled()` は JIT 前提で false になる）。
-- `xyo gui` / `xyo edit` はブラウザシェル未対応（`play` のみ）。
+- `xyo gui` はブラウザシェル未対応（`play` のみ）。
 - WASM のスタックは既定 64KiB → 本ビルドは `-sSTACK_SIZE=5242880`（5MiB）。
 
 ## ブラウザ内 LLVM JIT（2026-11-05）

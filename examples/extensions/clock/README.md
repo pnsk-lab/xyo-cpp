@@ -7,7 +7,7 @@
 ## 試す
 
 ```sh
-XYO_EXTENSION_PATH=examples/extensions ./build/xyo edit tests/fixtures/basic.sb3
+XYO_EXTENSION_PATH=examples/extensions ./build/xyo run tests/fixtures/basic.sb3
 ```
 
 ツールボックスに **Clock** カテゴリが現れ、`now` / `wait %1 seconds` /

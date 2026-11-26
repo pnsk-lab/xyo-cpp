@@ -459,7 +459,7 @@ inline const std::vector<BlockDef> kBlockDefs = {
         { ArgKind::Dropdown, "OPERATOR", "abs", {"abs", "abs", "floor", "floor", "ceiling", "ceiling", "sqrt", "sqrt", "sin", "sin", "cos", "cos", "tan", "tan", "asin", "asin", "acos", "acos", "atan", "atan", "ln", "ln", "log", "log", "e ^", "e ^", "10 ^", "10 ^", }, "", "", "" },
         { ArgKind::Value, "NUM", "", {}, "math_number", "", "" },
     } },
-    { "procedures_definition", "define %1", Shape::Hat, 1, 0xFF6680, 0xFF4D6A, 0xFF3355, "", {
+    { "procedures_definition", "define %1", Shape::Hat, 0, 0xFF6680, 0xFF4D6A, 0xFF3355, "", {
         { ArgKind::Value, "custom_block", "", {}, "", "", "" },
     } },
     { "procedures_call", "", Shape::Stack, 0, 0xFF6680, 0xFF4D6A, 0xFF3355, "", {

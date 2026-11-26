@@ -111,9 +111,6 @@ Item {
             } else if (kind === "play") {
                 ctx.moveTo(w * 0.30, h * 0.22); ctx.lineTo(w * 0.78, h * 0.50); ctx.lineTo(w * 0.30, h * 0.78); ctx.closePath()
                 ctx.stroke(); ctx.fill(); return
-            } else if (kind === "edit") {
-                ctx.moveTo(w * 0.22, h * 0.78); ctx.lineTo(w * 0.28, h * 0.58); ctx.lineTo(w * 0.68, h * 0.18)
-                ctx.lineTo(w * 0.82, h * 0.32); ctx.lineTo(w * 0.42, h * 0.72); ctx.closePath()
             } else if (kind === "bolt") {
                 ctx.moveTo(w * 0.56, h * 0.16); ctx.lineTo(w * 0.26, h * 0.54); ctx.lineTo(w * 0.50, h * 0.54)
                 ctx.lineTo(w * 0.44, h * 0.84); ctx.lineTo(w * 0.74, h * 0.46); ctx.lineTo(w * 0.50, h * 0.46); ctx.closePath()
@@ -1044,13 +1041,6 @@ Item {
                         }
                         ActionBtn {
                             Layout.fillWidth: true
-                            iconKind: "edit"
-                            label: "エディタで編集 (E)"
-                            enabled: launcher.projectSelected
-                            onClicked: launcher.openEditor()
-                        }
-                        ActionBtn {
-                            Layout.fillWidth: true
                             iconKind: "bolt"
                             label: "AOT コンパイル実行"
                             enabled: launcher.projectSelected && launcher.jitAvailable
@@ -1421,8 +1411,6 @@ Item {
             launcher.goUp()
         } else if (ev.key === Qt.Key_Return || ev.key === Qt.Key_Enter) {
             launcher.activate()
-        } else if (ev.text === "e") {
-            launcher.openEditor()
         } else if (ev.text === "a") {
             launcher.exportAot()
         } else if (ev.text === "/") {

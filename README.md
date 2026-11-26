@@ -91,7 +91,6 @@ Windows は MSYS2 / MinGW-w64 でのビルドに対応しています。必要�
 | `xyo run project.sb3 --frames 120` | ヘッドレス実行 |
 | `xyo play project.sb3` | ウィンドウで再生 |
 | `xyo gui [directory]` | プロジェクトランチャー |
-| `xyo edit project.sb3` | エディタを開く |
 | `xyo aot project.sb3 -o app` | 事前コンパイル |
 | `xyo dump project.sb3` | プロジェクト情報を出力 |
 | `xyo analyze project.sb3` | スクリプト構造を解析 |

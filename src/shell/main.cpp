@@ -40,7 +40,6 @@
 #endif
 
 #include "gui.hpp"
-#include "editor.hpp"
 #include "wasm_command.hpp"
 
 #include "core/cast.hpp"
@@ -161,7 +160,7 @@ static int usage() {
         "  xyo aot <project.sb3> (-o <out> | --obj <file>)  "
         "事前コンパイル（実験的; 進捗は stderr）\n"
         "  --no-progress  AOT 進捗ログを無効化 (XYO_AOT_PROGRESS=0)\n"
-        "  xyo gui [dir]                   ランチャー GUI（引数なしでも起動）\n  xyo edit <project.sb3>             ビルトインエディタ\n"
+        "  xyo gui [dir]                   ランチャー GUI（引数なしでも起動）\n"
         "  xyo dump <project.sb3>\n"
         "  xyo analyze <project.sb3> [--dot out.dot] [--top N] [--scripts N] [--type-flow]\n"
         "              [--complexity]\n"
@@ -1711,6 +1710,38 @@ void winInit(WinArgs& out, int& argc, char**& argv) {
     out.ptrs.push_back(nullptr);
     argc = int(out.store.size());
     argv = out.ptrs.data();
+    // librsvg/Pango 用 fontconfig: 配布 zip に同梱の etc/fonts/fonts.conf が
+    // exe の隣にあれば FONTCONFIG_FILE を向ける（環境変数の明示設定を優先）。
+    // 同梱 Liberation Sans＋Windows システムフォントで SVG <text> を描ける。
+    // 日本語ユーザー名等の非 ASCII パス対策として 8.3 短パス（ASCII のみ）で渡す。
+    if (!std::getenv("FONTCONFIG_FILE") && !std::getenv("FONTCONFIG_PATH")) {
+        wchar_t exe[MAX_PATH];
+        DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        if (n > 0 && n < MAX_PATH) {
+            std::wstring dir(exe, n);
+            size_t p = dir.find_last_of(L"\\/");
+            if (p != std::wstring::npos) dir.resize(p);
+            std::wstring conf = dir + L"\\etc\\fonts\\fonts.conf";
+            DWORD attr = GetFileAttributesW(conf.c_str());
+            if (attr != INVALID_FILE_ATTRIBUTES &&
+                !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+                wchar_t shortConf[MAX_PATH];
+                DWORD sn =
+                    GetShortPathNameW(conf.c_str(), shortConf, MAX_PATH);
+                if (sn > 0 && sn < MAX_PATH) {
+                    int m = WideCharToMultiByte(CP_UTF8, 0, shortConf, -1,
+                                                nullptr, 0, nullptr, nullptr);
+                    std::string u8(m > 0 ? size_t(m - 1) : 0, '\0');
+                    if (m > 0)
+                        WideCharToMultiByte(CP_UTF8, 0, shortConf, -1, u8.data(),
+                                            m, nullptr, nullptr);
+                    _putenv_s("FONTCONFIG_FILE", u8.c_str());
+                } else {
+                    SetEnvironmentVariableW(L"FONTCONFIG_FILE", conf.c_str());
+                }
+            }
+        }
+    }
 }
 } // namespace
 #endif
@@ -1870,7 +1901,7 @@ int main(int argc, char** argv) {
     // strongest headless profile: Eager + every source-certified Mega
     // feature. Any explicit XYO_JIT_MODE / --jit / --block-count choice
     // keeps the previous path, so existing harnesses and A/B runs are
-    // unaffected. `play`/`gui`/`edit` are renderer paths and stay HotSpot.
+    // unaffected. `play`/`gui` are renderer paths and stay HotSpot.
     bool megaOff = false, megaOn = false, jitArg = false;
     bool blockCountArg = false;
     for (int i = 1; i < argc; ++i) {
@@ -2042,7 +2073,6 @@ int main(int argc, char** argv) {
     if (std::strcmp(cmd, "analyze") == 0) return cmdAnalyze(argc, argv);
     if (std::strcmp(cmd, "minify") == 0) return cmdMinify(argc, argv);
     if (std::strcmp(cmd, "rewrite") == 0) return cmdRewrite(argc, argv);
-    if (std::strcmp(cmd, "edit") == 0) return editorMainQt(argv[2], g_danger);
     if (std::strcmp(cmd, "test") == 0) return cmdTest(argv[2]);
     return usage();
 }

@@ -827,13 +827,41 @@ void SdlRenderer::freeSkin(Skin& s) {
 
 namespace {
 // Cache only large, expensive SVG rasterizations. Reuse exact RGBA pixels
+// keyed by bytes+rotation center so collision masks stay platform-exact.
+
+// Scratch の paint editor は viewBox を "0,0,W,H"（カンマ区切り）で出す。
+// sscanf("%lf %lf %lf %lf") はカンマで止まり 1 値しか読めないため、
+// カンマ・空白の両方を区切りとする自前パーサで読む（Windows の nanosvg
+// 経路専用。librsvg 経路はライブラリが解釈する）。
+inline bool parseSvgViewBox(const char* s, double& x, double& y, double& w,
+                            double& h) {
+    double v[4] = {0, 0, 0, 0};
+    int n = 0;
+    const char* p = s;
+    while (n < 4) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' ||
+               *p == ',')
+            ++p;
+        if (*p == '\0' || *p == '"' || *p == '\'') return n == 4;
+        char* end = nullptr;
+        v[n] = std::strtod(p, &end);
+        if (end == p) return false;
+        ++n;
+        p = end;
+    }
+    x = v[0];
+    y = v[1];
+    w = v[2];
+    h = v[3];
+    return true;
+}
 // and geometry; SDL textures remain per-renderer/main-thread objects.
 // The format version must change when rasterization semantics change.
 constexpr uint64_t kSkinCacheMagic =
 #ifdef XYO_HAVE_RSVG
     0x58594f534b494e75ULL; // librsvg+premultiplied-alpha correction
 #else
-    0x58594f534b494e76ULL; // nanosvg fallback
+    0x58594f534b494e77ULL; // nanosvg fallback（viewBox カンマ区切り対応版）
 #endif
 
 struct CachedSkinPixels {
@@ -1066,15 +1094,15 @@ SdlRenderer::Skin* SdlRenderer::decodeCostume(const Costume* c) {
                       skin->px.data(), skin->w, skin->h, skin->w * 4);
         nsvgDeleteRasterizer(rast);
         nsvgDelete(img);
-        // viewBox の原点・寸法（nanosvg は原点を捨てるので XML から拾う）
+        // viewBox の原点・寸法（nanosvg は原点を捨てるので XML から拾う）。
+        // Scratch は "0,0,W,H" とカンマで出すため sscanf ではなく自前パーサ。
         double vbX = 0, vbY = 0, vbW = 0, vbH = 0;
         {
             size_t p = xml.find("viewBox");
             if (p != std::string::npos) {
                 size_t q = xml.find_first_of("\"'", p);
                 if (q != std::string::npos)
-                    std::sscanf(xml.c_str() + q + 1, "%lf %lf %lf %lf",
-                                &vbX, &vbY, &vbW, &vbH);
+                    parseSvgViewBox(xml.c_str() + q + 1, vbX, vbY, vbW, vbH);
             }
         }
         // SVG の rotationCenter は論理 px（= svg px）

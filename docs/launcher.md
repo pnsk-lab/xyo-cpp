@@ -71,4 +71,4 @@ SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
   ./build/xyo gui examples
 ```
 
-`XYO_GUI_ACTIONS` は1フレームに1アクションを実行します。従来の `down/up/home/end/enter/run/aotrun/export/edit/back/wheeldown/wheelup/quit` のほか、`view-list`、`view-icons`、`backnav`、`forward`、`browse-home`、`examples`、`sort`、`path:<dir>`、`search:<word>`、`recent0`、`resize:760x560` を使えます。`XYO_GUI_EXIT_FRAMES=N` と `XYO_GUI_SHOT=path.ppm` で指定フレーム後の画像を保存できます。`XYO_GUI_DEBUG=1` は標準エラーへデバッグ情報を出力します。
+`XYO_GUI_ACTIONS` は1フレームに1アクションを実行します。従来の `down/up/home/end/enter/run/aotrun/export/back/wheeldown/wheelup/quit` のほか、`view-list`、`view-icons`、`backnav`、`forward`、`browse-home`、`examples`、`sort`、`path:<dir>`、`search:<word>`、`recent0`、`resize:760x560` を使えます。`XYO_GUI_EXIT_FRAMES=N` と `XYO_GUI_SHOT=path.ppm` で指定フレーム後の画像を保存できます。`XYO_GUI_DEBUG=1` は標準エラーへデバッグ情報を出力します。

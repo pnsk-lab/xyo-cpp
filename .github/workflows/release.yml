@@ -153,6 +153,7 @@ jobs:
             mingw-w64-x86_64-ncurses
             mingw-w64-x86_64-libxml2
             mingw-w64-x86_64-SDL2
+            mingw-w64-x86_64-librsvg
             mingw-w64-x86_64-qt6-base
             mingw-w64-x86_64-qt6-declarative
 
@@ -169,6 +170,8 @@ jobs:
           objdump -p build-win/xyo.exe | grep -i "DLL Name" || true
           objdump -p build-win/xyo.exe | grep -i "DLL Name" | grep -qi qt6 \
             || { echo "Qt6 DLL にリンクされていません"; exit 1; }
+          objdump -p build-win/xyo.exe | grep -qi "DLL Name: librsvg" \
+            || { echo "librsvg にリンクされていません（SVG は nanosvg fallback）"; exit 1; }
 
       - name: Smoke (run / play / gui)
         run: |
@@ -186,7 +189,7 @@ jobs:
             -DXYO_BUILD_TESTS=OFF
           cmake --build build-win-static -j"$(nproc)"
           strip -s build-win-static/xyo.exe
-          for dll in SDL2.dll Qt6Core.dll Qt6Quick.dll Qt6Qml.dll; do
+          for dll in SDL2.dll Qt6Core.dll Qt6Quick.dll Qt6Qml.dll librsvg; do
             if objdump -p build-win-static/xyo.exe | grep -qi "DLL Name: $dll"; then
               echo "$dll に依存しています（静的リンクになっていない）"
               exit 1
@@ -225,6 +228,14 @@ jobs:
             ldd dist/pkg/xyo.exe | grep '/mingw64/' >&2
             exit 1
           fi
+          # librsvg/Pango 用フォント: 同梱 Liberation（OFL）＋ fontconfig 設定。
+          # xyo.exe 起動時に winInit が FONTCONFIG_FILE をここへ向ける。
+          mkdir -p dist/pkg/fonts dist/pkg/etc/fonts
+          cp third_party/fonts/LiberationSans-Regular.ttf \
+             third_party/fonts/LiberationSans-Bold.ttf dist/pkg/fonts/
+          cp third_party/fonts/LICENSE-Liberation.txt dist/pkg/fonts/
+          cp tools/ci/windows-fonts.conf dist/pkg/etc/fonts/fonts.conf
+          test -f dist/pkg/etc/fonts/fonts.conf
           (cd dist/pkg && zip -qr "../xyo-windows-x86_64.zip" .)
           ls -lh dist
 

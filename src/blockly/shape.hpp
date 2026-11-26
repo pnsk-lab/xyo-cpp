@@ -21,6 +21,9 @@ namespace blockly {
 /// lb の外形パス（ブロック左上 = (0,0) 相対、論理座標）。
 /// drawBlock が lb.x/lb.y と zoom を掛けて実座標へ展開する。
 Path blockOutline(const LBlock& lb);
+/// lb の外形の内側か（描画と同じパスで内外判定する）。
+/// ハット/レポーター/六角形/C ブロックの口/ノッチを正確に扱う。
+bool pointInOutline(const LBlock& lb, float x, float y);
 /// ノッチ（上の切り欠き）を (x, y) 起点に追加（左→右、深さ kNotchH）。
 void notchDown(Path& p, float x, float y);
 /// バンプ（下の張り出し）を (x, y) 起点に追加（右→左、深さ kNotchH）。

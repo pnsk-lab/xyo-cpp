@@ -1222,15 +1222,19 @@ Value snsSetDragMode(const ArgValues& a, BlockUtility& u) {
 Value snsKeyPressed(const ArgValues& a, BlockUtility& u) {
     return V(u.keyboardIsDown(v(a, "KEY_OPTION")));
 }
+// Linux/Windowsで呼出順の違いを吸収する（中身は localtime 相当で同一）。
+static bool localtimePortable(const std::time_t* t, std::tm* out) {
+#ifdef _WIN32
+    return localtime_s(out, t) == 0;
+#else
+    return localtime_r(t, out) != nullptr;
+#endif
+}
 Value snsCurrent(const ArgValues& a, BlockUtility&) {
     std::u16string option = strLower(a, "CURRENTMENU");
     std::time_t now = std::time(nullptr);
-    std::tm tm;
-#ifdef _WIN32
-    localtime_s(&tm, &now);      // ordem invertida da POSIX localtime_r
-#else
-    localtime_r(&now, &tm);
-#endif
+    std::tm tm{};
+    (void)localtimePortable(&now, &tm);
     if (option == u"year") return V(tm.tm_year + 1900.0);
     if (option == u"month") return V(tm.tm_mon + 1.0);
     if (option == u"date") return V(double(tm.tm_mday));

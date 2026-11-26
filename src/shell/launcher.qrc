@@ -1,6 +1,5 @@
 <RCC>
     <qresource prefix="/xyo">
         <file>qml/Launcher.qml</file>
-        <file>qml/Editor.qml</file>
     </qresource>
 </RCC>

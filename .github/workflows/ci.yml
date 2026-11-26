@@ -336,6 +336,7 @@ jobs:
             mingw-w64-x86_64-ncurses
             mingw-w64-x86_64-libxml2
             mingw-w64-x86_64-SDL2
+            mingw-w64-x86_64-librsvg
             mingw-w64-x86_64-qt6-base
             mingw-w64-x86_64-qt6-declarative
 
@@ -355,6 +356,8 @@ jobs:
           echo "--- 依存 DLL（Qt は LGPL のため動的リンク必須） ---"
           objdump -p build-win/xyo.exe | grep -i "DLL Name" | grep -i qt6 \
             || { echo "Qt6 DLL にリンクされていません"; exit 1; }
+          objdump -p build-win/xyo.exe | grep -qi "DLL Name: librsvg" \
+            || { echo "librsvg にリンクされていません（SVG は nanosvg  fallback）"; exit 1; }
 
       - name: Smoke (run / play / gui)
         run: |
@@ -375,7 +378,7 @@ jobs:
           ls -l build-win-static/xyo.exe
           echo "--- 依存 DLL ---"
           objdump -p build-win-static/xyo.exe | grep -i "DLL Name" || true
-          for dll in SDL2.dll Qt6Core.dll Qt6Quick.dll Qt6Qml.dll; do
+          for dll in SDL2.dll Qt6Core.dll Qt6Quick.dll Qt6Qml.dll librsvg; do
             if objdump -p build-win-static/xyo.exe | grep -qi "DLL Name: $dll"; then
               echo "$dll に依存しています（静的リンクになっていない）"
               exit 1

@@ -10,13 +10,6 @@ set_tests_properties(native-ui PROPERTIES
   ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy"
 )
 
-if(TARGET xyo-cli)
-  add_test(NAME native-editor-operations
-    COMMAND xyo-cli edit ${PROJECT_SOURCE_DIR}/examples/play_demo.sb3)
-  set_tests_properties(native-editor-operations PROPERTIES
-    ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy;XYO_EDIT_TEST=1")
-endif()
-
 add_executable(xyo-native-font-tests
   test_native_font.cpp
   ${PROJECT_SOURCE_DIR}/src/ui/draw.cpp

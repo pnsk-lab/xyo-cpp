@@ -7,14 +7,14 @@
 //    （背景 + 表示中スプライトを sb3 から遅延デコード、QThreadPool 上で生成）
 //  - クリックで選択、ダブルクリック or Enter で実行、ディレクトリは開く
 //  - `/` または Ctrl+F でインクリメンタル絞り込み
-//  - [実行] で再生、[編集] で内蔵エディタ、[AOT 実行]/[AOT 書き出し] は
+//  - [実行] で再生、[AOT 実行]/[AOT 書き出し] は
 //    事前コンパイル経路（JIT 無しビルドでは書き出し不可）
 //
 // 自動検証用: XYO_GUI_ACTIONS="down,enter,export" をカンマ区切りで
 // 順に実行する（down/up/home/end/enter/back/backnav/forward/
 // browse-home/examples/sort/settings/view-list/view-icons/
 // scale:N/fps:N/jit:MODE/lazy:MODE/gpu:MODE/turbo:0|1/danger:0|1/
-// aotrun/export/edit/search:TEXT/path:PATH/recent0/wheeldown/wheelup/
+// aotrun/export/search:TEXT/path:PATH/recent0/wheeldown/wheelup/
 // click:X:Y/resize:WxH/quit）。XYO_GUI_DEBUG=1 で選択・書き出しログ。
 // XYO_GUI_EXIT_FRAMES=N で約 N フレーム分の時間後に終了、
 // XYO_GUI_SHOT=path.ppm で終了時のウィンドウを保存する（レイアウト回帰用）。
@@ -31,6 +31,8 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -63,13 +65,22 @@
 #include <QVariantMap>
 #include <QtQml/qqml.h>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 // Qt は「slots」をQ_SLOTSのマクロにする。プロジェクト側ヘッダの
 // BuildResult::slots と衝突するため解除してから xyo ヘッダを読む。
 #ifdef slots
 #undef slots
 #endif
 #include "launcher_core.hpp"
-#include "editor.hpp"
 #include "engine/runtime.hpp"
 #include "load/sb3.hpp"
 #ifdef XYO_JIT
@@ -347,7 +358,11 @@ public:
         setJitLazyMode(oldLazy_);
 #endif
 #ifdef _WIN32
-        _putenv_s("XYO_DANGER", hadDanger_ ? previousDanger_.c_str() : "");
+        // _putenv_s(name,"") は空文字設定であって unset ではない。
+        // 空文字は getenv で非NULLが返り、Linuxの unset (NULL) と挙動が
+        // 割れる（Mega既定判定の !getenv が変わる）ため、真に消す。
+        if (hadDanger_) _putenv_s("XYO_DANGER", previousDanger_.c_str());
+        else SetEnvironmentVariableA("XYO_DANGER", nullptr);
 #else
         if (hadDanger_) setenv("XYO_DANGER", previousDanger_.c_str(), 1);
         else unsetenv("XYO_DANGER");
@@ -468,9 +483,8 @@ public:
     enum Result {
         ResultNone = 0,
         ResultQuit = 3,
-        ResultContinue = 4,  // 再生/編集済み。外側ループを継続
+        ResultContinue = 4,  // 再生済み。外側ループを継続
         ResultRun = 5,
-        ResultEdit = 6,
     };
 
     explicit LauncherController(QObject* parent = nullptr)
@@ -721,25 +735,6 @@ public:
         result_ = ResultRun;
         QCoreApplication::quit();
     }
-    Q_INVOKABLE void openEditor() {
-        const LauncherEntry* e = entryForPath(selPath_);
-        if (!e || e->isDir) {
-            setStatus(QStringLiteral(
-                          "編集するプロジェクトを選んでください"),
-                      true);
-            return;
-        }
-#ifndef XYO_HAVE_SDL2
-        setStatus(QStringLiteral(
-                      "このビルドは SDL2 無しのため編集できません"),
-                  true);
-        return;
-#endif
-        pendingPath_ = e->path;
-        rememberRecent(QString::fromStdString(e->path));
-        result_ = ResultEdit;
-        QCoreApplication::quit();
-    }
     Q_INVOKABLE void quitApp() {
         result_ = ResultQuit;
         QCoreApplication::quit();
@@ -813,8 +808,8 @@ public:
             return;
         }
         const uint64_t hash = aot::hashBytes(data.data(), data.size());
-        Runtime rt;
-        if (!loadSb3File(rt, data.data(), data.size()).ok) {
+        AotBuildOutcome outcome = runAotBuildPumped(data, hash);
+        if (outcome.loadFailed) {
             endAotProgress();
             setBusy(false);
             setStatus(QStringLiteral(
@@ -822,25 +817,22 @@ public:
                       true);
             return;
         }
-        aot::BuildResult br;
-        std::string why;
-        if (!aot::compileProject(rt, hash, br, &why,
-                                 [this](const aot::Progress& p) {
-                                     showAotProgress(p);
-                                 })) {
+        if (!outcome.ok) {
             endAotProgress();
             setBusy(false);
             setStatus(QStringLiteral("AOT コンパイル不可: ") +
-                          QString::fromStdString(why),
+                          QString::fromStdString(outcome.why),
                       true);
             return;
         }
+        aot::BuildResult& br = outcome.build;
         const fs::path src(e->path);
         fs::path out = src.parent_path() / src.stem();
         std::error_code ec;
         if (fs::exists(out, ec))
             out = src.parent_path() / (src.stem().string() + "-aot");
         showAotProgress({aot::ProgressStage::WriteOutput});
+        std::string why;
         if (!aot::writeExecutable(out.string(), data.data(), data.size(), br,
                                   hash, &why)) {
             endAotProgress();
@@ -888,8 +880,8 @@ public:
             return;
         }
         const uint64_t hash = aot::hashBytes(data.data(), data.size());
-        Runtime rt;
-        if (!loadSb3File(rt, data.data(), data.size()).ok) {
+        AotBuildOutcome outcome = runAotBuildPumped(data, hash);
+        if (outcome.loadFailed) {
             endAotProgress();
             setBusy(false);
             setStatus(QStringLiteral(
@@ -897,19 +889,15 @@ public:
                       true);
             return;
         }
-        aot::BuildResult br;
-        std::string why;
-        if (!aot::compileProject(rt, hash, br, &why,
-                                 [this](const aot::Progress& p) {
-                                     showAotProgress(p);
-                                 })) {
+        if (!outcome.ok) {
             endAotProgress();
             setBusy(false);
             setStatus(QStringLiteral("AOT コンパイル不可: ") +
-                          QString::fromStdString(why),
+                          QString::fromStdString(outcome.why),
                       true);
             return;
         }
+        aot::BuildResult& br = outcome.build;
         TemporaryAotObject temp;
         if (temp.path.empty()) {
             endAotProgress();
@@ -920,6 +908,7 @@ public:
             return;
         }
         showAotProgress({aot::ProgressStage::WriteOutput});
+        std::string why;
         if (!aot::writeObjectFile(temp.path, br, &why)) {
             endAotProgress();
             setBusy(false);
@@ -955,6 +944,9 @@ public:
     /// 自動検証アクション列を 1 つ消費して実行する。
     /// true = まだ続きがある or 実行した、false = キューが空。
     bool stepAction() {
+        // AOT ビルドのポンプ中は processEvents 経由で再入する。キューを
+        // 消費せず「まだ続きがある」扱いにして、ビルド完了まで待たせる。
+        if (busy_) return true;
         if (actIdx_ >= actions_.size()) return false;
         const std::string a = actions_[actIdx_++];
         const QString qa = QString::fromStdString(a);
@@ -965,7 +957,6 @@ public:
         else if (a == "enter" || a == "run") activate();
         else if (a == "aotrun") runAotProject();
         else if (a == "export") exportAot();
-        else if (a == "edit") openEditor();
         else if (a == "back") goUp();
         else if (a == "backnav") goBack();
         else if (a == "forward") goForward();
@@ -1282,6 +1273,92 @@ private:
     }
 
 #ifdef XYO_JIT
+    // ワーカー側のビルド結果。loadSb3File の失敗とコンパイルの失敗を
+    // 区別する（呼び出し側のメッセージを変えないため）。
+    struct AotBuildOutcome {
+        bool ok = false;
+        bool loadFailed = false;
+        std::string why;
+        aot::BuildResult build;
+    };
+    // AOT ビルドの進捗をワーカー→GUI へ渡すメールボックス。
+    // 描画 (showAotProgress) は GUI スレッドだけで行う。
+    struct AotProgressMailbox {
+        std::mutex mutex;
+        bool has = false;
+        aot::Progress latest{};
+    };
+    // 重い AOT ビルド (sb3 ロード + compileProject) をワーカースレッドで
+    // 回し、GUI スレッドはイベントをポンプし続ける。LLVM O2/オブジェクト
+    // 生成中は進捗コールバックが来ないが、メッセージループを回すので
+    // OS の応答なし (ハング) 判定にならない。呼び出しは GUI スレッド専用。
+    // sb3 バイト列は呼び出し側が書き出しにも使うため、ワーカー用に
+    // コピーして渡す (ムーブしない)。
+    AotBuildOutcome runAotBuildPumped(const std::vector<uint8_t>& sb3,
+                                      uint64_t hash) {
+        AotProgressMailbox box;
+        AotBuildOutcome outcome;
+        std::future<void> worker = std::async(
+            std::launch::async,
+            [data = sb3, hash, &box, &outcome]() mutable {
+                Runtime rt;
+                if (!loadSb3File(rt, data.data(), data.size()).ok) {
+                    outcome.loadFailed = true;
+                    return;
+                }
+                std::string why;
+                const bool ok = aot::compileProject(
+                    rt, hash, outcome.build, &why,
+                    [&box](const aot::Progress& p) {
+                        std::lock_guard<std::mutex> lock(box.mutex);
+                        box.latest = p;
+                        box.has = true;
+                    });
+                outcome.ok = ok;
+                outcome.why = why;
+            });
+        while (worker.wait_for(std::chrono::milliseconds(30)) !=
+               std::future_status::ready) {
+            aot::Progress pending{};
+            bool got = false;
+            {
+                std::lock_guard<std::mutex> lock(box.mutex);
+                if (box.has) {
+                    pending = box.latest;
+                    box.has = false;
+                    got = true;
+                }
+            }
+            if (got) showAotProgress(pending);
+            else touchAotProgress();
+            QCoreApplication::processEvents(QEventLoop::AllEvents);
+        }
+        worker.get();
+        // 最後の進捗を取りこぼさない。
+        {
+            std::lock_guard<std::mutex> lock(box.mutex);
+            if (box.has) {
+                showAotProgress(box.latest);
+                box.has = false;
+            }
+        }
+        QCoreApplication::processEvents(QEventLoop::AllEvents);
+        return outcome;
+    }
+    // O2 等の不透明フェーズ中も秒表示だけ進め、OS に生存を知らせる。
+    void touchAotProgress() {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - aotLastPump_ < std::chrono::milliseconds(200)) return;
+        aotLastPump_ = now;
+        const auto seconds =
+            std::chrono::duration_cast<std::chrono::seconds>(
+                now - aotStartedAt_)
+                .count();
+        setStatus(aotOperation_ + QStringLiteral(" — 処理中  ·  ") +
+                      QString::number(seconds) + QStringLiteral("秒"),
+                  false);
+        Q_EMIT aotProgressChanged();
+    }
     void beginAotProgress(const QString& operation) {
         aotOperation_ = operation;
         aotStartedAt_ = std::chrono::steady_clock::now();
@@ -1429,6 +1506,12 @@ int guiMain(const char* startDir) {
         if (oneShot || exitFrames > 0) {
             actionTimer.setInterval(30);
             QObject::connect(&actionTimer, &QTimer::timeout, [&] {
+                // AOT ビルド中はポンプが UI を回す。完了まで終了せず、
+                // ビルド時間はフレーム数に数えない。
+                if (controller.busy()) {
+                    doneStall = 0;
+                    return;
+                }
                 ++tickFrames;
                 if (oneShot) {
                     if (controller.stepAction()) {
@@ -1474,12 +1557,6 @@ int guiMain(const char* startDir) {
             continue;  // AOT 実行済み
         }
         view.hide();
-        if (act == LauncherController::ResultEdit) {
-            if (!runPath.empty())
-                editorMainQt(runPath.c_str());
-            if (oneShot) return 0;
-            continue;
-        }
         if (act == LauncherController::ResultRun && !runPath.empty()) {
             ScopedGuiRunFlags flags(options);
             xyoShellPlay(runPath.c_str(), nullptr, options.scale,

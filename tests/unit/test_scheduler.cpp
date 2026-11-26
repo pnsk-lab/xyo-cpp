@@ -46,6 +46,31 @@ bool generalCoroEnabled() {
     return value && value[0] == '1';
 }
 
+/// codegen/backend 機構（mega_goto/mega_partial 融合・stackless coro
+/// lowering）は MLIR フロントエンドでは意図的にバイパスされる
+/// （backend_llvm が !cs->mlirFrontend でゲートしている）。それらの
+/// 機構そのものを検査するテストは legacy codegen で走らせる。
+struct MlirOffEnv {
+    bool had = std::getenv("XYO_MLIR") != nullptr;
+    std::string prev;
+    MlirOffEnv() {
+        if (had) prev = std::getenv("XYO_MLIR");
+#ifdef _WIN32
+        _putenv_s("XYO_MLIR", "0");
+#else
+        setenv("XYO_MLIR", "0", 1);
+#endif
+    }
+    ~MlirOffEnv() {
+#ifdef _WIN32
+        _putenv_s("XYO_MLIR", had ? prev.c_str() : "");
+#else
+        if (had) setenv("XYO_MLIR", prev.c_str(), 1);
+        else unsetenv("XYO_MLIR");
+#endif
+    }
+};
+
 struct MockRenderer final : RendererAPI {
     const std::thread::id caller = std::this_thread::get_id();
     mutable std::atomic<unsigned> wrongThread{0}, visual{0}, fences{0};
@@ -6854,6 +6879,8 @@ void testMegaBatchProcedureDispatch() {
 }
 
 void testMegaPartialSchedulerProcedureFusion() {
+    // 融合機構は legacy codegen 経路（MLIR では backend が skip する）。
+    // MLIR でも手続き融合が動くので MlirOffEnv は付けない。
     // Force the new bounded, partial-path inliner to modify a real
     // sched_* procedure without deleting the other native entry symbols.
     if (!jitEnabled() || jitMode() != JitMode::Eager) return;
@@ -6987,6 +7014,8 @@ void testMegaPartialSchedulerProcedureFusion() {
 }
 
 void testMegaGotoProcedureFusion() {
+    // 融合機構は legacy codegen 経路（MLIR では backend が skip する）。
+    // MLIR でも手続き融合が動くので MlirOffEnv は付けない。
     // With the beta enabled, P -> Q -> scalar write becomes one LLVM
     // entry CFG. Executing the same Scratch program must not depend on
     // external procedure function symbols after fusion.
@@ -8044,6 +8073,8 @@ void testPool() {
     check(visible, "pool completion synchronizes non-atomic task results");
 }
 void testCoroAskAndWait() {
+    // stackless coro lowering は legacy codegen 経路（MLIR では skip）。
+    // MLIR も一般コルーチン経路に対応したので MlirOffEnv は付けない。
     const std::string blocks =
         "{\"hat\":" + hat("ask") +
         ",\"ask\":" + block("sensing_askandwait", "set",

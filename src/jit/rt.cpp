@@ -1361,6 +1361,12 @@ uint64_t xyo_rt_compat(JitCtx* c, const BlockCached* op) {
         // 別ファイバの compat が util を上書きしている可能性があるため、
         // 再開後は自分の合成 EC / 現在オペを設定し直してから再評価する
         // （broadcast-and-wait は待機中に他スレッドの compat が走る）。
+        // util は thread_local で全 fiber 共有なので thread/sequencer も
+        // 自分へ結び直す — さもないと u.target() が別スレッドのものを
+        // 返し、compat プリミティブが他ターゲットの変数を書き換える
+        // （MLIR frontend の xyo.compat.get がこの再評価経路に乗る）。
+        util.thread = c->thread;
+        util.sequencer = c->sequencer;
         util.jitCompatEc = &ec;
         util.op = op;
         util.primitiveContext = op->primitiveContext;

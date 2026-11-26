@@ -347,6 +347,10 @@ using Bits = std::vector<std::vector<uint64_t>>;
 Bits run(JitMode mode, const std::vector<E>& exprs, const Bits* interp, bool aotMode = false) {
     setJitMode(mode);
     const std::string json = project(exprs);
+    if (const char* dp = std::getenv("XYO_TEST_DUMP")) {
+        std::FILE* f = std::fopen(dp, "w");
+        if (f) { std::fwrite(json.data(), 1, json.size(), f); std::fclose(f); }
+    }
 #ifdef XYO_JIT
     constexpr uint64_t projectHash = 0x4e414e434f455243ull;
     aot::BuildResult build;

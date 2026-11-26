@@ -11,7 +11,7 @@ For every ``repro/*.sb3``:
   * the ``out`` list and the process exit status are compared.
 
 This script is informational: some cases are expected to differ until the
-divergences documented in ``docs/scratch-divergences.md`` are fixed.
+divergences documented in ``docs/bench/scratch-divergences.md`` are fixed.
 """
 import argparse
 import json

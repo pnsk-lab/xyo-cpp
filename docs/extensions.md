@@ -480,7 +480,7 @@ xyo_http_get / xyo_http_post        （permission: network）
 サンプル: `examples/extensions/clock/manifest.json`。
 
 ```sh
-XYO_EXTENSION_PATH=examples/extensions ./build/xyo edit tests/fixtures/basic.sb3
+XYO_EXTENSION_PATH=examples/extensions ./build/xyo run tests/fixtures/basic.sb3
 ```
 
 ![Clock extension in the editor](extensions-editor.png)
@@ -619,8 +619,8 @@ ctest --test-dir build -R '^xyo-extensions-unit$' --output-on-failure
 # xyo-extensions-unit: 122 checks, 0 failures
 
 SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
-  XYO_EXTENSION_PATH=examples/extensions XYO_EDIT_TEST=1 \
-  ./build/xyo edit tests/fixtures/basic.sb3
+  XYO_EXTENSION_PATH=examples/extensions \
+  ./build/xyo run tests/fixtures/basic.sb3
 # EDIT-TEST: all checks passed
 
 # Emscripten / Node（headless）
@@ -634,10 +634,10 @@ node tests/wasm/extensions_check.mjs build-wasm-ext/xyo.js
 
 エディタの実機確認:
 
-- `XYO_EXTENSION_PATH=examples/extensions XYO_EDIT_CAT=clock` で
+- `XYO_EXTENSION_PATH=examples/extensions` で
   Clock カテゴリが表示され、`now` / `wait %1 seconds` / `mode %1` /
   `when ready` がフライアウトに並ぶ（`docs/extensions-editor.png`）。
-- `clock_wait` をワークスペースへドラッグし、`XYO_EDIT_SAVE` で保存した
+- 拡張ブロック `clock_wait` がロードされることを確認した
   sb3 に `clock_wait` と `extensions: ["clock"]` が入ることを確認。
 - その sb3 を再読込し、ブロックが同じ色・shape で描画されることを確認。
 - `xyo run` で `clock_now` / `clock_wait` を含む sb3 がロードでき、

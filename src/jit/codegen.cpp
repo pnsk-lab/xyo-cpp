@@ -656,21 +656,23 @@ struct Codegen {
 
     /// 条件付きループ（repeat until / while）用の入口。条件が単調な affine
     /// 比較であることを検出器が証明したときだけ、反復回数を実行時に
-    /// 二分探索して行列累乗へ置き換える。
-    bool tryEmitMatPowCond(Block* blk, BasicBlock* fallback,
-                           BasicBlock* merge) {
+    /// 二分探索して行列累乗へ置き換える。emit したときだけ fallback ブロ
+    /// ックを作って返す（未使用の空ブロックを残すと終端子なしの不正 IR
+    /// になる）。呼び出し側は fallback に通常経路（induction/GPU/汎用）
+    /// を必ず出す — 実行時 reject（ret 0）はそこへ落ちる。
+    BasicBlock* tryEmitMatPowCond(Block* blk, BasicBlock* merge) {
         if (captureReporterListReadEvaluation || matPowDisabled || aot ||
             runtime.blockCountEnabled || !blocks)
-            return false;
+            return nullptr;
         std::string why;
         auto planOpt = jit::analyzeMatPow(*blocks, blk, &why);
         if (!planOpt) {
             if (verbose)
                 std::fprintf(stderr, "xyo-jit: matpow skip (%s): %s\n",
                              blk->id.c_str(), why.c_str());
-            return false;
+            return nullptr;
         }
-        if (planOpt->condKind == 0) return false;
+        if (planOpt->condKind == 0) return nullptr;
         if (std::getenv("XYO_MATPOW_DEBUG")) {
             std::fprintf(stderr, "xyo-jit: matpow cond k=%d post/writ:",
                          int(planOpt->postSrc.size()));
@@ -679,7 +681,9 @@ struct Codegen {
                              int(planOpt->written[i]));
             std::fprintf(stderr, "\n");
         }
-        return emitMatPowPlan(*planOpt, cf64(0.0), fallback, merge, nullptr);
+        BasicBlock* fb = newBB("matpow.fallback");
+        emitMatPowPlan(*planOpt, cf64(0.0), fb, merge, nullptr);
+        return fb;
     }
 
     bool emitMatPowPlan(jit::MatPowPlan& plan, llvm::Value* n,
@@ -10414,16 +10418,25 @@ struct Codegen {
             BasicBlock* head = BasicBlock::Create(lc, "", fn);
             BasicBlock* bodyBB = BasicBlock::Create(lc, "", fn);
             BasicBlock* merge = BasicBlock::Create(lc, "", fn);
+            // yield スコープの入口は matpow 振分けより前に置く
+            // （counted-repeat 側と同型）。スコープの退避値（quantum 等）
+            // は merge の出口処理が全経路で使うため、振分けより後だと
+            // matpow 経路が支配しない値を参照して IR が壊れる。
+            beginLoopYieldScope(blk);
             // 条件が単調な affine 比較なら、反復回数を二分探索して行列累乗
-            // O(log N) へ置き換える。ここで成功した場合は以下のチョーク型
-            // 誘導ループ／GPU／逐次ループを丸ごと省略する（意味論は同じ）。
-            const bool matPowApplied =
-                !nestedOsrInFlightGuard && !runtime.blockCountEnabled &&
-                tryEmitMatPowCond(blk, head, merge);
-            if (matPowApplied) {
-                b.SetInsertPoint(merge);
-                return;
-            }
+            // O(log N) へ置き換える。成功時（ret 1/2）は merge へ直行する
+            // ので通常経路は実行されないが、実行時 reject（ret 0: 非数値
+            // 文字列 init・範囲証明失敗等）は汎用ループへ落とす必要がある。
+            // counted-repeat 側と同様、汎用ループの生成を省略しない
+            // （省略すると fallback 先が空のまま unreachable Fixup され、
+            // reject 時にループが消える）。fallback は専用ブロックに受け、
+            // 通常経路（induction/GPU/汎用）の先頭へ繋ぐ。
+            BasicBlock* matpowFb =
+                (!nestedOsrInFlightGuard && !runtime.blockCountEnabled)
+                    ? tryEmitMatPowCond(blk, merge)
+                    : nullptr;
+            const bool matPowApplied = matpowFb != nullptr;
+            if (matPowApplied) b.SetInsertPoint(matpowFb);
             if (!runtime.blockCountEnabled)
             if (auto plan = warpInductionPlan(blk)) {
                 BasicBlock* fallback = newBB("induction.fallback");
@@ -10438,6 +10451,9 @@ struct Codegen {
                 if (safeTransientReporter(
                         transientChild(blk, "CONDITION"),
                         plan->variable->id)) {
+                    // 上で開いた外側スコープを閉じてから抜ける
+                    // （開きっぱなしだと後続ループの退避/復帰がずれる）。
+                    endLoopYieldScope(false);
                     emitTransientRepeat(blk, std::move(*plan));
                     return;
                 }
@@ -10446,8 +10462,15 @@ struct Codegen {
             // 境界は limitParent/limitInput が指す不変オペランドを
             // ループ前に一度だけ評価する。元の条件は CPU パスで
             // 変更なく再評価される。
-            beginLoopYieldScope(blk);
-            const bool promotedLoop = beginLoopPromotion(blk, false);
+            bool promotedLoop = beginLoopPromotion(blk, false);
+            if (matPowApplied && promotedLoop) {
+                // matpow の適用書き込み（applyBB）は昇格前の実ストレージへ
+                // 直書きする。昇格を残すと merge の flush が未初期化スロッ
+                // トを書き戻して適用結果を壊す。フォールバックの汎用ルー
+                // プは実メモリで動く（昇格なしループと同一の意味論）。
+                clearLoopPromotion(true);
+                promotedLoop = false;
+            }
             const gpu::ParallelLoop* pl =
                 promotedLoop ? nullptr : tryGpuLoopEx(blk);
             if (pl && pl->limitParent && !pl->limitInput.empty()) {

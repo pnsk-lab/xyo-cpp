@@ -28,6 +28,34 @@ modules inside xyo.app/Contents/{Frameworks,Resources} (wired via qt.conf
 and @rpath). In each case the Qt binaries remain separate, replaceable
 shared libraries, and you may substitute your own builds there.
 
+librsvg and its stack (SVG costumes on Linux and Windows xyo.exe)
+------------------------------------------------------------------
+SVG costumes are rasterized with librsvg
+(https://wiki.gnome.org/Projects/LibRsvg), licensed under the GNU Lesser
+General Public License version 2.1 or later (LGPL-2.1-or-later), plus its
+runtime stack: Cairo (LGPL-2.1-or-later or MPL-1.1), Pango/PangoCairo
+(LGPL-2.0-or-later), gdk-pixbuf/GLib/GObject/GIO (LGPL-2.1-or-later),
+HarfBuzz (MIT), Fontconfig (MIT), FreeType (FTL/GPL-2.0), FriBidi (LGPL),
+libxml2 (MIT), Pixman (MIT), libpng/zlib (zlib license).
+
+xyo links this stack as *shared libraries only* (never statically;
+the fully static xyo-headless.exe falls back to the embedded nanosvg
+rasterizer instead), so you may replace them with compatible versions at
+any time. Linux releases bundle them under lib/ next to the executable;
+Windows releases (xyo.exe, DLL bundle) place the *.dll files next to the
+executable. The corresponding sources are available from the GNOME
+project, freedesktop.org, and the MSYS2 package channels
+(mingw-w64-x86_64-librsvg and its dependencies) that provided the
+libraries.
+
+Bundled fonts (Liberation Sans, OFL)
+-------------------------------------
+The Windows package ships Liberation Sans Regular/Bold
+(third_party/fonts/, SIL Open Font License 1.1, see
+fonts/LICENSE-Liberation.txt in the package) for SVG <text> rendering via
+Pango/Fontconfig. The same files are embedded in every build for the
+built-in text renderer.
+
 Other bundled dependencies
 --------------------------
 See the sources in third_party/ and the CMake configuration for the full

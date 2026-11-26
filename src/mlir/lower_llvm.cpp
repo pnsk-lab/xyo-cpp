@@ -3847,13 +3847,46 @@ void Lowerer::emitOp(Op& op) {
         }
         LValue* trunc = b.CreateUnaryIntrinsic(llvm::Intrinsic::trunc, f);
         LValue* isInt = b.CreateFCmpOEQ(trunc, f);
-        // isNum はここでは問わない（f は数値化済み）。素の double で
-        // ない正確な整数（正準形の整数文字列 "0" 等）も通す。isNum を
-        // 掛けると文字列 entry が全滅し、guard/box が常に else/float 側へ
-        // 落ちる（found: suite list_read）。
-        vals[k0] = b.CreateAnd(ordered,
-                               b.CreateAnd(b.CreateAnd(inRange, isInt),
-                                           nonZero));
+        // 数値比較の資格が必要: 素の double でない値は、数値確定の
+        // 文字列（numState==1）に限る。to_num が 0 を返す非数値文字列
+        // （"abc" 等）や未 parse・比較非数値の文字列は字句比較になる
+        // ため、coerce 値での int 輸送はループ回数を捏造する（"abc" が
+        // 通って 5 回転する等）。正準形の整数文字列 "0" 等は state==1
+        // で通す（初回 parse 前は else/float 側へ落ち、helper が parse
+        // して次回以降速くなる — 意味論は常に正しい）。
+        // isNum を一律に掛けると文字列 entry が全滅し、guard/box が常に
+        // else/float 側へ落ちる（found: suite list_read）ので、文字列
+        // だけを追加判定する。
+        BasicBlock* curBB = b.GetInsertBlock();
+        BasicBlock* strChkBB = BasicBlock::Create(lc, "int_exact.str", fn);
+        BasicBlock* eligBB = BasicBlock::Create(lc, "int_exact.elig", fn);
+        LValue* isStr = b.CreateICmpEQ(
+            b.CreateLShr(bits, llvm::ConstantInt::get(i64(), 48)),
+            llvm::ConstantInt::get(
+                i64(), (static_cast<uint64_t>(val::kTagStr) >> 48)));
+        b.CreateCondBr(isStr, strChkBB, eligBB);
+        b.SetInsertPoint(strChkBB);
+        LValue* sp = b.CreateIntToPtr(
+            b.CreateAnd(bits,
+                        llvm::ConstantInt::get(i64(), val::kPtrMask)),
+            ptr());
+        auto* numState = b.CreateLoad(
+            i32(), b.CreateConstGEP1_32(
+                       i8(), sp,
+                       uint32_t(offsetof(SStr, numState))));
+        numState->setAtomic(llvm::AtomicOrdering::Acquire);
+        LValue* strOk = b.CreateICmpEQ(
+            numState, llvm::ConstantInt::get(i32(), 1));
+        b.CreateBr(eligBB);
+        b.SetInsertPoint(eligBB);
+        llvm::PHINode* strElig = b.CreatePHI(b.getInt1Ty(), 2);
+        strElig->addIncoming(b.getFalse(), curBB);
+        strElig->addIncoming(strOk, strChkBB);
+        LValue* eligible =
+            b.CreateOr(isNum, b.CreateAnd(isStr, strElig));
+        vals[k0] = b.CreateAnd(
+            ordered, b.CreateAnd(b.CreateAnd(inRange, isInt),
+                                 b.CreateAnd(nonZero, eligible)));
         return;
     }
     if (n == "xyo.box.f") {

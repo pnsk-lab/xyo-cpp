@@ -728,6 +728,9 @@ static float layoutChainImpl(Ctx& cx, const std::string& head, float x,
         lb.shadow = b->shadow;
         lb.hat = st.shape == edit::Shape::Hat;
         lb.defineHat = b->opcode == "procedures_definition";
+        // 定義ブロックはハットであって C ブロックではない（口を持たない）。
+        // カタログ側の cblock が誤っていても形状を壊さないよう明示する。
+        if (lb.defineHat) lb.cblock = 0;
         lb.depth = depth;
         lb.sub2Label = st.sub2Label;
         lb.segs = sz.segs;

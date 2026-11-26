@@ -125,6 +125,11 @@ int xyo_matpow(void* /*ctx*/, double n, const xyo::Value* const* vars,
             val = v->asNumberUnchecked();
         } else if (v->isString()) {
             if (!v->asStrPtr()) return 0;  // 空文字列は型が観測される
+            // 非数値文字列（"abc" 等）の条件比較は字句比較になるため、
+            // toNumber 強制（NaN→0）の affine モデルと一致しない。逐次へ。
+            // （小数文字列は下の floor 検査で落ちる。整数文字列は数値
+            // 比較になるので加速してよい。）
+            if (std::isnan(xyo::cast::toNumberOrNaN(*v))) return 0;
             val = xyo::cast::toNumber(*v);
             stringInit[size_t(i)] = 1;
         } else {

@@ -189,6 +189,13 @@ char pathListSeparator() {
 #endif
 }
 
+static bool isPathListSeparator(char c) {
+    // Linux/Windowsで同一文字列が同一に解釈されるよう両区切りを許容。
+    // Windowsのドライブ文字直後の ':' (例 C:\x) は区切りと誤認し得るため
+    // 呼び出し側で1文字目直後の ':' を保護する。
+    return c == ';' || c == ':';
+}
+
 void addManifestFile(const fs::path& path, ExtensionLoadReport* report) {
     ExtensionDef def;
     std::string error;
@@ -304,10 +311,22 @@ ExtensionLoadReport loadExtensionManifests(const std::string& pathList) {
     ExtensionLoadReport report;
     if (pathList.empty()) return report;
 
-    const char separator = pathListSeparator();
     size_t start = 0;
     while (start <= pathList.size()) {
-        const size_t end = pathList.find(separator, start);
+        size_t end = std::string::npos;
+        for (size_t i = start; i < pathList.size(); ++i) {
+            // Windowsドライブ (例 "C:\dir") のコロンは区切りにしない。
+            if (i == start + 1 && pathList.size() > start + 2 &&
+                pathList[i] == ':' &&
+                ((pathList[start] >= 'A' && pathList[start] <= 'Z') ||
+                 (pathList[start] >= 'a' && pathList[start] <= 'z')) &&
+                (pathList[i + 1] == '\\' || pathList[i + 1] == '/'))
+                continue;
+            if (isPathListSeparator(pathList[i])) {
+                end = i;
+                break;
+            }
+        }
         const std::string part = pathList.substr(
             start, end == std::string::npos ? std::string::npos : end - start);
         if (!part.empty()) scanPathEntry(fs::path(part), &report);

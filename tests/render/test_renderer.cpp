@@ -1084,6 +1084,64 @@ int test_svg_anchor_and_viewbox() {
     return g_fail;
 }
 
+// Scratch の paint editor は viewBox を "0,0,W,H"（カンマ区切り）で出す。
+// Windows（nanosvg 経路）の手書きパーサがカンマで止まると論理サイズが
+// ceil 値に化け、当たり判定・フェンスが最大 0.5px ずれる。カンマ区切りの
+// 小数 viewBox でも論理サイズと回転中心が正しく付くことを見る。
+int test_svg_comma_viewbox() {
+    Runtime rt;
+    // rotationCenter は viewBox 原点(10,20)を引いた値になる想定。
+    CHECK(loadProject(rt, R"JSON([{"assetId":"c","name":"c",
+        "dataFormat":"svg","md5ext":"c.svg","bitmapResolution":1,
+        "rotationCenterX":110.5,"rotationCenterY":120.25}])JSON"));
+    Target* sp = spriteOf(rt);
+    CHECK(sp != nullptr);
+    if (!sp) return g_fail;
+    const char* kComma =
+        R"SVG(<svg xmlns="http://www.w3.org/2000/svg" width="344.07373" height="262.28571" viewBox="0,0,344.07373,262.28571"><rect x="0" y="0" width="344.07373" height="262.28571" fill="#18a15f"/></svg>)SVG";
+    const char* kCommaOrigin =
+        R"SVG(<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50" viewBox="10,20,100,50"><rect x="10" y="20" width="100" height="50" fill="#18a15f"/></svg>)SVG";
+    setCostumeData(sp, 0, kComma, std::strlen(kComma));
+
+    SdlRenderer ren;
+    CHECK(ren.init(rt, 1));
+    rt.renderer = &ren;
+
+    const auto* s = svgSkin(ren, sp, 0);
+    CHECK(s != nullptr);
+    if (s) {
+        // librsvg は viewBox を float 精度で返すため 1e-3 で比較する。
+        // 肝心なのは ceil フォールバック（344.5x262.5）にならないこと。
+        CHECK(std::fabs(s->logicalW - 344.07373) < 1e-3);
+        CHECK(std::fabs(s->logicalH - 262.28571) < 1e-3);
+        // ceil フォールバック（344.5x262.5）になっていないこと。
+        CHECK(s->logicalW < 344.5 - 1e-9);
+    }
+    // 原点付きカンマ viewBox: rc から原点を引く。
+    Runtime rt2;
+    CHECK(loadProject(rt2, R"JSON([{"assetId":"d","name":"d",
+        "dataFormat":"svg","md5ext":"d.svg","bitmapResolution":1,
+        "rotationCenterX":110.5,"rotationCenterY":120.25}])JSON"));
+    Target* sp2 = spriteOf(rt2);
+    CHECK(sp2 != nullptr);
+    if (!sp2) return g_fail;
+    setCostumeData(sp2, 0, kCommaOrigin, std::strlen(kCommaOrigin));
+    SdlRenderer ren2;
+    CHECK(ren2.init(rt2, 1));
+    rt2.renderer = &ren2;
+    const auto* s2 = svgSkin(ren2, sp2, 0);
+    CHECK(s2 != nullptr);
+    if (s2) {
+        CHECK(std::fabs(s2->logicalW - 100.0) < 1e-9);
+        CHECK(std::fabs(s2->logicalH - 50.0) < 1e-9);
+        CHECK(std::fabs(s2->rcx - 100.5) < 1e-9);
+        CHECK(std::fabs(s2->rcy - 100.25) < 1e-9);
+    }
+    std::printf("svg-comma-viewbox: %d checks, %d failures\n", g_checks,
+                g_fail);
+    return g_fail;
+}
+
 int test_svg_bad_decode() {
     Runtime rt;
     CHECK(loadSvgCostumes(rt, 5, 0, 0));
@@ -1855,6 +1913,7 @@ int main() {
     test_pen_alpha_accum();
     test_svg_text_render();
     test_svg_anchor_and_viewbox();
+    test_svg_comma_viewbox();
     test_svg_bad_decode();
     test_svg_text_usage();
     test_stamp_ghost_and_hidden();

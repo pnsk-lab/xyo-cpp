@@ -685,21 +685,6 @@ if(Python3_EXECUTABLE AND TARGET xyo-cli AND XYO_JIT)
   set_tests_properties(xyo-mlir-frontend PROPERTIES TIMEOUT 300)
 endif()
 
-# START-016: the real editor (software SDL renderer) must commit each
-# semantic field edit through Blocks::setBlockField, advancing the AOT
-# source revision before native code can be scheduled again.
-if(TARGET xyo-cli AND SDL2_FOUND AND NOT EMSCRIPTEN)
-  add_test(NAME xyo-start016-editor-source-revision
-    COMMAND "${CMAKE_COMMAND}" -E env
-      SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy XYO_PEN_CPU=1
-      XYO_EDIT_TEST=1
-      "$<TARGET_FILE:xyo-cli>" edit
-      "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/basic.sb3")
-  set_tests_properties(xyo-start016-editor-source-revision
-    PROPERTIES TIMEOUT 60
-               PASS_REGULAR_EXPRESSION "EDIT-TEST: all checks passed")
-endif()
-
 # v1.2.2: same millisecond wall-clock reporter, boxed vs direct-f64 JIT path.
 # Check time-invariant arithmetic in the Interpreter, Eager and HotSpot
 # tiers without mocking the system clock.

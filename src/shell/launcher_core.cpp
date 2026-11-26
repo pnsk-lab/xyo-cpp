@@ -97,13 +97,13 @@ void writeRunOptions(const GuiRunOptions& o) {
         if (!out) return;
     }
     fs::rename(tmp, file, ec);
-#ifdef _WIN32
+    // Windowsのウイルス対策ロックだけでなくNFS等でも起きるため両OSで再試行。
+    // 観測挙動（tmpが残らない・設定が保存される）を一致させる。
     if (ec) {
         fs::remove(file, ec);
         ec.clear();
         fs::rename(tmp, file, ec);
     }
-#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -111,27 +111,27 @@ void writeRunOptions(const GuiRunOptions& o) {
 // ---------------------------------------------------------------------------
 
 std::string userHome() {
-#ifdef _WIN32
+    // Linux/Windowsで同一の優先順位: HOME → USERPROFILE → HOMEDRIVE+HOMEPATH
+    // → getpwuid。WindowsのMSYS2等ではHOMEが設定されるため先に見る。
+    if (const char* home = std::getenv("HOME"); home && *home) return home;
     if (const char* home = std::getenv("USERPROFILE"); home && *home)
         return home;
     const char* drive = std::getenv("HOMEDRIVE");
     const char* path = std::getenv("HOMEPATH");
-    return drive && path ? std::string(drive) + path : std::string();
-#else
-    if (const char* home = std::getenv("HOME"); home && *home)
-        return home;
+    if (drive && path && (*drive || *path)) return std::string(drive) + path;
+#if !defined(_WIN32)
     // Applications launched outside a shell can lack HOME.
     if (const passwd* user = getpwuid(getuid()); user && user->pw_dir)
         return user->pw_dir;
-    return {};
 #endif
+    return {};
 }
 
 std::string recentHistoryPath() {
+    // 両OSで同一: XDG_STATE_HOME → APPDATA → userHome() 以下の既定。
+    // LinuxにAPPDATAがあれば拾うし、WindowsにXDGがあれば優先する。
     const char* state = std::getenv("XDG_STATE_HOME");
-#ifdef _WIN32
     if (!state || !*state) state = std::getenv("APPDATA");
-#endif
     fs::path base;
     if (state && *state) base = state;
     else if (!userHome().empty()) {
@@ -191,15 +191,18 @@ std::string humanSize(uint64_t n) {
     return buf;
 }
 
+static bool launcherLocaltime(const std::time_t* t, std::tm* out) {
+#ifdef _WIN32
+    return localtime_s(out, t) == 0;
+#else
+    return localtime_r(t, out) != nullptr;
+#endif
+}
 std::string formatDate(long long t) {
     if (t <= 0) return {};
     std::time_t tt = std::time_t(t);
     std::tm tm{};
-#ifdef _WIN32
-    localtime_s(&tm, &tt);
-#else
-    localtime_r(&tt, &tm);
-#endif
+    (void)launcherLocaltime(&tt, &tm);
     char buf[32];
     std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d", tm.tm_year + 1900,
                   tm.tm_mon + 1, tm.tm_mday);
@@ -322,13 +325,12 @@ void rememberRecentProject(std::vector<std::string>& recent,
     }
     // A same-directory temporary file avoids partially written history.
     fs::rename(tmp, filename, ec);
-#ifdef _WIN32
+    // Windowsのウイルス対策ロックだけでなくNFS等でも起きるため両OSで再試行。
     if (ec) {
         fs::remove(filename, ec);
         ec.clear();
         fs::rename(tmp, filename, ec);
     }
-#endif
 }
 
 // ---------------------------------------------------------------------------

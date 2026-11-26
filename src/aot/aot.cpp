@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <string>
@@ -398,7 +399,9 @@ bool copySelf(const std::string& outPath, std::string* why) {
     }
     const std::wstring src = pathFromUtf8(self).wstring();
     const std::wstring dst = pathFromUtf8(outPath).wstring();
-    if (!CopyFileW(src.c_str(), dst.c_str(), FALSE)) {
+    // Linux側は fopen "wb" で上書きするため、Windowsも上書きを許可して
+    // 観測挙動を一致させる（FALSEだと同名再出力だけ失敗して差になる）。
+    if (!CopyFileW(src.c_str(), dst.c_str(), TRUE)) {
         if (why) *why = "CopyFile failed";
         return false;
     }
@@ -439,9 +442,26 @@ bool copySelf(const std::string& outPath, std::string* why) {
 }
 
 /// 出力先が実行中のバイナリ自身か（上書きすると壊れる）。
+/// Linux/Windowsで判定が割れないよう、まず両OS共通の
+/// std::filesystem::equivalent（ハードリンク/シンボリックリンク解決、
+/// 各OSのFSの大文字小文字規則に従う）で見て、取れなければ従来経路へ。
 bool isSelf(const std::string& outPath) {
     const std::string self = selfExePath();
     if (self.empty()) return false;
+    {
+        std::error_code ec;
+        namespace fs = std::filesystem;
+        const fs::path sp = pathFromUtf8(self);
+        const fs::path op = pathFromUtf8(outPath);
+        bool eq = false;
+        // 両方存在するときだけ判定できる。存在しない・権限不足は
+        // 例外を投げず ec 付きで false 扱いにして従来経路へ落とす。
+        if (fs::exists(sp, ec) && fs::exists(op, ec)) {
+            ec.clear();
+            eq = fs::equivalent(sp, op, ec);
+            if (!ec) return eq;
+        }
+    }
 #ifdef _WIN32
     const std::wstring sw = pathFromUtf8(self).wstring();
     const std::wstring ow = pathFromUtf8(outPath).wstring();

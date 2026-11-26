@@ -590,9 +590,20 @@ void Gc::collect() {
             (void)jbBase;
         }
 #ifdef _WIN32
-        // 現コンテキストのコミット範囲。ファイバ上では TIB の
-        // StackBase/StackLimit がファイバのものに差し替わる。
-        {
+        // Linuxと同一方針: ファイバ上ではファイバ範囲を走査せず
+        // （Runtime::markRoots が精密に見る）、スケジューラ退避rspから
+        // メインスタック頂までを保守走査する。ファイバ外は現範囲を走査。
+        if (xyo::currentFiber() != nullptr) {
+            if (g_mainStackLo < g_mainStackHi) {
+                uintptr_t lo = static_cast<uintptr_t>(
+                    xyo::detail::gSchedulerRegs.rsp);
+                const uintptr_t hi = static_cast<uintptr_t>(g_mainStackHi);
+                if (lo < g_mainStackLo) lo = g_mainStackLo;
+                if (lo < hi)
+                    scanRange(reinterpret_cast<void*>(lo),
+                              reinterpret_cast<void*>(hi));
+            }
+        } else {
             ULONG_PTR lo, hi;
             GetCurrentThreadStackLimits(&lo, &hi);
             uintptr_t cur = reinterpret_cast<uintptr_t>(
@@ -601,15 +612,12 @@ void Gc::collect() {
             if (cur < hi)
                 scanRange(reinterpret_cast<void*>(cur),
                           reinterpret_cast<void*>(hi));
-        }
-        // ファイバ/別スレッド上の collect では現在範囲がメインスタックを
-        // カバーしない — Gc::get() で記録したメイン範囲を併走する。
-        // メインスレッド上かつファイバ外なら現在範囲と重複するので省く。
-        if (GetCurrentThreadId() != g_mainTid ||
-            xyo::currentFiber() != nullptr) {
-            if (g_mainStackLo < g_mainStackHi)
-                scanRange(reinterpret_cast<void*>(g_mainStackLo),
-                          reinterpret_cast<void*>(g_mainStackHi));
+            // 別スレッド上の collect では現在範囲がメインをカバーしない。
+            if (GetCurrentThreadId() != g_mainTid) {
+                if (g_mainStackLo < g_mainStackHi)
+                    scanRange(reinterpret_cast<void*>(g_mainStackLo),
+                              reinterpret_cast<void*>(g_mainStackHi));
+            }
         }
 #elif defined(__linux__)
         pthread_attr_t attr;

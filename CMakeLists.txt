@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(xyo-cpp VERSION 1.3.6 LANGUAGES C CXX ASM)
+project(xyo-cpp VERSION 1.3.7 LANGUAGES C CXX ASM)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -546,7 +546,7 @@ option(XYO_REQUIRE_SDL2 "Fail the configure step if SDL2 is not found" OFF)
 if(XYO_SDL2 AND NOT EMSCRIPTEN)
 # Linux: pkg-config / Windows 等: SDL2Config.cmake（-DSDL2_DIR= か
 # -DCMAKE_PREFIX_PATH= で mingw 用 SDL2 を指定すると play/gui が有効になる）。
-option(XYO_RSVG "Use librsvg for SVG costumes (Windows では通常 OFF)" ON)
+option(XYO_RSVG "Use librsvg for SVG costumes (XYO_STATIC の完全静的ビルドでは OFF に倒す)" ON)
 find_package(PkgConfig QUIET)
 set(XYO_SDL2_LIB "")
 # 1) config モード（Windows は SDL2::SDL2-static を取るために必須）。
@@ -617,7 +617,11 @@ endif()
       message(STATUS "Music: system FluidSynth enabled")
     endif()
   endif()
-  if(PkgConfig_FOUND AND XYO_RSVG)
+  if(PkgConfig_FOUND AND XYO_RSVG AND NOT XYO_STATIC)
+    # XYO_STATIC（完全静的・単体 exe）では共有ライブラリの librsvg スタックを
+    # リンクできない（-static）＋ LGPL 静的リンクの壁があるため、明示的に
+    # nanosvg フォールバックへ落とす。動的リンク版（Windows の xyo.exe 等）は
+    # MSYS2 の mingw-w64-x86_64-librsvg を入れれば自動で有効になる。
     pkg_check_modules(RSVG QUIET IMPORTED_TARGET librsvg-2.0>=2.52)
   endif()
   if(RSVG_FOUND)
@@ -721,17 +725,10 @@ if(XYO_BUILD_SHELL)
   elseif(XYO_STATIC)
     message(STATUS "XYO_STATIC: Qt Quick launcher disabled (LGPL requires dynamic linking)")
   endif()
-  # エディタは Qt Quick 版（editor_qt.cpp + qml/Editor.qml）。
-  # 旧 ImGui 版 editor.cpp は削除済み（履歴は git を参照）。
   add_executable(xyo-cli src/shell/main.cpp src/shell/gui_qt.cpp
                  src/shell/launcher_core.cpp
                  src/shell/launcher.qrc
-                 src/shell/wasm_command.cpp
-                 src/shell/editor_qt.cpp
-                 src/blockly/shape.cpp src/blockly/layout.cpp
-                 src/blockly/geom.cpp
-                 src/blockly/label.cpp src/blockly/ops.cpp
-                 src/blockly/dynamic_catalog.cpp)
+                 src/shell/wasm_command.cpp)
   target_link_libraries(xyo-cli PRIVATE xyo)
   if(XYO_QT_GUI)
     # gui_qt.cpp 内の Q_OBJECT クラスと qml/Launcher.qml リソース用。

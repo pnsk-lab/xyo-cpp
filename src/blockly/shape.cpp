@@ -49,14 +49,17 @@ void notchR(Path& p, float x, float y) {
 /// 上辺（ブロック左上から時計回り開始）。
 void edgeTop(Path& p, const LBlock& lb) {
     float w = lb.w;
-    if (lb.defineHat) {
-        // procedures_definition: TOP_LEFT/RIGHT_CORNER_DEFINE_HAT（R=20）
-        // 上辺が y=-20 まで盛り上がった大きな角丸四角形。
+    if (lb.defineHat ||
+        (lb.block && lb.block->opcode == "procedures_definition")) {
+        // procedures_definition: TOP_LEFT/RIGHT_CORNER_DEFINE_HAT（R=20）。
+        // ブロック上辺 y=0 から半径 20 の四分円で、平らな天板 y=-20 へ
+        // 立ち上がる左右対称の帽子。左右で半径と高さを揃える
+        // （中心を y=-DR に置くと左だけ垂直な壁が付き、左右非対称になる）。
         const float DR = 20;
         p.moveTo(0, 0);
-        p.arcTo(DR, -DR, DR, 180, 270, 10);
+        p.arcTo(DR, 0, DR, 180, 270, 10);      // (0,0) → (20,-20)
         p.lineTo(w - DR, -DR);
-        p.arcTo(w - DR, 0, DR, -90, 0, 10);
+        p.arcTo(w - DR, 0, DR, -90, 0, 10);    // (w-20,-20) → (w,0)
         return;
     }
     if (lb.hat) {
@@ -205,6 +208,25 @@ Path blockOutline(const LBlock& lb) {
     }
     p.close();
     return p;
+}
+
+/// 描画と同じ外形パスによる内外判定（y 下向きの偶奇レイキャスト）。
+/// レポーター/六角形の角、C ブロックの口の内側、ハットのドーム、
+/// 上ノッチ/下バンプを正確に扱う。
+bool pointInOutline(const LBlock& lb, float x, float y) {
+    const Path path = blockOutline(lb);
+    const size_t n = path.pts.size();
+    if (n < 3) return false;
+    bool inside = false;
+    for (size_t i = 0, j = n - 1; i < n; j = i++) {
+        const Path::Pt& a = path.pts[i];
+        const Path::Pt& b = path.pts[j];
+        if (a.y == b.y) continue;
+        if ((a.y > y) != (b.y > y) &&
+            x < (b.x - a.x) * (y - a.y) / (b.y - a.y) + a.x)
+            inside = !inside;
+    }
+    return inside;
 }
 
 // ---- 描画 -------------------------------------------------------------------

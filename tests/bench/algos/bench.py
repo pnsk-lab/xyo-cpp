@@ -200,7 +200,7 @@ def main():
                                           v["median_ms"]) if v else "-")
         tw = row["modes"].get("tw-compiled")
         xy = row["modes"].get("xyo-jit")
-        if tw and xy and tw["valid"] and xy["valid"]:
+        if tw and xy and tw["valid"] and xy["valid"] and xy["median_ms"] > 0:
             line += "%10.2fx" % (tw["median_ms"] / xy["median_ms"])
         else:
             line += "%10s" % "-"
@@ -214,6 +214,9 @@ def main():
         "node": node_version(),
         "llvm": llvm_version(),
         "xyo_build": args.xyo,
+        "xyo_commit": git_rev(ROOT),
+        "tw_commit": git_rev(os.path.join(ROOT, "refs", "scratch-vm")),
+        "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "sizes": sizes,
         "modes": modes,
         "reps": args.reps,
@@ -233,6 +236,15 @@ def cpu_model():
     except OSError:
         pass
     return platform.processor() or "unknown"
+
+
+def git_rev(path):
+    try:
+        p = subprocess.run(["git", "-C", path, "rev-parse", "--short", "HEAD"],
+                           capture_output=True, text=True)
+        return p.stdout.strip() if p.returncode == 0 else "n/a"
+    except OSError:
+        return "n/a"
 
 
 def node_version():

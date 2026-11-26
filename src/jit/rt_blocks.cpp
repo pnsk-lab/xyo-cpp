@@ -852,16 +852,19 @@ void xyo_sns_resettimer(JitCtx* c) {
     XYO_RT_PROF(kBlocks);
     c->runtime->ioDevices.clock.resetProjectTimer();
 }
+static bool rtLocaltimePortable(const std::time_t* t, std::tm* out) {
+#ifdef _WIN32
+    return localtime_s(out, t) == 0;
+#else
+    return localtime_r(t, out) != nullptr;
+#endif
+}
 uint64_t xyo_sns_current(JitCtx* c, uint64_t menu) {
     XYO_RT_PROF(kBlocks);
     std::u16string option = u16lower(toV(menu));
     std::time_t now = std::time(nullptr);
-    std::tm tm;
-#ifdef _WIN32
-    localtime_s(&tm, &now);   // 引数順が POSIX localtime_r と逆
-#else
-    localtime_r(&now, &tm);
-#endif
+    std::tm tm{};
+    (void)rtLocaltimePortable(&now, &tm);
     if (option == u"year") return toB(V(tm.tm_year + 1900.0));
     if (option == u"month") return toB(V(tm.tm_mon + 1.0));
     if (option == u"date") return toB(V(double(tm.tm_mday)));
