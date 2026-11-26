@@ -4,9 +4,8 @@
 # Copies every DT_NEEDED lib except the glibc core set (libc/m/dl/pthread/rt,
 # ld-linux, vdso), then the binary finds them via $ORIGIN rpath (set at build
 # time with -DCMAKE_INSTALL_RPATH='$ORIGIN/lib'). The release build emits
-# DT_RPATH (not DT_RUNPATH) via --disable-new-dtags so the transitive
-# dependency closure (e.g. libQt6Qml.so.6 needing libQt6QmlModels.so.6) also
-# resolves to lib/ instead of falling back to a mismatched system Qt.
+# DT_RPATH (not DT_RUNPATH) via --disable-new-dtags so transitive deps that
+# lack their own RUNPATH also resolve to lib/.
 set -euo pipefail
 BIN="$1"
 LIBDIR="$2"
@@ -22,4 +21,20 @@ ldd "$BIN" | awk '/=>/ {print $3}' | grep -E '^/' | sort -u | while read -r lib;
   echo "bundle: $base"
   cp -L "$lib" "$LIBDIR/"
 done
+
+# Some libraries carry an absolute RUNPATH pointing at a distro-private
+# subdirectory (e.g. libpulse.so.0 → /usr/lib/x86_64-linux-gnu/pulseaudio,
+# libproxy → .../libproxy). That RUNPATH masks the executable's own RPATH
+# for their children, so libpulsecommon/libpxbackend copied into lib/ would
+# never be found on end-user machines. Replace every bundled library's
+# RUNPATH with $ORIGIN so siblings in lib/ are found first.
+if ! command -v patchelf >/dev/null 2>&1; then
+  echo "error: patchelf is required to fix RUNPATH on bundled libs" >&2
+  exit 1
+fi
+for f in "$LIBDIR"/*.so*; do
+  [ -f "$f" ] || continue
+  patchelf --set-rpath '$ORIGIN' "$f"
+done
+
 echo "bundled $(ls "$LIBDIR" | wc -l) libs into $LIBDIR"

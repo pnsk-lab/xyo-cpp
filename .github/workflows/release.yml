@@ -25,7 +25,7 @@ jobs:
         uses: ./.github/actions/linux-deps
         with:
           llvm: ${{ env.LLVM_STATIC }}
-          extra: libzstd-dev libxml2-dev libncurses-dev libsdl2-dev librsvg2-dev libgl-dev glslc qt6-base-dev qt6-declarative-dev qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-layouts qml6-module-qtqml-workerscript qml6-module-qtquick-templates qml6-module-qtquick-window qml6-module-qtqml qml6-module-qtquick-shapes
+          extra: patchelf libzstd-dev libxml2-dev libncurses-dev libsdl2-dev librsvg2-dev libgl-dev glslc qt6-base-dev qt6-declarative-dev qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-layouts qml6-module-qtqml-workerscript qml6-module-qtquick-templates qml6-module-qtquick-window qml6-module-qtqml qml6-module-qtquick-shapes
 
       - name: Configure and build (Release / static LLVM / dynamic Qt)
         run: |
@@ -72,10 +72,16 @@ jobs:
           readelf -d dist/pkg/xyo | grep -F '$ORIGIN/lib'
           echo "--- Qt resolves to bundled lib (not system) ---"
           LD_LIBRARY_PATH= ldd dist/pkg/xyo | grep libQt6Core
-          echo "--- transitive deps resolve to bundled lib/ (no system /usr/lib, none missing) ---"
+          echo "--- all bundled libs resolve from lib/ (none missing, none from system paths) ---"
           ! LD_LIBRARY_PATH= ldd dist/pkg/xyo | grep -q "not found"
-          ! LD_LIBRARY_PATH= ldd dist/pkg/xyo | grep -qE "libQt6|libSDL2|librsvg" | \
-            grep -qE "/usr/lib|/lib/|/lib64/"
+          for f in dist/pkg/lib/*.so*; do
+            base=$(basename "$f")
+            resolved=$(LD_LIBRARY_PATH= ldd dist/pkg/xyo | awk -v b="$base" '$1==b {print $3}')
+            case "$resolved" in
+              "$(pwd)/dist/pkg/lib/"*) ;;
+              *) echo "BAD: $base resolves to ${resolved:-missing}"; exit 1 ;;
+            esac
+          done
           tar -C dist/pkg -czf dist/xyo-linux-x86_64.tar.gz \
             xyo lib LICENSE THIRD-PARTY-NOTICES.txt RUNNING.txt
           ls -lh dist
