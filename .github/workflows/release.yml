@@ -35,7 +35,7 @@ jobs:
             -DLLVM_CONFIG="/usr/lib/llvm-${LLVM_STATIC}/bin/llvm-config" \
             -DXYO_SDL2=ON -DXYO_REQUIRE_SDL2=ON -DXYO_FULL_BUILD=ON \
             -DXYO_STATIC_LLVM=ON \
-            -DCMAKE_BUILD_WITH_INSTALL_RPATH=TRUE "-DCMAKE_INSTALL_RPATH=$ORIGIN/lib"
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=TRUE '-DCMAKE_INSTALL_RPATH=$ORIGIN/lib'
           cmake --build build -j"$(nproc)"
           echo "--- libLLVM に依存していないこと ---"
           readelf -d build/xyo | grep -c "libLLVM" | grep -q "^0$"
@@ -67,7 +67,7 @@ jobs:
           cp RUNNING.md dist/pkg/RUNNING.txt
           bash tools/ci/bundle_linux_libs.sh build/xyo dist/pkg/lib
           echo "--- rpath points at bundled lib ---"
-          readelf -d dist/pkg/xyo | grep -E "RUNPATH|RPATH"
+          readelf -d dist/pkg/xyo | grep -F '$ORIGIN/lib'
           echo "--- Qt resolves to bundled lib (not system) ---"
           LD_LIBRARY_PATH= ldd dist/pkg/xyo | grep libQt6Core
           tar -C dist/pkg -czf dist/xyo-linux-x86_64.tar.gz \
