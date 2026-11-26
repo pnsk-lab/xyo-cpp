@@ -35,7 +35,8 @@ jobs:
             -DLLVM_CONFIG="/usr/lib/llvm-${LLVM_STATIC}/bin/llvm-config" \
             -DXYO_SDL2=ON -DXYO_REQUIRE_SDL2=ON -DXYO_FULL_BUILD=ON \
             -DXYO_STATIC_LLVM=ON \
-            -DCMAKE_BUILD_WITH_INSTALL_RPATH=TRUE '-DCMAKE_INSTALL_RPATH=$ORIGIN/lib'
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=TRUE '-DCMAKE_INSTALL_RPATH=$ORIGIN/lib' \
+            -DCMAKE_EXE_LINKER_FLAGS='-Wl,--disable-new-dtags'
           cmake --build build -j"$(nproc)"
           echo "--- libLLVM に依存していないこと ---"
           readelf -d build/xyo | grep -c "libLLVM" | grep -q "^0$"
@@ -66,10 +67,15 @@ jobs:
           cp LICENSE THIRD-PARTY-NOTICES.txt dist/pkg/
           cp RUNNING.md dist/pkg/RUNNING.txt
           bash tools/ci/bundle_linux_libs.sh build/xyo dist/pkg/lib
-          echo "--- rpath points at bundled lib ---"
+          echo "--- rpath points at bundled lib (DT_RPATH so transitive deps resolve too) ---"
+          readelf -d dist/pkg/xyo | grep -F 'RPATH'
           readelf -d dist/pkg/xyo | grep -F '$ORIGIN/lib'
           echo "--- Qt resolves to bundled lib (not system) ---"
           LD_LIBRARY_PATH= ldd dist/pkg/xyo | grep libQt6Core
+          echo "--- transitive deps resolve to bundled lib/ (no system /usr/lib, none missing) ---"
+          ! LD_LIBRARY_PATH= ldd dist/pkg/xyo | grep -q "not found"
+          ! LD_LIBRARY_PATH= ldd dist/pkg/xyo | grep -qE "libQt6|libSDL2|librsvg" | \
+            grep -qE "/usr/lib|/lib/|/lib64/"
           tar -C dist/pkg -czf dist/xyo-linux-x86_64.tar.gz \
             xyo lib LICENSE THIRD-PARTY-NOTICES.txt RUNNING.txt
           ls -lh dist

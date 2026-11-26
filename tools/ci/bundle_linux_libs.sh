@@ -3,7 +3,10 @@
 # Usage: bundle_linux_libs.sh <xyo-binary> <pkg-lib-dir>
 # Copies every DT_NEEDED lib except the glibc core set (libc/m/dl/pthread/rt,
 # ld-linux, vdso), then the binary finds them via $ORIGIN rpath (set at build
-# time with -DCMAKE_INSTALL_RPATH='$ORIGIN/lib').
+# time with -DCMAKE_INSTALL_RPATH='$ORIGIN/lib'). The release build emits
+# DT_RPATH (not DT_RUNPATH) via --disable-new-dtags so the transitive
+# dependency closure (e.g. libQt6Qml.so.6 needing libQt6QmlModels.so.6) also
+# resolves to lib/ instead of falling back to a mismatched system Qt.
 set -euo pipefail
 BIN="$1"
 LIBDIR="$2"
