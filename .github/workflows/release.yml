@@ -308,9 +308,9 @@ jobs:
           # CLI も xyo.app/Contents/MacOS/xyo で実行する（Frameworks の
           # 同梱 dylib を @rpath で解決するので自己完結）。brew 絶対パスを
           # 参照したままのビルド直後バイナリは同梱しない。
-          mkdir -p dist/pkg/docs
+          mkdir -p dist/pkg/docs/platform
           cp LICENSE THIRD-PARTY-NOTICES.txt RUNNING.md dist/pkg/
-          cp docs/platform/macos.md dist/pkg/docs/
+          cp docs/platform/macos.md dist/pkg/docs/platform/
           mv dist/pkg/RUNNING.md dist/pkg/RUNNING.txt
           mv dist/xyo.app dist/pkg/
           # シンボリックリンク（framework 内）を保持して固める。
